@@ -40,6 +40,35 @@ def test_html_to_markdown_and_cleaning(monkeypatch):
     assert "Title" in md2 and "<" not in md2
 
 
+@pytest.mark.skipif(not getattr(utils, "_BS4_AVAILABLE", False), reason="bs4 not installed")
+def test_prune_html_for_markdown_removes_chrome():
+    html = """
+    <html>
+      <head><title>SuperWidget</title></head>
+      <body>
+        <header id="site-header">Mega Menu</header>
+        <div class="cookie-banner">We use cookies to improve...</div>
+        <nav class="navbar">Top Nav</nav>
+        <main>
+          <h1>SuperWidget</h1>
+          <section><h2>Features</h2><ul><li>Fast</li><li>Light</li></ul></section>
+          <section><h2>Specifications</h2><p>Size: 10cm</p></section>
+        </main>
+        <footer>© 2025 ACME — Privacy Policy</footer>
+      </body>
+    </html>
+    """
+    cleaned_html = utils.prune_html_for_markdown(html)
+    md = utils.html_to_markdown(cleaned_html)
+    md = utils.clean_markdown(md)
+
+    assert "SuperWidget" in md
+    assert "Features" in md
+    assert "cookie" not in md.lower()
+    assert "Mega Menu" not in md
+    assert "Privacy Policy" not in md
+
+
 def test_chunk_text_respects_size():
     text = "para1\n\n" + "x" * 300 + "\n\npara3"
     parts = list(utils.chunk_text(text, max_chars=120))
@@ -98,13 +127,13 @@ def test_should_crawl_url_gate():
 
 def test_save_markdown_layout(tmp_path: Path):
     md = "# Title\n\nHello"
-    host = "example.com"
-    url = "https://example.com/products/alpha"
+    host = "www.example.com"  # ensure 'www.' is dropped
+    url = "https://www.example.com/products/alpha"
     url_path = "/products/alpha"
     out = utils.save_markdown(tmp_path, host, url_path, url, md)
     assert out.exists()
     # filename includes slug + short hash
-    assert out.parent.name == host
+    assert out.parent.name == "example.com"
     assert out.suffix == ".md"
     assert re.match(r".+-[0-9a-f]{10}\.md$", out.name)
 

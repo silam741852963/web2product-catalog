@@ -41,7 +41,7 @@ if str(ROOT) not in sys.path:
 from scraper.browser import init_browser, shutdown_browser
 from scraper.crawler import SiteCrawler
 from scraper.config import load_config
-from scraper.utils import html_to_markdown, clean_markdown, save_markdown, TransientHTTPError
+from scraper.utils import prune_html_for_markdown, html_to_markdown, clean_markdown, save_markdown, TransientHTTPError
 
 
 # ---------------------------- Data Models ----------------------------
@@ -167,7 +167,8 @@ def _save_markdown_for_snaps(cfg, snaps: list) -> None:
         if not p.exists():
             continue
         html = p.read_text(encoding="utf-8", errors="ignore")
-        md = clean_markdown(html_to_markdown(html))
+        cleaned_html = prune_html_for_markdown(html)
+        md = clean_markdown(html_to_markdown(cleaned_html))
         parsed = urlparse(snap.url)
         host = parsed.hostname or "unknown-host"
         url_path = parsed.path or "/"

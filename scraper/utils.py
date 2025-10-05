@@ -25,6 +25,15 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
+# ---- Optional BeautifulSoup (used by prune_html_for_markdown) ----
+try:  # pragma: no cover - availability checked in tests
+    from bs4 import BeautifulSoup, Comment  # type: ignore
+    _BS4_AVAILABLE = True
+except Exception:  # pragma: no cover
+    BeautifulSoup = None  # type: ignore
+    Comment = None        # type: ignore
+    _BS4_AVAILABLE = False
+
 try:
     # markdownify is lightweight and preserves structure better than html2text for our use
     from markdownify import markdownify as _markdownify
@@ -49,9 +58,8 @@ def normalize_url(url: str) -> str:
     url = url.strip()
     parsed = urlparse(url)
 
-    # If no scheme and no netloc, but path looks like a hostname (e.g., 'example.com' or 'example.com:8080')
+    # If no scheme/netloc, but path looks like a hostname (e.g., 'example.com' or 'example.com:8080')
     if not parsed.scheme and not parsed.netloc and parsed.path:
-        # Detect optional port
         m = re.match(r"^(?P<host>[A-Za-z0-9.-]+)(?::(?P<port>\d+))?$", parsed.path)
         if m and "." in m.group("host"):  # require at least one dot to look like a domain
             host = m.group("host").lower()
@@ -72,8 +80,9 @@ def normalize_url(url: str) -> str:
 
     return urlunparse((scheme, netloc, path, "", query, ""))
 
+
 def is_same_domain(a: str, b: str) -> bool:
-    """Return True if URLs share the same registrable domain (simple host match)."""
+    """Return True if URLs share the same (exact) hostname."""
     pa, pb = urlparse(a), urlparse(b)
     return (pa.hostname or "").lower() == (pb.hostname or "").lower()
 
@@ -140,6 +149,115 @@ def retry_async(max_attempts: int, initial_delay_ms: int, max_delay_ms: int, jit
 
         return wrapper
     return _decorator
+
+
+# ---------- HTML pruning (before Markdown) ----------
+
+# Heuristics for stripping site chrome, compliance, and noisy blocks
+_CHROME_ID_CLASS = re.compile(
+    r"(?:^|[-_])(header|footer|nav|navbar|menu|mega|breadcrumb|aside|sidebar|"
+    r"social|share|subscribe|newsletter|signup|modal|popup|overlay|cookie|gdpr|consent|"
+    r"banner|intercom|chat|widget|toolbar|sticky|floating|drawer|offcanvas|"
+    r"comments|related|pagination|pager|sitemap|language|locale|switcher|"
+    r"searchbox|search-bar|promo|advert|ad-)\b",
+    re.I,
+)
+
+_COMPLIANCE_TEXT = re.compile(
+    r"(cookie|gdpr|consent|we use cookies|privacy\s+policy|terms\s+of\s+use|"
+    r"copyright|all rights reserved|trademark|forward-looking statements)",
+    re.I,
+)
+
+_CTA_TEXT = re.compile(
+    r"(request (a )?demo|contact sales|start (your )?trial|get started|"
+    r"join (our )?newsletter|subscribe)", re.I
+)
+
+
+def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
+    """
+    Remove boilerplate & low-signal sections before HTML->Markdown.
+    Conservative: tries not to nuke product content.
+
+    If BeautifulSoup is not available, returns the original HTML.
+    """
+    if not html or not _BS4_AVAILABLE:
+        return html
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # 0) strip comments and obvious non-content tags
+    for c in soup(text=lambda t: isinstance(t, Comment)):  # type: ignore
+        c.extract()
+    for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
+        tag.decompose()
+
+    # 1) remove elements by role/landmark (but keep <main>, <article>)
+    for tag in soup.select("[role='navigation'], [role='banner'], [role='contentinfo'], nav, aside, header, footer"):
+        tag.decompose()
+
+    # 2) remove elements by id/class keywords
+    for el in soup.find_all(attrs={"class": True}):
+        classes = " ".join(el.get("class") or [])
+        if _CHROME_ID_CLASS.search(classes):
+            el.decompose()
+    for el in soup.find_all(attrs={"id": True}):
+        if _CHROME_ID_CLASS.search(el.get("id") or ""):
+            el.decompose()
+
+    # 3) remove compliance/marketing blocks by visible text
+    for el in list(soup.find_all(True)):
+        # quick skip for main/article/section with lots of text
+        if el.name in ("main", "article", "section"):
+            continue
+        txt = (el.get_text(" ", strip=True) or "")[:500].lower()
+        if not txt:
+            continue
+        if _COMPLIANCE_TEXT.search(txt):
+            el.decompose()
+            continue
+        # CTA blocks (keep the first one if asked)
+        if _CTA_TEXT.search(txt):
+            if keep_first_cta:
+                keep_first_cta = False
+            else:
+                el.decompose()
+
+    # 4) remove empty containers
+    for el in list(soup.find_all(True)):
+        if el.name in ("main", "article", "section"):  # keep
+            continue
+        txt = el.get_text("", strip=True)
+        if not txt:
+            el.decompose()
+
+    # 5) Fallback: if page lacks a <main>, prefer the largest text block
+    if not soup.find("main"):
+        candidates = sorted(
+            (el for el in soup.find_all(["article", "section", "div"])),
+            key=lambda e: len((e.get_text(" ", strip=True) or "")),
+            reverse=True,
+        )
+        if candidates:
+            keep = candidates[0]
+            # remove siblings around the largest block to reduce noise
+            parent = keep.parent
+            if parent:
+                for sib in list(parent.children):
+                    if getattr(sib, "name", None) and sib is not keep:
+                        try:
+                            sib.decompose()
+                        except Exception:
+                            pass
+
+    # 6) Clean anchor junk
+    for a in soup.find_all("a"):
+        href = (a.get("href") or "").strip()
+        if href.startswith(("javascript:", "mailto:", "tel:", "#")):
+            a.attrs.pop("href", None)
+
+    return str(soup)
 
 
 # ---------- HTML → Markdown ----------
@@ -254,6 +372,7 @@ def append_jsonl(path: Path, json_line: str, encoding: str = "utf-8") -> None:
     with path.open("a", encoding=encoding) as f:
         f.write(json_line.rstrip() + "\n")
 
+
 def save_markdown(base_dir: Path, host: str, url_path: str, url: str, md: str) -> Path:
     """
     Save markdown in a deterministic path mirroring HTML cache:
@@ -275,6 +394,7 @@ def save_markdown(base_dir: Path, host: str, url_path: str, url: str, md: str) -
     atomic_write_text(out_path, md)
     return out_path
 
+
 def safe_json_loads(s: str) -> Optional[dict]:
     """
     Try strict json.loads first; if it fails, attempt to extract the first
@@ -292,8 +412,21 @@ def safe_json_loads(s: str) -> Optional[dict]:
     start = s.find("{")
     while start != -1:
         depth = 0
+        in_str = False
+        esc = False
         for i in range(start, len(s)):
             ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
             if ch == "{":
                 depth += 1
             elif ch == "}":
