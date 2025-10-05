@@ -24,7 +24,6 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential_jitter,
 )
-from tenacity import RetryError
 
 try:
     # markdownify is lightweight and preserves structure better than html2text for our use
@@ -272,16 +271,40 @@ def save_markdown(base_dir: Path, host: str, url_path: str, url: str, md: str) -
     return out_path
 
 def safe_json_loads(s: str) -> Optional[dict]:
+    """
+    Try strict json.loads first; if it fails, attempt to extract the first
+    top-level JSON object by scanning braces (robust to noisy wrappers).
+    Returns None if nothing valid is found.
+    """
+    if not isinstance(s, str):
+        return None
+    # Fast path
     try:
         return json.loads(s)
     except Exception:
-        m = re.search(r"\{.*\}\s*$", s, flags=re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                return None
-        return None
+        pass
+
+    # Try regex fallback for a {...} block anywhere in the string
+    # (good enough for many LLM responses)
+    # If you prefer more safety, do a brace-scan:
+    start = s.find("{")
+    while start != -1:
+        depth = 0
+        for i in range(start, len(s)):
+            ch = s[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start:i+1]
+                    try:
+                        return json.loads(candidate)
+                    except Exception:
+                        break  # try next '{'
+        start = s.find("{", start + 1)
+
+    return None
 
 
 # ---------- Robots (simple, optional) ----------

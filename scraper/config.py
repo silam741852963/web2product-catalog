@@ -141,6 +141,8 @@ class Config:
     checkpoints_dir: Path
     embeddings_dir: Path
 
+    per_page_delay_ms: int  # polite delay per fetched page (0 = disabled)
+
 
 def load_config() -> Config:
     cfg = Config(
@@ -213,6 +215,8 @@ def load_config() -> Config:
             _getenv_str("PREFER_DETAIL_URL_KEYWORDS", "/product,/products")
             .split(",")
         ),
+        per_page_delay_ms = _getenv_int("PER_PAGE_DELAY_MS", 0, 0, 2000),
+
     )
     _init_logging(cfg)
     return cfg

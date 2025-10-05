@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Tuple, Optional
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright
