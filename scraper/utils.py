@@ -188,7 +188,7 @@ def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
     soup = BeautifulSoup(html, "lxml")
 
     # 0) strip comments and obvious non-content tags
-    for c in soup(text=lambda t: isinstance(t, Comment)):  # type: ignore
+    for c in soup(string=lambda t: isinstance(t, Comment)):  # type: ignore
         c.extract()
     for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
         tag.decompose()
