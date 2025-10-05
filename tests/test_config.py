@@ -24,46 +24,62 @@ def test_load_config_defaults(monkeypatch):
         "RETRY_MAX_ATTEMPTS", "RETRY_INITIAL_DELAY_MS", "RETRY_MAX_DELAY_MS", "RETRY_JITTER_MS",
         "RESPECT_ROBOTS", "SCRAPER_USER_AGENT",
         "OLLAMA_BASE_URL", "OLLAMA_MODEL", "LLM_MAX_INPUT_TOKENS", "LLM_SCHEMA_NAME",
-        "CACHE_HTML", "SANITIZE_MARKDOWN",
-        # NEW fields:
-        "CRAWLER_MAX_RETRIES", "BLOCK_HEAVY_RESOURCES", "PER_PAGE_DELAY_MS",
+        "CACHE_HTML", "SANITIZE_MARKDOWN", "CRAWLER_MAX_RETRIES", "BLOCK_HEAVY_RESOURCES", "PER_PAGE_DELAY_MS",
         "MIN_SECTION_CHARS", "MAX_SECTION_CHARS",
         "PRODUCT_URL_KEYWORDS", "NON_PRODUCT_KEYWORDS", "PREFER_DETAIL_URL_KEYWORDS",
+        # NEW:
+        "ALLOW_SUBDOMAINS", "MAX_PAGES_PER_COMPANY",
+        "PRIMARY_LANG", "LANG_PATH_DENY", "LANG_QUERY_KEYS", "LANG_SUBDOMAIN_DENY",
     ]:
         monkeypatch.delenv(var, raising=False)
 
     cfg = load_config()
 
-    # existing expectations
-    assert cfg.timezone == "Asia/Ho_Chi_Minh"
+    # runtime & concurrency defaults
+    assert cfg.timezone == "Asia/Singapore"
     assert cfg.env == "dev"
-    assert cfg.max_companies_parallel == 6
-    assert cfg.max_pages_per_domain_parallel == 6
+    assert cfg.max_companies_parallel == 14
+    assert cfg.max_pages_per_domain_parallel == 4
     assert cfg.request_timeout_ms == 30000
-    assert cfg.page_load_timeout_ms == 35000
-    assert cfg.navigation_wait_until == "networkidle"
+    assert cfg.page_load_timeout_ms == 45000
+    assert cfg.navigation_wait_until == "domcontentloaded"
+
+    # retry defaults
     assert cfg.retry_max_attempts == 4
     assert cfg.retry_initial_delay_ms == 500
     assert cfg.retry_max_delay_ms == 8000
     assert cfg.retry_jitter_ms == 300
+
+    # ethics / UA
     assert cfg.respect_robots_txt is False
     assert "Mozilla/5.0" in cfg.user_agent
+
+    # llm defaults
     assert cfg.ollama_base_url == "http://localhost:11434"
     assert isinstance(cfg.output_jsonl, Path)
+
+    # misc flags
     assert cfg.cache_html is True
     assert cfg.sanitize_markdown is True
+    assert cfg.block_heavy_resources in (True, False)
+    assert cfg.crawler_max_retries == 3
+    assert cfg.per_page_delay_ms == 50
 
-    # NEW: defaults for added knobs/paths
+    # new: subdomain, per-company budget, language policy
+    assert cfg.allow_subdomains is True
+    assert cfg.max_pages_per_company == 150
+    assert cfg.primary_lang == "en"
+    assert isinstance(cfg.lang_path_deny, tuple) and len(cfg.lang_path_deny) > 0
+    assert isinstance(cfg.lang_query_keys, tuple) and len(cfg.lang_query_keys) > 0
+    assert isinstance(cfg.lang_subdomain_deny, tuple) and len(cfg.lang_subdomain_deny) > 0
+
+    # sectionizer/classifier defaults and path objects
     assert isinstance(cfg.candidates_dir, Path)
     assert isinstance(cfg.entities_dir, Path)
     assert isinstance(cfg.company_summaries_dir, Path)
     assert isinstance(cfg.page_meta_dir, Path)
     assert isinstance(cfg.checkpoints_dir, Path)
     assert isinstance(cfg.embeddings_dir, Path)
-
-    assert cfg.crawler_max_retries in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)  # default 2 per our suggestion
-    assert isinstance(cfg.block_heavy_resources, bool)
-    assert cfg.per_page_delay_ms >= 0
 
     assert isinstance(cfg.product_like_url_keywords, tuple)
     assert isinstance(cfg.non_product_keywords, tuple)
@@ -102,6 +118,14 @@ def test_load_config_env_overrides_and_bounds(monkeypatch):
     monkeypatch.setenv("NON_PRODUCT_KEYWORDS", "/blog,/careers")
     monkeypatch.setenv("PREFER_DETAIL_URL_KEYWORDS", "/product")
 
+    # NEWER fields (subdomain, budget, language policy)
+    monkeypatch.setenv("ALLOW_SUBDOMAINS", "false")
+    monkeypatch.setenv("MAX_PAGES_PER_COMPANY", "77")
+    monkeypatch.setenv("PRIMARY_LANG", "de")
+    monkeypatch.setenv("LANG_PATH_DENY", "/fr,/es")
+    monkeypatch.setenv("LANG_QUERY_KEYS", "lang,hl")
+    monkeypatch.setenv("LANG_SUBDOMAIN_DENY", "fr.,es.")
+
     cfg = load_config()
 
     assert cfg.timezone == "UTC"
@@ -133,6 +157,14 @@ def test_load_config_env_overrides_and_bounds(monkeypatch):
     assert cfg.product_like_url_keywords == ("/product", "/solutions")
     assert cfg.non_product_keywords == ("/blog", "/careers")
     assert cfg.prefer_detail_url_keywords == ("/product",)
+
+    # newer fields assertions
+    assert cfg.allow_subdomains is False
+    assert cfg.max_pages_per_company == 77
+    assert cfg.primary_lang == "de"
+    assert cfg.lang_path_deny == ("/fr", "/es")
+    assert cfg.lang_query_keys == ("lang", "hl")
+    assert cfg.lang_subdomain_deny == ("fr.", "es.")
 
 
 def test_logging_file_exists_and_writable():

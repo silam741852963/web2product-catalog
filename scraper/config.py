@@ -52,7 +52,7 @@ def _getenv_str(name: str, default: str) -> str:
     return value if isinstance(value, str) and value.strip() else default
 
 
-def _getenv_int(name: str, default: int, min_val: Optional[int] = None, 
+def _getenv_int(name: str, default: int, min_val: Optional[int] = None,
                 max_val: Optional[int] = None) -> int:
     raw = os.getenv(name)
     if raw is None:
@@ -88,8 +88,7 @@ class Config:
     max_pages_per_domain_parallel: int
     request_timeout_ms: int
     page_load_timeout_ms: int
-    navigation_wait_until: Literal["load", "domcontentloaded", "networkidle", 
-                                   "commit"]
+    navigation_wait_until: Literal["load", "domcontentloaded", "networkidle", "commit"]
 
     # Retry / backoff
     retry_max_attempts: int
@@ -101,7 +100,6 @@ class Config:
     respect_robots_txt: bool
     user_agent: str
     block_heavy_resources: bool
-
 
     # LLM / Ollama
     ollama_base_url: str
@@ -124,6 +122,15 @@ class Config:
 
     # Crawler extras
     crawler_max_retries: int
+    per_page_delay_ms: int  # polite delay per fetched page (0 = disabled)
+    allow_subdomains: bool  # include subdomains as same "site" when True
+    max_pages_per_company: int  # soft cap per company (adaptive logic can stop earlier)
+
+    # Language/translation policy
+    primary_lang: str
+    lang_path_deny: tuple[str, ...]
+    lang_query_keys: tuple[str, ...]
+    lang_subdomain_deny: tuple[str, ...]
 
     # Sectionizer / classifier defaults
     min_section_chars: int
@@ -132,7 +139,7 @@ class Config:
     non_product_keywords: tuple[str, ...]
     prefer_detail_url_keywords: tuple[str, ...]  # used later in consolidation
 
-    # Paths (new)
+    # Paths
     candidates_dir: Path
     evidence_dir: Path
     entities_dir: Path
@@ -141,20 +148,18 @@ class Config:
     checkpoints_dir: Path
     embeddings_dir: Path
 
-    per_page_delay_ms: int  # polite delay per fetched page (0 = disabled)
-
 
 def load_config() -> Config:
     cfg = Config(
-        timezone=_getenv_str("APP_TZ", "Asia/Ho_Chi_Minh"),
-        env=_getenv_str("APP_ENV", "dev"),  # dev|staging|prod
+        timezone=_getenv_str("APP_TZ", "Asia/Singapore"),
+        env=_getenv_str("APP_ENV", "dev"),
 
         # concurrency/timeouts
-        max_companies_parallel=_getenv_int("MAX_COMPANIES_PARALLEL", 6, min_val=1, max_val=64),
-        max_pages_per_domain_parallel=_getenv_int("MAX_PAGES_PER_DOMAIN_PARALLEL", 6, min_val=1, max_val=32),
+        max_companies_parallel=_getenv_int("MAX_COMPANIES_PARALLEL", 14, min_val=1, max_val=64),
+        max_pages_per_domain_parallel=_getenv_int("MAX_PAGES_PER_DOMAIN_PARALLEL", 4, min_val=1, max_val=32),
         request_timeout_ms=_getenv_int("REQUEST_TIMEOUT_MS", 30000, min_val=5000, max_val=120000),
-        page_load_timeout_ms=_getenv_int("PAGE_LOAD_TIMEOUT_MS", 35000, min_val=5000, max_val=180000),
-        navigation_wait_until=_getenv_str("NAV_WAIT_UNTIL", "networkidle"),  # good default for headless
+        page_load_timeout_ms=_getenv_int("PAGE_LOAD_TIMEOUT_MS", 45000, min_val=5000, max_val=180000),
+        navigation_wait_until=_getenv_str("NAV_WAIT_UNTIL", "domcontentloaded"),
 
         # retry/backoff
         retry_max_attempts=_getenv_int("RETRY_MAX_ATTEMPTS", 4, min_val=1, max_val=10),
@@ -163,7 +168,7 @@ def load_config() -> Config:
         retry_jitter_ms=_getenv_int("RETRY_JITTER_MS", 300, min_val=0, max_val=2000),
 
         # robots / blocking
-        respect_robots_txt=_getenv_bool("RESPECT_ROBOTS", False),  # default false for internal research; set true if needed
+        respect_robots_txt=_getenv_bool("RESPECT_ROBOTS", False),
         user_agent=_getenv_str(
             "SCRAPER_USER_AGENT",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -174,7 +179,7 @@ def load_config() -> Config:
 
         # LLM / Ollama
         ollama_base_url=_getenv_str("OLLAMA_BASE_URL", "http://localhost:11434"),
-        ollama_model=_getenv_str("OLLAMA_MODEL", "qwen3:30b"),
+        ollama_model=_getenv_str("OLLAMA_MODEL", "qwen2.5:14b-instruct-q4_K_M"),
         llm_max_input_tokens=_getenv_int("LLM_MAX_INPUT_TOKENS", 8000, min_val=2048, max_val=32768),
         llm_target_json_schema_name=_getenv_str("LLM_SCHEMA_NAME", "product_catalog_schema"),
 
@@ -198,25 +203,36 @@ def load_config() -> Config:
         cache_html=_getenv_bool("CACHE_HTML", True),
         sanitize_markdown=_getenv_bool("SANITIZE_MARKDOWN", True),
 
-        crawler_max_retries=_getenv_int("CRAWLER_MAX_RETRIES", 2, 0, 10),
+        # crawler extras
+        crawler_max_retries=_getenv_int("CRAWLER_MAX_RETRIES", 3, 0, 10),
+        per_page_delay_ms=_getenv_int("PER_PAGE_DELAY_MS", 50, 0, 2000),
+        allow_subdomains=_getenv_bool("ALLOW_SUBDOMAINS", True),
+        max_pages_per_company=_getenv_int("MAX_PAGES_PER_COMPANY", 150, 50, 2000),
 
+        # language policy
+        primary_lang=_getenv_str("PRIMARY_LANG", "en"),
+        lang_path_deny=tuple(
+            _getenv_str("LANG_PATH_DENY", "/fr,/de,/es,/pt,/it,/ru,/zh,/zh-cn,/ja,/ko").split(",")
+        ),
+        lang_query_keys=tuple(
+            _getenv_str("LANG_QUERY_KEYS", "lang,locale,hl").split(",")
+        ),
+        lang_subdomain_deny=tuple(
+            _getenv_str("LANG_SUBDOMAIN_DENY", "fr.,de.,es.,pt.,it.,ru.,zh.,cn.,jp.,kr.").split(",")
+        ),
+
+        # sectionizer/classifier
         min_section_chars=_getenv_int("MIN_SECTION_CHARS", 180, 50, 2000),
         max_section_chars=_getenv_int("MAX_SECTION_CHARS", 2400, 400, 6000),
-
         product_like_url_keywords=tuple(
-            _getenv_str("PRODUCT_URL_KEYWORDS", "/product,/products,/solutions,/services,/catalog")
-            .split(",")
+            _getenv_str("PRODUCT_URL_KEYWORDS", "/product,/products,/solutions,/services,/catalog").split(",")
         ),
         non_product_keywords=tuple(
-            _getenv_str("NON_PRODUCT_KEYWORDS", "/blog,/news,/legal,/privacy,/careers,/investors")
-            .split(",")
+            _getenv_str("NON_PRODUCT_KEYWORDS", "/blog,/news,/legal,/privacy,/careers,/investors").split(",")
         ),
         prefer_detail_url_keywords=tuple(
-            _getenv_str("PREFER_DETAIL_URL_KEYWORDS", "/product,/products")
-            .split(",")
+            _getenv_str("PREFER_DETAIL_URL_KEYWORDS", "/product,/products").split(",")
         ),
-        per_page_delay_ms = _getenv_int("PER_PAGE_DELAY_MS", 0, 0, 2000),
-
     )
     _init_logging(cfg)
     return cfg

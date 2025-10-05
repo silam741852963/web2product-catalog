@@ -18,15 +18,24 @@ class FakeResponse:
 
 
 class FakePage:
-    def __init__(self, url, html, title, links=None, status=200):
+    """
+    Minimal page stub:
+      - holds a canonical page URL
+      - returns raw HTML string
+      - returns a title
+      - returns raw hrefs from eval_on_selector_all("a[href]", ...)
+      - supports wait_for_selector (no-op)
+    """
+    def __init__(self, url, html, title, hrefs=None, status=200):
         self._url = url
         self._html = html
         self._title = title
-        self._links = links or []
+        self._hrefs = hrefs or []
         self._status = status
         self.closed = False
 
     async def goto(self, url, wait_until=None, timeout=None):
+        # Simulate navigation result status only; content/title come from this stub
         return FakeResponse(self._status)
 
     async def content(self):
@@ -36,7 +45,12 @@ class FakePage:
         return self._title
 
     async def eval_on_selector_all(self, selector, js):
-        return list(self._links)
+        # Return raw hrefs (relative or absolute), not normalized URLs
+        return list(self._hrefs)
+
+    async def wait_for_selector(self, selector, timeout=None):
+        # no-op; assume success
+        return None
 
     async def close(self):
         self.closed = True
@@ -54,6 +68,10 @@ class FakeContext:
 
 
 class FakeNewPageProxy:
+    """
+    Proxy that swaps in the right FakePage for each goto().
+    Exposes .url and wait_for_selector to match the crawler's usage.
+    """
     def __init__(self, pages_by_url):
         self._pages_by_url = pages_by_url
         self._impl = None
@@ -62,6 +80,15 @@ class FakeNewPageProxy:
         page = self._pages_by_url[url]
         self._impl = page
         return await page.goto(url, wait_until=wait_until, timeout=timeout)
+
+    @property
+    def url(self):
+        return "" if self._impl is None else self._impl._url
+
+    async def wait_for_selector(self, selector, timeout=None):
+        if self._impl is None:
+            return None
+        return await self._impl.wait_for_selector(selector, timeout=timeout)
 
     async def content(self):
         return await self._impl.content()
@@ -87,9 +114,16 @@ class FakeCfg:
         self.max_pages_per_domain_parallel = 3
         self.cache_html = True
         self.scraped_html_dir = tmpdir
-        # NEW optional knobs:
+        # crawler knobs used by SiteCrawler
         self.per_page_delay_ms = 0
         self.crawler_max_retries = 2
+        # NEW: language/subdomain + company cap
+        self.allow_subdomains = False
+        self.max_pages_per_company = 100
+        self.primary_lang = "en"
+        self.lang_path_deny = ("/fr", "/de", "/es")
+        self.lang_query_keys = ("lang", "hl", "locale")
+        self.lang_subdomain_deny = ("fr.", "de.", "es.")
 
 
 # ---------- Tests ----------
@@ -102,6 +136,7 @@ async def test_crawl_site_collects_internal_links_and_saves_html(tmp_path):
     b = "https://example.com/products/b"
     external = "http://external.com/x"
 
+    # IMPORTANT: supply raw hrefs (relative and absolute), not normalized URLs
     pages = {
         home: FakePage(
             url=home,
@@ -109,10 +144,10 @@ async def test_crawl_site_collects_internal_links_and_saves_html(tmp_path):
                   "<a href='/products/a'>A</a><a href='/about'>About</a>"
                   "<a href='http://external.com/x'>E</a></html>"),
             title="Home",
-            links=[a, about, external],
+            hrefs=["/products/a", "/about", external],
         ),
         a: FakePage(url=a, html="<html><title>Product A</title><h1>A</h1></html>", title="Product A"),
-        about: FakePage(url=about, html="<html><title>About</title><a href='/products/b'>B</a></html>", title="About", links=[b]),
+        about: FakePage(url=about, html="<html><title>About</title><a href='/products/b'>B</a></html>", title="About", hrefs=["/products/b"]),
         b: FakePage(url=b, html="<html><title>Product B</title><h1>B</h1></html>", title="Product B"),
     }
 
@@ -145,8 +180,8 @@ async def test_crawl_site_respects_allow_and_deny_filters(tmp_path):
     prod2 = "https://acme.test/products/p2"
 
     pages = {
-        home: FakePage(url=home, html="<html>home</html>", title="home", links=[prods, careers]),
-        prods: FakePage(url=prods, html="<html>prods</html>", title="prods", links=[prod1, prod2]),
+        home: FakePage(url=home, html="<html>home</html>", title="home", hrefs=[prods, careers]),
+        prods: FakePage(url=prods, html="<html>prods</html>", title="prods", hrefs=[prod1, prod2]),
         careers: FakePage(url=careers, html="<html>careers</html>", title="careers"),
         prod1: FakePage(url=prod1, html="<html>p1</html>", title="p1"),
         prod2: FakePage(url=prod2, html="<html>p2</html>", title="p2"),
@@ -173,8 +208,8 @@ async def test_crawl_site_max_pages_cap(tmp_path):
     c = "https://limit.test/c"
 
     pages = {
-        home: FakePage(url=home, html="home", title="home", links=[a, b]),
-        a: FakePage(url=a, html="a", title="a", links=[c]),
+        home: FakePage(url=home, html="home", title="home", hrefs=[a, b]),
+        a: FakePage(url=a, html="a", title="a", hrefs=[c]),
         b: FakePage(url=b, html="b", title="b"),
         c: FakePage(url=c, html="c", title="c"),
     }
@@ -192,7 +227,7 @@ async def test_fetch_retry_on_transient_error(monkeypatch, tmp_path):
     a = "https://retry.test/a"
 
     pages = {
-        home: FakePage(url=home, html="home", title="home", links=[a]),
+        home: FakePage(url=home, html="home", title="home", hrefs=[a]),
         a: FakePage(url=a, html="a", title="a"),
     }
     context = FakeContext(pages_by_url=pages)
@@ -223,8 +258,8 @@ async def test_http_error_status_triggers_transient(tmp_path):
     bad = "https://err.test/404"
 
     pages = {
-        home: FakePage(url=home, html="home", title="home", links=[bad]),
-        bad: FakePage(url=bad, html="not found", title="err", links=[], status=404),
+        home: FakePage(url=home, html="home", title="home", hrefs=[bad]),
+        bad: FakePage(url=bad, html="not found", title="err", hrefs=[], status=404),
     }
     context = FakeContext(pages_by_url=pages)
     cfg = FakeCfg(tmp_path)
@@ -234,3 +269,64 @@ async def test_http_error_status_triggers_transient(tmp_path):
 
     urls = sorted(s.url for s in snaps)
     assert urls == [home]
+
+
+@pytest.mark.asyncio
+async def test_language_filters_drop_non_primary(tmp_path):
+    home = "https://example.com/"
+    fr = "https://example.com/fr/produits"
+    de_q = "https://example.com/products?lang=de"
+    prod = "https://example.com/products"
+
+    pages = {
+        home: FakePage(url=home, html="<html>home</html>", title="home",
+                       hrefs=["/fr/produits", "/products?lang=de", "/products"]),
+        fr:   FakePage(url=fr,   html="<html>fr</html>",   title="fr"),
+        de_q: FakePage(url=de_q, html="<html>de</html>",   title="de"),
+        prod: FakePage(url=prod, html="<html>prod</html>", title="prod"),
+    }
+
+    context = FakeContext(pages_by_url=pages)
+    cfg = FakeCfg(tmp_path)
+    # language policy in FakeCfg denies /fr and ?lang=de
+
+    crawler = SiteCrawler(cfg, context)
+    snaps = await crawler.crawl_site(homepage=home)
+
+    urls = sorted(s.url for s in snaps)
+    # should only include home and /products
+    assert urls == sorted([home, prod])
+
+
+@pytest.mark.asyncio
+async def test_subdomain_toggle(tmp_path):
+    home = "https://example.com/"
+    docs = "https://docs.example.com/guide"
+    prod = "https://example.com/products"
+
+    pages = {
+        home: FakePage(url=home, html="<html>home</html>", title="home",
+                       hrefs=[docs, "/products"]),
+        docs: FakePage(url=docs, html="<html>docs</html>", title="docs"),
+        prod: FakePage(url=prod, html="<html>prod</html>", title="prod"),
+    }
+
+    # 1) disallow subdomains: docs should be excluded
+    context = FakeContext(pages_by_url=pages)
+    cfg = FakeCfg(tmp_path)
+    cfg.allow_subdomains = False
+
+    crawler = SiteCrawler(cfg, context)
+    snaps = await crawler.crawl_site(homepage=home)
+    urls = sorted(s.url for s in snaps)
+    assert urls == sorted([home, prod])
+
+    # 2) allow subdomains: docs should be included
+    context2 = FakeContext(pages_by_url=pages)
+    cfg2 = FakeCfg(tmp_path)
+    cfg2.allow_subdomains = True
+
+    crawler2 = SiteCrawler(cfg2, context2)
+    snaps2 = await crawler2.crawl_site(homepage=home)
+    urls2 = sorted(s.url for s in snaps2)
+    assert urls2 == sorted([home, docs, prod])

@@ -260,6 +260,10 @@ def save_markdown(base_dir: Path, host: str, url_path: str, url: str, md: str) -
     data/markdown/{host}/{slug}-{sha}.md
     """
     from hashlib import sha1
+    host = (host or "unknown-host").lower()
+    if host.startswith("www."):
+        host = host[4:]  # drop leading www.
+
     path = url_path or "/"
     if path.endswith("/"):
         path += "index"
@@ -267,6 +271,7 @@ def save_markdown(base_dir: Path, host: str, url_path: str, url: str, md: str) -
     h = sha1(url.encode("utf-8")).hexdigest()[:10]
     fname = f"{slug}-{h}.md"
     out_path = base_dir / host / fname
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(out_path, md)
     return out_path
 
@@ -284,9 +289,6 @@ def safe_json_loads(s: str) -> Optional[dict]:
     except Exception:
         pass
 
-    # Try regex fallback for a {...} block anywhere in the string
-    # (good enough for many LLM responses)
-    # If you prefer more safety, do a brace-scan:
     start = s.find("{")
     while start != -1:
         depth = 0
@@ -301,7 +303,7 @@ def safe_json_loads(s: str) -> Optional[dict]:
                     try:
                         return json.loads(candidate)
                     except Exception:
-                        break  # try next '{'
+                        break
         start = s.find("{", start + 1)
 
     return None
