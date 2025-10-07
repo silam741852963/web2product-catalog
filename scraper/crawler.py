@@ -1,24 +1,24 @@
+# scraper/crawler.py
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import logging
 import re
+import ssl
 from dataclasses import dataclass, field
 from typing import List, Set, Dict, Optional
 from urllib.parse import urlparse, urljoin
 
+import httpx
 from playwright.async_api import BrowserContext
 
 from .config import Config
 from .utils import (
-    normalize_url,
-    is_http_url,
-    is_same_domain,  # still used when subdomains are disabled
-    slugify,
-    atomic_write_text,
-    retry_async,
-    TransientHTTPError,
+    normalize_url, is_http_url, slugify, atomic_write_text,
+    retry_async, TransientHTTPError, get_base_domain,
+    looks_like_js_app, extract_links_static, extract_title_static, same_site,
+    looks_non_product_url
 )
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 class NonRetryableHTTPError(Exception):
     pass
 
+class NeedsBrowser(Exception):
+    """Signal to fall back to Playwright rendering."""
+    pass
 
 @dataclass
 class PageSnapshot:
@@ -105,31 +108,11 @@ def _language_ok(u: str, cfg: Config) -> bool:
         return True
 
 
-# --- Subdomain support helpers ---
-def _registrable(host: str) -> str:
-    """
-    Simple fallback: last two labels (ok for most .com/.net). If you need
-    bullet-proof eTLD+1 worldwide, we can switch to `tldextract`.
-    """
-    host = (host or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
-    parts = host.split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else host
-
-def _same_site(a: str, b: str, allow_subdomains: bool) -> bool:
-    if not allow_subdomains:
-        return is_same_domain(a, b)
-    ha = _registrable(urlparse(a).hostname or "")
-    hb = _registrable(urlparse(b).hostname or "")
-    return ha == hb
-
-
 class SiteCrawler:
     """
     Concurrent, retrying, per-domain crawler:
     - Starts from a homepage
-    - Follows internal links (same host by default; optionally subdomains)
+    - Follows internal links (same host or eTLD+1 if allow_subdomains)
     - Saves raw HTML (optional, per config.cache_html)
     - Returns PageSnapshot list for downstream processing
     """
@@ -211,7 +194,7 @@ class SiteCrawler:
                         if link in visited or link in queued:
                             continue
                         # site scope
-                        if not _same_site(url, link, getattr(self.cfg, "allow_subdomains", False)):
+                        if not same_site(url, link, getattr(self.cfg, "allow_subdomains", False)):
                             continue
                         # language policy
                         if not _language_ok(link, self.cfg):
@@ -223,6 +206,8 @@ class SiteCrawler:
                             continue
                         # file/junk filters
                         if not _should_visit(link):
+                            continue
+                        if looks_non_product_url(link):
                             continue
                         await queue.put(link)
                         queued.add(link)
@@ -264,6 +249,27 @@ class SiteCrawler:
         jitter_ms=300,
     )
     async def _fetch_and_extract(self, url: str) -> PageSnapshot:
+        """
+        Static-first: try httpx; on JS-app, auth/blocked statuses, or TLS/network problems,
+        fall back to Playwright rendering once within the same attempt.
+        """
+        if bool(getattr(self.cfg, "enable_static_first", False)):
+            try:
+                return await self._fetch_static(url)
+            except NeedsBrowser:
+                # fall through to Playwright below
+                pass
+            except NonRetryableHTTPError:
+                # 404 etc. — propagate so caller won't retry
+                raise
+            except TransientHTTPError:
+                # let retry decorator handle, but first try a browser pass
+                pass
+            except Exception as e:
+                # unknown issues → attempt browser before treating as transient
+                logger.debug("Static fetch unknown error on %s: %s (will try browser)", url, e)
+
+        # Playwright fallback / dynamic render
         page = await self.context.new_page()
         resp = None  # ensure defined for logging/guards
         try:
@@ -315,13 +321,16 @@ class SiteCrawler:
             # Same-site + language filter early (reduces out_links payload)
             filtered = []
             for l in links:
-                if not _same_site(url, l, getattr(self.cfg, "allow_subdomains", False)):
+                ln = normalize_url(l)
+                if not same_site(url, ln, getattr(self.cfg, "allow_subdomains", False)):
                     continue
-                if not _language_ok(l, self.cfg):
+                if not _language_ok(ln, self.cfg):
                     continue
-                if not _should_visit(l):
+                if not _should_visit(ln):
                     continue
-                filtered.append(l)
+                if looks_non_product_url(ln):
+                        continue
+                filtered.append(ln)
 
             return PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered)
 
@@ -339,12 +348,160 @@ class SiteCrawler:
                 await page.close()
             except Exception:
                 pass
+            
+    async def fetch_dynamic_only(self, url: str) -> PageSnapshot:
+        """
+        Always render with Playwright once (no retry decorator here);
+        let caller decide if/how to retry.
+        """
+        page = await self.context.new_page()
+        resp = None
+        try:
+            last_err = None
+            for wu in [self.wait_until, "domcontentloaded", "load"]:
+                try:
+                    resp = await page.goto(url, wait_until=wu, timeout=self.cfg.page_load_timeout_ms)
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    continue
+            if last_err is not None and resp is None:
+                raise TransientHTTPError(f"Navigation failed for {url}: {last_err}")
+
+            status = getattr(resp, "status", None)
+            if status is not None:
+                s = int(status)
+                if s == 404:
+                    raise NonRetryableHTTPError(f"HTTP 404 for {url}")
+                if s >= 400:
+                    raise TransientHTTPError(f"HTTP {s} for {url}")
+
+            try:
+                await page.wait_for_selector("body", timeout=3000)
+            except Exception:
+                pass
+
+            title = await _safe_title(page)
+            html = await page.content()
+            if html and len(html) > 3_000_000:
+                html = html[:3_000_000]
+
+            html_path = None
+            if self.cfg.cache_html:
+                html_path = self._save_html(url, html)
+
+            links = await _extract_links(page)
+            links = [normalize_url(l) for l in links if is_http_url(l)]
+
+            filtered = []
+            for l in links:
+                if not same_site(url, l, getattr(self.cfg, "allow_subdomains", False)):
+                    continue
+                if not _language_ok(l, self.cfg):
+                    continue
+                if not _should_visit(l):
+                    continue
+                filtered.append(l)
+
+            return PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered)
+
+        finally:
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+    async def _fetch_static(self, url: str) -> PageSnapshot:
+        """
+        Fetch with httpx; save HTML immediately; if page looks client-rendered
+        or blocked (auth/CAPTCHA), raise NeedsBrowser to re-fetch with Playwright.
+        """
+        timeout_ms = int(getattr(self.cfg, "static_timeout_ms", 12000))
+        timeout = httpx.Timeout(timeout_ms / 1000.0, connect=timeout_ms / 1000.0)
+        limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
+        headers = {
+            "User-Agent": self.cfg.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        http2 = bool(getattr(self.cfg, "static_http2", True))
+        max_redirects = int(getattr(self.cfg, "static_max_redirects", 5))
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                limits=limits,
+                headers=headers,
+                follow_redirects=True,
+                http2=http2,
+                max_redirects=max_redirects,
+            ) as client:
+                try:
+                    r = await client.get(url)
+                except (httpx.TimeoutException, httpx.NetworkError, ssl.SSLError) as e:
+                    # TLS/self-signed, timeouts, network problems → try browser
+                    raise NeedsBrowser(str(e)) from e
+
+            s = r.status_code
+            if s == 404:
+                raise NonRetryableHTTPError(f"HTTP 404 for {url}")
+            if s in (401, 403, 429, 503):
+                # likely bot protection or auth needed → browser
+                raise NeedsBrowser(f"HTTP {s} for {url}")
+            if s >= 400:
+                # other 4xx/5xx → transient (let retry)
+                raise TransientHTTPError(f"HTTP {s} for {url}")
+
+            html = r.text or ""
+
+            # Save raw HTML *before* heuristics so we keep a debug artifact
+            html_path = None
+            if self.cfg.cache_html:
+                # clamp before saving to avoid giant files
+                max_bytes = int(getattr(self.cfg, "static_max_bytes", 2_000_000))
+                if len(html) > max_bytes:
+                    html = html[:max_bytes]
+                html_path = self._save_html(url, html)
+
+            # Heuristic: if it looks like a JS app and visible text is tiny, ask for browser
+            threshold = int(getattr(self.cfg, "static_js_app_text_threshold", 300))
+            if looks_like_js_app(html, threshold):
+                raise NeedsBrowser("Likely client-rendered app")
+
+            # Extract links/title using static parser
+            title = extract_title_static(html)
+            links = extract_links_static(html, url)
+            links = [normalize_url(l) for l in links if is_http_url(l)]
+
+            # Apply the same out_link filters (site scope, language, junk)
+            filtered = []
+            for l in links:
+                if not same_site(url, l, getattr(self.cfg, "allow_subdomains", False)):
+                    continue
+                if not _language_ok(l, self.cfg):
+                    continue
+                if not _should_visit(l):
+                    continue
+                filtered.append(l)
+
+            return PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered)
+
+        except NeedsBrowser:
+            # propagate to _fetch_and_extract to run Playwright
+            raise
+        except NonRetryableHTTPError:
+            raise
+        except Exception as e:
+            # Unknown condition → treat transient so retry_async can re-attempt or fall back
+            raise TransientHTTPError(str(e)) from e
 
     def _save_html(self, url: str, html: str) -> str:
         parsed = urlparse(url)
         host = (parsed.hostname or "unknown-host").lower()
-        if host.startswith("www."):
-            host = host[4:]  # drop leading www.
+        base_host = get_base_domain(host)  # collapse subdomains to eTLD+1
 
         base = parsed.path or "/"
         if base.endswith("/"):
@@ -354,7 +511,7 @@ class SiteCrawler:
         h = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
         fname = f"{slug}-{h}.html"
 
-        out_dir = self.cfg.scraped_html_dir / host
+        out_dir = self.cfg.scraped_html_dir / base_host
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / fname
         atomic_write_text(out_path, html)

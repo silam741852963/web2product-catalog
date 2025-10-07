@@ -27,6 +27,7 @@ SCRAPED_HTML_DIR: Path = DATA_DIR / "scraped_html"
 MARKDOWN_DIR: Path = DATA_DIR / "markdown"
 OUTPUT_JSONL: Path = DATA_DIR / "output.jsonl"
 INPUT_URLS: Path = DATA_DIR / "input_urls.csv"
+INPUT_ROOT_DIR: Path = DATA_DIR / "input"
 LOG_FILE: Path = LOG_DIR / "scraper.log"
 CANDIDATES_DIR: Path = DATA_DIR / "candidates"
 EVIDENCE_DIR: Path = DATA_DIR / "evidence"
@@ -38,7 +39,7 @@ EMBEDDINGS_DIR: Path = DATA_DIR / "embeddings"
 
 # Ensure directories exist at import time (idempotent)
 for p in (
-    DATA_DIR, LOG_DIR, SCRAPED_HTML_DIR, MARKDOWN_DIR,
+    DATA_DIR, LOG_DIR, INPUT_ROOT_DIR, SCRAPED_HTML_DIR, MARKDOWN_DIR,
     CANDIDATES_DIR, EVIDENCE_DIR, ENTITIES_DIR,
     COMPANY_SUMMARIES_DIR, PAGE_META_DIR, CHECKPOINTS_DIR, EMBEDDINGS_DIR,
 ):
@@ -114,6 +115,8 @@ class Config:
     markdown_dir: Path
     output_jsonl: Path
     input_urls_csv: Path
+    input_root: Path
+    input_glob: str
     log_file: Path
 
     # Misc
@@ -131,6 +134,14 @@ class Config:
     lang_path_deny: tuple[str, ...]
     lang_query_keys: tuple[str, ...]
     lang_subdomain_deny: tuple[str, ...]
+
+    # Static-first (requests+BS4) fast-path knobs ------
+    enable_static_first: bool                 # try http client + BS4 before Playwright
+    static_timeout_ms: int                    # request timeout (total)
+    static_max_bytes: int                     # clamp huge HTML bodies
+    static_http2: bool                        # enable HTTP/2 in client
+    static_max_redirects: int                 # redirect cap
+    static_js_app_text_threshold: int  
 
     # Sectionizer / classifier defaults
     min_section_chars: int
@@ -190,6 +201,8 @@ def load_config() -> Config:
         markdown_dir=MARKDOWN_DIR,
         output_jsonl=OUTPUT_JSONL,
         input_urls_csv=INPUT_URLS,
+        input_root=INPUT_ROOT_DIR,
+        input_glob=_getenv_str("INPUT_GLOB", "data/input/us/*.csv"),
         log_file=LOG_FILE,
         candidates_dir=CANDIDATES_DIR,
         evidence_dir=EVIDENCE_DIR,
@@ -207,7 +220,7 @@ def load_config() -> Config:
         crawler_max_retries=_getenv_int("CRAWLER_MAX_RETRIES", 3, 0, 10),
         per_page_delay_ms=_getenv_int("PER_PAGE_DELAY_MS", 50, 0, 2000),
         allow_subdomains=_getenv_bool("ALLOW_SUBDOMAINS", True),
-        max_pages_per_company=_getenv_int("MAX_PAGES_PER_COMPANY", 150, 50, 2000),
+        max_pages_per_company=_getenv_int("MAX_PAGES_PER_COMPANY", 200, 1, 2000),
 
         # language policy
         primary_lang=_getenv_str("PRIMARY_LANG", "en"),
@@ -220,6 +233,14 @@ def load_config() -> Config:
         lang_subdomain_deny=tuple(
             _getenv_str("LANG_SUBDOMAIN_DENY", "fr.,de.,es.,pt.,it.,ru.,zh.,cn.,jp.,kr.").split(",")
         ),
+
+        # Static-first (with sensible defaults) ------
+        enable_static_first=_getenv_bool("ENABLE_STATIC_FIRST", True),
+        static_timeout_ms=_getenv_int("STATIC_TIMEOUT_MS", 9000, 1000, 60000),
+        static_max_bytes=_getenv_int("STATIC_MAX_BYTES", 2_000_000, 200_000, 8_000_000),
+        static_http2=_getenv_bool("STATIC_HTTP2", True),
+        static_max_redirects=_getenv_int("STATIC_MAX_REDIRECTS", 8, 1, 20),
+        static_js_app_text_threshold=_getenv_int("STATIC_JS_APP_TEXT_THRESHOLD", 800, 200, 4000),
 
         # sectionizer/classifier
         min_section_chars=_getenv_int("MIN_SECTION_CHARS", 180, 50, 2000),

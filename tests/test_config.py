@@ -1,4 +1,3 @@
-# tests/test_config.py
 import os
 from pathlib import Path
 
@@ -30,6 +29,11 @@ def test_load_config_defaults(monkeypatch):
         # NEW:
         "ALLOW_SUBDOMAINS", "MAX_PAGES_PER_COMPANY",
         "PRIMARY_LANG", "LANG_PATH_DENY", "LANG_QUERY_KEYS", "LANG_SUBDOMAIN_DENY",
+        # static-first:
+        "ENABLE_STATIC_FIRST", "STATIC_TIMEOUT_MS", "STATIC_MAX_BYTES",
+        "STATIC_HTTP2", "STATIC_MAX_REDIRECTS", "STATIC_JS_APP_TEXT_THRESHOLD",
+        # input discovery:
+        "INPUT_GLOB",
     ]:
         monkeypatch.delenv(var, raising=False)
 
@@ -58,6 +62,10 @@ def test_load_config_defaults(monkeypatch):
     assert cfg.ollama_base_url == "http://localhost:11434"
     assert isinstance(cfg.output_jsonl, Path)
 
+    # input discovery knobs
+    assert isinstance(cfg.input_root, Path)
+    assert isinstance(cfg.input_glob, str) and cfg.input_glob == "data/input/us/*.csv"
+
     # misc flags
     assert cfg.cache_html is True
     assert cfg.sanitize_markdown is True
@@ -67,11 +75,19 @@ def test_load_config_defaults(monkeypatch):
 
     # new: subdomain, per-company budget, language policy
     assert cfg.allow_subdomains is True
-    assert cfg.max_pages_per_company == 150
+    assert cfg.max_pages_per_company == 200
     assert cfg.primary_lang == "en"
     assert isinstance(cfg.lang_path_deny, tuple) and len(cfg.lang_path_deny) > 0
     assert isinstance(cfg.lang_query_keys, tuple) and len(cfg.lang_query_keys) > 0
     assert isinstance(cfg.lang_subdomain_deny, tuple) and len(cfg.lang_subdomain_deny) > 0
+
+    # static-first defaults
+    assert cfg.enable_static_first is True
+    assert cfg.static_timeout_ms == 9000
+    assert cfg.static_max_bytes == 2_000_000
+    assert cfg.static_http2 is True
+    assert cfg.static_max_redirects == 8
+    assert cfg.static_js_app_text_threshold == 800
 
     # sectionizer/classifier defaults and path objects
     assert isinstance(cfg.candidates_dir, Path)
@@ -118,13 +134,24 @@ def test_load_config_env_overrides_and_bounds(monkeypatch):
     monkeypatch.setenv("NON_PRODUCT_KEYWORDS", "/blog,/careers")
     monkeypatch.setenv("PREFER_DETAIL_URL_KEYWORDS", "/product")
 
-    # NEWER fields (subdomain, budget, language policy)
+    # newer fields (subdomain, budget, language policy)
     monkeypatch.setenv("ALLOW_SUBDOMAINS", "false")
     monkeypatch.setenv("MAX_PAGES_PER_COMPANY", "77")
     monkeypatch.setenv("PRIMARY_LANG", "de")
     monkeypatch.setenv("LANG_PATH_DENY", "/fr,/es")
     monkeypatch.setenv("LANG_QUERY_KEYS", "lang,hl")
     monkeypatch.setenv("LANG_SUBDOMAIN_DENY", "fr.,es.")
+
+    # static-first overrides
+    monkeypatch.setenv("ENABLE_STATIC_FIRST", "false")
+    monkeypatch.setenv("STATIC_TIMEOUT_MS", "15000")
+    monkeypatch.setenv("STATIC_MAX_BYTES", "300000")
+    monkeypatch.setenv("STATIC_HTTP2", "false")
+    monkeypatch.setenv("STATIC_MAX_REDIRECTS", "3")
+    monkeypatch.setenv("STATIC_JS_APP_TEXT_THRESHOLD", "1200")
+
+    # input discovery
+    monkeypatch.setenv("INPUT_GLOB", "data/input/custom/*.csv")
 
     cfg = load_config()
 
@@ -165,6 +192,17 @@ def test_load_config_env_overrides_and_bounds(monkeypatch):
     assert cfg.lang_path_deny == ("/fr", "/es")
     assert cfg.lang_query_keys == ("lang", "hl")
     assert cfg.lang_subdomain_deny == ("fr.", "es.")
+
+    # static-first overrides
+    assert cfg.enable_static_first is False
+    assert cfg.static_timeout_ms == 15000
+    assert cfg.static_max_bytes == 300000
+    assert cfg.static_http2 is False
+    assert cfg.static_max_redirects == 3
+    assert cfg.static_js_app_text_threshold == 1200
+
+    # input discovery override
+    assert cfg.input_glob == "data/input/custom/*.csv"
 
 
 def test_logging_file_exists_and_writable():
