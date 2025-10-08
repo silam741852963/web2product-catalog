@@ -1,239 +1,197 @@
-"""
-Shared utilities:
-- URL helpers (normalization, domain checks)
-- Robust retry decorators (sync & async) using tenacity
-- HTML -> Markdown conversion and cleaning
-- Text chunking for LLM token budgets
-- File I/O helpers (atomic write)
-- Simple robots.txt guard (opt-in)
-"""
-
+# scraper/utils.py
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import string
 from dataclasses import dataclass
+from hashlib import sha1
 from pathlib import Path
 from typing import Iterable, Callable, Awaitable, Optional
-from urllib.parse import urlparse, urlunparse
-import json
-from urllib.parse import urlparse, urlunparse, parse_qsl
-from typing import Any, TYPE_CHECKING
-import math
-import string
-if TYPE_CHECKING:
-    from bs4.element import Tag
-else:
-    Tag = Any
+from urllib.parse import urlparse, urlunparse, parse_qsl, urljoin
 
-try:
-    import tldextract  # optional but preferred
-    _TLD_EXTRACT_AVAILABLE = True
-except Exception:
-    tldextract = None
-    _TLD_EXTRACT_AVAILABLE = False
+import httpx
+import tldextract
+from bs4 import BeautifulSoup, Comment
+from bs4.element import Tag
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential_jitter,
-)
-
-# ---- BeautifulSoup (optional) ----
-try:  # pragma: no cover
-    from bs4 import BeautifulSoup, Comment  # type: ignore
-    from bs4.element import Tag            # type: ignore
-    _BS4_AVAILABLE = True
-except Exception:  # pragma: no cover
-    BeautifulSoup = None  # type: ignore
-    Comment = None        # type: ignore
-    Tag = None            # type: ignore
-    _BS4_AVAILABLE = False
-
-# ---- markdownify (optional) ----
 try:
     from markdownify import markdownify as _markdownify
-except Exception:  # pragma: no cover
+except Exception as e:  # pragma: no cover
     _markdownify = None
+    logging.getLogger(__name__).warning(
+        "markdownify import failed (%s). Falling back to plain-text stripping. "
+        "Ensure 'markdownify' and 'beautifulsoup4' are installed in this interpreter.",
+        repr(e),
+    )
 
 logger = logging.getLogger(__name__)
 
-# ---------- URL helpers ----------
+# ========== Environment & Logging helpers (moved from config.py) ==========
 
-# A tiny fallback list for common multi-part TLDs when tldextract isn't installed.
-# This is not exhaustive; meant as a reasonable heuristic.
-_MULTIPART_TLDS = {
-    "co.uk", "ac.uk", "gov.uk",
-    "com.au", "net.au", "org.au",
-    "co.jp", "ne.jp",
-    "co.nz", "org.nz",
-    "com.sg", "com.br", "com.mx",
-}
+def getenv_str(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return v if v is not None and v.strip() else default
+
+def getenv_int(name: str, default: int, min_val: Optional[int] = None, max_val: Optional[int] = None) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        return default
+    if min_val is not None:
+        val = max(min_val, val)
+    if max_val is not None:
+        val = min(max_val, val)
+    return val
+
+def getenv_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+def init_logging(log_path: Path, level: int = logging.INFO) -> None:
+    """
+    Simple file+console logger. Call once early (e.g., in run_scraper.py) with cfg.log_file.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    fmt = "%(levelname)s %(asctime)s %(name)s: %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    handlers = [
+        logging.FileHandler(log_path, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+    logging.basicConfig(level=level, format=fmt, datefmt=datefmt, handlers=handlers)
+
+# ========== Exceptions & HTTP status mapping ==========
+
+class TransientHTTPError(Exception):
+    """Retryable transient HTTP/Net error (429/5xx/timeouts)."""
+
+class NonRetryableHTTPError(Exception):
+    """Non-retryable client error (e.g., 404) or policy block."""
+
+class NeedsBrowser(Exception):
+    """Signals that static fetch is insufficient and a browser is required."""
+
+def http_status_to_exc(status: Optional[int]) -> Optional[Exception]:
+    if status is None:
+        return None
+    if status == 404:
+        return NonRetryableHTTPError("404 Not Found")
+    if status >= 400:
+        return TransientHTTPError(f"HTTP {status}")
+    return None
+
+# ========== URL & domain helpers ==========
 
 _JS_APP_SIGNATURES = (
     "__NEXT_DATA__", 'id="__next"', "data-reactroot", "reactdom",
     "window.__NUXT__", 'id="app"', "ng-app", "sapper", "astro-island",
-    "vite", "webpackjsonp"
+    "vite", "webpackjsonp",
 )
 
-# strong allow-hints: if the path has these, we DO NOT block (even if other tokens match)
+# strong allow-hints: if the path has these, we DO NOT block
 _PRODUCT_HINTS = (
     "product", "products", "solution", "solutions",
     "service", "services", "catalog", "portfolio",
     "platform", "features", "pricing", "specs", "datasheet",
-    "store", "shop"
+    "store", "shop",
 )
 
-# Obvious non-product path fragments (lowercased, substring match on path)
-# Expanded based on your run logs and common enterprise sites.
+# Obvious non-product path fragments
 _NON_PRODUCT_PATH_PARTS = (
-    # legal / policy / compliance
     "privacy", "cookies", "cookie-policy", "cookie-preferences", "cookie-settings",
     "terms", "legal", "disclaimer", "compliance", "accessibility",
     "policy", "policies", "charter", "bylaws", "guidelines", "ethics",
     "anti-bribery", "sanctions", "human-rights", "code-of-conduct",
-
-    # corp / governance / leadership
     "governance", "board", "leadership",
-    # (deliberately NOT "about", NOT "management")
-
-    # investor / media / press
     "investor", "investors", "ir", "sec", "earnings", "transcript",
     "prospectus", "summaryprospectus", "factcard", "sai", "holdings",
     "annual-report", "semi-annual", "shareholder", "premiumdiscount",
     "newsroom", "press", "press-release", "press-releases", "media", "news",
-
-    # forms / marketing content
     "information-request", "request-information", "request-info", "request",
     "contact", "contact-us", "form", "forms", "subscribe", "newsletter",
     "whitepaper", "whitepapers", "case-study", "case-studies", "ebook", "e-book",
     "resources", "resource-center", "brochure",
-
-    # auth / account / commerce
     "login", "log-in", "signin", "sign-in", "signup", "sign-up", "register",
     "account", "my-account", "profile", "auth", "sso", "oauth",
     "cart", "checkout", "wishlist", "compare",
-
-    # general site/other
     "sitemap", "search", "search-results", "results", "site-search",
     "preferences", "settings", "help", "support", "faq",
     "wp-admin", "wp-login", "wp-json", "xmlrpc.php", "feed", "rss", "atom",
-
-    # language/site plumbing
     "translate", "lang", "locale",
-
-    # careers
     "careers", "jobs", "recruit", "hiring",
-
-    # assets & CMS buckets
     "wp-content/uploads", "media-library", "document-library", "asset-library",
-
-    # observed noisy routes
     "acquire/tel",
 )
 
-# Query keys that strongly imply tracking/auth/file download pages
 _NON_PRODUCT_QUERY_KEYS = (
     "gclid", "fbclid", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "session", "sessionid", "token", "auth", "sso", "oauth", "attachment", "attachment_id",
-    "download", "redirect", "ref", "trk"
+    "download", "redirect", "ref", "trk",
 )
 
-# Subdomain tokens that almost always mean non-product surface
 _NON_PRODUCT_HOST_TOKENS = (
     "investor", "investors", "ir", "press", "news", "careers", "jobs",
-    "support", "help", "auth", "login", "accounts"
+    "support", "help", "auth", "login", "accounts",
 )
 
-# Tel/fax slug anywhere in the path (e.g., /acquire/tel2488047732)
 _TEL_PATH_RE = re.compile(r"(?:^|/)(?:tel|fax)\d{6,}(?:/|$)", re.IGNORECASE)
 
 def looks_non_product_url(u: str) -> bool:
-    """
-    Heuristic filter for URLs that are unlikely to describe products/services.
-    Returns True if the URL should be skipped.
-    """
     try:
         p = urlparse(u)
         host = (p.hostname or "").lower()
         path = (p.path or "").lower()
 
-        # Always allow home page
         if path in ("", "/"):
             return False
-
-        # If path shows strong product intent, allow it
         if any(tok in path for tok in _PRODUCT_HINTS):
             return False
-
-        # Obvious tel/fax slugs (seen in your logs: /acquire/tel248...)
         if _TEL_PATH_RE.search(path or ""):
             return True
-
-        # Host-level hints (investor.*, ir.*, press.*, careers.* etc.)
         if any(hint in host.split(".") for hint in _NON_PRODUCT_HOST_TOKENS):
             return True
-
-        # Path fragments
         for frag in _NON_PRODUCT_PATH_PARTS:
             if frag in path:
                 return True
-
-        # Query-key hints
         if p.query:
             q = dict(parse_qsl(p.query, keep_blank_values=True))
             for k in _NON_PRODUCT_QUERY_KEYS:
                 if k in q:
                     return True
-
         return False
     except Exception:
-        # If we can't parse, don't over-filter
         return False
 
 def get_base_domain(host: str) -> str:
     """
-    Return the registrable domain (eTLD+1).
-    Uses tldextract.top_domain_under_public_suffix when available.
+    Return registrable domain (eTLD+1); fall back to host if unknown.
     """
     if not host:
         return "unknown-host"
     host = host.strip().lower()
     if host.startswith("www."):
         host = host[4:]
-
-    if _TLD_EXTRACT_AVAILABLE:
-        try:
-            ext = tldextract.extract(host)
-            # New API name (preferred)
-            td = getattr(ext, "top_domain_under_public_suffix", None)
-            if td:
-                return td
-            if ext.domain and ext.suffix:
-                return f"{ext.domain}.{ext.suffix}"
-        except Exception:
-            pass
-
-    # Fallback heuristic
-    parts = host.split(".")
-    if len(parts) <= 2:
-        return host
-    last2 = ".".join(parts[-2:])
-    last3 = ".".join(parts[-3:])
-    if last2 in _MULTIPART_TLDS and len(parts) >= 3:
-        return last3
-    return last2
+    try:
+        ext = tldextract.extract(host)
+        td = getattr(ext, "top_domain_under_public_suffix", None)
+        if td:
+            return td
+        if ext.domain and ext.suffix:
+            return f"{ext.domain}.{ext.suffix}"
+    except Exception:
+        pass
+    return host
 
 def normalize_url(url: str) -> str:
-    """
-    Normalize a URL for consistency:
-    - if input looks like a bare hostname, coerce to http://<host>/
-    - lowercase scheme/host
-    - strip default ports
-    - remove fragment
-    - ensure trailing slash on empty path
-    """
     url = url.strip()
     parsed = urlparse(url)
 
@@ -263,92 +221,14 @@ def is_http_url(url: str) -> bool:
     s = urlparse(url).scheme.lower()
     return s in {"http", "https"}
 
-
-def slugify(text: str, max_len: int = 80) -> str:
-    text = text.strip().lower()
-    text = re.sub(r"[^a-z0-9\-_.]+", "-", text)
-    text = re.sub(r"-{2,}", "-", text).strip("-._")
-    if len(text) > max_len:
-        text = text[:max_len].rstrip("-._")
-    return text or "untitled"
-
-def visible_text_len(html: str) -> int:
-    if not html:
-        return 0
-    if _BS4_AVAILABLE:
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            return len((soup.get_text(" ", strip=True) or ""))
-        except Exception:
-            pass
-    txt = re.sub(r"<[^>]+>", " ", html)
-    txt = re.sub(r"\s{2,}", " ", txt).strip()
-    return len(txt)
-
-def looks_like_js_app(html: str, threshold: int) -> bool:
-    if not html:
-        return True
-    lower = html.lower()
-    if any(sig in lower for sig in _JS_APP_SIGNATURES) and visible_text_len(html) < threshold:
-        return True
-    if "enable javascript" in lower or "requires javascript" in lower:
-        return True
-    return False
-
-def extract_links_static(html: str, base_url: str) -> list[str]:
-    links: list[str] = []
-    seen = set()
-    if _BS4_AVAILABLE:
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            for a in soup.select("a[href]"):
-                href = a.get("href") or ""
-                if not href:
-                    continue
-                abs_u = urljoin(base_url, href)
-                abs_u = re.sub(r"#.*$", "", abs_u)
-                if abs_u not in seen:
-                    seen.add(abs_u)
-                    links.append(abs_u)
-            return links
-        except Exception:
-            pass
-    for m in re.finditer(r'href=["\']([^"\']+)["\']', html, re.I):
-        h = m.group(1)
-        abs_u = urljoin(base_url, h)
-        abs_u = re.sub(r"#.*$", "", abs_u)
-        if abs_u not in seen:
-            seen.add(abs_u)
-            links.append(abs_u)
-    return links
-
-def extract_title_static(html: str) -> str | None:
-    if _BS4_AVAILABLE:
-        try:
-            soup = BeautifulSoup(html, "lxml")
-            t = soup.title.string if soup.title else None
-            return (t or "").strip() or None
-        except Exception:
-            pass
-    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
-    if m:
-        t = re.sub(r"\s+", " ", m.group(1)).strip()
-        return t or None
-    return None
-
 def same_site(url_a: str, url_b: str, allow_subdomains: bool) -> bool:
-    from urllib.parse import urlparse
     if not allow_subdomains:
         return is_same_domain(url_a, url_b)
     ha = get_base_domain((urlparse(url_a).hostname or "").lower())
     hb = get_base_domain((urlparse(url_b).hostname or "").lower())
     return ha == hb
 
-# ---------- Retry decorators ----------
-
-class TransientHTTPError(Exception):
-    """Retryable transient HTTP/Net error (429/5xx/timeouts)."""
-
+# ========== Retry decorators ==========
 
 def retry_sync(max_attempts: int, initial_delay_ms: int, max_delay_ms: int, jitter_ms: int):
     return retry(
@@ -361,7 +241,6 @@ def retry_sync(max_attempts: int, initial_delay_ms: int, max_delay_ms: int, jitt
         ),
         retry=retry_if_exception_type((TransientHTTPError, IOError, TimeoutError)),
     )
-
 
 def retry_async(max_attempts: int, initial_delay_ms: int, max_delay_ms: int, jitter_ms: int):
     def _decorator(fn: Callable[..., Awaitable]):
@@ -380,8 +259,54 @@ def retry_async(max_attempts: int, initial_delay_ms: int, max_delay_ms: int, jit
         return wrapper
     return _decorator
 
+# ========== Static parsing / HTML utils ==========
 
-# ---------- HTML pruning (before Markdown) ----------
+def visible_text_len(html: str) -> int:
+    if not html:
+        return 0
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        return len((soup.get_text(" ", strip=True) or ""))
+    except Exception:
+        return 0
+
+def looks_like_js_app(html: str, threshold: int) -> bool:
+    if not html:
+        return True
+    lower = html.lower()
+    if any(sig in lower for sig in _JS_APP_SIGNATURES) and visible_text_len(html) < threshold:
+        return True
+    if "enable javascript" in lower or "requires javascript" in lower:
+        return True
+    return False
+
+def extract_links_static(html: str, base_url: str) -> list[str]:
+    links: list[str] = []
+    seen = set()
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        for a in soup.select("a[href]"):
+            href = a.get("href") or ""
+            if not href:
+                continue
+            abs_u = urljoin(base_url, href)
+            abs_u = re.sub(r"#.*$", "", abs_u)
+            if abs_u not in seen:
+                seen.add(abs_u)
+                links.append(abs_u)
+        return links
+    except Exception:
+        return []
+
+def extract_title_static(html: str) -> str | None:
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        t = soup.title.string if soup.title else None
+        return (t or "").strip() or None
+    except Exception:
+        return None
+
+# ========== HTML pruning (before Markdown) ==========
 
 _CHROME_ID_CLASS = re.compile(
     r"(?:^|[-_])(header|footer|nav|navbar|menu|mega|breadcrumb|aside|sidebar|"
@@ -391,13 +316,11 @@ _CHROME_ID_CLASS = re.compile(
     r"searchbox|search-bar|promo|advert|ad-)\b",
     re.I,
 )
-
 _COMPLIANCE_TEXT = re.compile(
     r"(cookie|gdpr|consent|we use cookies|privacy\s+policy|terms\s+of\s+use|"
     r"copyright|all rights reserved|trademark|forward-looking statements)",
     re.I,
 )
-
 _CTA_TEXT = re.compile(
     r"(request (a )?demo|contact sales|start (your )?trial|get started|"
     r"join (our )?newsletter|subscribe)", re.I
@@ -422,22 +345,14 @@ def _safe_id(el) -> str:
         return ""
 
 def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
-    """
-    Remove boilerplate & low-signal sections before HTML->Markdown.
-    Conservative: tries not to nuke product content.
-
-    If BeautifulSoup is not available, returns the original HTML.
-    """
-    if not html or not _BS4_AVAILABLE:
+    if not html:
         return html
 
-    # Prefer lxml; fallback to built-in if unavailable
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
         soup = BeautifulSoup(html, "html.parser")
 
-    # 0) strip comments and obvious non-content tags
     try:
         for c in list(soup(string=lambda t: isinstance(t, Comment))):  # type: ignore
             try:
@@ -454,7 +369,6 @@ def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
             except Exception:
                 pass
 
-    # 1) remove elements by role/landmark (but keep <main>, <article>)
     for tag in list(soup.select("[role='navigation'], [role='banner'], [role='contentinfo'], nav, aside, header, footer")):
         if isinstance(tag, Tag):
             try:
@@ -462,7 +376,6 @@ def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
             except Exception:
                 pass
 
-    # 2) remove elements by id/class keywords (snapshot lists first)
     for el in list(soup.find_all(attrs={"class": True})):
         if not isinstance(el, Tag):
             continue
@@ -481,7 +394,6 @@ def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
             except Exception:
                 pass
 
-    # 3) remove compliance/marketing blocks by visible text
     for el in list(soup.find_all(True)):
         if not isinstance(el, Tag):
             continue
@@ -508,7 +420,6 @@ def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
                 except Exception:
                     pass
 
-    # 4) remove empty containers
     for el in list(soup.find_all(True)):
         if not isinstance(el, Tag):
             continue
@@ -524,7 +435,6 @@ def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
             except Exception:
                 pass
 
-    # 5) Fallback: if page lacks a <main>, prefer the largest text block
     try:
         if not soup.find("main"):
             candidates = sorted(
@@ -545,7 +455,6 @@ def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
     except Exception:
         pass
 
-    # 6) Clean anchor junk
     for a in list(soup.find_all("a")):
         if not isinstance(a, Tag):
             continue
@@ -561,15 +470,13 @@ def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
 
     return str(soup)
 
-
-# ---------- HTML → Markdown ----------
+# ========== HTML → Markdown ==========
 
 @dataclass
 class MarkdownOptions:
     strip: bool = True
     heading_style: str = "ATX"
     code_language: Optional[str] = None
-
 
 def html_to_markdown(html: str, opts: MarkdownOptions = MarkdownOptions()) -> str:
     if not html:
@@ -583,7 +490,6 @@ def html_to_markdown(html: str, opts: MarkdownOptions = MarkdownOptions()) -> st
     if opts.strip:
         md = md.strip()
     return md
-
 
 def clean_markdown(md: str, remove_boilerplate: bool = True) -> str:
     if not md:
@@ -610,7 +516,7 @@ def clean_markdown(md: str, remove_boilerplate: bool = True) -> str:
             blank = False
     return "\n".join(cleaned).strip()
 
-# ---------- LLM chunking helpers ----------
+# ========== LLM chunking helpers ==========
 
 def chunk_text(text: str, max_chars: int) -> Iterable[str]:
     if not text:
@@ -635,8 +541,7 @@ def chunk_text(text: str, max_chars: int) -> Iterable[str]:
     if buf:
         yield "\n\n".join(buf)
 
-
-# ---------- File I/O ----------
+# ========== File I/O ==========
 
 def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -644,34 +549,35 @@ def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
     tmp.write_text(data, encoding=encoding)
     tmp.replace(path)
 
-
 def append_jsonl(path: Path, json_line: str, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding=encoding) as f:
         f.write(json_line.rstrip() + "\n")
-
 
 def save_markdown(base_dir: Path, host: str, url_path: str, url: str, md: str) -> Path:
     """
     Save markdown under the registrable domain folder (eTLD+1),
     collapsing subdomains (investors.example.com -> example.com).
     """
-    from hashlib import sha1
-
     base_host = get_base_domain(host or "unknown-host")
-
     path = url_path or "/"
     if path.endswith("/"):
         path += "index"
     slug = slugify(path, max_len=80)
     h = sha1(url.encode("utf-8")).hexdigest()[:10]
     fname = f"{slug}-{h}.md"
-
     out_path = base_dir / base_host / fname
     out_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(out_path, md)
     return out_path
 
+def slugify(text: str, max_len: int = 80) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"[^a-z0-9\-_.]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-._")
+    if len(text) > max_len:
+        text = text[:max_len].rstrip("-._")
+    return text or "untitled"
 
 def safe_json_loads(s: str) -> Optional[dict]:
     if not isinstance(s, str):
@@ -713,28 +619,15 @@ def safe_json_loads(s: str) -> Optional[dict]:
     return None
 
 def markdown_quality(md: str) -> dict:
-    """
-    Cheap quality metrics for a markdown blob.
-    Returns a dict so callers can log/tune thresholds.
-    """
     if not isinstance(md, str):
         return {"chars": 0, "words": 0, "alpha": 0, "lines": 0, "uniq_words": 0}
-
     chars = len(md)
     words_list = [w.strip(string.punctuation) for w in md.split()]
     words = len(words_list)
     uniq_words = len(set(w.lower() for w in words_list if w))
     alpha = sum(ch.isalnum() for ch in md)
     lines = md.count("\n") + 1
-
-    return {
-        "chars": chars,
-        "words": words,
-        "alpha": alpha,
-        "lines": lines,
-        "uniq_words": uniq_words,
-    }
-
+    return {"chars": chars, "words": words, "alpha": alpha, "lines": lines, "uniq_words": uniq_words}
 
 def is_meaningful_markdown(md: str,
                            *,
@@ -742,10 +635,6 @@ def is_meaningful_markdown(md: str,
                            min_words: int = 80,
                            min_uniq_words: int = 50,
                            min_lines: int = 8) -> bool:
-    """
-    Heuristic “is this worth keeping?” gate.
-    Meant to catch empty/JS-placeholder pages produced by static fetch.
-    """
     q = markdown_quality(md)
     if q["chars"] < min_chars:
         return False
@@ -757,9 +646,145 @@ def is_meaningful_markdown(md: str,
         return False
     return True
 
-# ---------- Robots gate ----------
+# ========== Robots gate ==========
 
 def should_crawl_url(respect_robots: bool, robots_txt_allowed: Optional[bool]) -> bool:
     if not respect_robots:
         return True
     return bool(robots_txt_allowed)
+
+# ========== HTTPX client (shared static fetch wiring) ==========
+
+def httpx_client(cfg) -> httpx.AsyncClient:
+    """
+    Return a preconfigured AsyncClient honoring cfg static settings.
+    """
+    limits = httpx.Limits(max_keepalive_connections=16, max_connections=64)
+    timeout = httpx.Timeout(cfg.static_timeout_ms / 1000.0)
+    headers = {
+        "User-Agent": cfg.user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    return httpx.AsyncClient(
+        timeout=timeout,
+        limits=limits,
+        headers=headers,
+        follow_redirects=True,
+        http2=cfg.static_http2,
+        max_redirects=cfg.static_max_redirects,
+    )
+
+# ========== Playwright helpers (shared dynamic fetch wiring) ==========
+
+async def play_goto(page, url: str, wait_chain: list[str], timeout_ms: int) -> tuple[Optional[int], str]:
+    """
+    Try a chain of wait_until strategies; return (status, html).
+    """
+    last_status = None
+    for wu in wait_chain:
+        try:
+            resp = await page.goto(url, wait_until=wu, timeout=timeout_ms)
+            last_status = resp.status if resp else None
+            break
+        except Exception:
+            continue
+    # Ensure body exists, then pull html
+    try:
+        await page.wait_for_selector("body", timeout=timeout_ms)
+    except Exception:
+        pass
+    try:
+        html = await page.content()
+    except Exception:
+        html = ""
+    return last_status, html
+
+async def play_title(page) -> Optional[str]:
+    try:
+        t = await page.title()
+        return (t or "").strip() or None
+    except Exception:
+        return None
+
+async def play_links(page) -> list[str]:
+    links: list[str] = []
+    try:
+        anchors = await page.locator("a[href]").element_handles()
+        seen = set()
+        for a in anchors:
+            try:
+                href = await a.get_attribute("href")
+            except Exception:
+                href = None
+            if not href:
+                continue
+            try:
+                abs_u = await a.evaluate("(el, base) => new URL(el.getAttribute('href'), base).toString()", page.url)
+            except Exception:
+                # fallback: best effort
+                abs_u = urljoin(page.url, href)
+            abs_u = re.sub(r"#.*$", "", abs_u)
+            if abs_u not in seen:
+                seen.add(abs_u)
+                links.append(abs_u)
+    except Exception:
+        pass
+    return links
+
+# ========== Uniform link filtering ==========
+
+def filter_links(
+    source_url: str,
+    links: list[str],
+    cfg,
+    *,
+    allow_re: re.Pattern | None = None,
+    deny_re: re.Pattern | None = None,
+    product_only: bool = True,
+) -> list[str]:
+    """
+    Apply same-site/language/junk/product filters uniformly.
+    """
+    out: list[str] = []
+    seen = set()
+    for u in links:
+        if not is_http_url(u):
+            continue
+
+        # same-site gate
+        if not same_site(source_url, u, cfg.allow_subdomains):
+            continue
+
+        # language policy
+        low = u.lower()
+        # subdomain deny
+        host = (urlparse(u).hostname or "").lower()
+        if any(sub and host.startswith(sub.strip().lower()) for sub in cfg.lang_subdomain_deny):
+            continue
+        # path deny
+        path = (urlparse(u).path or "").lower()
+        if any(p and p in path for p in cfg.lang_path_deny):
+            continue
+        # query keys deny
+        if urlparse(u).query:
+            q = dict(parse_qsl(urlparse(u).query, keep_blank_values=True))
+            if any(k in q for k in cfg.lang_query_keys):
+                continue
+
+        # allow/deny regex policy
+        if allow_re and not allow_re.search(u):
+            continue
+        if deny_re and deny_re.search(u):
+            continue
+
+        # product-likeness gate
+        if product_only and looks_non_product_url(u):
+            continue
+
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out

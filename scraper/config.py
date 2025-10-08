@@ -1,28 +1,17 @@
-"""
-Centralized configuration for the web2product-catalog project.
-
-- Loads environment variables (with sane defaults)
-- Normalizes and ensures data/log directories exist
-- Exposes a strongly-typed Config object for use across modules
-- Sets up standard logging via dictConfig (rotating file + console)
-"""
-
+# scraper/config.py
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional
-from logging.config import dictConfig
-
+from typing import Literal
+from .utils import getenv_bool, getenv_int, getenv_str
 
 # ---------- Project Paths ----------
-
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 DATA_DIR: Path = PROJECT_ROOT / "data"
 LOG_DIR: Path = PROJECT_ROOT / "logs"
 
-# subfolders
+# Subfolders & files (paths only; no logging init here)
 SCRAPED_HTML_DIR: Path = DATA_DIR / "scraped_html"
 MARKDOWN_DIR: Path = DATA_DIR / "markdown"
 OUTPUT_JSONL: Path = DATA_DIR / "output.jsonl"
@@ -37,7 +26,7 @@ PAGE_META_DIR: Path = DATA_DIR / "page_meta"
 CHECKPOINTS_DIR: Path = DATA_DIR / "checkpoints"
 EMBEDDINGS_DIR: Path = DATA_DIR / "embeddings"
 
-# Ensure directories exist at import time (idempotent)
+# Ensure directories exist at import time (but do NOT create/log to files here)
 for p in (
     DATA_DIR, LOG_DIR, INPUT_ROOT_DIR, SCRAPED_HTML_DIR, MARKDOWN_DIR,
     CANDIDATES_DIR, EVIDENCE_DIR, ENTITIES_DIR,
@@ -46,38 +35,7 @@ for p in (
     p.mkdir(parents=True, exist_ok=True)
 
 
-# ---------- Environment helpers ----------
-
-def _getenv_str(name: str, default: str) -> str:
-    value = os.getenv(name, default)
-    return value if isinstance(value, str) and value.strip() else default
-
-
-def _getenv_int(name: str, default: int, min_val: Optional[int] = None,
-                max_val: Optional[int] = None) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        val = int(raw)
-        if min_val is not None:
-            val = max(min_val, val)
-        if max_val is not None:
-            val = min(max_val, val)
-        return val
-    except ValueError:
-        return default
-
-
-def _getenv_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
 # ---------- Config dataclass ----------
-
 @dataclass(frozen=True)
 class Config:
     # Runtime
@@ -125,9 +83,9 @@ class Config:
 
     # Crawler extras
     crawler_max_retries: int
-    per_page_delay_ms: int  # polite delay per fetched page (0 = disabled)
-    allow_subdomains: bool  # include subdomains as same "site" when True
-    max_pages_per_company: int  # soft cap per company (adaptive logic can stop earlier)
+    per_page_delay_ms: int
+    allow_subdomains: bool
+    max_pages_per_company: int
 
     # Language/translation policy
     primary_lang: str
@@ -135,22 +93,22 @@ class Config:
     lang_query_keys: tuple[str, ...]
     lang_subdomain_deny: tuple[str, ...]
 
-    # Static-first (requests+BS4) fast-path knobs ------
-    enable_static_first: bool                 # try http client + BS4 before Playwright
-    static_timeout_ms: int                    # request timeout (total)
-    static_max_bytes: int                     # clamp huge HTML bodies
-    static_http2: bool                        # enable HTTP/2 in client
-    static_max_redirects: int                 # redirect cap
-    static_js_app_text_threshold: int  
+    # Static-first HTTP client knobs
+    enable_static_first: bool
+    static_timeout_ms: int
+    static_max_bytes: int
+    static_http2: bool
+    static_max_redirects: int
+    static_js_app_text_threshold: int
 
     # Sectionizer / classifier defaults
     min_section_chars: int
     max_section_chars: int
     product_like_url_keywords: tuple[str, ...]
     non_product_keywords: tuple[str, ...]
-    prefer_detail_url_keywords: tuple[str, ...]  # used later in consolidation
+    prefer_detail_url_keywords: tuple[str, ...]
 
-    # Paths
+    # Extra output dirs
     candidates_dir: Path
     evidence_dir: Path
     entities_dir: Path
@@ -159,40 +117,40 @@ class Config:
     checkpoints_dir: Path
     embeddings_dir: Path
 
-
+# ---------- Loader ----------
 def load_config() -> Config:
     cfg = Config(
-        timezone=_getenv_str("APP_TZ", "Asia/Singapore"),
-        env=_getenv_str("APP_ENV", "dev"),
+        timezone=getenv_str("APP_TZ", "Asia/Singapore"),
+        env=getenv_str("APP_ENV", "dev"),
 
         # concurrency/timeouts
-        max_companies_parallel=_getenv_int("MAX_COMPANIES_PARALLEL", 14, min_val=1, max_val=64),
-        max_pages_per_domain_parallel=_getenv_int("MAX_PAGES_PER_DOMAIN_PARALLEL", 4, min_val=1, max_val=32),
-        request_timeout_ms=_getenv_int("REQUEST_TIMEOUT_MS", 30000, min_val=5000, max_val=120000),
-        page_load_timeout_ms=_getenv_int("PAGE_LOAD_TIMEOUT_MS", 45000, min_val=5000, max_val=180000),
-        navigation_wait_until=_getenv_str("NAV_WAIT_UNTIL", "domcontentloaded"),
+        max_companies_parallel=getenv_int("MAX_COMPANIES_PARALLEL", 14, 1, 64),
+        max_pages_per_domain_parallel=getenv_int("MAX_PAGES_PER_DOMAIN_PARALLEL", 4, 1, 32),
+        request_timeout_ms=getenv_int("REQUEST_TIMEOUT_MS", 30000, 5000, 120000),
+        page_load_timeout_ms=getenv_int("PAGE_LOAD_TIMEOUT_MS", 45000, 5000, 180000),
+        navigation_wait_until=getenv_str("NAV_WAIT_UNTIL", "domcontentloaded"),
 
         # retry/backoff
-        retry_max_attempts=_getenv_int("RETRY_MAX_ATTEMPTS", 4, min_val=1, max_val=10),
-        retry_initial_delay_ms=_getenv_int("RETRY_INITIAL_DELAY_MS", 500, min_val=100, max_val=10000),
-        retry_max_delay_ms=_getenv_int("RETRY_MAX_DELAY_MS", 8000, min_val=1000, max_val=60000),
-        retry_jitter_ms=_getenv_int("RETRY_JITTER_MS", 300, min_val=0, max_val=2000),
+        retry_max_attempts=getenv_int("RETRY_MAX_ATTEMPTS", 4, 1, 10),
+        retry_initial_delay_ms=getenv_int("RETRY_INITIAL_DELAY_MS", 500, 100, 10000),
+        retry_max_delay_ms=getenv_int("RETRY_MAX_DELAY_MS", 8000, 1000, 60000),
+        retry_jitter_ms=getenv_int("RETRY_JITTER_MS", 300, 0, 2000),
 
         # robots / blocking
-        respect_robots_txt=_getenv_bool("RESPECT_ROBOTS", False),
-        user_agent=_getenv_str(
+        respect_robots_txt=getenv_bool("RESPECT_ROBOTS", False),
+        user_agent=getenv_str(
             "SCRAPER_USER_AGENT",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         ),
-        block_heavy_resources=_getenv_bool("BLOCK_HEAVY_RESOURCES", True),
+        block_heavy_resources=getenv_bool("BLOCK_HEAVY_RESOURCES", True),
 
         # LLM / Ollama
-        ollama_base_url=_getenv_str("OLLAMA_BASE_URL", "http://localhost:11434"),
-        ollama_model=_getenv_str("OLLAMA_MODEL", "qwen2.5:14b-instruct-q4_K_M"),
-        llm_max_input_tokens=_getenv_int("LLM_MAX_INPUT_TOKENS", 8000, min_val=2048, max_val=32768),
-        llm_target_json_schema_name=_getenv_str("LLM_SCHEMA_NAME", "product_catalog_schema"),
+        ollama_base_url=getenv_str("OLLAMA_BASE_URL", "http://localhost:11434"),
+        ollama_model=getenv_str("OLLAMA_MODEL", "qwen2.5:14b-instruct-q4_K_M"),
+        llm_max_input_tokens=getenv_int("LLM_MAX_INPUT_TOKENS", 8000, 2048, 32768),
+        llm_target_json_schema_name=getenv_str("LLM_SCHEMA_NAME", "product_catalog_schema"),
 
         # paths
         project_root=PROJECT_ROOT,
@@ -202,7 +160,7 @@ def load_config() -> Config:
         output_jsonl=OUTPUT_JSONL,
         input_urls_csv=INPUT_URLS,
         input_root=INPUT_ROOT_DIR,
-        input_glob=_getenv_str("INPUT_GLOB", "data/input/us/*.csv"),
+        input_glob=getenv_str("INPUT_GLOB", "data/input/us/*.csv"),
         log_file=LOG_FILE,
         candidates_dir=CANDIDATES_DIR,
         evidence_dir=EVIDENCE_DIR,
@@ -213,93 +171,34 @@ def load_config() -> Config:
         embeddings_dir=EMBEDDINGS_DIR,
 
         # misc
-        cache_html=_getenv_bool("CACHE_HTML", True),
-        sanitize_markdown=_getenv_bool("SANITIZE_MARKDOWN", True),
+        cache_html=getenv_bool("CACHE_HTML", True),
+        sanitize_markdown=getenv_bool("SANITIZE_MARKDOWN", True),
 
         # crawler extras
-        crawler_max_retries=_getenv_int("CRAWLER_MAX_RETRIES", 3, 0, 10),
-        per_page_delay_ms=_getenv_int("PER_PAGE_DELAY_MS", 50, 0, 2000),
-        allow_subdomains=_getenv_bool("ALLOW_SUBDOMAINS", True),
-        max_pages_per_company=_getenv_int("MAX_PAGES_PER_COMPANY", 200, 1, 2000),
+        crawler_max_retries=getenv_int("CRAWLER_MAX_RETRIES", 3, 0, 10),
+        per_page_delay_ms=getenv_int("PER_PAGE_DELAY_MS", 50, 0, 2000),
+        allow_subdomains=getenv_bool("ALLOW_SUBDOMAINS", True),
+        max_pages_per_company=getenv_int("MAX_PAGES_PER_COMPANY", 200, 1, 2000),
 
         # language policy
-        primary_lang=_getenv_str("PRIMARY_LANG", "en"),
-        lang_path_deny=tuple(
-            _getenv_str("LANG_PATH_DENY", "/fr,/de,/es,/pt,/it,/ru,/zh,/zh-cn,/ja,/ko").split(",")
-        ),
-        lang_query_keys=tuple(
-            _getenv_str("LANG_QUERY_KEYS", "lang,locale,hl").split(",")
-        ),
-        lang_subdomain_deny=tuple(
-            _getenv_str("LANG_SUBDOMAIN_DENY", "fr.,de.,es.,pt.,it.,ru.,zh.,cn.,jp.,kr.").split(",")
-        ),
+        primary_lang=getenv_str("PRIMARY_LANG", "en"),
+        lang_path_deny=tuple(getenv_str("LANG_PATH_DENY", "/fr,/de,/es,/pt,/it,/ru,/zh,/zh-cn,/ja,/ko").split(",")),
+        lang_query_keys=tuple(getenv_str("LANG_QUERY_KEYS", "lang,locale,hl").split(",")),
+        lang_subdomain_deny=tuple(getenv_str("LANG_SUBDOMAIN_DENY", "fr.,de.,es.,pt.,it.,ru.,zh.,cn.,jp.,kr.").split(",")),
 
-        # Static-first (with sensible defaults) ------
-        enable_static_first=_getenv_bool("ENABLE_STATIC_FIRST", True),
-        static_timeout_ms=_getenv_int("STATIC_TIMEOUT_MS", 9000, 1000, 60000),
-        static_max_bytes=_getenv_int("STATIC_MAX_BYTES", 2_000_000, 200_000, 8_000_000),
-        static_http2=_getenv_bool("STATIC_HTTP2", True),
-        static_max_redirects=_getenv_int("STATIC_MAX_REDIRECTS", 8, 1, 20),
-        static_js_app_text_threshold=_getenv_int("STATIC_JS_APP_TEXT_THRESHOLD", 800, 200, 4000),
+        # Static-first HTTP client
+        enable_static_first=getenv_bool("ENABLE_STATIC_FIRST", True),
+        static_timeout_ms=getenv_int("STATIC_TIMEOUT_MS", 9000, 1000, 60000),
+        static_max_bytes=getenv_int("STATIC_MAX_BYTES", 2_000_000, 200_000, 8_000_000),
+        static_http2=getenv_bool("STATIC_HTTP2", True),
+        static_max_redirects=getenv_int("STATIC_MAX_REDIRECTS", 8, 1, 20),
+        static_js_app_text_threshold=getenv_int("STATIC_JS_APP_TEXT_THRESHOLD", 800, 200, 4000),
 
         # sectionizer/classifier
-        min_section_chars=_getenv_int("MIN_SECTION_CHARS", 180, 50, 2000),
-        max_section_chars=_getenv_int("MAX_SECTION_CHARS", 2400, 400, 6000),
-        product_like_url_keywords=tuple(
-            _getenv_str("PRODUCT_URL_KEYWORDS", "/product,/products,/solutions,/services,/catalog").split(",")
-        ),
-        non_product_keywords=tuple(
-            _getenv_str("NON_PRODUCT_KEYWORDS", "/blog,/news,/legal,/privacy,/careers,/investors").split(",")
-        ),
-        prefer_detail_url_keywords=tuple(
-            _getenv_str("PREFER_DETAIL_URL_KEYWORDS", "/product,/products").split(",")
-        ),
+        min_section_chars=getenv_int("MIN_SECTION_CHARS", 180, 50, 2000),
+        max_section_chars=getenv_int("MAX_SECTION_CHARS", 2400, 400, 6000),
+        product_like_url_keywords=tuple(getenv_str("PRODUCT_URL_KEYWORDS", "/product,/products,/solutions,/services,/catalog").split(",")),
+        non_product_keywords=tuple(getenv_str("NON_PRODUCT_KEYWORDS", "/blog,/news,/legal,/privacy,/careers,/investors").split(",")),
+        prefer_detail_url_keywords=tuple(getenv_str("PREFER_DETAIL_URL_KEYWORDS", "/product,/products").split(",")),
     )
-    _init_logging(cfg)
     return cfg
-
-
-# ---------- Logging ----------
-
-def _init_logging(cfg: Config) -> None:
-    """
-    Configure structured logging:
-    - Rotating file handler for long runs
-    - Console handler for local dev
-    """
-    log_level = "INFO" if cfg.env != "dev" else "DEBUG"
-
-    dictConfig({
-        "version": 1,
-        "disable_existing_loggers": False,
-        "formatters": {
-            "console": {
-                "format": "[{levelname}] {asctime} {name}: {message}",
-                "style": "{",
-            },
-            "file": {
-                "format": "{asctime} | {levelname:<8} | {name:<24} | {message}",
-                "style": "{",
-            },
-        },
-        "handlers": {
-            "console": {
-                "class": "logging.StreamHandler",
-                "level": log_level,
-                "formatter": "console",
-            },
-            "file": {
-                "class": "logging.handlers.RotatingFileHandler",
-                "level": "INFO",
-                "formatter": "file",
-                "filename": str(cfg.log_file),
-                "maxBytes": 5 * 1024 * 1024,  # 5 MB
-                "backupCount": 5,
-                "encoding": "utf-8",
-            },
-        },
-        "root": {
-            "level": log_level,
-            "handlers": ["console", "file"],
-        },
-    })

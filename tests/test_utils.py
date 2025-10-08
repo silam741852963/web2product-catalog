@@ -39,8 +39,6 @@ def test_html_to_markdown_and_cleaning(monkeypatch):
     md2 = utils.html_to_markdown(html)
     assert "Title" in md2 and "<" not in md2
 
-
-@pytest.mark.skipif(not getattr(utils, "_BS4_AVAILABLE", False), reason="bs4 not installed")
 def test_prune_html_for_markdown_removes_chrome():
     html = """
     <html>

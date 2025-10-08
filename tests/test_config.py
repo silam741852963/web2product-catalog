@@ -1,10 +1,10 @@
 import os
 from pathlib import Path
-
 import pytest
 
-from scraper.config import load_config, DATA_DIR, LOG_DIR, SCRAPED_HTML_DIR, MARKDOWN_DIR, LOG_FILE
-
+from scraper.config import (
+    load_config, DATA_DIR, LOG_DIR, SCRAPED_HTML_DIR, MARKDOWN_DIR, LOG_FILE
+)
 
 def test_directories_exist_after_import():
     # created at import-time by config module
@@ -12,7 +12,6 @@ def test_directories_exist_after_import():
     assert LOG_DIR.exists()
     assert SCRAPED_HTML_DIR.exists()
     assert MARKDOWN_DIR.exists()
-
 
 def test_load_config_defaults(monkeypatch):
     # Clear relevant env vars to test defaults
@@ -73,7 +72,7 @@ def test_load_config_defaults(monkeypatch):
     assert cfg.crawler_max_retries == 3
     assert cfg.per_page_delay_ms == 50
 
-    # new: subdomain, per-company budget, language policy
+    # newer knobs
     assert cfg.allow_subdomains is True
     assert cfg.max_pages_per_company == 200
     assert cfg.primary_lang == "en"
@@ -89,7 +88,7 @@ def test_load_config_defaults(monkeypatch):
     assert cfg.static_max_redirects == 8
     assert cfg.static_js_app_text_threshold == 800
 
-    # sectionizer/classifier defaults and path objects
+    # sectionizer/classifier and path objects
     assert isinstance(cfg.candidates_dir, Path)
     assert isinstance(cfg.entities_dir, Path)
     assert isinstance(cfg.company_summaries_dir, Path)
@@ -100,7 +99,6 @@ def test_load_config_defaults(monkeypatch):
     assert isinstance(cfg.product_like_url_keywords, tuple)
     assert isinstance(cfg.non_product_keywords, tuple)
     assert isinstance(cfg.prefer_detail_url_keywords, tuple)
-
 
 def test_load_config_env_overrides_and_bounds(monkeypatch):
     # Override with custom values (and some edge/bounds)
@@ -204,9 +202,7 @@ def test_load_config_env_overrides_and_bounds(monkeypatch):
     # input discovery override
     assert cfg.input_glob == "data/input/custom/*.csv"
 
-
-def test_logging_file_exists_and_writable():
-    # The config defines LOG_FILE constant; ensure actual file exists.
-    # The logging handler may not write here, but presence is enough.
-    assert LOG_FILE.exists()
-    assert LOG_FILE.stat().st_size >= 0
+def test_log_path_is_exposed_but_not_created_automatically():
+    # We only guarantee the directory exists; LOG_FILE creation happens elsewhere (utils.init_logging later).
+    assert LOG_DIR.exists()
+    assert isinstance(LOG_FILE, Path)

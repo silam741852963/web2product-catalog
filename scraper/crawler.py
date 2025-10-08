@@ -1,35 +1,41 @@
-# scraper/crawler.py
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import logging
-import re
-import ssl
 from dataclasses import dataclass, field
 from typing import List, Set, Dict, Optional
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 
 import httpx
 from playwright.async_api import BrowserContext
 
+
 from .config import Config
 from .utils import (
-    normalize_url, is_http_url, slugify, atomic_write_text,
-    retry_async, TransientHTTPError, get_base_domain,
-    looks_like_js_app, extract_links_static, extract_title_static, same_site,
-    looks_non_product_url
+    normalize_url,
+    is_http_url,
+    slugify,
+    atomic_write_text,
+    retry_async,
+    TransientHTTPError,
+    NonRetryableHTTPError,
+    NeedsBrowser,
+    get_base_domain,
+    looks_like_js_app,
+    extract_links_static,
+    extract_title_static,
+    same_site,
+    http_status_to_exc,
+    httpx_client,
+    play_goto,
+    play_title,
+    play_links,
+    filter_links,
 )
 
 logger = logging.getLogger(__name__)
 
-# --- Non-retryable error for permanent failures like 404 ---
-class NonRetryableHTTPError(Exception):
-    pass
-
-class NeedsBrowser(Exception):
-    """Signal to fall back to Playwright rendering."""
-    pass
 
 @dataclass
 class PageSnapshot:
@@ -37,75 +43,6 @@ class PageSnapshot:
     title: Optional[str]
     html_path: Optional[str]  # path on disk if cached
     out_links: List[str] = field(default_factory=list)
-
-
-# --- URL hygiene gates ---
-DENY_EXTS = (
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".zip", ".csv", ".mp4", ".mov", ".avi",
-    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
-)
-TEL_PATH_RE = re.compile(r"(?:^|/)(?:tel|fax)\d{6,}(?:/|$)", flags=re.IGNORECASE)
-
-def _should_visit(u: str) -> bool:
-    """Skip obvious non-HTML or junk routes."""
-    try:
-        p = urlparse(u)
-        if any(p.path.lower().endswith(ext) for ext in DENY_EXTS):
-            return False
-        if "download=YES" in (p.query or "").upper():
-            return False
-        if TEL_PATH_RE.search(p.path or ""):
-            return False
-        return True
-    except Exception:
-        return False
-
-
-# --- Language / translation filtering ---
-def _language_ok(u: str, cfg: Config) -> bool:
-    """
-    Heuristics to avoid non-primary language URLs:
-      - deny language subdomains (e.g., fr., de., es.)
-      - deny language path prefixes (e.g., /fr, /de)
-      - deny language query keys when != en (lang, locale, hl)
-    """
-    try:
-        p = urlparse(u)
-        host = (p.hostname or "").lower()
-        # subdomain deny prefixes
-        if any(host.startswith(prefix.strip().lower()) for prefix in cfg.lang_subdomain_deny):
-            return False
-
-        # path deny tokens
-        path = (p.path or "").lower()
-        for tok in cfg.lang_path_deny:
-            tok = tok.strip().lower()
-            if not tok:
-                continue
-            # ensure leading slash semantics
-            if not tok.startswith("/"):
-                tok = "/" + tok
-            if path == tok or path.startswith(tok + "/"):
-                return False
-
-        # query keys deny (if value is not en/en-us)
-        q = (p.query or "").lower()
-        if q:
-            for key in cfg.lang_query_keys:
-                key = key.strip().lower()
-                if not key:
-                    continue
-                # crude check for presence
-                if f"{key}=" in q:
-                    # if not explicitly en or en-us, drop
-                    if not re.search(fr"{key}=(en|en-us)\b", q):
-                        return False
-
-        return True
-    except Exception:
-        # On parse failures, be conservative and allow
-        return True
 
 
 class SiteCrawler:
@@ -157,8 +94,10 @@ class SiteCrawler:
 
         snapshots: Dict[str, PageSnapshot] = {}
 
+        import re
+
         allow_re = re.compile(url_allow_regex) if url_allow_regex else None
-        deny_re = re.compile(url_deny_regex) if url_deny_regex else None
+        deny_re  = re.compile(url_deny_regex)  if url_deny_regex  else None
 
         async def worker():
             while True:
@@ -179,7 +118,7 @@ class SiteCrawler:
                 visited.add(url)
                 try:
                     async with self.sem:
-                        snap = await self._fetch_and_extract(url)
+                        snap = await self._fetch_and_extract(url, allow_re=allow_re, deny_re=deny_re)
 
                     # optional polite delay to reduce bans
                     if self.cfg.per_page_delay_ms > 0:
@@ -187,27 +126,11 @@ class SiteCrawler:
 
                     snapshots[url] = snap
 
-                    # Enqueue new links
+                    # Enqueue new links (already filtered in snap.out_links)
                     for link in snap.out_links:
                         if max_pages is not None and len(visited) >= max_pages:
                             break
                         if link in visited or link in queued:
-                            continue
-                        # site scope
-                        if not same_site(url, link, getattr(self.cfg, "allow_subdomains", False)):
-                            continue
-                        # language policy
-                        if not _language_ok(link, self.cfg):
-                            continue
-                        # user allow/deny
-                        if allow_re and not allow_re.search(link):
-                            continue
-                        if deny_re and deny_re.search(link):
-                            continue
-                        # file/junk filters
-                        if not _should_visit(link):
-                            continue
-                        if looks_non_product_url(link):
                             continue
                         await queue.put(link)
                         queued.add(link)
@@ -233,6 +156,9 @@ class SiteCrawler:
                 finally:
                     queue.task_done()
 
+        # Compile regex here (import placed late to avoid shadowing)
+        import re  # noqa: WPS433 (intentional local import for clarity)
+
         workers = [asyncio.create_task(worker()) for _ in range(self.cfg.max_pages_per_domain_parallel)]
         await queue.join()
         for w in workers:
@@ -248,14 +174,20 @@ class SiteCrawler:
         max_delay_ms=8000,
         jitter_ms=300,
     )
-    async def _fetch_and_extract(self, url: str) -> PageSnapshot:
+    async def _fetch_and_extract(
+        self,
+        url: str,
+        *,
+        allow_re=None,
+        deny_re=None,
+    ) -> PageSnapshot:
         """
         Static-first: try httpx; on JS-app, auth/blocked statuses, or TLS/network problems,
         fall back to Playwright rendering once within the same attempt.
         """
         if bool(getattr(self.cfg, "enable_static_first", False)):
             try:
-                return await self._fetch_static(url)
+                return await self._fetch_static(url, allow_re=allow_re, deny_re=deny_re)
             except NeedsBrowser:
                 # fall through to Playwright below
                 pass
@@ -271,138 +203,73 @@ class SiteCrawler:
 
         # Playwright fallback / dynamic render
         page = await self.context.new_page()
-        resp = None  # ensure defined for logging/guards
+        status = None
         try:
-            # Try a small cascade of wait strategies (stop on first success)
-            last_err = None
-            for wu in [self.wait_until, "domcontentloaded", "load"]:
-                try:
-                    resp = await page.goto(url, wait_until=wu, timeout=self.cfg.page_load_timeout_ms)
-                    last_err = None
-                    break
-                except Exception as e:
-                    last_err = e
-                    continue
-            if last_err is not None and resp is None:
-                raise TransientHTTPError(f"Navigation failed for {url}: {last_err}")
+            status, html = await play_goto(
+                page,
+                url,
+                [self.wait_until, "domcontentloaded", "load"],
+                self.cfg.page_load_timeout_ms,
+            )
+            exc = http_status_to_exc(status)
+            if exc:
+                raise exc
 
-            # Status guard (if we received a response)
-            status = getattr(resp, "status", None)
-            if status is not None:
-                s = int(status)
-                if s == 404:
-                    # permanent — do NOT retry
-                    raise NonRetryableHTTPError(f"HTTP 404 for {url}")
-                if s >= 400:
-                    # transient — let retry_async/worker retry
-                    raise TransientHTTPError(f"HTTP {s} for {url}")
-
-            # Ensure content is present (best-effort)
-            try:
-                await page.wait_for_selector("body", timeout=3000)
-            except Exception:
-                pass
-
-            title = await _safe_title(page)
-            html = await page.content()
-
-            # Clamp giant HTML to 3MB to avoid downstream issues
-            if html and len(html) > 3_000_000:
+            title = await play_title(page)
+            if html and len(html) > 3_000_000:  # clamp giant pages
                 html = html[:3_000_000]
 
             html_path = None
             if self.cfg.cache_html:
-                html_path = self._save_html(url, html)
+                html_path = self._save_html(url, html or "")
 
-            links = await _extract_links(page)
-            # Absolute, normalized, HTTP(S) only
+            links = await play_links(page)
             links = [normalize_url(l) for l in links if is_http_url(l)]
-
-            # Same-site + language filter early (reduces out_links payload)
-            filtered = []
-            for l in links:
-                ln = normalize_url(l)
-                if not same_site(url, ln, getattr(self.cfg, "allow_subdomains", False)):
-                    continue
-                if not _language_ok(ln, self.cfg):
-                    continue
-                if not _should_visit(ln):
-                    continue
-                if looks_non_product_url(ln):
-                        continue
-                filtered.append(ln)
+            filtered = filter_links(url, links, self.cfg, allow_re=allow_re, deny_re=deny_re, product_only=True)
 
             return PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered)
 
         except NonRetryableHTTPError:
-            raise  # bubble up as non-retryable
+            raise
         except Exception as e:
-            # include status if available for better logs
-            st = getattr(resp, "status", None)
-            if st is not None:
-                logger.debug("Error on %s (status=%s): %s", url, st, e)
-            # treat the rest as transient so outer retry can apply
+            if status is not None:
+                logger.debug("Error on %s (status=%s): %s", url, status, e)
             raise TransientHTTPError(str(e))
         finally:
             try:
                 await page.close()
             except Exception:
                 pass
-            
-    async def fetch_dynamic_only(self, url: str) -> PageSnapshot:
+
+    async def fetch_dynamic_only(self, url: str, *, allow_re=None, deny_re=None) -> PageSnapshot:
         """
         Always render with Playwright once (no retry decorator here);
         let caller decide if/how to retry.
         """
         page = await self.context.new_page()
-        resp = None
+        status = None
         try:
-            last_err = None
-            for wu in [self.wait_until, "domcontentloaded", "load"]:
-                try:
-                    resp = await page.goto(url, wait_until=wu, timeout=self.cfg.page_load_timeout_ms)
-                    last_err = None
-                    break
-                except Exception as e:
-                    last_err = e
-                    continue
-            if last_err is not None and resp is None:
-                raise TransientHTTPError(f"Navigation failed for {url}: {last_err}")
+            status, html = await play_goto(
+                page,
+                url,
+                [self.wait_until, "domcontentloaded", "load"],
+                self.cfg.page_load_timeout_ms,
+            )
+            exc = http_status_to_exc(status)
+            if exc:
+                raise exc
 
-            status = getattr(resp, "status", None)
-            if status is not None:
-                s = int(status)
-                if s == 404:
-                    raise NonRetryableHTTPError(f"HTTP 404 for {url}")
-                if s >= 400:
-                    raise TransientHTTPError(f"HTTP {s} for {url}")
-
-            try:
-                await page.wait_for_selector("body", timeout=3000)
-            except Exception:
-                pass
-
-            title = await _safe_title(page)
-            html = await page.content()
+            title = await play_title(page)
             if html and len(html) > 3_000_000:
                 html = html[:3_000_000]
 
             html_path = None
             if self.cfg.cache_html:
-                html_path = self._save_html(url, html)
+                html_path = self._save_html(url, html or "")
 
-            links = await _extract_links(page)
+            links = await play_links(page)
             links = [normalize_url(l) for l in links if is_http_url(l)]
-
-            filtered = []
-            for l in links:
-                if not same_site(url, l, getattr(self.cfg, "allow_subdomains", False)):
-                    continue
-                if not _language_ok(l, self.cfg):
-                    continue
-                if not _should_visit(l):
-                    continue
-                filtered.append(l)
+            filtered = filter_links(url, links, self.cfg, allow_re=allow_re, deny_re=deny_re, product_only=False)
 
             return PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered)
 
@@ -412,38 +279,18 @@ class SiteCrawler:
             except Exception:
                 pass
 
-    async def _fetch_static(self, url: str) -> PageSnapshot:
+    async def _fetch_static(self, url: str, *, allow_re=None, deny_re=None) -> PageSnapshot:
         """
         Fetch with httpx; save HTML immediately; if page looks client-rendered
         or blocked (auth/CAPTCHA), raise NeedsBrowser to re-fetch with Playwright.
         """
-        timeout_ms = int(getattr(self.cfg, "static_timeout_ms", 12000))
-        timeout = httpx.Timeout(timeout_ms / 1000.0, connect=timeout_ms / 1000.0)
-        limits = httpx.Limits(max_keepalive_connections=20, max_connections=50)
-        headers = {
-            "User-Agent": self.cfg.user_agent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
-        http2 = bool(getattr(self.cfg, "static_http2", True))
-        max_redirects = int(getattr(self.cfg, "static_max_redirects", 5))
-
+        client = httpx_client(self.cfg)
         try:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                limits=limits,
-                headers=headers,
-                follow_redirects=True,
-                http2=http2,
-                max_redirects=max_redirects,
-            ) as client:
-                try:
-                    r = await client.get(url)
-                except (httpx.TimeoutException, httpx.NetworkError, ssl.SSLError) as e:
-                    # TLS/self-signed, timeouts, network problems → try browser
-                    raise NeedsBrowser(str(e)) from e
+            try:
+                r = await client.get(url)
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                # TLS/timeouts/network problems → try browser
+                raise NeedsBrowser(str(e)) from e
 
             s = r.status_code
             if s == 404:
@@ -476,16 +323,7 @@ class SiteCrawler:
             links = extract_links_static(html, url)
             links = [normalize_url(l) for l in links if is_http_url(l)]
 
-            # Apply the same out_link filters (site scope, language, junk)
-            filtered = []
-            for l in links:
-                if not same_site(url, l, getattr(self.cfg, "allow_subdomains", False)):
-                    continue
-                if not _language_ok(l, self.cfg):
-                    continue
-                if not _should_visit(l):
-                    continue
-                filtered.append(l)
+            filtered = filter_links(url, links, self.cfg, allow_re=allow_re, deny_re=deny_re, product_only=True)
 
             return PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered)
 
@@ -497,6 +335,8 @@ class SiteCrawler:
         except Exception as e:
             # Unknown condition → treat transient so retry_async can re-attempt or fall back
             raise TransientHTTPError(str(e)) from e
+        finally:
+            await client.aclose()
 
     def _save_html(self, url: str, html: str) -> str:
         parsed = urlparse(url)
@@ -516,39 +356,3 @@ class SiteCrawler:
         out_path = out_dir / fname
         atomic_write_text(out_path, html)
         return str(out_path)
-
-
-async def _safe_title(page) -> Optional[str]:
-    try:
-        return await page.title()
-    except Exception:
-        return None
-
-
-async def _extract_links(page) -> List[str]:
-    """
-    Extract links; resolve relative hrefs against the current page URL.
-    We intentionally use getAttribute('href') and resolve with urljoin to
-    ensure relative links like '/surecare-service' are included.
-    """
-    try:
-        raw_hrefs: List[str] = await page.eval_on_selector_all(
-            "a[href]",
-            "els => els.map(e => e.getAttribute('href'))",
-        )
-        base = page.url  # property access (not awaitable)
-        cleaned: List[str] = []
-        seen = set()
-        for h in raw_hrefs:
-            if not h:
-                continue
-            abs_u = urljoin(base, h)
-            # strip fragment
-            abs_u = re.sub(r"#.*$", "", abs_u)
-            if abs_u not in seen:
-                seen.add(abs_u)
-                cleaned.append(abs_u)
-        return cleaned
-    except Exception as e:
-        logger.warning("Failed extracting links: %s", e)
-        return []

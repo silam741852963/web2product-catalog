@@ -1,25 +1,4 @@
-#!/usr/bin/env python3
-"""
-Run the batch scraper with true intra-company resume.
-
-Inputs:
-  - Preferred: CSV shards via --input-glob (default from cfg.input_glob, e.g. "data/input/us/*.csv")
-  - Fallback: single file cfg.input_urls_csv
-
-CSV schema:
-  hojin_id,company_name,url,hightechflag,us_flag
-
-Resume:
-  - Per-CSV checkpoint: data/checkpoints/<csv-name>.json {"done": [ "<hojin_id>:<url>", ... ]}
-  - Per-company state:  data/checkpoints/companies/<hojin_id>_<host>_<hash>.json
-      { visited: [...], pending: [...], done: bool, homepage: url, ... }
-
-Robustness:
-  - Seed/frontier persists after every processed seed
-  - Retries within SiteCrawler; company-level attempts as a second guard
-  - Bounded concurrency (companies)
-"""
-
+# scraper/run_scraper.py
 from __future__ import annotations
 
 import asyncio
@@ -45,7 +24,7 @@ from scraper.config import load_config
 from scraper.utils import (
     prune_html_for_markdown, html_to_markdown, clean_markdown, save_markdown,
     TransientHTTPError, is_http_url, normalize_url, same_site, get_base_domain,
-    looks_non_product_url, is_meaningful_markdown
+    looks_non_product_url, is_meaningful_markdown, init_logging,
 )
 
 log = logging.getLogger("scripts.run_scraper")
@@ -337,7 +316,6 @@ async def _drain_company(
         return True
 
     progress = False
-    # share this across the whole company so we don’t repeatedly dynamic-retry the same URL
     retried_dynamic: set[str] = set()
 
     while state["pending"] and remaining > 0:
@@ -347,7 +325,6 @@ async def _drain_company(
         if not seeds:
             break
 
-        # fair-share budget per seed this pass
         denom = max(1, len(seeds))
         share = max(1, remaining // denom)
         if max_pages_per_seed is not None:
@@ -389,10 +366,8 @@ async def _drain_company(
             snaps = res or []
             prev_visited = len(state.get("visited", []))
 
-            # IMPORTANT: _save_markdown_for_snaps is async and may dynamic-refetch via Playwright
             await _save_markdown_for_snaps(cfg, crawler, snaps, retried_dynamic=retried_dynamic)
 
-            # update state & persist
             _update_state_from_snaps(
                 state, snaps,
                 homepage_url=homepage,
@@ -417,12 +392,18 @@ async def _drain_company(
             break
 
         if not progress:
-            log.debug("No progress this pass for %s, stopping.", state.get("company", ""))
+            state["done"] = True
+            _save_company_state(state_path, state)
+            log.debug(
+                "No progress this pass for %s, marking company done and stopping.",
+                state.get("company", "")
+            )
             break
         progress = False
 
-    finished = remaining == 0 or len(state["pending"]) == 0
-    state["done"] = bool(finished)
+    # <-- compute finished AFTER the loop and persist once
+    finished = bool(state.get("done", False) or remaining == 0 or len(state.get("pending", [])) == 0)
+    state["done"] = finished
     _save_company_state(state_path, state)
     return finished
 
@@ -551,7 +532,7 @@ def _parse_args(argv: list[str]):
     p.add_argument("--deny", type=str, default=None, help="Deny regex for URLs (e.g. /blog|/careers)")
     p.add_argument("--no-resume", action="store_true", help="Ignore checkpoints and start fresh")
     p.add_argument("--company-attempts", type=int, default=3, help="Attempts to recover a company on transient errors (default: 3)")
-    p.add_argument("--debug", action="store_true", help="Set root logging level to DEBUG for this run")
+    p.add_argument("--debug", action="store_true", help="Set logging level to DEBUG for this run")
     return p.parse_args(argv)
 
 
@@ -559,8 +540,9 @@ async def main_async(argv: list[str] | None = None) -> None:
     args = _parse_args(argv or sys.argv[1:])
     cfg = load_config()
 
+    # Centralized logging init (file + console)
+    init_logging(cfg.log_file, level=(logging.DEBUG if args.debug else logging.INFO))
     if args.debug:
-        logging.getLogger().setLevel("DEBUG")
         log.debug("Debug logging enabled")
 
     input_glob = args.input_glob or args.pattern or getattr(cfg, "input_glob", None)
@@ -568,11 +550,9 @@ async def main_async(argv: list[str] | None = None) -> None:
     files = _discover_input_files(arg_glob=input_glob, cfg=cfg)
     if not files:
         log.error(
-            "No input CSVs found. Checked --input-glob (%s), cfg.input_glob (%s), "
-            "and fallback single file %s",
+            "No input CSVs found. Checked --input-glob (%s), cfg.input_glob (%s), and fallback single file %s",
             args.input_glob or args.pattern, getattr(cfg, "input_glob", None), getattr(cfg, "input_urls_csv", None),
         )
-        print('No input files found. Use --input-glob "data/input/us/*.csv" or set INPUT_GLOB env var.')
         return
 
     log.info("Discovered %d input file(s). Example: %s", len(files), files[0])

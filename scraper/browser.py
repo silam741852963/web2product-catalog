@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Tuple, Optional
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright
@@ -17,24 +16,24 @@ async def init_browser(cfg: Config) -> Tuple[Playwright, Browser, BrowserContext
     Start Playwright, launch Chromium headless, and create a context with:
     - Custom User-Agent from config
     - Reasonable default timeouts
-    - HTTP headers to look like a real browser
+    - Optional proxy from cfg.proxy_server
+    - Optional request blocking for heavy resources
     """
-    proxy = None
-    proxy_url = os.getenv("SCRAPER_PROXY")
-    if proxy_url:
-        proxy = {"server": proxy_url}
+    # Use proxy from configuration (no direct env reads here)
+    proxy = {"server": cfg.proxy_server} if getattr(cfg, "proxy_server", None) else None
+
     pw = await async_playwright().start()
     browser = await pw.chromium.launch(
         headless=True,
-        # You can pass proxies or args here when needed
         args=[
             "--disable-dev-shm-usage",
             "--no-sandbox",
             "--disable-gpu",
             "--disable-features=IsolateOrigins,site-per-process",
         ],
-        proxy=proxy
+        proxy=proxy,
     )
+
     context = await browser.new_context(
         user_agent=cfg.user_agent,
         viewport={"width": 1366, "height": 900},
@@ -51,10 +50,11 @@ async def init_browser(cfg: Config) -> Tuple[Playwright, Browser, BrowserContext
     context.set_default_timeout(cfg.page_load_timeout_ms)
     context.set_default_navigation_timeout(cfg.page_load_timeout_ms)
 
+    # Optional: install resource blocking (images/media/fonts)
     if getattr(cfg, "block_heavy_resources", True):
         await _install_request_blocking(context)
 
-    logger.info("Browser initialized (UA: %s)", cfg.user_agent)
+    logger.info("Browser initialized (UA: %s, proxy=%s)", cfg.user_agent, bool(proxy))
     return pw, browser, context
 
 
@@ -63,15 +63,16 @@ async def _install_request_blocking(context: BrowserContext) -> None:
     Abort images, fonts, media to reduce bandwidth for text scraping.
     """
     async def route_handler(route, request):
-        resource_type = request.resource_type
-        if resource_type in {"image", "media", "font"}:
+        if request.resource_type in {"image", "media", "font"}:
             return await route.abort()
         return await route.continue_()
 
     await context.route("**/*", route_handler)
 
 
-async def shutdown_browser(pw: Playwright, browser: Browser, context: Optional[BrowserContext] = None) -> None:
+async def shutdown_browser(
+    pw: Playwright, browser: Browser, context: Optional[BrowserContext] = None
+) -> None:
     """
     Gracefully close context and browser, then stop Playwright.
     """
@@ -97,8 +98,7 @@ async def new_page(context: BrowserContext):
     Helper to open a new page with robust error handling.
     """
     try:
-        page = await context.new_page()
-        return page
+        return await context.new_page()
     except Exception as e:
         logger.error("Failed to open new page: %s", e)
         raise TransientHTTPError(str(e))
