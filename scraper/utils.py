@@ -18,6 +18,9 @@ from bs4 import BeautifulSoup, Comment
 from bs4.element import Tag
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
+from collections import Counter
+
+
 try:
     from markdownify import markdownify as _markdownify
 except Exception as e:  # pragma: no cover
@@ -91,59 +94,182 @@ def http_status_to_exc(status: Optional[int]) -> Optional[Exception]:
 
 # ========== URL & domain helpers ==========
 
+import re
+
+# ===== Super-aggressive file extensions to drop (treat as files, not pages) =====
+_DENY_FILE_EXTS = (
+    # docs / data
+    ".pdf", ".ps", ".rtf", ".doc", ".docx", ".ppt", ".pptx", ".pps", ".xls", ".xlsx",
+    ".csv", ".tsv", ".xml", ".json", ".yml", ".yaml", ".md", ".rst",
+    # archives / binaries / installers
+    ".zip", ".rar", ".7z", ".gz", ".bz2", ".xz", ".tar", ".tgz", ".dmg", ".exe", ".msi", ".apk",
+    # images / icons
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".bmp", ".tif", ".tiff", ".ico",
+    # audio
+    ".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac",
+    # video
+    ".mp4", ".m4v", ".webm", ".mov", ".avi", ".wmv", ".mkv",
+    # misc
+    ".ics", ".eot", ".ttf", ".otf", ".woff", ".woff2", ".map",
+)
+
+# ===== Endpoints that are almost never useful for product scraping =====
+_BACKEND_ENDPOINT_HINTS = (
+    # APIs / services
+    "/api/", "/rest/", "/graphql", "/oembed", "/wp-json", "/feeds", "/feed",
+    # admin/cms
+    "/wp-admin", "/xmlrpc.php", "/umbraco", "/cms/", "/admin/", "/joomla", "/drupal",
+    # machine listings
+    "/sitemap", "/sitemap.xml", "/sitemaps", "/robots.txt", "/rss", "/atom",
+    # classic server tech / handlers
+    ".jsp", ".do", ".action", ".ashx", ".aspx", ".cfm", ".cgi",
+    # infra/system paths
+    "/cdn-cgi/",
+)
+
+# ===== Query keys that should NOT affect canonical equality (collapse variants) =====
+_IGNORED_QUERY_KEYS_FOR_DEDUPE = {
+    # tracking / campaign
+    "gclid", "fbclid", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
+    "mc_cid", "mc_eid", "ref", "trk", "cmpgn", "campaign", "source", "medium", "cid", "bid",
+    # session-ish
+    "session", "sessionid", "sid", "token", "auth", "hash",
+    # sorting / filtering / searches
+    "sort", "orderby", "order", "dir", "view", "layout", "display", "grid", "list",
+    "filter", "filters", "facet", "facets", "category", "cat", "tag", "tags",
+    "q", "query", "search", "s", "k", "keyword",
+    "page", "paged", "pagenum", "start", "offset", "limit", "per_page", "size",
+    # i18n toggles
+    "lang", "hl", "locale", "region", "lc", "lr",
+    # wordpress / cms cruft
+    "page_id", "p", "post_type",
+    # forums/boards noise
+    "postid", "reply", "thread", "topic",
+}
+
 _JS_APP_SIGNATURES = (
     "__NEXT_DATA__", 'id="__next"', "data-reactroot", "reactdom",
     "window.__NUXT__", 'id="app"', "ng-app", "sapper", "astro-island",
     "vite", "webpackjsonp",
 )
 
-# strong allow-hints: if the path has these, we DO NOT block
+# Strong allow-hints: if the path has these, we DO NOT block
 _PRODUCT_HINTS = (
     "product", "products", "solution", "solutions",
     "service", "services", "catalog", "portfolio",
-    "platform", "features", "pricing", "specs", "datasheet",
+    "platform", "features", "pricing", "specs", "datasheet", "datasheets",
     "store", "shop",
+    # B2B/industrial nouns commonly used as product detail
+    "grade", "grades", "sds", "msds", "safety-data-sheet", "safety-data-sheets",
 )
 
 # Obvious non-product path fragments
 _NON_PRODUCT_PATH_PARTS = (
+    # legal / compliance
     "privacy", "cookies", "cookie-policy", "cookie-preferences", "cookie-settings",
     "terms", "legal", "disclaimer", "compliance", "accessibility",
     "policy", "policies", "charter", "bylaws", "guidelines", "ethics",
     "anti-bribery", "sanctions", "human-rights", "code-of-conduct",
-    "governance", "board", "leadership",
+    "governance", "board", "leadership", "management", "members",
+    "leader", "leaders", "leadership-team", "our-team", "team",
+
+    # investor relations / finance
     "investor", "investors", "ir", "sec", "earnings", "transcript",
     "prospectus", "summaryprospectus", "factcard", "sai", "holdings",
-    "annual-report", "semi-annual", "shareholder", "premiumdiscount",
+    "annual-report", "semi-annual", "shareholder", "premiumdiscount", "market",
+    "markets",
+
+    # comms / newsroom
     "newsroom", "press", "press-release", "press-releases", "media", "news",
+
+    # forms / lead-gen
     "information-request", "request-information", "request-info", "request",
     "contact", "contact-us", "form", "forms", "subscribe", "newsletter",
+
+    # content marketing (usually non-product)
     "whitepaper", "whitepapers", "case-study", "case-studies", "ebook", "e-book",
-    "resources", "resource-center", "brochure",
+    "resources", "resource-center", "brochure", "blog", "blogs", "stories",
+    "giveaway", "community",
+
+    # auth / account / ecommerce
     "login", "log-in", "signin", "sign-in", "signup", "sign-up", "register",
     "account", "my-account", "profile", "auth", "sso", "oauth",
     "cart", "checkout", "wishlist", "compare",
+
+    # site chrome / discovery
     "sitemap", "search", "search-results", "results", "site-search",
     "preferences", "settings", "help", "support", "faq",
+
+    # wp / feeds / apis
     "wp-admin", "wp-login", "wp-json", "xmlrpc.php", "feed", "rss", "atom",
-    "translate", "lang", "locale",
-    "careers", "jobs", "recruit", "hiring",
     "wp-content/uploads", "media-library", "document-library", "asset-library",
+
+    # infra/system
+    "cdn-cgi",
+
+    # i18n helpers
+    "translate", "lang", "locale",
+
+    # careers
+    "careers", "jobs", "recruit", "hiring",
+
+    # misc known time sinks
     "acquire/tel",
+    # video & social slugs that often 302 off-site or thin content
+    "video", "videos", "eb-video", "eb-video-en", "media-center",
+    # event/webinar marketing
+    "event", "events", "webinar", "webinars",
+    # category/tag archives (WP/Drupal etc.)
+    "category", "tag", "tags", "archive", "archives", "author",
+    # training portals that rarely have product detail
+    "training", "education", "ausbildung",
+    # store/branch locators
+    "locations",
 )
 
 _NON_PRODUCT_QUERY_KEYS = (
+    # tracking / sessions
     "gclid", "fbclid", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "session", "sessionid", "token", "auth", "sso", "oauth", "attachment", "attachment_id",
-    "download", "redirect", "ref", "trk",
+    "session", "sessionid", "token", "auth", "sso", "oauth", "redirect", "ref", "trk",
+    # downloads / attachments
+    "download", "attachment", "attachment_id",
+    # wordpress & CMS cruft
+    "page_id", "p", "post_type", "orderby", "order", "cat", "tag",
+    # i18n toggles
+    "lang", "hl", "locale", "lc", "lr", "region",
+    # forums/boards noise
+    "postid", "reply", "thread", "topic",
 )
 
 _NON_PRODUCT_HOST_TOKENS = (
-    "investor", "investors", "ir", "press", "news", "careers", "jobs",
-    "support", "help", "auth", "login", "accounts",
+    "investor", "investors", "ir", "investorrelations",
+    "press", "news", "events",
+    "careers", "jobs",
+    "support", "help",
+    "auth", "login", "accounts",
+    "blog", "community",
+    "stories", "makers",
 )
 
 _TEL_PATH_RE = re.compile(r"(?:^|/)(?:tel|fax)\d{6,}(?:/|$)", re.IGNORECASE)
+
+# Common ISO language tags (2-letter + popular regionized forms)
+_LANG_CODES = {
+    # European
+    "fr", "fr-fr", "fr-ca", "de", "de-de", "es", "es-es", "it", "pt", "pt-pt", "pt-br",
+    "nl", "sv", "no", "da", "fi", "pl", "cs", "sk", "sl", "hu", "el", "ro", "bg", "hr", "sr", "uk", "et", "lv", "lt",
+    # Asian
+    "zh", "zh-cn", "zh-tw", "zh-hk", "ja", "jp", "ko", "kr", "th", "vi", "id", "ms", "hi", "bn", "ta", "te", "ur", "fa",
+    # Middle East
+    "ar", "he", "tr", "ir",
+    # Misc
+    "ru",
+}
+
+# compile a path prefix regex like ^/(fr|fr-fr|de|zh-cn)(/|$)
+_LANG_PATH_PREFIX_RE = re.compile(
+    r"^/(?P<tag>[a-z]{2}(?:-[a-z]{2})?)(?:/|$)", re.IGNORECASE
+)
 
 def looks_non_product_url(u: str) -> bool:
     try:
@@ -221,12 +347,174 @@ def is_http_url(url: str) -> bool:
     s = urlparse(url).scheme.lower()
     return s in {"http", "https"}
 
-def same_site(url_a: str, url_b: str, allow_subdomains: bool) -> bool:
-    if not allow_subdomains:
-        return is_same_domain(url_a, url_b)
-    ha = get_base_domain((urlparse(url_a).hostname or "").lower())
-    hb = get_base_domain((urlparse(url_b).hostname or "").lower())
-    return ha == hb
+def expand_same_site(
+    base_url: str,
+    target_url: str,
+    allow_subdomains: bool,
+    extra_hosts: Optional[Iterable[str]] = None,
+) -> bool:
+    """
+    Same-site policy:
+      - If allow_subdomains=True → eTLD+1 match is enough.
+      - If allow_subdomains=False → exact hostname match only.
+      - Aliases/probation: if target eTLD+1 is in extra_hosts → treat as same-site;
+        when allow_subdomains=False, accept only the bare base (and www.) host, not arbitrary subdomains.
+    """
+    try:
+        bp = urlparse(base_url)
+        tp = urlparse(target_url)
+        if not (bp.hostname and tp.hostname):
+            return False
+
+        b_host = bp.hostname.lower()
+        t_host = tp.hostname.lower()
+        b_base = get_base_domain(b_host)
+        t_base = get_base_domain(t_host)
+
+        # Primary host comparison
+        if allow_subdomains:
+            if b_base == t_base:
+                return True
+        else:
+            if b_host == t_host:
+                return True
+
+        # Aliases/probation hosts (by eTLD+1)
+        extras = set(h.lower().strip() for h in (extra_hosts or []) if h)
+        if t_base in extras:
+            if allow_subdomains:
+                return True
+            # strict: allow only the bare base (and www.) as same-site when subdomains are disabled
+            if t_host == t_base or t_host == f"www.{t_base}":
+                return True
+
+        return False
+    except Exception:
+        return False
+
+def same_site(
+    base_url: str,
+    target_url: str,
+    allow_subdomains: bool,
+    extra_hosts: Optional[Iterable[str]] = None,
+) -> bool:
+    return expand_same_site(base_url, target_url, allow_subdomains, extra_hosts=extra_hosts)
+
+def _canonicalize_for_dedupe(u: str) -> str:
+    """
+    Normalize a URL for deduplication:
+      - lower-case scheme/host
+      - drop fragment
+      - remove ignored query keys
+      - sort remaining query keys
+      - keep path as-is (so /a and /a/ differ)
+    """
+    pu = urlparse(u)
+    scheme = (pu.scheme or "http").lower()
+    host = (pu.hostname or "").lower()
+    netloc = f"{host}:{pu.port}" if pu.port and not ((scheme == "http" and pu.port == 80) or (scheme == "https" and pu.port == 443)) else host
+    path = pu.path or "/"
+
+    # strip junk query keys; sort remaining for stable equality
+    if pu.query:
+        kept = [(k, v) for (k, v) in parse_qsl(pu.query, keep_blank_values=True) if k.lower() not in _IGNORED_QUERY_KEYS_FOR_DEDUPE]
+        if kept:
+            kept.sort(key=lambda kv: (kv[0].lower(), kv[1]))
+            query = "&".join(f"{k}={v}" if v != "" else k for k, v in kept)
+        else:
+            query = ""
+    else:
+        query = ""
+
+    return urlunparse((scheme, netloc, path, "", query, ""))
+
+def _looks_backend_or_file(u: str) -> bool:
+    pu = urlparse(u)
+    path = (pu.path or "").lower()
+
+    # media/docs: deny by extension
+    for ext in _DENY_FILE_EXTS:
+        if path.endswith(ext):
+            return True
+
+    # backend-y endpoints and feeds
+    for hint in _BACKEND_ENDPOINT_HINTS:
+        if hint in path:
+            return True
+
+    return False
+
+def is_non_english_url(u: str, primary_lang: str = "en") -> bool:
+    """
+    Return True if the URL clearly targets a non-English locale via subdomain,
+    path prefix, or query parameter values.
+    """
+    try:
+        pu = urlparse(u)
+        host = (pu.hostname or "").lower()
+        path = (pu.path or "/").lower()
+        q = dict(parse_qsl(pu.query or "", keep_blank_values=True))
+        primary = (primary_lang or "en").lower()
+
+        # 1) subdomain like fr.example.com, de.example.com, zh-cn.example.com
+        #    (ignore common www)
+        labels = host.split(".")
+        if len(labels) >= 3:  # subdomain present
+            sub = labels[0]
+            if sub in _LANG_CODES and not sub.startswith(primary):
+                return True
+            # accept regioned english (en, en-us) only; anything else is non-en
+            if sub != "www" and re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", sub):
+                if not sub.startswith(primary):
+                    return True
+
+        # 2) path prefix like /fr/, /de-de/, /zh-cn/
+        m = _LANG_PATH_PREFIX_RE.match(path)
+        if m:
+            tag = m.group("tag").lower()
+            if tag in _LANG_CODES and not tag.startswith(primary):
+                return True
+            if re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", tag) and not tag.startswith(primary):
+                return True
+
+        # 3) query keys lang/hl/locale/lc/lr/region set to non-en
+        for k in ("lang", "hl", "locale", "lc", "lr", "region"):
+            v = (q.get(k) or "").lower()
+            if v and not v.startswith(primary):
+                return True
+
+        return False
+    except Exception:
+        return False
+    
+
+def _collect_extra_hosts(cfg) -> set[str]:
+    """
+    Build the extra eTLD+1 host set that should be considered same-site.
+    Reads cfg.extra_same_site_hosts (tuple or list), and also optionally
+    the env var EXTRA_SAME_SITE_HOSTS (comma separated).
+    """
+    extra: set[str] = set()
+    try:
+        seq = getattr(cfg, "extra_same_site_hosts", ()) or ()
+        for h in seq:
+            h = (h or "").strip().lower()
+            if h:
+                extra.add(h)
+    except Exception:
+        pass
+
+    try:
+        import os
+        raw = os.getenv("EXTRA_SAME_SITE_HOSTS", "")
+        if raw:
+            for h in raw.split(","):
+                h = (h or "").strip().lower()
+                if h:
+                    extra.add(h)
+    except Exception:
+        pass
+    return extra
 
 # ========== Retry decorators ==========
 
@@ -736,6 +1024,18 @@ async def play_links(page) -> list[str]:
 
 # ========== Uniform link filtering ==========
 
+
+def _trace_enabled(cfg) -> bool:
+    try:
+        if getattr(cfg, "debug_filter", False):
+            return True
+    except Exception:
+        pass
+    return os.getenv("SCRAPER_FILTER_TRACE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+def _reason(counter: Counter, key: str):
+    counter[key] += 1
+
 def filter_links(
     source_url: str,
     links: list[str],
@@ -744,47 +1044,147 @@ def filter_links(
     allow_re: re.Pattern | None = None,
     deny_re: re.Pattern | None = None,
     product_only: bool = True,
+    on_drop: Optional[Callable][[str, str], None] = None,
+    on_keep: Optional[Callable][[str], None] = None
 ) -> list[str]:
     """
-    Apply same-site/language/junk/product filters uniformly.
+    Apply same-site, language, backend/file, regex, and product heuristics.
+    Collapse "same page, different query" via canonicalization.
+    When tracing is enabled (cfg.debug_filter or SCRAPER_FILTER_TRACE=1),
+    log per-URL decisions (capped) and a final summary.
     """
     out: list[str] = []
-    seen = set()
+    seen_canon: set[str] = set()
+    source_canon = _canonicalize_for_dedupe(source_url)
+
+    trace = _trace_enabled(cfg)
+    reasons = Counter()
+    kept = 0
+    # cap verbose per-URL logs so we don't flood (per invocation)
+    VERBOSE_CAP = 200
+    verbose_count = 0
+
+    def vlog(msg: str):
+        nonlocal verbose_count
+        if trace and verbose_count < VERBOSE_CAP:
+            logger.info("[filter] %s", msg)
+            verbose_count += 1
+
+    if trace:
+        logger.info("[filter] source=%s allow=%s deny=%s product_only=%s links_in=%d",
+                     source_url, getattr(allow_re, "pattern", None),
+                     getattr(deny_re, "pattern", None), product_only, len(links))
+
     for u in links:
+        # baseline normalization for logging
+        canon = None
+
         if not is_http_url(u):
+            _reason(reasons, "skip:not-http")
+            if on_drop: on_drop(u, "not-http")
+            vlog(f"DROP (not-http): {u}")
             continue
 
-        # same-site gate
-        if not same_site(source_url, u, cfg.allow_subdomains):
+        # same-site (respect subdomain policy, incl. aliases/probation from cfg.extra_same_site_hosts)
+        extra_hosts = _collect_extra_hosts(cfg)
+        if not same_site(source_url, u, cfg.allow_subdomains, extra_hosts=extra_hosts):
+            _reason(reasons, "drop:off-site")
+            if on_drop: 
+                on_drop(u, "off-site")
+            vlog(f"DROP (off-site): {u}")
             continue
 
-        # language policy
-        low = u.lower()
-        # subdomain deny
-        host = (urlparse(u).hostname or "").lower()
+        pu = urlparse(u)
+        host = (pu.hostname or "").lower()
+        path = (pu.path or "").lower()
+
+        # --- HARD language filter (English-only) ---
+        if is_non_english_url(u, getattr(cfg, "primary_lang", "en")):
+            _reason(reasons, "drop:non-english")
+            if on_drop: on_drop(u, "non-english")
+            vlog(f"DROP (non-en): {u}")
+            continue
+
+        # existing language gates (complementary policies)
         if any(sub and host.startswith(sub.strip().lower()) for sub in cfg.lang_subdomain_deny):
+            _reason(reasons, "drop:lang-subdomain")
+            if on_drop: on_drop(u, "lang-subdomain")
+            vlog(f"DROP (lang-subdomain): {u}")
             continue
-        # path deny
-        path = (urlparse(u).path or "").lower()
         if any(p and p in path for p in cfg.lang_path_deny):
+            _reason(reasons, "drop:lang-path")
+            if on_drop: on_drop(u, "lang-path")
+            vlog(f"DROP (lang-path): {u}")
             continue
-        # query keys deny
-        if urlparse(u).query:
-            q = dict(parse_qsl(urlparse(u).query, keep_blank_values=True))
+        if pu.query:
+            q = dict(parse_qsl(pu.query, keep_blank_values=True))
             if any(k in q for k in cfg.lang_query_keys):
+                _reason(reasons, "drop:lang-query-key")
+                if on_drop: on_drop(u, "lang-query-key")
+                vlog(f"DROP (lang-query-key): {u}")
                 continue
+
+        # backend endpoints & files
+        if _looks_backend_or_file(u):
+            _reason(reasons, "drop:backend-or-file")
+            if on_drop: on_drop(u, "backend-or-file")
+            vlog(f"DROP (backend/file): {u}")
+            continue
 
         # allow/deny regex policy
         if allow_re and not allow_re.search(u):
+            _reason(reasons, "drop:not-match-allow")
+            if on_drop: on_drop(u, "no-allow-match")
+            vlog(f"DROP (no allow match): {u}")
             continue
         if deny_re and deny_re.search(u):
+            _reason(reasons, "drop:match-deny")
+            if on_drop: on_drop(u, "deny-match")
+            vlog(f"DROP (deny match): {u}")
             continue
 
-        # product-likeness gate
+        # product-like heuristic
         if product_only and looks_non_product_url(u):
+            _reason(reasons, "drop:non-product")
+            if on_drop: on_drop(u, "non-product")
+            vlog(f"DROP (non-product): {u}")
             continue
 
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
+        # canonicalize & dedupe (collapse same page, different query)
+        canon = _canonicalize_for_dedupe(u)
+        if canon == source_canon:
+            _reason(reasons, "drop:self-canon")
+            if on_drop: on_drop(u, "self-canonical")
+            vlog(f"DROP (self-canon): {u} -> {canon}")
+            continue
+        if canon in seen_canon:
+            _reason(reasons, "drop:dup-canon")
+            if on_drop: on_drop(u, "dup-canonical")
+            vlog(f"DROP (dup-canon): {u} -> {canon}")
+            continue
+
+        seen_canon.add(canon)
+        out.append(u)
+        kept += 1
+        if on_keep: on_keep(u)
+        vlog(f"KEEP: {u} -> {canon}")
+
+    # Summary line (always at DEBUG if trace; otherwise compact DEBUG)
+    if trace:
+        logger.info(
+            "[filter] kept=%d dropped=%d by_reason=%s",
+            kept, len(links) - kept, dict(reasons.most_common())
+        )
+        if verbose_count >= VERBOSE_CAP:
+            logger.info("[filter] verbose cap reached (%d); further per-URL logs suppressed.", VERBOSE_CAP)
+    else:
+        # emit a single compact line at DEBUG so you still get counts without per-URL noise
+        if links:
+            logger.info(
+                "[filter] %s -> kept=%d/%d (top drops: %s)",
+                urlparse(source_url).hostname or "source",
+                kept, len(links),
+                ", ".join(f"{k}:{v}" for k, v in reasons.most_common()[:5]) or "none"
+            )
+
     return out

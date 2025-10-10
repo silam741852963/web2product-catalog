@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
-from typing import List, Set, Dict, Optional
-from urllib.parse import urlparse
+from typing import List, Set, Dict, Optional, Callable
+from urllib.parse import urlparse, urljoin
 
 import httpx
 from playwright.async_api import BrowserContext
-
 
 from .config import Config
 from .utils import (
@@ -43,29 +43,43 @@ class PageSnapshot:
     title: Optional[str]
     html_path: Optional[str]  # path on disk if cached
     out_links: List[str] = field(default_factory=list)
+    # filtered-out links with a reason (url, reason)
+    dropped: List[tuple[str, str]] = field(default_factory=list)
 
 
 class SiteCrawler:
     """
-    Concurrent, retrying, per-domain crawler:
-    - Starts from a homepage
-    - Follows internal links (same host or eTLD+1 if allow_subdomains)
-    - Saves raw HTML (optional, per config.cache_html)
-    - Returns PageSnapshot list for downstream processing
+    Concurrent, retrying, per-domain crawler.
+    Emits status-driven signals to the runner via callbacks (redirects, canonical, backoff, server errors).
     """
 
-    def __init__(self, cfg: Config, context: BrowserContext):
+    def __init__(
+        self,
+        cfg: Config,
+        context: BrowserContext,
+        *,
+        on_redirect: Optional[Callable[[str, str, int, bool], None]] = None,
+        on_canonical: Optional[Callable[[str, str, bool], None]] = None,
+        on_backoff: Optional[Callable[[str], None]] = None,
+        on_server_error: Optional[Callable[[str, str, int], None]] = None,
+    ):
         self.cfg = cfg
         self.context = context
-        # "load" | "domcontentloaded" | "networkidle" | "commit"
         self.wait_until = cfg.navigation_wait_until
 
-        # Per-domain concurrency limiter
-        self.sem = asyncio.Semaphore(cfg.max_pages_per_domain_parallel)
+        self.on_redirect = on_redirect
+        self.on_canonical = on_canonical
+        self.on_backoff = on_backoff
+        self.on_server_error = on_server_error
 
-        # track per-URL attempts (queue-level retries for transient errors)
+        self.sem = asyncio.Semaphore(cfg.max_pages_per_domain_parallel)
         self._attempts: Dict[str, int] = {}
         self._max_retries: int = int(getattr(cfg, "crawler_max_retries", 3))
+
+        # set per-crawl homepage to detect “homepage special cases”
+        self._homepage_url: Optional[str] = None
+
+    # ----------------- public API -----------------
 
     async def crawl_site(
         self,
@@ -75,29 +89,30 @@ class SiteCrawler:
         url_deny_regex: Optional[str] = None,
     ) -> List[PageSnapshot]:
         start_url = normalize_url(homepage)
+        self._homepage_url = start_url
+
         if not is_http_url(start_url):
             logger.warning("Skip non-http URL: %s", start_url)
             return []
 
-        # Default to config cap if not explicitly provided
         if max_pages is None:
             max_pages = getattr(self.cfg, "max_pages_per_company", None)
+
+        allow_pat = url_allow_regex or getattr(self.cfg, "default_allow_regex", None)
+        deny_pat = url_deny_regex or getattr(self.cfg, "default_deny_regex", None)
+        allow_re = re.compile(allow_pat) if allow_pat else None
+        deny_re = re.compile(deny_pat) if deny_pat else None
 
         host = urlparse(start_url).hostname or ""
         logger.info("Crawling %s", host)
 
         visited: Set[str] = set()
-        queued: Set[str] = set()  # prevent duplicate enqueues
+        queued: Set[str] = set()
         queue: asyncio.Queue[str] = asyncio.Queue()
         await queue.put(start_url)
         queued.add(start_url)
 
         snapshots: Dict[str, PageSnapshot] = {}
-
-        import re
-
-        allow_re = re.compile(url_allow_regex) if url_allow_regex else None
-        deny_re  = re.compile(url_deny_regex)  if url_deny_regex  else None
 
         async def worker():
             while True:
@@ -106,11 +121,9 @@ class SiteCrawler:
                 except asyncio.TimeoutError:
                     return
 
-                # Cap: if we hit max_pages, drain fast
                 if max_pages is not None and len(visited) >= max_pages:
                     queue.task_done()
                     continue
-
                 if url in visited:
                     queue.task_done()
                     continue
@@ -120,13 +133,11 @@ class SiteCrawler:
                     async with self.sem:
                         snap = await self._fetch_and_extract(url, allow_re=allow_re, deny_re=deny_re)
 
-                    # optional polite delay to reduce bans
                     if self.cfg.per_page_delay_ms > 0:
                         await asyncio.sleep(self.cfg.per_page_delay_ms / 1000.0)
 
                     snapshots[url] = snap
 
-                    # Enqueue new links (already filtered in snap.out_links)
                     for link in snap.out_links:
                         if max_pages is not None and len(visited) >= max_pages:
                             break
@@ -136,17 +147,16 @@ class SiteCrawler:
                         queued.add(link)
 
                 except NonRetryableHTTPError as e:
-                    # Do not retry 404s etc.
-                    logger.warning("Non-retryable error on %s: %s", url, e)
+                    logger.debug("Non-retryable on %s: %s", url, e)
                 except TransientHTTPError as e:
                     attempts = self._attempts.get(url, 0) + 1
                     self._attempts[url] = attempts
                     if attempts <= self._max_retries:
-                        logger.warning(
+                        logger.debug(
                             "Transient error on %s (attempt %d/%d): %s",
                             url, attempts, self._max_retries, e
                         )
-                        visited.discard(url)  # let it retry
+                        visited.discard(url)
                         await queue.put(url)
                         queued.add(url)
                     else:
@@ -156,9 +166,6 @@ class SiteCrawler:
                 finally:
                     queue.task_done()
 
-        # Compile regex here (import placed late to avoid shadowing)
-        import re  # noqa: WPS433 (intentional local import for clarity)
-
         workers = [asyncio.create_task(worker()) for _ in range(self.cfg.max_pages_per_domain_parallel)]
         await queue.join()
         for w in workers:
@@ -167,6 +174,61 @@ class SiteCrawler:
 
         logger.info("Crawl finished: %s pages from %s", len(snapshots), host)
         return list(snapshots.values())
+
+    # ----------------- internals -----------------
+
+    def _is_homepage(self, src: str) -> bool:
+        try:
+            return normalize_url(src) == normalize_url(self._homepage_url or "")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _extract_canonical_href(html: str) -> Optional[str]:
+        """
+        Minimal parse for <link rel="canonical" href="..."> without BeautifulSoup dep.
+        """
+        if not html:
+            return None
+        # allow rel="canonical" in any order (rel attr must contain 'canonical')
+        m = re.search(
+            r'<link\s+[^>]*rel=["\']?[^"\']*canonical[^"\']*["\']?[^>]*>',
+            html,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            return None
+        tag = m.group(0)
+        href = re.search(r'href=["\']([^"\']+)["\']', tag, flags=re.IGNORECASE)
+        return href.group(1) if href else None
+
+    def _signal_redirect(self, src: str, dst: str, code: int):
+        if self.on_redirect:
+            try:
+                self.on_redirect(src, dst, code, self._is_homepage(src))
+            except Exception as e:
+                logger.debug("on_redirect callback failed: %s", e)
+
+    def _signal_canonical(self, src: str, dst: str):
+        if self.on_canonical:
+            try:
+                self.on_canonical(src, dst, self._is_homepage(src))
+            except Exception as e:
+                logger.debug("on_canonical callback failed: %s", e)
+
+    def _signal_backoff(self, host: str):
+        if self.on_backoff:
+            try:
+                self.on_backoff(host)
+            except Exception as e:
+                logger.debug("on_backoff callback failed: %s", e)
+
+    def _signal_server_error(self, host: str, path: str, status: int):
+        if self.on_server_error:
+            try:
+                self.on_server_error(host, path, status)
+            except Exception as e:
+                logger.debug("on_server_error callback failed: %s", e)
 
     @retry_async(
         max_attempts=4,
@@ -182,26 +244,21 @@ class SiteCrawler:
         deny_re=None,
     ) -> PageSnapshot:
         """
-        Static-first: try httpx; on JS-app, auth/blocked statuses, or TLS/network problems,
-        fall back to Playwright rendering once within the same attempt.
+        Static-first; fallback to Playwright; emit signals for redirects, canonicals, and backoff/server errors.
         """
         if bool(getattr(self.cfg, "enable_static_first", False)):
             try:
                 return await self._fetch_static(url, allow_re=allow_re, deny_re=deny_re)
             except NeedsBrowser:
-                # fall through to Playwright below
                 pass
             except NonRetryableHTTPError:
-                # 404 etc. — propagate so caller won't retry
                 raise
             except TransientHTTPError:
-                # let retry decorator handle, but first try a browser pass
                 pass
             except Exception as e:
-                # unknown issues → attempt browser before treating as transient
                 logger.debug("Static fetch unknown error on %s: %s (will try browser)", url, e)
 
-        # Playwright fallback / dynamic render
+        # Dynamic render
         page = await self.context.new_page()
         status = None
         try:
@@ -211,23 +268,65 @@ class SiteCrawler:
                 [self.wait_until, "domcontentloaded", "load"],
                 self.cfg.page_load_timeout_ms,
             )
+
+            # status-aware decisions
+            if status == 429:
+                host = urlparse(url).hostname or ""
+                self._signal_backoff(host)
+
             exc = http_status_to_exc(status)
             if exc:
+                # Special-case 401/403: allow extra grace on homepage only
+                if status in (401, 403):
+                    if self._is_homepage(url):
+                        raise TransientHTTPError(f"HTTP {status} on homepage {url}")
+                    raise NonRetryableHTTPError(f"HTTP {status} for {url}")
+                if 500 <= (status or 0) <= 599:
+                    up = urlparse(url)
+                    self._signal_server_error(up.hostname or "", up.path or "", status or 0)
                 raise exc
 
+            # JS redirect off-site
+            final_url = page.url
+            if not same_site(url, final_url, self.cfg.allow_subdomains):
+                logger.debug("Off-domain JS redirect: %s -> %s ; dropping.", url, final_url)
+                # treat as redirect event (no HTTP code; use 307 as a neutral JS redirect code)
+                self._signal_redirect(url, final_url, 307)
+                raise NonRetryableHTTPError(f"Off-domain JS redirect to {final_url}")
+
             title = await play_title(page)
-            if html and len(html) > 3_000_000:  # clamp giant pages
+            if html and len(html) > 3_000_000:
                 html = html[:3_000_000]
+
+            # 200 + canonical pointing off-site → signal + possibly suppress frontier (runner decides)
+            canon = self._extract_canonical_href(html or "")
+            if canon:
+                try:
+                    if get_base_domain(urlparse(canon).hostname or "") != get_base_domain(urlparse(final_url).hostname or ""):
+                        logger.debug("Off-site canonical: %s -> %s", final_url, canon)
+                        self._signal_canonical(final_url, canon)
+                except Exception:
+                    pass
 
             html_path = None
             if self.cfg.cache_html:
-                html_path = self._save_html(url, html or "")
+                html_path = self._save_html(final_url, html or "")
 
             links = await play_links(page)
             links = [normalize_url(l) for l in links if is_http_url(l)]
-            filtered = filter_links(url, links, self.cfg, allow_re=allow_re, deny_re=deny_re, product_only=True)
 
-            return PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered)
+            dropped: list[tuple[str, str]] = []
+            filtered = filter_links(
+                final_url,
+                links,
+                self.cfg,
+                allow_re=allow_re,
+                deny_re=deny_re,
+                product_only=True,
+                on_drop=lambda u, r: dropped.append((u, r)),
+            )
+
+            return PageSnapshot(url=final_url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
 
         except NonRetryableHTTPError:
             raise
@@ -243,8 +342,7 @@ class SiteCrawler:
 
     async def fetch_dynamic_only(self, url: str, *, allow_re=None, deny_re=None) -> PageSnapshot:
         """
-        Always render with Playwright once (no retry decorator here);
-        let caller decide if/how to retry.
+        Always render with Playwright once (no retry decorator here).
         """
         page = await self.context.new_page()
         status = None
@@ -255,23 +353,60 @@ class SiteCrawler:
                 [self.wait_until, "domcontentloaded", "load"],
                 self.cfg.page_load_timeout_ms,
             )
+
+            if status == 429:
+                host = urlparse(url).hostname or ""
+                self._signal_backoff(host)
+
             exc = http_status_to_exc(status)
             if exc:
+                if status in (401, 403):
+                    if self._is_homepage(url):
+                        raise TransientHTTPError(f"HTTP {status} on homepage {url}")
+                    raise NonRetryableHTTPError(f"HTTP {status} for {url}")
+                if 500 <= (status or 0) <= 599:
+                    up = urlparse(url)
+                    self._signal_server_error(up.hostname or "", up.path or "", status or 0)
                 raise exc
+
+            final_url = page.url
+            if not same_site(url, final_url, self.cfg.allow_subdomains):
+                logger.debug("Off-domain JS redirect: %s -> %s ; dropping.", url, final_url)
+                self._signal_redirect(url, final_url, 307)
+                raise NonRetryableHTTPError(f"Off-domain JS redirect to {final_url}")
 
             title = await play_title(page)
             if html and len(html) > 3_000_000:
                 html = html[:3_000_000]
 
+            canon = self._extract_canonical_href(html or "")
+            if canon:
+                try:
+                    if get_base_domain(urlparse(canon).hostname or "") != get_base_domain(urlparse(final_url).hostname or ""):
+                        logger.debug("Off-site canonical: %s -> %s", final_url, canon)
+                        self._signal_canonical(final_url, canon)
+                except Exception:
+                    pass
+
             html_path = None
             if self.cfg.cache_html:
-                html_path = self._save_html(url, html or "")
+                html_path = self._save_html(final_url, html or "")
 
             links = await play_links(page)
             links = [normalize_url(l) for l in links if is_http_url(l)]
-            filtered = filter_links(url, links, self.cfg, allow_re=allow_re, deny_re=deny_re, product_only=False)
 
-            return PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered)
+            dropped: list[tuple[str, str]] = []
+            filtered = filter_links(
+                final_url,
+                links,
+                self.cfg,
+                allow_re=allow_re,
+                deny_re=deny_re,
+                product_only=True,
+                on_drop=lambda u, r: dropped.append((u, r)),
+            )
+
+            return PageSnapshot(url=final_url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
 
         finally:
             try:
@@ -281,59 +416,100 @@ class SiteCrawler:
 
     async def _fetch_static(self, url: str, *, allow_re=None, deny_re=None) -> PageSnapshot:
         """
-        Fetch with httpx; save HTML immediately; if page looks client-rendered
-        or blocked (auth/CAPTCHA), raise NeedsBrowser to re-fetch with Playwright.
+        Fetch with httpx; preflight 3xx; save HTML; JS-app heuristic → NeedsBrowser.
+        Emits redirect/backoff/server-error signals for runner state.
         """
         client = httpx_client(self.cfg)
         try:
+            # --- preflight: detect off-site 3xx early ---
+            try:
+                r0 = await client.get(url, follow_redirects=False)
+            except (httpx.TimeoutException, httpx.NetworkError) as e:
+                raise NeedsBrowser(str(e)) from e
+
+            if 300 <= r0.status_code < 400:
+                loc = r0.headers.get("location") or r0.headers.get("Location")
+                if loc:
+                    target = urljoin(url, loc)
+                    # always signal redirect (even if same-site; runner can count)
+                    try:
+                        self._signal_redirect(url, target, r0.status_code)
+                    except Exception:
+                        pass
+                    # off-site: drop here, keep same-site to be followed by next GET
+                    if not same_site(url, target, self.cfg.allow_subdomains):
+                        logger.debug("Off-domain redirect: %s -> %s ; dropping.", url, target)
+                        raise NonRetryableHTTPError(f"Off-domain redirect to {target}")
+
+            # follow (client default redirects=True)
             try:
                 r = await client.get(url)
             except (httpx.TimeoutException, httpx.NetworkError) as e:
-                # TLS/timeouts/network problems → try browser
                 raise NeedsBrowser(str(e)) from e
 
             s = r.status_code
+            if s == 429:
+                host = urlparse(url).hostname or ""
+                self._signal_backoff(host)
+
             if s == 404:
                 raise NonRetryableHTTPError(f"HTTP 404 for {url}")
-            if s in (401, 403, 429, 503):
-                # likely bot protection or auth needed → browser
+            if s in (401, 403):
+                # try browser; dynamic will special-case homepage/non-homepage outcome
                 raise NeedsBrowser(f"HTTP {s} for {url}")
+            if 500 <= s <= 599:
+                up = urlparse(url)
+                self._signal_server_error(up.hostname or "", up.path or "", s)
+                # transient; let retry backoff or dynamic
+                raise TransientHTTPError(f"HTTP {s} for {url}")
             if s >= 400:
-                # other 4xx/5xx → transient (let retry)
                 raise TransientHTTPError(f"HTTP {s} for {url}")
 
             html = r.text or ""
 
-            # Save raw HTML *before* heuristics so we keep a debug artifact
             html_path = None
             if self.cfg.cache_html:
-                # clamp before saving to avoid giant files
                 max_bytes = int(getattr(self.cfg, "static_max_bytes", 2_000_000))
                 if len(html) > max_bytes:
                     html = html[:max_bytes]
                 html_path = self._save_html(url, html)
 
-            # Heuristic: if it looks like a JS app and visible text is tiny, ask for browser
             threshold = int(getattr(self.cfg, "static_js_app_text_threshold", 300))
             if looks_like_js_app(html, threshold):
                 raise NeedsBrowser("Likely client-rendered app")
 
-            # Extract links/title using static parser
+            # canonical: 200 with off-site rel=canonical → signal
+            canon = self._extract_canonical_href(html or "")
+            if canon:
+                try:
+                    if get_base_domain(urlparse(canon).hostname or "") != get_base_domain(urlparse(url).hostname or ""):
+                        logger.debug("Off-site canonical: %s -> %s", url, canon)
+                        self._signal_canonical(url, canon)
+                except Exception:
+                    pass
+
             title = extract_title_static(html)
             links = extract_links_static(html, url)
             links = [normalize_url(l) for l in links if is_http_url(l)]
 
-            filtered = filter_links(url, links, self.cfg, allow_re=allow_re, deny_re=deny_re, product_only=True)
+            dropped: list[tuple[str, str]] = []
+            filtered = filter_links(
+                url,
+                links,
+                self.cfg,
+                allow_re=allow_re,
+                deny_re=deny_re,
+                product_only=True,
+                on_drop=lambda u, r: dropped.append((u, r)),
+            )
 
-            return PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered)
+            return PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
 
         except NeedsBrowser:
-            # propagate to _fetch_and_extract to run Playwright
             raise
         except NonRetryableHTTPError:
             raise
         except Exception as e:
-            # Unknown condition → treat transient so retry_async can re-attempt or fall back
             raise TransientHTTPError(str(e)) from e
         finally:
             await client.aclose()
@@ -341,7 +517,7 @@ class SiteCrawler:
     def _save_html(self, url: str, html: str) -> str:
         parsed = urlparse(url)
         host = (parsed.hostname or "unknown-host").lower()
-        base_host = get_base_domain(host)  # collapse subdomains to eTLD+1
+        base_host = get_base_domain(host)
 
         base = parsed.path or "/"
         if base.endswith("/"):

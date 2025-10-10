@@ -1,4 +1,3 @@
-# scraper/run_scraper.py
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +10,8 @@ from dataclasses import dataclass
 from glob import glob
 from pathlib import Path
 from typing import Iterable, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse, ParseResult
+from itertools import islice
 
 # Make project root importable
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,8 +23,9 @@ from scraper.crawler import SiteCrawler, NonRetryableHTTPError
 from scraper.config import load_config
 from scraper.utils import (
     prune_html_for_markdown, html_to_markdown, clean_markdown, save_markdown,
-    TransientHTTPError, is_http_url, normalize_url, same_site, get_base_domain,
+    TransientHTTPError, is_http_url, normalize_url, same_site,
     looks_non_product_url, is_meaningful_markdown, init_logging,
+    get_base_domain,
 )
 
 log = logging.getLogger("scripts.run_scraper")
@@ -48,7 +49,6 @@ class CompanyRow:
 # ----------------------------- IO helpers ----------------------------
 
 def _discover_input_files(*, arg_glob: Optional[str], cfg) -> list[Path]:
-    """Resolve input CSVs via precedence: CLI glob -> cfg.input_glob -> cfg.input_urls_csv (single file)."""
     candidates: list[str] = []
     if arg_glob:
         candidates = glob(arg_glob)
@@ -57,12 +57,10 @@ def _discover_input_files(*, arg_glob: Optional[str], cfg) -> list[Path]:
         if getattr(cfg, "input_glob", None):
             candidates = glob(cfg.input_glob)
             log.info("Using cfg.input_glob=%s → %d file(s) found", cfg.input_glob, len(candidates))
-
     files: list[Path] = [Path(p) for p in candidates if Path(p).exists()]
     if not files and getattr(cfg, "input_urls_csv", None) and Path(cfg.input_urls_csv).exists():
         files = [Path(cfg.input_urls_csv)]
         log.info("Falling back to single file: %s", cfg.input_urls_csv)
-
     return sorted(files)
 
 
@@ -132,6 +130,12 @@ def _load_company_state(path: Path, row: CompanyRow | None) -> dict:
         "visited": [],
         "pending": pending,
         "done": False,
+        # new state buckets (lazy-init where used)
+        # "redirect_counter": {},
+        # "alias_domains": [],
+        # "migrated_to": "",
+        # "temp_allowed_hosts": [],
+        # "sick_prefixes": [],
     }
 
 
@@ -141,6 +145,32 @@ def _save_company_state(path: Path, state: dict) -> None:
     tmp.replace(path)
 
 
+_MAX_SKIPPED_PER_REASON = 200  # cap samples per company per reason to keep files small
+
+def _state_add_skips(state: dict, page_skips: list[tuple[str, str]]) -> None:
+    if not page_skips:
+        return
+    sk = state.setdefault("skipped", {"reasons": {}, "samples": {}})
+    reasons = sk.setdefault("reasons", {})
+    samples = sk.setdefault("samples", {})
+    for url, reason in page_skips:
+        reason = str(reason)
+        reasons[reason] = int(reasons.get(reason, 0)) + 1
+        arr = samples.setdefault(reason, [])
+        if len(arr) < _MAX_SKIPPED_PER_REASON:
+            arr.append(url)
+
+def _summarize_skips(state: dict, top_k: int = 3) -> str:
+    try:
+        reasons = (state.get("skipped", {}) or {}).get("reasons", {}) or {}
+        if not reasons:
+            return "skips: none"
+        # top-k by count desc, then key
+        top = sorted(reasons.items(), key=lambda kv: (-int(kv[1]), kv[0]))[:top_k]
+        return "skips: " + ", ".join(f"{k}={int(v)}" for k, v in top)
+    except Exception:
+        return "skips: n/a"
+
 # ---------------------------- URL helpers ----------------------------
 
 def _norm(u: str) -> str:
@@ -148,6 +178,28 @@ def _norm(u: str) -> str:
         return normalize_url(u)
     except Exception:
         return u or ""
+
+
+def _with_base_domain(u: str, new_base: str) -> str:
+    """Replace the eTLD+1 of u with new_base (keep scheme, path, query, fragment)."""
+    try:
+        pu = urlparse(u)
+        if not pu.hostname:
+            return u
+        # keep subdomain? Migration adopts base; we normalize to just new_base (no subdomain).
+        new_netloc = new_base
+        if pu.port:
+            new_netloc = f"{new_netloc}:{pu.port}"
+        return urlunparse(ParseResult(
+            scheme=pu.scheme or "https",
+            netloc=new_netloc,
+            path=pu.path or "/",
+            params=pu.params,
+            query=pu.query,
+            fragment=pu.fragment,
+        ))
+    except Exception:
+        return u
 
 
 def _pop_pending_equiv(state: dict, u: str) -> None:
@@ -164,6 +216,181 @@ def _pop_pending_equiv(state: dict, u: str) -> None:
     if removed:
         state["pending"] = keep
 
+
+def _rebuild_frontier_after_migration(
+    state: dict,
+    *,
+    new_base: str,
+    allow_subdomains: bool,
+    old_base: str | None = None,
+) -> None:
+    """Drop off-domain; map old base→new base when path-equivalent; de-dupe."""
+    # Use provided old_base from pre-migration homepage if available; otherwise derive.
+    if not old_base:
+        home = _norm(state.get("homepage", ""))
+        old_base = get_base_domain((urlparse(home).hostname or "")) if home else ""
+
+    visited = {_norm(u) for u in state.get("visited", []) if u}
+    new_pending: set[str] = set()
+
+    for u in state.get("pending", []):
+        if not u:
+            continue
+        nu = _norm(u)
+        host = (urlparse(nu).hostname or "").lower()
+        base = get_base_domain(host) if host else ""
+
+        if base == old_base:
+            # map to new base (preserve path/query/fragment)
+            mapped = _norm(_with_base_domain(nu, new_base))
+            # Only require that the mapped URL is actually on the new base and not visited
+            m_host = (urlparse(mapped).hostname or "").lower()
+            if get_base_domain(m_host) == new_base and mapped not in visited:
+                new_pending.add(mapped)
+        else:
+            # keep only if already on the new base
+            if get_base_domain(host) == new_base and nu not in visited:
+                new_pending.add(nu)
+
+    state["pending"] = sorted(new_pending)
+
+# ---------------------------- Redirect/Canonical handlers ----------------------------
+
+def _record_redirect(cfg, state_path: Path, state: dict, src: str, dst: str, code: int, is_homepage: bool) -> None:
+    """Handle 3xx (and JS) redirects observed by crawler."""
+    try:
+        old_host = (urlparse(src).hostname or "").lower()
+        new_host = (urlparse(dst).hostname or "").lower()
+        if not old_host or not new_host:
+            return
+        old_base = get_base_domain(old_host)
+        new_base = get_base_domain(new_host)
+        same = (old_base == new_base)
+
+        log.debug("REDIR %s %s → %s (same-site=%s, homepage=%s)", code, src, dst, same, is_homepage)
+
+        # count off-site targets
+        if not same:
+            forbid = set(getattr(cfg, "migration_forbid_hosts", ()) or ())
+            if new_base in forbid:
+                return
+            rc = state.setdefault("redirect_counter", {})
+            rc[new_base] = int(rc.get(new_base, 0)) + 1
+            _save_company_state(state_path, state)
+
+            # 301/308 → migration candidate
+            if code in (301, 308):
+                seen = rc[new_base]
+                need = int(getattr(cfg, "migration_threshold", 2))
+                log.info('301/308 migrate candidate: %s → %s (homepage=%s, seen=%d/%d)', old_base, new_base, is_homepage, seen, need)
+                if is_homepage or seen >= need:
+                    _adopt_migration(cfg, state_path, state, new_base, homepage_dst=dst)
+                    return
+
+            # 302/307 on homepage → probation: allow seed to be crawled this pass
+            if code in (302, 307) and is_homepage:
+                tmp = set(state.get("temp_allowed_hosts", []) or [])
+                if new_base not in tmp:
+                    tmp.add(new_base)
+                    state["temp_allowed_hosts"] = sorted(tmp)
+                # enqueue destination as a seed explicitly
+                pend = set(state.get("pending", []) or [])
+                pend.add(_norm(dst))
+                state["pending"] = sorted(pend)
+                log.info("[PROBATION] 302/307: homepage redirected to %s; enqueued for this pass.", new_base)
+                _save_company_state(state_path, state)
+
+    except Exception as e:
+        log.debug("redirect handler failed: %s", e)
+
+
+def _record_canonical(cfg, state_path: Path, state: dict, src: str, dst: str, is_homepage: bool) -> None:
+    """Handle 200 + rel=canonical pointing off-site."""
+    try:
+        src_host = (urlparse(src).hostname or "").lower()
+        dst_host = (urlparse(dst).hostname or "").lower()
+        if not src_host or not dst_host:
+            return
+        src_base = get_base_domain(src_host)
+        dst_base = get_base_domain(dst_host)
+        if src_base == dst_base:
+            return
+
+        forbid = set(getattr(cfg, "migration_forbid_hosts", ()) or ())
+        if dst_base in forbid:
+            return
+
+        rc = state.setdefault("redirect_counter", {})
+        rc[dst_base] = int(rc.get(dst_base, 0)) + 1
+        need = int(getattr(cfg, "migration_threshold", 2))
+        log.info('CANON migrate candidate: %s → %s (homepage=%s, seen=%d/%d)',
+                 src_base, dst_base, is_homepage, rc[dst_base], need)
+
+        if is_homepage or rc[dst_base] >= need:
+            _adopt_migration(cfg, state_path, state, dst_base, homepage_dst=dst)
+    except Exception as e:
+        log.debug("canonical handler failed: %s", e)
+
+
+def _note_backoff(cfg, state_path: Path, state: dict, host: str) -> None:
+    """Remember that we hit 429; runner can slow down next pass."""
+    try:
+        b = state.setdefault("backoff_hits", 0) + 1
+        state["backoff_hits"] = b
+        _save_company_state(state_path, state)
+        log.info("company backoff triggered ×%d", b)
+    except Exception:
+        pass
+
+
+def _note_server_error(cfg, state_path: Path, state: dict, host: str, path: str, status: int) -> None:
+    """Tag a sick prefix candidate (for future pass-level suppression)."""
+    try:
+        pref = path.split("/")
+        prefix = "/" + (pref[1] if len(pref) > 1 else "")
+        sick = set(state.get("sick_prefixes", []) or [])
+        if prefix and prefix != "/":
+            if prefix not in sick:
+                log.info("prefix %s tagged sick", prefix)
+            sick.add(prefix)
+            state["sick_prefixes"] = sorted(sick)[:20]
+            _save_company_state(state_path, state)
+    except Exception:
+        pass
+
+def _adopt_migration(cfg, state_path: Path, state: dict, new_base: str, *, homepage_dst: Optional[str] = None) -> None:
+    """Adopt a new eTLD+1 as primary for this company; rebuild frontier."""
+    old_home = _norm(state.get("homepage", ""))
+    old_host = (urlparse(old_home).hostname or "").lower()
+    old_base = get_base_domain(old_host) if old_host else ""
+
+    # guard: no-op if already migrated
+    if get_base_domain((urlparse(old_home).hostname or "")) == new_base and not homepage_dst:
+        return
+
+    aliases = set(state.get("alias_domains", []) or [])
+    if old_base and old_base != new_base:
+        aliases.add(old_base)
+    state["alias_domains"] = sorted(aliases)[:3]
+
+    # set homepage to target (prefer full redirected dst if given)
+    if homepage_dst:
+        state["homepage"] = _norm(homepage_dst)
+    else:
+        state["homepage"] = _norm(_with_base_domain(old_home, new_base))
+    state["migrated_to"] = new_base
+
+    log.info("[MIGRATE] Domain migration adopted for company: base=%s (aliases: %s)",
+             new_base, ", ".join(state.get("alias_domains", [])))
+
+    # Rebuild frontier using the PRE-migration base
+    _rebuild_frontier_after_migration(
+        state,
+        new_base=new_base,
+        allow_subdomains=bool(getattr(cfg, "allow_subdomains", False)),
+        old_base=old_base,
+    )
+    _save_company_state(state_path, state)
 
 # ---------------------------- Core routines ----------------------------
 
@@ -186,7 +413,6 @@ async def _crawl_seed_pass(
 
 
 def _render_markdown_from_html(cfg, url: str, html: str) -> str:
-    # Small helper to keep logic in one place
     try:
         cleaned_html = prune_html_for_markdown(html)
     except Exception as e:
@@ -201,18 +427,22 @@ def _render_markdown_from_html(cfg, url: str, html: str) -> str:
 
 
 async def _save_markdown_for_snaps(cfg, crawler: SiteCrawler, snaps: list, *, retried_dynamic: set[str]) -> None:
-    """
-    Save Markdown for each snapshot; if the markdown looks meaningless,
-    try a one-time dynamic re-fetch and overwrite the artifacts.
-    """
-    for snap in snaps:
+    total = len(snaps)
+    if total == 0:
+        return
+    dyn_budget = int(getattr(cfg, "dynamic_retry_budget_per_pass", 8))
+    dyn_used = 0
+
+    for idx, snap in enumerate(snaps, start=1):
         if not getattr(snap, "html_path", None):
             continue
         p = Path(snap.html_path)
         if not p.exists():
             continue
 
-        # 1) initial render from cached HTML
+        if idx == 1 or idx % 10 == 0 or idx == total:
+            log.info("Rendering markdown for batch: %d/%d (dynamic budget remaining=%d)", idx, total, max(0, dyn_budget - dyn_used))
+
         try:
             html = p.read_text(encoding="utf-8", errors="ignore")
         except Exception:
@@ -220,10 +450,10 @@ async def _save_markdown_for_snaps(cfg, crawler: SiteCrawler, snaps: list, *, re
 
         md = _render_markdown_from_html(cfg, snap.url, html)
 
-        # 2) quality gate: if low quality and static-first is enabled, try once with Playwright
         want_dynamic_retry = (
             bool(getattr(cfg, "enable_static_first", False)) and
             snap.url not in retried_dynamic and
+            dyn_used < dyn_budget and
             not is_meaningful_markdown(md,
                                        min_chars=int(getattr(cfg, "md_min_chars", 400)),
                                        min_words=int(getattr(cfg, "md_min_words", 80)),
@@ -234,24 +464,18 @@ async def _save_markdown_for_snaps(cfg, crawler: SiteCrawler, snaps: list, *, re
         if want_dynamic_retry:
             try:
                 dyn_snap = await crawler.fetch_dynamic_only(snap.url)
-                # refresh local variables based on dynamic fetch
                 if dyn_snap.html_path and Path(dyn_snap.html_path).exists():
                     html = Path(dyn_snap.html_path).read_text(encoding="utf-8", errors="ignore")
                     md = _render_markdown_from_html(cfg, snap.url, html)
                     retried_dynamic.add(snap.url)
-                    # also, replace the outgoing links snapshot so the frontier can grow on JS pages
                     snap.out_links = dyn_snap.out_links
                     snap.html_path = dyn_snap.html_path
                     snap.title = dyn_snap.title
-                    log.debug("Dynamic retry improved markdown for %s (size=%d chars).", snap.url, len(md))
-            except NonRetryableHTTPError:
-                log.debug("Dynamic retry 404 for %s, skipping.", snap.url)
-            except TransientHTTPError as e:
-                log.debug("Dynamic retry transient for %s: %s", snap.url, e)
+                    dyn_used += 1
+                    log.info("Dynamic retry ✓ %s (now %d/%d; budget left=%d)", snap.url, idx, total, max(0, dyn_budget - dyn_used))
             except Exception as e:
                 log.debug("Dynamic retry failed for %s: %s", snap.url, e)
 
-        # 3) save markdown
         parsed = urlparse(snap.url)
         host = (parsed.hostname or "unknown-host")
         url_path = parsed.path or "/"
@@ -282,7 +506,7 @@ def _update_state_from_snaps(state: dict, snaps: list, homepage_url: str, allow_
                 continue
             if lu in visited or lu in pending:
                 continue
-            if looks_non_product_url(lu):  # extra belt-and-suspenders
+            if looks_non_product_url(lu):
                 continue
             if same_site(home_norm, lu, allow_subdomains):
                 pending.add(lu)
@@ -306,9 +530,8 @@ async def _drain_company(
     allow_subdomains = bool(getattr(cfg, "allow_subdomains", False))
 
     cap_total = int(getattr(cfg, "max_pages_per_company", 300) or 300)
-    already = len({ _norm(u) for u in state.get("visited", []) if u })
+    already = len({_norm(u) for u in state.get("visited", []) if u})
     remaining = max(0, cap_total - already)
-
     if remaining == 0:
         state["done"] = True
         _save_company_state(state_path, state)
@@ -319,7 +542,7 @@ async def _drain_company(
     retried_dynamic: set[str] = set()
 
     while state["pending"] and remaining > 0:
-        pending_list = sorted({ _norm(u) for u in state["pending"] if u })
+        pending_list = sorted({_norm(u) for u in state["pending"] if u})
         state["pending"] = pending_list
         seeds = pending_list[:seed_batch]
         if not seeds:
@@ -348,8 +571,8 @@ async def _drain_company(
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # remove attempted seeds from pending (normalized)
-        current_pending = { _norm(u) for u in state.get("pending", []) if u }
+        # remove attempted seeds from pending
+        current_pending = {_norm(u) for u in state.get("pending", []) if u}
         for s_url in seeds:
             current_pending.discard(s_url)
         state["pending"] = sorted(current_pending)
@@ -373,6 +596,11 @@ async def _drain_company(
                 homepage_url=homepage,
                 allow_subdomains=allow_subdomains
             )
+
+            for s in snaps:
+                if getattr(s, "dropped", None):
+                    _state_add_skips(state, s.dropped)
+
             _save_company_state(state_path, state)
 
             now_visited = len(state.get("visited", []))
@@ -392,19 +620,51 @@ async def _drain_company(
             break
 
         if not progress:
-            state["done"] = True
             _save_company_state(state_path, state)
-            log.debug(
-                "No progress this pass for %s, marking company done and stopping.",
-                state.get("company", "")
-            )
-            break
+            log.info("No progress this pass for %s (%s).",
+                    state.get("company", ""), _summarize_skips(state))
+            # DEBUG counters snapshot
+            try:
+                sk = (state.get("skipped", {}) or {}).get("reasons", {}) or {}
+                log.debug("Counters: visited=%d, pending=%d, skipped_total=%d (by reason: %s)",
+                        len(state.get("visited", [])),
+                        len(state.get("pending", [])),
+                        sum(int(v) for v in sk.values()),
+                        ", ".join(f"{k}={int(v)}" for k, v in sorted(sk.items())))
+            except Exception:
+                pass
+            continue
+
         progress = False
 
-    # <-- compute finished AFTER the loop and persist once
     finished = bool(state.get("done", False) or remaining == 0 or len(state.get("pending", [])) == 0)
     state["done"] = finished
     _save_company_state(state_path, state)
+
+    if finished:
+        log.info("Company DONE: %s (visited=%d, pending=%d) — %s",
+                state.get("company",""),
+                len(state.get("visited",[])),
+                len(state.get("pending",[])),
+                _summarize_skips(state))
+    else:
+        log.info("Company PASS complete: %s (visited=%d, pending=%d, remaining=%d)",
+                state.get("company",""),
+                len(state.get("visited",[])),
+                len(state.get("pending",[])),
+                remaining)
+
+    # DEBUG summary snapshot
+    try:
+        sk = (state.get("skipped", {}) or {}).get("reasons", {}) or {}
+        log.debug("End-of-company counters: visited=%d, pending=%d, skipped_total=%d (by reason: %s)",
+                len(state.get("visited", [])),
+                len(state.get("pending", [])),
+                sum(int(v) for v in sk.values()),
+                ", ".join(f"{k}={int(v)}" for k, v in sorted(sk.items())))
+    except Exception:
+        pass
+
     return finished
 
 
@@ -428,7 +688,26 @@ async def _process_company(
     log.debug("Company %s: starting with pending=%d visited=%d",
               row.company_name, len(state["pending"]), len(state["visited"]))
 
-    crawler = SiteCrawler(cfg, context)
+    # ---- wire crawler with stateful callbacks ----
+    def cb_redirect(src: str, dst: str, code: int, is_home: bool):
+        _record_redirect(cfg, state_path, state, src, dst, code, is_home)
+
+    def cb_canonical(src: str, dst: str, is_home: bool):
+        _record_canonical(cfg, state_path, state, src, dst, is_home)
+
+    def cb_backoff(host: str):
+        _note_backoff(cfg, state_path, state, host)
+
+    def cb_server_error(host: str, path: str, status: int):
+        _note_server_error(cfg, state_path, state, host, path, status)
+
+    crawler = SiteCrawler(
+        cfg, context,
+        on_redirect=cb_redirect,
+        on_canonical=cb_canonical,
+        on_backoff=cb_backoff,
+        on_server_error=cb_server_error,
+    )
 
     for attempt in range(1, max(1, company_attempts) + 1):
         try:
@@ -540,7 +819,6 @@ async def main_async(argv: list[str] | None = None) -> None:
     args = _parse_args(argv or sys.argv[1:])
     cfg = load_config()
 
-    # Centralized logging init (file + console)
     init_logging(cfg.log_file, level=(logging.DEBUG if args.debug else logging.INFO))
     if args.debug:
         log.debug("Debug logging enabled")

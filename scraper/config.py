@@ -1,9 +1,8 @@
-# scraper/config.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Tuple
 from .utils import getenv_bool, getenv_int, getenv_str
 
 # ---------- Project Paths ----------
@@ -117,8 +116,39 @@ class Config:
     checkpoints_dir: Path
     embeddings_dir: Path
 
+    # --------- NEW: Redirect/migration & filtering defaults ----------
+    # Default regexes used by crawler if CLI doesn't supply --allow/--deny
+    default_allow_regex: str | None
+    default_deny_regex: str | None
+
+    # Domain migration / redirect handling
+    migration_threshold: int                    # e.g., 2 off-site 301/308 (or homepage once)
+    migration_forbid_hosts: tuple[str, ...]     # known sinkholes, never adopt
+
+    # Auth & backoff policies
+    deny_on_auth: bool                          # 401/403: suppress frontier (non-homepage)
+    backoff_on_429: float                       # multiply delay (and/or reduce seed batch) next pass
+
+    # Same-site expansion for the current run (runner can set per company)
+    extra_same_site_hosts: tuple[str, ...]      # additional eTLD+1 treated as same-site this run
+
+
 # ---------- Loader ----------
 def load_config() -> Config:
+    # tiny helper: float env with default
+    def _env_float(name: str, default: float) -> float:
+        s = getenv_str(name, str(default)).strip()
+        try:
+            return float(s)
+        except Exception:
+            return default
+
+    # parse CSV-ish envs into tuples (trim blanks)
+    def _env_csv(name: str, default_csv: str) -> Tuple[str, ...]:
+        raw = getenv_str(name, default_csv)
+        parts = [x.strip() for x in raw.split(",")]
+        return tuple(p for p in parts if p)
+
     cfg = Config(
         timezone=getenv_str("APP_TZ", "Asia/Singapore"),
         env=getenv_str("APP_ENV", "dev"),
@@ -200,5 +230,31 @@ def load_config() -> Config:
         product_like_url_keywords=tuple(getenv_str("PRODUCT_URL_KEYWORDS", "/product,/products,/solutions,/services,/catalog").split(",")),
         non_product_keywords=tuple(getenv_str("NON_PRODUCT_KEYWORDS", "/blog,/news,/legal,/privacy,/careers,/investors").split(",")),
         prefer_detail_url_keywords=tuple(getenv_str("PREFER_DETAIL_URL_KEYWORDS", "/product,/products").split(",")),
+
+        # --------- NEW: Redirect/migration & filtering defaults ----------
+        default_allow_regex=(lambda s: s if s else None)(
+            getenv_str(
+                "DEFAULT_ALLOW_REGEX",
+                r"/(product|products|solution|solutions|service|services|catalog|portfolio|platform|features|pricing|specs|datasheet)"
+            ).strip()
+        ),
+        default_deny_regex=(lambda s: s if s else None)(
+            getenv_str(
+                "DEFAULT_DENY_REGEX",
+                r"(login|press|news(room)?|career|jobs|investor|event|webinar|blog|community|download|insights)"
+            ).strip()
+        ),
+
+        migration_threshold=getenv_int("MIGRATION_THRESHOLD", 2, 1, 10),
+        migration_forbid_hosts=_env_csv(
+            "MIGRATION_FORBID_HOSTS",
+            "youtube.com,facebook.com,instagram.com,tiktok.com,vimeo.com,shop.app,amazon.com,medium.com,linktr.ee,mailchi.mp,bit.ly"
+        ),
+
+        deny_on_auth=getenv_bool("DENY_ON_AUTH", True),
+        backoff_on_429=_env_float("BACKOFF_ON_429", 1.5),
+
+        # Runner can set this per company (comma-separated eTLD+1); default empty
+        extra_same_site_hosts=_env_csv("EXTRA_SAME_SITE_HOSTS", ""),
     )
     return cfg
