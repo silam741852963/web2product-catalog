@@ -41,10 +41,11 @@ logger = logging.getLogger(__name__)
 class PageSnapshot:
     url: str
     title: Optional[str]
-    html_path: Optional[str]  # path on disk if cached
+    html_path: Optional[str]
     out_links: List[str] = field(default_factory=list)
-    # filtered-out links with a reason (url, reason)
     dropped: List[tuple[str, str]] = field(default_factory=list)
+    content_sha1: Optional[str] = None
+    not_modified: bool = False
 
 
 class SiteCrawler:
@@ -79,18 +80,19 @@ class SiteCrawler:
         # set per-crawl homepage to detect “homepage special cases”
         self._homepage_url: Optional[str] = None
 
+        self._ims: Dict[str, float] = {}
+        self._prio_seq: int = 0 
+
     # ----------------- public API -----------------
 
     async def crawl_site(
-        self,
-        homepage: str,
-        max_pages: Optional[int] = None,
-        url_allow_regex: Optional[str] = None,
-        url_deny_regex: Optional[str] = None,
-    ) -> List[PageSnapshot]:
+    self,
+    homepage: str,
+    max_pages: Optional[int] = None,
+    url_allow_regex: Optional[str] = None,
+    url_deny_regex: Optional[str] = None,
+) -> List[PageSnapshot]:
         start_url = normalize_url(homepage)
-        self._homepage_url = start_url
-
         if not is_http_url(start_url):
             logger.warning("Skip non-http URL: %s", start_url)
             return []
@@ -98,26 +100,40 @@ class SiteCrawler:
         if max_pages is None:
             max_pages = getattr(self.cfg, "max_pages_per_company", None)
 
-        allow_pat = url_allow_regex or getattr(self.cfg, "default_allow_regex", None)
-        deny_pat = url_deny_regex or getattr(self.cfg, "default_deny_regex", None)
-        allow_re = re.compile(allow_pat) if allow_pat else None
-        deny_re = re.compile(deny_pat) if deny_pat else None
-
         host = urlparse(start_url).hostname or ""
         logger.info("Crawling %s", host)
 
         visited: Set[str] = set()
         queued: Set[str] = set()
-        queue: asyncio.Queue[str] = asyncio.Queue()
-        await queue.put(start_url)
+
+        # --- priority queue: producty first ---
+        from asyncio import PriorityQueue
+        queue: PriorityQueue[tuple[int, int, str]] = PriorityQueue()
+        prio_seq = 0
+
+        import re
+        allow_re = re.compile(url_allow_regex) if url_allow_regex else None
+        deny_re  = re.compile(url_deny_regex)  if url_deny_regex  else None
+
+        def _priority(u: str) -> int:
+            # 0 for product-like URLs; 1 otherwise
+            try:
+                from .utils import is_producty_url
+                return 0 if is_producty_url(u) else 1
+            except Exception:
+                return 1
+
+        await queue.put((_priority(start_url), prio_seq, start_url))
+        prio_seq += 1
         queued.add(start_url)
 
         snapshots: Dict[str, PageSnapshot] = {}
 
         async def worker():
+            nonlocal prio_seq
             while True:
                 try:
-                    url = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    prio, _, url = await asyncio.wait_for(queue.get(), timeout=0.5)
                 except asyncio.TimeoutError:
                     return
 
@@ -143,21 +159,20 @@ class SiteCrawler:
                             break
                         if link in visited or link in queued:
                             continue
-                        await queue.put(link)
+                        await queue.put((_priority(link), prio_seq, link))
+                        prio_seq += 1
                         queued.add(link)
 
                 except NonRetryableHTTPError as e:
                     logger.debug("Non-retryable on %s: %s", url, e)
                 except TransientHTTPError as e:
-                    attempts = self._attempts.get(url, 0) + 1
+                    attempts = getattr(self, "_attempts", {}).get(url, 0) + 1
                     self._attempts[url] = attempts
-                    if attempts <= self._max_retries:
-                        logger.debug(
-                            "Transient error on %s (attempt %d/%d): %s",
-                            url, attempts, self._max_retries, e
-                        )
+                    if attempts <= getattr(self, "_max_retries", 3):
+                        logger.debug("Transient error on %s (attempt %d/%d): %s", url, attempts, self._max_retries, e)
                         visited.discard(url)
-                        await queue.put(url)
+                        await queue.put((_priority(url), prio_seq, url))
+                        prio_seq += 1
                         queued.add(url)
                     else:
                         logger.warning("Giving up on %s after %d attempts", url, attempts)
@@ -174,6 +189,11 @@ class SiteCrawler:
 
         logger.info("Crawl finished: %s pages from %s", len(snapshots), host)
         return list(snapshots.values())
+
+    
+    def set_if_modified_since(self, last_seen: Optional[Dict[str, float]]):
+        self._ims = {normalize_url(k): float(v) for k, v in (last_seen or {}).items() if v}
+
 
     # ----------------- internals -----------------
 
@@ -421,7 +441,7 @@ class SiteCrawler:
         """
         client = httpx_client(self.cfg)
         try:
-            # --- preflight: detect off-site 3xx early ---
+            # --- preflight: detect off-site 3xx early (don’t spend cycles following) ---
             try:
                 r0 = await client.get(url, follow_redirects=False)
             except (httpx.TimeoutException, httpx.NetworkError) as e:
@@ -431,23 +451,32 @@ class SiteCrawler:
                 loc = r0.headers.get("location") or r0.headers.get("Location")
                 if loc:
                     target = urljoin(url, loc)
-                    # always signal redirect (even if same-site; runner can count)
+                    # signal redirect (runner may count toward migration/probation)
                     try:
                         self._signal_redirect(url, target, r0.status_code)
                     except Exception:
                         pass
-                    # off-site: drop here, keep same-site to be followed by next GET
+                    # off-site: drop fast (your runner handles migration candidates)
                     if not same_site(url, target, self.cfg.allow_subdomains):
                         logger.debug("Off-domain redirect: %s -> %s ; dropping.", url, target)
                         raise NonRetryableHTTPError(f"Off-domain redirect to {target}")
 
-            # follow (client default redirects=True)
+            # --- follow with conditional headers (If-Modified-Since) ---
             try:
-                r = await client.get(url)
+                ims_epoch = getattr(self, "_ims", {}).get(normalize_url(url))
+                headers = None
+                if ims_epoch:
+                    from .utils import httpdate_from_epoch
+                    headers = {"If-Modified-Since": httpdate_from_epoch(float(ims_epoch))}
+                r = await client.get(url, headers=headers)
             except (httpx.TimeoutException, httpx.NetworkError) as e:
                 raise NeedsBrowser(str(e)) from e
 
             s = r.status_code
+            if s == 304:
+                # Not modified since last crawl — return empty frontier
+                return PageSnapshot(url=url, title=None, html_path=None, out_links=[], dropped=dropped)
+
             if s == 429:
                 host = urlparse(url).hostname or ""
                 self._signal_backoff(host)
@@ -455,18 +484,18 @@ class SiteCrawler:
             if s == 404:
                 raise NonRetryableHTTPError(f"HTTP 404 for {url}")
             if s in (401, 403):
-                # try browser; dynamic will special-case homepage/non-homepage outcome
+                # try browser; dynamic path will special-case homepage/non-homepage
                 raise NeedsBrowser(f"HTTP {s} for {url}")
             if 500 <= s <= 599:
                 up = urlparse(url)
                 self._signal_server_error(up.hostname or "", up.path or "", s)
-                # transient; let retry backoff or dynamic
                 raise TransientHTTPError(f"HTTP {s} for {url}")
             if s >= 400:
                 raise TransientHTTPError(f"HTTP {s} for {url}")
 
             html = r.text or ""
 
+            # Save (truncate if needed)
             html_path = None
             if self.cfg.cache_html:
                 max_bytes = int(getattr(self.cfg, "static_max_bytes", 2_000_000))
@@ -474,11 +503,12 @@ class SiteCrawler:
                     html = html[:max_bytes]
                 html_path = self._save_html(url, html)
 
+            # JS-app heuristic → punt to browser
             threshold = int(getattr(self.cfg, "static_js_app_text_threshold", 300))
             if looks_like_js_app(html, threshold):
                 raise NeedsBrowser("Likely client-rendered app")
 
-            # canonical: 200 with off-site rel=canonical → signal
+            # 200 with off-site rel=canonical → signal
             canon = self._extract_canonical_href(html or "")
             if canon:
                 try:
@@ -488,6 +518,7 @@ class SiteCrawler:
                 except Exception:
                     pass
 
+            # Extract title/links; filter downstream
             title = extract_title_static(html)
             links = extract_links_static(html, url)
             links = [normalize_url(l) for l in links if is_http_url(l)]
@@ -503,7 +534,16 @@ class SiteCrawler:
                 on_drop=lambda u, r: dropped.append((u, r)),
             )
 
-            return PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
+            try:
+                from hashlib import sha1 as _sha1
+                content_sha1 = _sha1(html.encode("utf-8", errors="ignore")).hexdigest()
+            except Exception:
+                content_sha1 = None
+
+            snap = PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
+            setattr(snap, "content_sha1", content_sha1)
+
+            return snap
 
         except NeedsBrowser:
             raise
@@ -513,6 +553,7 @@ class SiteCrawler:
             raise TransientHTTPError(str(e)) from e
         finally:
             await client.aclose()
+
 
     def _save_html(self, url: str, html: str) -> str:
         parsed = urlparse(url)

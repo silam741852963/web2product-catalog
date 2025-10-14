@@ -231,20 +231,23 @@ def load_config() -> Config:
         non_product_keywords=tuple(getenv_str("NON_PRODUCT_KEYWORDS", "/blog,/news,/legal,/privacy,/careers,/investors").split(",")),
         prefer_detail_url_keywords=tuple(getenv_str("PREFER_DETAIL_URL_KEYWORDS", "/product,/products").split(",")),
 
-        # --------- NEW: Redirect/migration & filtering defaults ----------
-        default_allow_regex=(lambda s: s if s else None)(
-            getenv_str(
-                "DEFAULT_ALLOW_REGEX",
-                r"/(product|products|solution|solutions|service|services|catalog|portfolio|platform|features|pricing|specs|datasheet)"
-            ).strip()
-        ),
-        default_deny_regex=(lambda s: s if s else None)(
-            getenv_str(
-                "DEFAULT_DENY_REGEX",
-                r"(login|press|news(room)?|career|jobs|investor|event|webinar|blog|community|download|insights)"
-            ).strip()
-        ),
+        # --------- Redirect/migration & filtering defaults ----------
+        # default_allow_regex=(lambda s: s if s else None)(
+        #     getenv_str(
+        #         "DEFAULT_ALLOW_REGEX",
+        #         r"/(product|products|solution|solutions|service|services|catalog|portfolio|platform|features|pricing|specs|datasheet)"
+        #     ).strip()
+        # ),
+        # default_deny_regex=(lambda s: s if s else None)(
+        #     getenv_str(
+        #         "DEFAULT_DENY_REGEX",
+        #         r"(login|press|news(room)?|career|jobs|investor|event|webinar|blog|community|download|insights)"
+        #     ).strip()
+        # ),
 
+        default_allow_regex= None,
+        default_deny_regex= None,
+        
         migration_threshold=getenv_int("MIGRATION_THRESHOLD", 2, 1, 10),
         migration_forbid_hosts=_env_csv(
             "MIGRATION_FORBID_HOSTS",

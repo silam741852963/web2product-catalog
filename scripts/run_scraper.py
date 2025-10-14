@@ -11,7 +11,11 @@ from glob import glob
 from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import urlparse, urlunparse, ParseResult
-from itertools import islice
+import os
+import tempfile
+import time
+import shutil
+from threading import Lock
 
 # Make project root importable
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,7 +29,7 @@ from scraper.utils import (
     prune_html_for_markdown, html_to_markdown, clean_markdown, save_markdown,
     TransientHTTPError, is_http_url, normalize_url, same_site,
     looks_non_product_url, is_meaningful_markdown, init_logging,
-    get_base_domain,
+    get_base_domain, is_producty_url
 )
 
 log = logging.getLogger("scripts.run_scraper")
@@ -99,9 +103,48 @@ def _save_csv_checkpoint(checkpoints_dir: Path, csv_input: Path, done_keys: set[
     ckpt = _csv_checkpoint_path(checkpoints_dir, csv_input)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
     body = {"done": sorted(done_keys)}
-    tmp = ckpt.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(ckpt)
+
+    fd, tmp_name = tempfile.mkstemp(prefix=ckpt.stem + "_", suffix=".tmp", dir=str(ckpt.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(body, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
+        log.exception("Failed writing CSV checkpoint temp %s", ckpt)
+        return
+
+    with _state_lock(ckpt):
+        backoff = 0.05
+        for _ in range(8):
+            try:
+                os.replace(tmp_name, ckpt)
+                return
+            except PermissionError:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 0.8)
+            except Exception:
+                log.exception("CSV checkpoint replace failed for %s", ckpt)
+                break
+
+    try:
+        bak = ckpt.with_suffix(ckpt.suffix + ".bak")
+        shutil.move(tmp_name, bak)
+        log.warning("CSV checkpoint replace failing for %s; wrote backup %s", ckpt, bak)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
+        log.exception("CSV checkpoint backup move also failed for %s", ckpt)
 
 
 def _company_state_path(checkpoints_dir: Path, row: CompanyRow) -> Path:
@@ -114,6 +157,16 @@ def _company_state_path(checkpoints_dir: Path, row: CompanyRow) -> Path:
 
 def _load_company_state(path: Path, row: CompanyRow | None) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Best-effort cleanup of any stale temp file from prior crash
+    tmp_glob = f"{path.name}*.tmp"
+    try:
+        for p in path.parent.glob(tmp_glob):
+            # Only delete small json temps; ignore unrelated files
+            if p.is_file() and p.stat().st_size < 10_000_000:
+                p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
@@ -140,9 +193,61 @@ def _load_company_state(path: Path, row: CompanyRow | None) -> dict:
 
 
 def _save_company_state(path: Path, state: dict) -> None:
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    """
+    Robust atomic-ish write:
+      - write to a temp file in the same directory
+      - flush + fsync
+      - try os.replace with exponential backoff on Windows AV/locking
+      - never raise; log and keep a .bak if we couldn't replace
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Use a unique temp file (not a fixed .json.tmp) to avoid races
+    fd, tmp_name = tempfile.mkstemp(prefix=path.stem + "_", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        # ensure file descriptor closed on json dump error
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
+        log.exception("Failed writing temp state for %s", path)
+        return
+
+    # Replace with retries under a lock (avoid concurrent writers)
+    with _state_lock(path):
+        backoff = 0.05  # 50ms
+        for attempt in range(8):  # ~ (0.05 + 0.1 + 0.2 + ... ~1.5s total)
+            try:
+                os.replace(tmp_name, path)
+                return
+            except PermissionError as e:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 0.8)
+            except Exception:
+                log.exception("State replace failed for %s", path)
+                break
+
+    # Last resort: keep a backup to avoid total loss
+    try:
+        bak = path.with_suffix(path.suffix + ".bak")
+        shutil.move(tmp_name, bak)
+        log.warning("State replace still failing for %s; wrote backup %s", path, bak)
+    except Exception:
+        # If even backup move fails, remove temp to avoid clutter
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
+        log.exception("State backup move also failed for %s", path)
 
 
 _MAX_SKIPPED_PER_REASON = 200  # cap samples per company per reason to keep files small
@@ -394,6 +499,18 @@ def _adopt_migration(cfg, state_path: Path, state: dict, new_base: str, *, homep
 
 # ---------------------------- Core routines ----------------------------
 
+# ---- cross-thread/process safe-ish save helpers ----
+_STATE_LOCKS: dict[str, Lock] = {}
+
+def _state_lock(path: Path) -> Lock:
+    key = str(path.resolve())
+    lock = _STATE_LOCKS.get(key)
+    if lock is None:
+        lock = Lock()
+        _STATE_LOCKS[key] = lock
+    return lock
+
+
 async def _crawl_seed_pass(
     cfg,
     crawler: SiteCrawler,
@@ -490,6 +607,12 @@ def _update_state_from_snaps(state: dict, snaps: list, homepage_url: str, allow_
     pending = set(_norm(u) for u in state.get("pending", []) if u)
     home_norm = _norm(homepage_url)
 
+    # --- per-URL metadata bucket ---
+    page_meta = state.setdefault("page_meta", {})
+    import time as _time
+    now = _time.time()
+
+    # Mark visited & update meta (sha1 if available; always update ts)
     for s in snaps:
         su = _norm(s.url)
         if su:
@@ -499,6 +622,14 @@ def _update_state_from_snaps(state: dict, snaps: list, homepage_url: str, allow_
             else:
                 _pop_pending_equiv(state, s.url)
 
+            meta = page_meta.get(su, {})
+            sha = getattr(s, "content_sha1", None)
+            if sha:
+                meta["sha1"] = sha
+            meta["ts"] = now
+            page_meta[su] = meta
+
+    # Grow frontier only from pages we actually fetched content/links from
     for s in snaps:
         for link in getattr(s, "out_links", []) or []:
             lu = _norm(link)
@@ -513,7 +644,8 @@ def _update_state_from_snaps(state: dict, snaps: list, homepage_url: str, allow_
 
     state["visited"] = sorted(visited)
     state["pending"] = sorted(pending)
-
+    # company-level crawl timestamp (coarse)
+    state["company_last_crawl"] = now
 
 async def _drain_company(
     cfg,
@@ -542,7 +674,9 @@ async def _drain_company(
     retried_dynamic: set[str] = set()
 
     while state["pending"] and remaining > 0:
-        pending_list = sorted({_norm(u) for u in state["pending"] if u})
+        pend_set = {_norm(u) for u in state["pending"] if u}
+        # product-first sort (0 for producty)
+        pending_list = sorted(pend_set, key=lambda u: 0 if is_producty_url(u) else 1)
         state["pending"] = pending_list
         seeds = pending_list[:seed_batch]
         if not seeds:
@@ -709,6 +843,30 @@ async def _process_company(
         on_server_error=cb_server_error,
     )
 
+    # --- feed per-URL last-seen (for If-Modified-Since) ---
+    last_seen: dict[str, float] = {}
+    try:
+        for u, meta in (state.get("page_meta", {}) or {}).items():
+            ts = meta.get("ts")
+            if isinstance(ts, (int, float)) and ts > 0:
+                last_seen[normalize_url(u)] = float(ts)
+    except Exception:
+        pass
+    # No strict setter required; make it available to crawler
+    setattr(crawler, "_ims", last_seen)
+
+    # (Optional) Product-first order for company seeds — helps pick initial seeds
+    try:
+        from scraper.utils import is_producty_url
+        pend = [p for p in state.get("pending", []) if p]
+        if pend:
+            pend_sorted = sorted({normalize_url(p) for p in pend},
+                                 key=lambda u: 0 if is_producty_url(u) else 1)
+            state["pending"] = pend_sorted
+            _save_company_state(state_path, state)
+    except Exception:
+        pass
+
     for attempt in range(1, max(1, company_attempts) + 1):
         try:
             finished = await _drain_company(
@@ -728,7 +886,6 @@ async def _process_company(
             break
 
     return False
-
 
 async def _process_csv(
     cfg,

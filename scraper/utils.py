@@ -11,6 +11,8 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Iterable, Callable, Awaitable, Optional
 from urllib.parse import urlparse, urlunparse, parse_qsl, urljoin
+from email.utils import formatdate, parsedate_to_datetime
+from typing import Optional
 
 import httpx
 import tldextract
@@ -189,12 +191,12 @@ _NON_PRODUCT_PATH_PARTS = (
     # content marketing (usually non-product)
     "whitepaper", "whitepapers", "case-study", "case-studies", "ebook", "e-book",
     "resources", "resource-center", "brochure", "blog", "blogs", "stories",
-    "giveaway", "community",
+    "giveaway", "community", "explained"
 
     # auth / account / ecommerce
     "login", "log-in", "signin", "sign-in", "signup", "sign-up", "register",
     "account", "my-account", "profile", "auth", "sso", "oauth",
-    "cart", "checkout", "wishlist", "compare",
+    "cart", "checkout", "wishlist", "compare", "enrollment"
 
     # site chrome / discovery
     "sitemap", "search", "search-results", "results", "site-search",
@@ -230,7 +232,7 @@ _NON_PRODUCT_PATH_PARTS = (
 _NON_PRODUCT_QUERY_KEYS = (
     # tracking / sessions
     "gclid", "fbclid", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "session", "sessionid", "token", "auth", "sso", "oauth", "redirect", "ref", "trk",
+    "session", "sessionid", "token", "auth", "sso", "oauth", "redirect", "ref", "trk", "_gl"
     # downloads / attachments
     "download", "attachment", "attachment_id",
     # wordpress & CMS cruft
@@ -271,28 +273,68 @@ _LANG_PATH_PREFIX_RE = re.compile(
     r"^/(?P<tag>[a-z]{2}(?:-[a-z]{2})?)(?:/|$)", re.IGNORECASE
 )
 
+# Boundary-aware core product tokens (safe against "production"/"productive").
+# Matches hyphen/underscore/slash/dot/query boundaries.
+_PRODUCT_CORE_RE = re.compile(
+    r"(?i)"                                # case-insensitive
+    r"(?:(?<=^)|(?<=[/._?#-]))"            # left boundary: start or / . _ ? # -
+    r"(product|products|solution|solutions|service|services|catalog|catalogue|"
+    r"store|shop|pricing|plans|features|specs|datasheet|data-sheet|price|buy|quote)"
+    r"(?=$|[/._?#-])"                      # right boundary: end or / . _ ? # -
+)
+
+# Broader cookie/consent zapping (helps with SproutSocial/consent pages)
+_COOKIE_QUERY_KEYS = {"optanonconsent", "consent", "gdpr", "euconsent", "cookie"}
+_COOKIE_PATH_HINTS = ("cookie", "cookies", "cookie-policy", "consent", "privacy-center", "preferences")
+
 def looks_non_product_url(u: str) -> bool:
+    """
+    Returns True if the URL is clearly non-product.
+    IMPORTANT: If the URL is 'producty' by structure (is_producty_url),
+    we return False (i.e., do NOT classify as non-product), except for hard-stops
+    like backend endpoints or obvious files—those are handled earlier in filtering.
+    """
     try:
         p = urlparse(u)
         host = (p.hostname or "").lower()
         path = (p.path or "").lower()
 
+        # home pages can be product portals
         if path in ("", "/"):
             return False
-        if any(tok in path for tok in _PRODUCT_HINTS):
+
+        # NEW: productiness overrides non-product tokens (except hard-stops handled elsewhere)
+        if is_producty_url(u):
             return False
+
+        # telephone-like slugs (rare company directory pages)
         if _TEL_PATH_RE.search(path or ""):
             return True
-        if any(hint in host.split(".") for hint in _NON_PRODUCT_HOST_TOKENS):
+
+        # Host-level non-product tokens (press, careers, etc.)
+        if any(tok in host.split(".") for tok in _NON_PRODUCT_HOST_TOKENS):
             return True
+
+        # Path fragments that are commonly non-product (legal, press, etc.)
         for frag in _NON_PRODUCT_PATH_PARTS:
             if frag in path:
                 return True
+
+        # Query hints (attachments, wp cruft, forum noise, i18n toggles)
         if p.query:
             q = dict(parse_qsl(p.query, keep_blank_values=True))
             for k in _NON_PRODUCT_QUERY_KEYS:
                 if k in q:
                     return True
+
+        # Cookie/consent specific filters (path & query)
+        if any(tok in path for tok in _COOKIE_PATH_HINTS):
+            return True
+        if p.query:
+            q = dict(parse_qsl(p.query, keep_blank_values=True))
+            if any(k.lower() in _COOKIE_QUERY_KEYS for k in q):
+                return True
+
         return False
     except Exception:
         return False
@@ -487,7 +529,6 @@ def is_non_english_url(u: str, primary_lang: str = "en") -> bool:
     except Exception:
         return False
     
-
 def _collect_extra_hosts(cfg) -> set[str]:
     """
     Build the extra eTLD+1 host set that should be considered same-site.
@@ -515,6 +556,45 @@ def _collect_extra_hosts(cfg) -> set[str]:
     except Exception:
         pass
     return extra
+
+
+def is_producty_url(u: str) -> bool:
+    """
+    Brand-agnostic heuristic for product/solution URLs:
+      1) boundary-aware core tokens (handles 'cbd-products', 'investment-products', 'products-for-sale', etc.)
+      2) plural last-segment heuristic for short category paths (/pet/dogs, /car/vehicles/, /banking/accounts)
+    """
+    if not u:
+        return False
+
+    p = urlparse(u)
+    path = (p.path or "").lower()
+
+    # 1) core tokens with safe boundaries (works for concatenations)
+    if _PRODUCT_CORE_RE.search(path):
+        return True
+
+    # 2) simple plural/category leaf heuristic
+    segs = [s for s in path.split("/") if s]
+    if 1 < len(segs) <= 5:
+        last = segs[-1]
+        if len(last) >= 3 and last.endswith("s") and "-" not in last and not last.isdigit():
+            return True
+
+    return False
+
+def httpdate_from_epoch(ts: float) -> str:
+    """RFC 7231 IMF-fixdate."""
+    try:
+        return formatdate(ts, usegmt=True)
+    except Exception:
+        return formatdate(0, usegmt=True)
+
+def epoch_from_httpdate(s: str) -> Optional[float]:
+    try:
+        return float(parsedate_to_datetime(s).timestamp())
+    except Exception:
+        return None
 
 # ========== Retry decorators ==========
 
@@ -1044,8 +1124,8 @@ def filter_links(
     allow_re: re.Pattern | None = None,
     deny_re: re.Pattern | None = None,
     product_only: bool = True,
-    on_drop: Optional[Callable][[str, str], None] = None,
-    on_keep: Optional[Callable][[str], None] = None
+    on_drop: Optional[Callable[[str, str], None]] = None,
+    on_keep: Optional[Callable[[str], None]] = None,
 ) -> list[str]:
     """
     Apply same-site, language, backend/file, regex, and product heuristics.
@@ -1071,9 +1151,14 @@ def filter_links(
             verbose_count += 1
 
     if trace:
-        logger.info("[filter] source=%s allow=%s deny=%s product_only=%s links_in=%d",
-                     source_url, getattr(allow_re, "pattern", None),
-                     getattr(deny_re, "pattern", None), product_only, len(links))
+        logger.info(
+            "[filter] source=%s allow=%s deny=%s product_only=%s links_in=%d",
+            source_url,
+            getattr(allow_re, "pattern", None),
+            getattr(deny_re, "pattern", None),
+            product_only,
+            len(links),
+        )
 
     for u in links:
         # baseline normalization for logging
@@ -1085,12 +1170,11 @@ def filter_links(
             vlog(f"DROP (not-http): {u}")
             continue
 
-        # same-site (respect subdomain policy, incl. aliases/probation from cfg.extra_same_site_hosts)
+        # same-site (respect subdomain policy, incl. aliases/probation via cfg.extra_same_site_hosts)
         extra_hosts = _collect_extra_hosts(cfg)
         if not same_site(source_url, u, cfg.allow_subdomains, extra_hosts=extra_hosts):
             _reason(reasons, "drop:off-site")
-            if on_drop: 
-                on_drop(u, "off-site")
+            if on_drop: on_drop(u, "off-site")
             vlog(f"DROP (off-site): {u}")
             continue
 
@@ -1105,7 +1189,7 @@ def filter_links(
             vlog(f"DROP (non-en): {u}")
             continue
 
-        # existing language gates (complementary policies)
+        # complementary language gates (subdomain/path/query)
         if any(sub and host.startswith(sub.strip().lower()) for sub in cfg.lang_subdomain_deny):
             _reason(reasons, "drop:lang-subdomain")
             if on_drop: on_drop(u, "lang-subdomain")
@@ -1124,26 +1208,33 @@ def filter_links(
                 vlog(f"DROP (lang-query-key): {u}")
                 continue
 
-        # backend endpoints & files
+        # backend endpoints & files (hard stop)
         if _looks_backend_or_file(u):
             _reason(reasons, "drop:backend-or-file")
             if on_drop: on_drop(u, "backend-or-file")
             vlog(f"DROP (backend/file): {u}")
             continue
 
-        # allow/deny regex policy
-        if allow_re and not allow_re.search(u):
-            _reason(reasons, "drop:not-match-allow")
-            if on_drop: on_drop(u, "no-allow-match")
-            vlog(f"DROP (no allow match): {u}")
-            continue
-        if deny_re and deny_re.search(u):
-            _reason(reasons, "drop:match-deny")
-            if on_drop: on_drop(u, "deny-match")
-            vlog(f"DROP (deny match): {u}")
-            continue
+        # --- Structure-aware productiness (brand-agnostic) ---
+        # Handles concatenations like ".../cbd-products/..." and category leafs like "/pet/dogs"
+        is_producty = is_producty_url(u)
 
-        # product-like heuristic
+        # allow/deny regex policy (SOFT allow for producty; deny overridden by producty)
+        if allow_re and not allow_re.search(u):
+            if not is_producty:
+                _reason(reasons, "drop:not-match-allow")
+                if on_drop: on_drop(u, "no-allow-match")
+                vlog(f"DROP (no allow match): {u}")
+                continue
+
+        if deny_re and deny_re.search(u):
+            if not is_producty:  # productiness overrides deny unless hard-stop (handled above)
+                _reason(reasons, "drop:match-deny")
+                if on_drop: on_drop(u, "deny-match")
+                vlog(f"DROP (deny match): {u}")
+                continue
+
+        # product-like heuristic (after SOFT allow/deny): if product_only, drop obvious non-product
         if product_only and looks_non_product_url(u):
             _reason(reasons, "drop:non-product")
             if on_drop: on_drop(u, "non-product")
@@ -1169,7 +1260,7 @@ def filter_links(
         if on_keep: on_keep(u)
         vlog(f"KEEP: {u} -> {canon}")
 
-    # Summary line (always at DEBUG if trace; otherwise compact DEBUG)
+    # Summary line
     if trace:
         logger.info(
             "[filter] kept=%d dropped=%d by_reason=%s",
@@ -1178,7 +1269,6 @@ def filter_links(
         if verbose_count >= VERBOSE_CAP:
             logger.info("[filter] verbose cap reached (%d); further per-URL logs suppressed.", VERBOSE_CAP)
     else:
-        # emit a single compact line at DEBUG so you still get counts without per-URL noise
         if links:
             logger.info(
                 "[filter] %s -> kept=%d/%d (top drops: %s)",
