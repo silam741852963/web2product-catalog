@@ -1,18 +1,18 @@
-# scraper/utils.py
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import string
+import time
 from dataclasses import dataclass
 from hashlib import sha1
 from pathlib import Path
-from typing import Iterable, Callable, Awaitable, Optional
+from typing import Iterable, Callable, Awaitable, Optional, Any, Tuple
 from urllib.parse import urlparse, urlunparse, parse_qsl, urljoin
 from email.utils import formatdate, parsedate_to_datetime
-from typing import Optional
 
 import httpx
 import tldextract
@@ -55,11 +55,32 @@ def getenv_int(name: str, default: int, min_val: Optional[int] = None, max_val: 
         val = min(max_val, val)
     return val
 
+def getenv_float(name: str, default: float, min_val: Optional[float] = None, max_val: Optional[float] = None) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        return default
+    if min_val is not None:
+        val = max(min_val, val)
+    if max_val is not None:
+        val = min(max_val, val)
+    return val
+
 def getenv_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+# parse CSV-ish envs into tuples (trim blanks)
+def getenv_csv(name: str, default_csv: str) -> Tuple[str, ...]:
+    raw = getenv_str(name, default_csv)
+    parts = [x.strip() for x in raw.split(",")]
+    return tuple(p for p in parts if p)
 
 def init_logging(log_path: Path, level: int = logging.INFO) -> None:
     """
@@ -91,12 +112,11 @@ def http_status_to_exc(status: Optional[int]) -> Optional[Exception]:
     if status == 404:
         return NonRetryableHTTPError("404 Not Found")
     if status >= 400:
+        # Treat all 4xx as transient for now except 404 above. Many 403/429/401 are temporary/gate-keepers.
         return TransientHTTPError(f"HTTP {status}")
     return None
 
 # ========== URL & domain helpers ==========
-
-import re
 
 # ===== Super-aggressive file extensions to drop (treat as files, not pages) =====
 _DENY_FILE_EXTS = (
@@ -283,61 +303,139 @@ _PRODUCT_CORE_RE = re.compile(
     r"(?=$|[/._?#-])"                      # right boundary: end or / . _ ? # -
 )
 
-# Broader cookie/consent zapping (helps with SproutSocial/consent pages)
 _COOKIE_QUERY_KEYS = {"optanonconsent", "consent", "gdpr", "euconsent", "cookie"}
 _COOKIE_PATH_HINTS = ("cookie", "cookies", "cookie-policy", "consent", "privacy-center", "preferences")
 
-def looks_non_product_url(u: str) -> bool:
+
+# ========== Throttling / Backoff (429-aware) ==========
+
+class TokenBucket:
     """
-    Returns True if the URL is clearly non-product.
-    IMPORTANT: If the URL is 'producty' by structure (is_producty_url),
-    we return False (i.e., do NOT classify as non-product), except for hard-stops
-    like backend endpoints or obvious files—those are handled earlier in filtering.
+    Simple async token bucket for rate limiting.
+    capacity: max tokens
+    refill_rate: tokens per second
     """
+    def __init__(self, capacity: float, refill_rate: float):
+        self.capacity = max(0.1, capacity)
+        self.refill_rate = max(0.1, refill_rate)
+        self._tokens = self.capacity
+        self._last = time.perf_counter()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, tokens: float = 1.0):
+        async with self._lock:
+            await self._drain_until(tokens)
+
+    async def _drain_until(self, tokens: float):
+        while True:
+            now = time.perf_counter()
+            elapsed = max(0.0, now - self._last)
+            self._last = now
+            self._tokens = min(self.capacity, self._tokens + elapsed * self.refill_rate)
+            if self._tokens >= tokens:
+                self._tokens -= tokens
+                return
+            # Not enough tokens—sleep until next refill tick
+            deficit = tokens - self._tokens
+            sleep_s = max(0.01, deficit / self.refill_rate)
+            await asyncio.sleep(sleep_s)
+
+
+class GlobalThrottle:
+    """
+    Global + per-host throttling with 'penalize' on 429 using Retry-After when available.
+    - Defaults can be overridden by env:
+        SCRAPER_GLOBAL_RPS (default 12.0)
+        SCRAPER_PER_HOST_RPS (default 2.0)
+        SCRAPER_RETRY_AFTER_MAX_S (cap for Retry-After, default 120)
+    """
+    def __init__(self):
+        self.global_rps = getenv_float("SCRAPER_GLOBAL_RPS", 12.0, 0.5)
+        self.per_host_rps = getenv_float("SCRAPER_PER_HOST_RPS", 2.0, 0.25)
+        self.retry_after_cap_s = getenv_float("SCRAPER_RETRY_AFTER_MAX_S", 120.0, 1.0)
+
+        self._global_bucket = TokenBucket(capacity=max(1.0, self.global_rps), refill_rate=self.global_rps)
+        self._host_buckets: dict[str, TokenBucket] = {}
+        self._blocked_until: dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    def _bucket_for_host(self, host: str) -> TokenBucket:
+        host = host or "unknown-host"
+        b = self._host_buckets.get(host)
+        if b is None:
+            # capacity ~= 2 seconds worth, so small bursts are ok
+            cap = max(1.0, self.per_host_rps * 2.0)
+            b = self._host_buckets[host] = TokenBucket(capacity=cap, refill_rate=self.per_host_rps)
+        return b
+
+    async def wait_for_host(self, host: str):
+        host = host or "unknown-host"
+        # If host is temporarily blocked due to previous 429s, wait it out
+        async with self._lock:
+            blocked_until = self._blocked_until.get(host, 0.0)
+        now = time.time()
+        if blocked_until > now:
+            delay = max(0.0, blocked_until - now)
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+        # Global then per-host
+        await self._global_bucket.acquire(1.0)
+        await self._bucket_for_host(host).acquire(1.0)
+
+    async def penalize(self, host: str, delay_s: float, *, reason: str = "429") -> None:
+        """
+        Block host until now + delay_s (capped), and also softly drop its rps for a while by
+        starving the bucket (natural refill will recover).
+        """
+        if not delay_s or delay_s < 0:
+            return
+        delay_s = float(min(self.retry_after_cap_s, max(0.0, delay_s)))
+        until = time.time() + delay_s
+        async with self._lock:
+            prev = self._blocked_until.get(host, 0.0)
+            self._blocked_until[host] = max(prev, until)
+        logger.info("Throttle: penalized host=%s for %.1fs (%s)", host, delay_s, reason)
+
+
+GLOBAL_THROTTLE = GlobalThrottle()
+
+
+def parse_retry_after_header(headers: dict[str, str] | Any) -> Optional[float]:
+    """
+    Parse Retry-After header. Supports:
+      - integer seconds
+      - HTTP-date
+    Returns seconds (float) or None.
+    """
+    if not headers:
+        return None
     try:
-        p = urlparse(u)
-        host = (p.hostname or "").lower()
-        path = (p.path or "").lower()
-
-        # home pages can be product portals
-        if path in ("", "/"):
-            return False
-
-        # NEW: productiness overrides non-product tokens (except hard-stops handled elsewhere)
-        if is_producty_url(u):
-            return False
-
-        # telephone-like slugs (rare company directory pages)
-        if _TEL_PATH_RE.search(path or ""):
-            return True
-
-        # Host-level non-product tokens (press, careers, etc.)
-        if any(tok in host.split(".") for tok in _NON_PRODUCT_HOST_TOKENS):
-            return True
-
-        # Path fragments that are commonly non-product (legal, press, etc.)
-        for frag in _NON_PRODUCT_PATH_PARTS:
-            if frag in path:
-                return True
-
-        # Query hints (attachments, wp cruft, forum noise, i18n toggles)
-        if p.query:
-            q = dict(parse_qsl(p.query, keep_blank_values=True))
-            for k in _NON_PRODUCT_QUERY_KEYS:
-                if k in q:
-                    return True
-
-        # Cookie/consent specific filters (path & query)
-        if any(tok in path for tok in _COOKIE_PATH_HINTS):
-            return True
-        if p.query:
-            q = dict(parse_qsl(p.query, keep_blank_values=True))
-            if any(k.lower() in _COOKIE_QUERY_KEYS for k in q):
-                return True
-
-        return False
+        # normalize lookup
+        ra = None
+        for k, v in headers.items():
+            if k.lower() == "retry-after":
+                ra = v
+                break
+        if not ra:
+            return None
+        ra = ra.strip()
+        if not ra:
+            return None
+        # numeric seconds?
+        if ra.isdigit():
+            return float(int(ra))
+        # HTTP-date
+        dt = parsedate_to_datetime(ra)
+        if not dt:
+            return None
+        delta = (dt.timestamp() - time.time())
+        return float(max(0.0, delta))
     except Exception:
-        return False
+        return None
+
+
+# ========== Domain helpers ==========
 
 def get_base_domain(host: str) -> str:
     """
@@ -388,6 +486,37 @@ def is_same_domain(a: str, b: str) -> bool:
 def is_http_url(url: str) -> bool:
     s = urlparse(url).scheme.lower()
     return s in {"http", "https"}
+
+
+# ========== Same-site policy (incl. alias hosts) ==========
+
+def _collect_extra_hosts(cfg) -> set[str]:
+    """
+    Build the extra eTLD+1 host set that should be considered same-site.
+    Reads cfg.extra_same_site_hosts (tuple or list), and also optionally
+    the env var EXTRA_SAME_SITE_HOSTS (comma separated).
+    """
+    extra: set[str] = set()
+    try:
+        seq = getattr(cfg, "extra_same_site_hosts", ()) or ()
+        for h in seq:
+            h = (h or "").strip().lower()
+            if h:
+                extra.add(h)
+    except Exception:
+        pass
+
+    try:
+        raw = os.getenv("EXTRA_SAME_SITE_HOSTS", "")
+        if raw:
+            for h in raw.split(","):
+                h = (h or "").strip().lower()
+                if h:
+                    extra.add(h)
+    except Exception:
+        pass
+    return extra
+
 
 def expand_same_site(
     base_url: str,
@@ -442,6 +571,9 @@ def same_site(
 ) -> bool:
     return expand_same_site(base_url, target_url, allow_subdomains, extra_hosts=extra_hosts)
 
+
+# ========== Canonicalization & filtering helpers ==========
+
 def _canonicalize_for_dedupe(u: str) -> str:
     """
     Normalize a URL for deduplication:
@@ -486,6 +618,9 @@ def _looks_backend_or_file(u: str) -> bool:
 
     return False
 
+
+# ========== Language & "productiness" heuristics ==========
+
 def is_non_english_url(u: str, primary_lang: str = "en") -> bool:
     """
     Return True if the URL clearly targets a non-English locale via subdomain,
@@ -528,35 +663,6 @@ def is_non_english_url(u: str, primary_lang: str = "en") -> bool:
         return False
     except Exception:
         return False
-    
-def _collect_extra_hosts(cfg) -> set[str]:
-    """
-    Build the extra eTLD+1 host set that should be considered same-site.
-    Reads cfg.extra_same_site_hosts (tuple or list), and also optionally
-    the env var EXTRA_SAME_SITE_HOSTS (comma separated).
-    """
-    extra: set[str] = set()
-    try:
-        seq = getattr(cfg, "extra_same_site_hosts", ()) or ()
-        for h in seq:
-            h = (h or "").strip().lower()
-            if h:
-                extra.add(h)
-    except Exception:
-        pass
-
-    try:
-        import os
-        raw = os.getenv("EXTRA_SAME_SITE_HOSTS", "")
-        if raw:
-            for h in raw.split(","):
-                h = (h or "").strip().lower()
-                if h:
-                    extra.add(h)
-    except Exception:
-        pass
-    return extra
-
 
 def is_producty_url(u: str) -> bool:
     """
@@ -583,6 +689,62 @@ def is_producty_url(u: str) -> bool:
 
     return False
 
+
+def looks_non_product_url(u: str) -> bool:
+    """
+    Returns True if the URL is clearly non-product.
+    IMPORTANT: If the URL is 'producty' by structure (is_producty_url),
+    we return False (i.e., do NOT classify as non-product), except for hard-stops
+    like backend endpoints or obvious files—those are handled earlier in filtering.
+    """
+    try:
+        p = urlparse(u)
+        host = (p.hostname or "").lower()
+        path = (p.path or "").lower()
+
+        # home pages can be product portals
+        if path in ("", "/"):
+            return False
+
+        # NEW: productiness overrides non-product tokens (except hard-stops handled elsewhere)
+        if is_producty_url(u):
+            return False
+
+        # telephone-like slugs (rare company directory pages)
+        if _TEL_PATH_RE.search(path or ""):
+            return True
+
+        # Host-level non-product tokens (press, careers, etc.)
+        if any(tok in host.split(".") for tok in _NON_PRODUCT_HOST_TOKENS):
+            return True
+
+        # Path fragments that are commonly non-product (legal, press, etc.)
+        for frag in _NON_PRODUCT_PATH_PARTS:
+            if frag in path:
+                return True
+
+        # Query hints (attachments, wp cruft, forum noise, i18n toggles)
+        if p.query:
+            q = dict(parse_qsl(p.query, keep_blank_values=True))
+            for k in _NON_PRODUCT_QUERY_KEYS:
+                if k in q:
+                    return True
+
+        # Cookie/consent specific filters (path & query)
+        if any(tok in path for tok in _COOKIE_PATH_HINTS):
+            return True
+        if p.query:
+            q = dict(parse_qsl(p.query, keep_blank_values=True))
+            if any(k.lower() in _COOKIE_QUERY_KEYS for k in q):
+                return True
+
+        return False
+    except Exception:
+        return False
+
+
+# ========== Date helpers ==========
+
 def httpdate_from_epoch(ts: float) -> str:
     """RFC 7231 IMF-fixdate."""
     try:
@@ -595,6 +757,7 @@ def epoch_from_httpdate(s: str) -> Optional[float]:
         return float(parsedate_to_datetime(s).timestamp())
     except Exception:
         return None
+
 
 # ========== Retry decorators ==========
 
@@ -626,6 +789,7 @@ def retry_async(max_attempts: int, initial_delay_ms: int, max_delay_ms: int, jit
             return await fn(*args, **kwargs)
         return wrapper
     return _decorator
+
 
 # ========== Static parsing / HTML utils ==========
 
@@ -673,6 +837,7 @@ def extract_title_static(html: str) -> str | None:
         return (t or "").strip() or None
     except Exception:
         return None
+
 
 # ========== HTML pruning (before Markdown) ==========
 
@@ -730,7 +895,7 @@ def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
     except Exception:
         pass
 
-    for tag in list(soup.find_all(["script", "style", "noscript", "svg", "canvas"])):
+    for tag in list(soup.find_all(["script", "style", "noscript", "svg", "canvas"])):  # noqa: B006
         if isinstance(tag, Tag):
             try:
                 tag.decompose()
@@ -838,6 +1003,7 @@ def prune_html_for_markdown(html: str, *, keep_first_cta: bool = True) -> str:
 
     return str(soup)
 
+
 # ========== HTML → Markdown ==========
 
 @dataclass
@@ -884,6 +1050,7 @@ def clean_markdown(md: str, remove_boilerplate: bool = True) -> str:
             blank = False
     return "\n".join(cleaned).strip()
 
+
 # ========== LLM chunking helpers ==========
 
 def chunk_text(text: str, max_chars: int) -> Iterable[str]:
@@ -908,6 +1075,7 @@ def chunk_text(text: str, max_chars: int) -> Iterable[str]:
                 buf, length = [para], len(para)
     if buf:
         yield "\n\n".join(buf)
+
 
 # ========== File I/O ==========
 
@@ -1014,6 +1182,7 @@ def is_meaningful_markdown(md: str,
         return False
     return True
 
+
 # ========== Robots gate ==========
 
 def should_crawl_url(respect_robots: bool, robots_txt_allowed: Optional[bool]) -> bool:
@@ -1021,11 +1190,15 @@ def should_crawl_url(respect_robots: bool, robots_txt_allowed: Optional[bool]) -
         return True
     return bool(robots_txt_allowed)
 
+
 # ========== HTTPX client (shared static fetch wiring) ==========
 
 def httpx_client(cfg) -> httpx.AsyncClient:
     """
-    Return a preconfigured AsyncClient honoring cfg static settings.
+    Return a preconfigured AsyncClient honoring cfg static settings and cooperating with
+    GLOBAL_THROTTLE. It will:
+      - Wait on global + per-host token buckets before each request
+      - Parse Retry-After on 429 responses and penalize the host accordingly
     """
     limits = httpx.Limits(max_keepalive_connections=16, max_connections=64)
     timeout = httpx.Timeout(cfg.static_timeout_ms / 1000.0)
@@ -1036,6 +1209,26 @@ def httpx_client(cfg) -> httpx.AsyncClient:
         "DNT": "1",
         "Upgrade-Insecure-Requests": "1",
     }
+
+    async def _on_request(request: httpx.Request):
+        try:
+            host = (request.url.host or "unknown-host").lower()
+            await GLOBAL_THROTTLE.wait_for_host(host)
+        except Exception as e:
+            logger.debug("throttle.request hook error: %s", e)
+
+    async def _on_response(response: httpx.Response):
+        try:
+            status = response.status_code
+            if status == 429:
+                host = (response.request.url.host or "unknown-host").lower()
+                delay = parse_retry_after_header(response.headers) or 20.0
+                await GLOBAL_THROTTLE.penalize(host, delay, reason="httpx:429")
+                logger.warning("HTTPX saw 429 for %s; backing off host=%s for %.1fs",
+                               str(response.request.url), host, delay)
+        except Exception as e:
+            logger.debug("throttle.response hook error: %s", e)
+
     return httpx.AsyncClient(
         timeout=timeout,
         limits=limits,
@@ -1043,14 +1236,31 @@ def httpx_client(cfg) -> httpx.AsyncClient:
         follow_redirects=True,
         http2=cfg.static_http2,
         max_redirects=cfg.static_max_redirects,
+        event_hooks={
+            "request": [_on_request],
+            "response": [_on_response],
+        },
     )
+
 
 # ========== Playwright helpers (shared dynamic fetch wiring) ==========
 
 async def play_goto(page, url: str, wait_chain: list[str], timeout_ms: int) -> tuple[Optional[int], str]:
     """
     Try a chain of wait_until strategies; return (status, html).
+
+    Cooperative throttling:
+      - Before navigating, wait on GLOBAL_THROTTLE for the target host.
+      - A 429 encountered by the browser is handled by the browser response hook
+        (see browser._install_429_response_hook), but we still return the status.
     """
+    # Throttle before attempting navigation
+    try:
+        host = (urlparse(url).hostname or "unknown-host").lower()
+        await GLOBAL_THROTTLE.wait_for_host(host)
+    except Exception as e:
+        logger.debug("throttle before goto failed: %s", e)
+
     last_status = None
     for wu in wait_chain:
         try:
@@ -1102,8 +1312,8 @@ async def play_links(page) -> list[str]:
         pass
     return links
 
-# ========== Uniform link filtering ==========
 
+# ========== Uniform link filtering ==========
 
 def _trace_enabled(cfg) -> bool:
     try:
@@ -1216,7 +1426,6 @@ def filter_links(
             continue
 
         # --- Structure-aware productiness (brand-agnostic) ---
-        # Handles concatenations like ".../cbd-products/..." and category leafs like "/pet/dogs"
         is_producty = is_producty_url(u)
 
         # allow/deny regex policy (SOFT allow for producty; deny overridden by producty)

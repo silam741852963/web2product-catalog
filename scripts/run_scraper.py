@@ -6,16 +6,17 @@ import hashlib
 import json
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from glob import glob
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Dict, Set, Tuple
 from urllib.parse import urlparse, urlunparse, ParseResult
 import os
 import tempfile
 import time
 import shutil
 from threading import Lock
+from collections import deque
 
 # Make project root importable
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +49,20 @@ class CompanyRow:
     @property
     def key(self) -> str:
         return f"{self.hojin_id}:{self.url.strip()}"
+
+
+# Fuse tracking (per-company, in-memory only; cfg stays frozen)
+@dataclass
+class CompanyRunState:
+    forbidden_count: int = 0  # sum of 401 + 403 observed by crawler
+    fp_window: int = 8
+    pending_fingerprints: deque[str] = field(default_factory=lambda: deque(maxlen=8))
+
+    def set_fp_window(self, n: int) -> None:
+        # Rebuild deque to adopt new maxlen, preserving items if any
+        items = list(self.pending_fingerprints)
+        self.pending_fingerprints = deque(items[-n:], maxlen=max(1, n))
+        self.fp_window = max(1, n)
 
 
 # ----------------------------- IO helpers ----------------------------
@@ -647,6 +662,15 @@ def _update_state_from_snaps(state: dict, snaps: list, homepage_url: str, allow_
     # company-level crawl timestamp (coarse)
     state["company_last_crawl"] = now
 
+
+def _frontier_fingerprint(pending_sorted: list[str], cap: int = 10) -> str:
+    """Stable, compact fingerprint of pending frontier."""
+    if not pending_sorted:
+        return "0:"
+    sample = ",".join(pending_sorted[:cap])
+    return f"{len(pending_sorted)}:{sample}"
+
+
 async def _drain_company(
     cfg,
     crawler: SiteCrawler,
@@ -657,6 +681,7 @@ async def _drain_company(
     deny_regex: Optional[str],
     max_pages_per_seed: Optional[int],
     seed_batch: int,
+    run_state: CompanyRunState,          # <<< NEW: per-company fuse state
 ) -> bool:
     homepage = _norm(state.get("homepage") or "")
     allow_subdomains = bool(getattr(cfg, "allow_subdomains", False))
@@ -666,14 +691,33 @@ async def _drain_company(
     remaining = max(0, cap_total - already)
     if remaining == 0:
         state["done"] = True
+        state.setdefault("done_reason", "cap_reached")
         _save_company_state(state_path, state)
         log.debug("Company cap already reached (%d). Marking done.", cap_total)
         return True
+
+    # Read fuse knobs (config-driven; cfg stays frozen)
+    forbidden_thresh = int(getattr(cfg, "forbidden_done_threshold", 0) or 0)
+    stall_pending_max = int(getattr(cfg, "stall_pending_max", 2))
+    stall_repeat_passes = int(getattr(cfg, "stall_repeat_passes", 3))
+    stall_fp_window = int(getattr(cfg, "stall_fingerprint_window", max(3, stall_repeat_passes)))
+    if run_state.fp_window != stall_fp_window:
+        run_state.set_fp_window(stall_fp_window)
 
     progress = False
     retried_dynamic: set[str] = set()
 
     while state["pending"] and remaining > 0:
+        # --- fuse A: auth/forbidden (401/403) trip check (early) ---
+        if forbidden_thresh > 0 and run_state.forbidden_count >= forbidden_thresh:
+            state["done"] = True
+            state["done_reason"] = "403_fuse"
+            state["blocked_reason"] = "forbidden"  # <<< add blocked_reason
+            state["done_meta"] = {"count": run_state.forbidden_count, "threshold": forbidden_thresh}
+            _save_company_state(state_path, state)
+            log.info("Fuse trip: 401/403 %d ≥ %d → mark done.", run_state.forbidden_count, forbidden_thresh)
+            return True
+
         pend_set = {_norm(u) for u in state["pending"] if u}
         # product-first sort (0 for producty)
         pending_list = sorted(pend_set, key=lambda u: 0 if is_producty_url(u) else 1)
@@ -681,6 +725,26 @@ async def _drain_company(
         seeds = pending_list[:seed_batch]
         if not seeds:
             break
+
+        # --- fuse B: stall detector (tiny, stable frontier) BEFORE crawling this pass
+        if len(pending_list) <= stall_pending_max:
+            fp = _frontier_fingerprint(pending_list, cap=10)
+            run_state.pending_fingerprints.append(fp)
+            if len(run_state.pending_fingerprints) >= stall_repeat_passes:
+                tail = list(run_state.pending_fingerprints)[-stall_repeat_passes:]
+                if len(set(tail)) == 1:
+                    state["done"] = True
+                    state["done_reason"] = "stall_fuse"
+                    state["blocked_reason"] = "stalled"  # <<< add blocked_reason
+                    state["done_meta"] = {"pending": len(pending_list), "repeat": stall_repeat_passes}
+                    _save_company_state(state_path, state)
+                    log.info("Fuse trip: stall (pending=%d, repeat=%d) → mark done.",
+                             len(pending_list), stall_repeat_passes)
+                    return True
+        else:
+            # keep fingerprint history aligned with configured window (append current fp too)
+            fp = _frontier_fingerprint(pending_list, cap=10)
+            run_state.pending_fingerprints.append(fp)
 
         denom = max(1, len(seeds))
         share = max(1, remaining // denom)
@@ -767,12 +831,38 @@ async def _drain_company(
                         ", ".join(f"{k}={int(v)}" for k, v in sorted(sk.items())))
             except Exception:
                 pass
+            # After a no-progress pass, re-check fuses immediately with the new fingerprint
+            pending_list = sorted({_norm(u) for u in state.get("pending", []) if u}, key=lambda u: 0 if is_producty_url(u) else 1)
+            fp = _frontier_fingerprint(pending_list, cap=10)
+            run_state.pending_fingerprints.append(fp)
+            if forbidden_thresh > 0 and run_state.forbidden_count >= forbidden_thresh:
+                state["done"] = True
+                state["done_reason"] = "403_fuse"
+                state["blocked_reason"] = "forbidden"  # <<< add blocked_reason
+                state["done_meta"] = {"count": run_state.forbidden_count, "threshold": forbidden_thresh}
+                _save_company_state(state_path, state)
+                log.info("Fuse trip: 401/403 %d ≥ %d → mark done.",
+                         run_state.forbidden_count, forbidden_thresh)
+                return True
+            if len(pending_list) <= stall_pending_max and len(run_state.pending_fingerprints) >= stall_repeat_passes:
+                tail = list(run_state.pending_fingerprints)[-stall_repeat_passes:]
+                if len(set(tail)) == 1:
+                    state["done"] = True
+                    state["done_reason"] = "stall_fuse"
+                    state["blocked_reason"] = "stalled"  # <<< add blocked_reason
+                    state["done_meta"] = {"pending": len(pending_list), "repeat": stall_repeat_passes}
+                    _save_company_state(state_path, state)
+                    log.info("Fuse trip: stall (pending=%d, repeat=%d) → mark done.",
+                             len(pending_list), stall_repeat_passes)
+                    return True
             continue
 
         progress = False
 
     finished = bool(state.get("done", False) or remaining == 0 or len(state.get("pending", [])) == 0)
     state["done"] = finished
+    if finished and "done_reason" not in state:
+        state["done_reason"] = "frontier_exhausted" if len(state.get("pending", [])) == 0 else "cap_reached"
     _save_company_state(state_path, state)
 
     if finished:
@@ -835,12 +925,21 @@ async def _process_company(
     def cb_server_error(host: str, path: str, status: int):
         _note_server_error(cfg, state_path, state, host, path, status)
 
+    run_state = CompanyRunState()
+    run_state.set_fp_window(int(getattr(cfg, "stall_fingerprint_window", 4)))
+
+    def cb_http_status(host: str, path: str, status: int):
+        # count both 401 and 403
+        if status in (401, 403):
+            run_state.forbidden_count += 1
+
     crawler = SiteCrawler(
         cfg, context,
         on_redirect=cb_redirect,
         on_canonical=cb_canonical,
         on_backoff=cb_backoff,
         on_server_error=cb_server_error,
+        on_http_status=cb_http_status,   # <<< NEW: increment 401/403
     )
 
     # --- feed per-URL last-seen (for If-Modified-Since) ---
@@ -875,6 +974,7 @@ async def _process_company(
                 deny_regex=deny_regex,
                 max_pages_per_seed=max_pages_per_seed,
                 seed_batch=seed_batch,
+                run_state=run_state,   # <<< pass fuse state
             )
             return finished
         except TransientHTTPError as e:
@@ -887,6 +987,7 @@ async def _process_company(
 
     return False
 
+# ------------- (kept for reference/back-compat; no longer used in main) -------------
 async def _process_csv(
     cfg,
     csv_path: Path,
@@ -900,6 +1001,10 @@ async def _process_csv(
     seed_batch: int,
     company_attempts: int,
 ) -> None:
+    """
+    Legacy per-file parallelizer (retained for back-compat or focused runs).
+    The new main() uses a global queue across all files instead.
+    """
     done = _load_csv_checkpoint(cfg.checkpoints_dir, csv_path)
     rows_all = list(_read_rows(csv_path))
 
@@ -948,6 +1053,7 @@ async def _process_csv(
 
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+# ------------------------------------------------------------------------------------
 
 
 def _parse_args(argv: list[str]):
@@ -992,6 +1098,7 @@ async def main_async(argv: list[str] | None = None) -> None:
 
     log.info("Discovered %d input file(s). Example: %s", len(files), files[0])
 
+    # Quick sample count (best-effort)
     total_rows = 0
     for pth in files[:5]:
         try:
@@ -1000,28 +1107,94 @@ async def main_async(argv: list[str] | None = None) -> None:
             pass
     log.info("Sampling shows at least ~%d rows in first %d file(s).", total_rows, min(5, len(files)))
 
+    # -------- Global Work Queue across all files --------
+    # 1) Preload per-file done sets and candidate rows (respect --limit per file)
+    per_file_done: Dict[Path, Set[str]] = {}
+    per_file_rows: Dict[Path, list[CompanyRow]] = {}
+    total_enqueued = 0
+
+    resume = not args.no_resume
+
+    for csv_path in files:
+        done = _load_csv_checkpoint(cfg.checkpoints_dir, csv_path)
+        per_file_done[csv_path] = done
+
+        rows_all = [
+            r for r in _read_rows(csv_path)
+            if r.url and is_http_url(r.url) and (urlparse(r.url).hostname or "").strip()
+        ]
+        if args.limit:
+            rows_all = rows_all[:args.limit]
+
+        if resume:
+            rows = [r for r in rows_all if r.key not in done]
+            log.info("CSV %s: %d already complete (skipped), %d to process",
+                     csv_path.name, len(rows_all) - len(rows), len(rows))
+        else:
+            rows = rows_all
+            log.info("CSV %s: resume disabled; processing %d rows", csv_path.name, len(rows))
+
+        per_file_rows[csv_path] = rows
+        total_enqueued += len(rows)
+
+    if total_enqueued == 0:
+        log.info("Nothing to do — all companies already completed across %d file(s).", len(files))
+        return
+
+    # 2) Build the global queue of (csv_path, CompanyRow)
+    queue: asyncio.Queue[Tuple[Path, CompanyRow] | None] = asyncio.Queue()
+    for csv_path, rows in per_file_rows.items():
+        for row in rows:
+            queue.put_nowait((csv_path, row))
+
+    log.info("Global queue initialized with %d companies from %d file(s).", total_enqueued, len(files))
+
+    # 3) Spin up cfg.max_companies_parallel workers that pull any row
     pw, browser, context = await init_browser(cfg)
     try:
-        for csv_path in files:
-            await _process_csv(
-                cfg,
-                csv_path,
-                context=context,
-                allow_regex=args.allow,
-                deny_regex=args.deny,
-                resume=not args.no_resume,
-                limit=args.limit,
-                max_pages_per_seed=args.max_pages_per_seed,
-                seed_batch=args.seed_batch,
-                company_attempts=args.company_attempts,
-            )
+        async def worker_loop(wid: int):
+            while True:
+                item = await queue.get()
+                if item is None:
+                    queue.task_done()
+                    return
+                csv_path, row = item
+                try:
+                    finished = await _process_company(
+                        cfg,
+                        context,
+                        row,
+                        allow_regex=args.allow,
+                        deny_regex=args.deny,
+                        max_pages_per_seed=args.max_pages_per_seed,
+                        seed_batch=args.seed_batch,
+                        company_attempts=max(2, args.company_attempts),
+                    )
+                    if finished:
+                        per_file_done[csv_path].add(row.key)
+                        _save_csv_checkpoint(cfg.checkpoints_dir, csv_path, per_file_done[csv_path])
+                except Exception:
+                    log.exception("Worker %d: unhandled error while processing %s (%s)", wid, row.company_name, row.url)
+                finally:
+                    queue.task_done()
+
+        concurrency = max(1, int(getattr(cfg, "max_companies_parallel", 6)))
+        workers = [asyncio.create_task(worker_loop(i + 1)) for i in range(concurrency)]
+
+        # Wait for all items to be processed
+        await queue.join()
+
+        # Send sentinels to stop workers
+        for _ in workers:
+            queue.put_nowait(None)
+        await asyncio.gather(*workers, return_exceptions=True)
+
     finally:
         await shutdown_browser(pw, browser, context)
 
 
 def main() -> None:
     asyncio.run(main_async())
-
 
 if __name__ == "__main__":
     main()

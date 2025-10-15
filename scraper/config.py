@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Tuple
-from .utils import getenv_bool, getenv_int, getenv_str
+from .utils import getenv_bool, getenv_int, getenv_str, getenv_float, getenv_csv
 
 # ---------- Project Paths ----------
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
@@ -116,7 +116,7 @@ class Config:
     checkpoints_dir: Path
     embeddings_dir: Path
 
-    # --------- NEW: Redirect/migration & filtering defaults ----------
+    # --------- Redirect/migration & filtering defaults ----------
     # Default regexes used by crawler if CLI doesn't supply --allow/--deny
     default_allow_regex: str | None
     default_deny_regex: str | None
@@ -132,38 +132,44 @@ class Config:
     # Same-site expansion for the current run (runner can set per company)
     extra_same_site_hosts: tuple[str, ...]      # additional eTLD+1 treated as same-site this run
 
+    # --------- Fuse / Stall controls (read-only; set via env or defaults) ----------
+    forbidden_done_threshold: int               # 403s ≥ this → mark company done
+    stall_pending_max: int                      # pending ≤ this AND…
+    stall_repeat_passes: int                    # …same fingerprint for ≥ this many passes → done
+    stall_fingerprint_window: int               # history length to compare fingerprints
+
+    # --------- Per-host throttling / 429 handling (crawler uses directly) ----------
+    host_min_interval_ms: int                   # minimum spacing between requests to a host
+    throttle_penalty_initial_ms: int            # penalty injected after the first 429
+    throttle_penalty_max_ms: int                # upper bound for penalty sleep
+    throttle_penalty_decay_mult: float          # multiply penalty by this on 2xx success (0<mult<1)
+
+    # GPU
+    browser_enable_gpu: bool
+
 
 # ---------- Loader ----------
 def load_config() -> Config:
-    # tiny helper: float env with default
-    def _env_float(name: str, default: float) -> float:
-        s = getenv_str(name, str(default)).strip()
-        try:
-            return float(s)
-        except Exception:
-            return default
 
-    # parse CSV-ish envs into tuples (trim blanks)
-    def _env_csv(name: str, default_csv: str) -> Tuple[str, ...]:
-        raw = getenv_str(name, default_csv)
-        parts = [x.strip() for x in raw.split(",")]
-        return tuple(p for p in parts if p)
 
     cfg = Config(
         timezone=getenv_str("APP_TZ", "Asia/Singapore"),
         env=getenv_str("APP_ENV", "dev"),
 
-        # concurrency/timeouts
-        max_companies_parallel=getenv_int("MAX_COMPANIES_PARALLEL", 14, 1, 64),
-        max_pages_per_domain_parallel=getenv_int("MAX_PAGES_PER_DOMAIN_PARALLEL", 4, 1, 32),
+        # ---------- Tuned for high-throughput workstation ----------
+        # Cross-company parallelism is the main throughput lever.
+        max_companies_parallel=getenv_int("MAX_COMPANIES_PARALLEL", 96, 1, 256),
+        # Keep per-domain parallelism modest to avoid 429 bursts.
+        max_pages_per_domain_parallel=getenv_int("MAX_PAGES_PER_DOMAIN_PARALLEL", 12, 1, 64),
         request_timeout_ms=getenv_int("REQUEST_TIMEOUT_MS", 30000, 5000, 120000),
-        page_load_timeout_ms=getenv_int("PAGE_LOAD_TIMEOUT_MS", 45000, 5000, 180000),
+        # Slightly tighter page timeout to avoid hanging SPAs.
+        page_load_timeout_ms=getenv_int("PAGE_LOAD_TIMEOUT_MS", 25000, 5000, 180000),
         navigation_wait_until=getenv_str("NAV_WAIT_UNTIL", "domcontentloaded"),
 
         # retry/backoff
         retry_max_attempts=getenv_int("RETRY_MAX_ATTEMPTS", 4, 1, 10),
-        retry_initial_delay_ms=getenv_int("RETRY_INITIAL_DELAY_MS", 500, 100, 10000),
-        retry_max_delay_ms=getenv_int("RETRY_MAX_DELAY_MS", 8000, 1000, 60000),
+        retry_initial_delay_ms=getenv_int("RETRY_INITIAL_DELAY_MS", 10000, 100, 10000),
+        retry_max_delay_ms=getenv_int("RETRY_MAX_DELAY_MS", 60000, 1000, 60000),
         retry_jitter_ms=getenv_int("RETRY_JITTER_MS", 300, 0, 2000),
 
         # robots / blocking
@@ -206,7 +212,8 @@ def load_config() -> Config:
 
         # crawler extras
         crawler_max_retries=getenv_int("CRAWLER_MAX_RETRIES", 3, 0, 10),
-        per_page_delay_ms=getenv_int("PER_PAGE_DELAY_MS", 50, 0, 2000),
+        # Gentle pacing between pages to reduce burstiness.
+        per_page_delay_ms=getenv_int("PER_PAGE_DELAY_MS", 15, 0, 2000),
         allow_subdomains=getenv_bool("ALLOW_SUBDOMAINS", True),
         max_pages_per_company=getenv_int("MAX_PAGES_PER_COMPANY", 200, 1, 2000),
 
@@ -217,9 +224,9 @@ def load_config() -> Config:
         lang_subdomain_deny=tuple(getenv_str("LANG_SUBDOMAIN_DENY", "fr.,de.,es.,pt.,it.,ru.,zh.,cn.,jp.,kr.").split(",")),
 
         # Static-first HTTP client
-        enable_static_first=getenv_bool("ENABLE_STATIC_FIRST", True),
         static_timeout_ms=getenv_int("STATIC_TIMEOUT_MS", 9000, 1000, 60000),
         static_max_bytes=getenv_int("STATIC_MAX_BYTES", 2_000_000, 200_000, 8_000_000),
+        enable_static_first=getenv_bool("ENABLE_STATIC_FIRST", True),
         static_http2=getenv_bool("STATIC_HTTP2", True),
         static_max_redirects=getenv_int("STATIC_MAX_REDIRECTS", 8, 1, 20),
         static_js_app_text_threshold=getenv_int("STATIC_JS_APP_TEXT_THRESHOLD", 800, 200, 4000),
@@ -232,32 +239,39 @@ def load_config() -> Config:
         prefer_detail_url_keywords=tuple(getenv_str("PREFER_DETAIL_URL_KEYWORDS", "/product,/products").split(",")),
 
         # --------- Redirect/migration & filtering defaults ----------
-        # default_allow_regex=(lambda s: s if s else None)(
-        #     getenv_str(
-        #         "DEFAULT_ALLOW_REGEX",
-        #         r"/(product|products|solution|solutions|service|services|catalog|portfolio|platform|features|pricing|specs|datasheet)"
-        #     ).strip()
-        # ),
-        # default_deny_regex=(lambda s: s if s else None)(
-        #     getenv_str(
-        #         "DEFAULT_DENY_REGEX",
-        #         r"(login|press|news(room)?|career|jobs|investor|event|webinar|blog|community|download|insights)"
-        #     ).strip()
-        # ),
+        default_allow_regex=None,
+        default_deny_regex=None,
 
-        default_allow_regex= None,
-        default_deny_regex= None,
-        
         migration_threshold=getenv_int("MIGRATION_THRESHOLD", 2, 1, 10),
-        migration_forbid_hosts=_env_csv(
+        migration_forbid_hosts=getenv_csv(
             "MIGRATION_FORBID_HOSTS",
             "youtube.com,facebook.com,instagram.com,tiktok.com,vimeo.com,shop.app,amazon.com,medium.com,linktr.ee,mailchi.mp,bit.ly"
         ),
 
         deny_on_auth=getenv_bool("DENY_ON_AUTH", True),
-        backoff_on_429=_env_float("BACKOFF_ON_429", 1.5),
+        # Stronger next-pass backoff factor when we keep hitting auth walls/429.
+        backoff_on_429=getenv_float("BACKOFF_ON_429", 2.5),
 
         # Runner can set this per company (comma-separated eTLD+1); default empty
-        extra_same_site_hosts=_env_csv("EXTRA_SAME_SITE_HOSTS", ""),
+        extra_same_site_hosts=getenv_csv("EXTRA_SAME_SITE_HOSTS", ""),
+
+        # --------- Fuse / Stall controls ----------
+        # Lower threshold so 403-heavy companies finish faster.
+        forbidden_done_threshold=getenv_int("FORBIDDEN_DONE_THRESHOLD", 25, 1, 10_000),
+        stall_pending_max=getenv_int("STALL_PENDING_MAX", 2, 0, 50),
+        # Fast-finish after 2 consecutive no-progress passes with tiny frontier.
+        stall_repeat_passes=getenv_int("STALL_REPEAT_PASSES", 2, 1, 50),
+        stall_fingerprint_window=getenv_int("STALL_FINGERPRINT_WINDOW", 4, 2, 50),
+
+        # --------- Per-host throttling / 429 handling ----------
+        # Gentle per-host pacing reduces 429 bursts while keeping overall QPS high.
+        host_min_interval_ms=getenv_int("HOST_MIN_INTERVAL_MS", 150, 0, 60000),
+        # Stronger penalty after a 429; decays on success.
+        throttle_penalty_initial_ms=getenv_int("THROTTLE_PENALTY_INITIAL_MS", 8000, 0, 120000),
+        throttle_penalty_max_ms=getenv_int("THROTTLE_PENALTY_MAX_MS", 60000, 100, 300000),
+        throttle_penalty_decay_mult=getenv_float("THROTTLE_PENALTY_DECAY_MULT", 0.66),
+
+        # GPU
+        browser_enable_gpu=getenv_bool("BROWSER_ENABLE_GPU", True)
     )
     return cfg

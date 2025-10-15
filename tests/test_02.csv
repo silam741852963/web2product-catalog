@@ -1,7 +1,0 @@
-hojin_id,company_name,url,hightechflag,us_flag,note
-700003,Ryan Specialty Group,https://ryanspecialty.com/,0,1,leader
-700085,VANGUARD RUSSELL 2000 INDEX FUND,https://investor.vanguard.com/,0,1,backend endpoints & auth only
-700108,Lemonade,https://www.lemonade.com/,1,1,blog
-700076,UMB FINANCIAL CORPORATION,https://www.umb.com/,1,1,blog & language
-700135,"CV SCIENCES, INC.",https://www.cvsciences.com/,0,1,unexpected pending
-700012,Sprout Social,https://sproutsocial.com/,1,1,different query in a same page

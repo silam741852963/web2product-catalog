@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import List, Set, Dict, Optional, Callable
 from urllib.parse import urlparse, urljoin
@@ -52,6 +53,7 @@ class SiteCrawler:
     """
     Concurrent, retrying, per-domain crawler.
     Emits status-driven signals to the runner via callbacks (redirects, canonical, backoff, server errors).
+    Throttles per-host in-process when rate limiting is detected (HTTP 429).
     """
 
     def __init__(
@@ -63,6 +65,8 @@ class SiteCrawler:
         on_canonical: Optional[Callable[[str, str, bool], None]] = None,
         on_backoff: Optional[Callable[[str], None]] = None,
         on_server_error: Optional[Callable[[str, str, int], None]] = None,
+        # generic status callback (e.g., to count 401/403/429)
+        on_http_status: Optional[Callable[[str, str, int], None]] = None,
     ):
         self.cfg = cfg
         self.context = context
@@ -72,27 +76,35 @@ class SiteCrawler:
         self.on_canonical = on_canonical
         self.on_backoff = on_backoff
         self.on_server_error = on_server_error
+        self.on_http_status = on_http_status
 
+        # concurrency limiter inside a single domain
         self.sem = asyncio.Semaphore(cfg.max_pages_per_domain_parallel)
         self._attempts: Dict[str, int] = {}
         self._max_retries: int = int(getattr(cfg, "crawler_max_retries", 3))
 
-        # set per-crawl homepage to detect “homepage special cases”
+        # per-crawl homepage (for 401/403 special casing)
         self._homepage_url: Optional[str] = None
 
+        # conditional GET token (If-Modified-Since)
         self._ims: Dict[str, float] = {}
-        self._prio_seq: int = 0 
+
+        # per-host (per-crawler) request pacing / rate control
+        self._throttle_lock = asyncio.Lock()
+        self._last_request_t: float = 0.0
+        self._penalty_ms: float = 0.0  # grows on 429, decays on 2xx
 
     # ----------------- public API -----------------
 
     async def crawl_site(
-    self,
-    homepage: str,
-    max_pages: Optional[int] = None,
-    url_allow_regex: Optional[str] = None,
-    url_deny_regex: Optional[str] = None,
-) -> List[PageSnapshot]:
+        self,
+        homepage: str,
+        max_pages: Optional[int] = None,
+        url_allow_regex: Optional[str] = None,
+        url_deny_regex: Optional[str] = None,
+    ) -> List[PageSnapshot]:
         start_url = normalize_url(homepage)
+        self._homepage_url = start_url
         if not is_http_url(start_url):
             logger.warning("Skip non-http URL: %s", start_url)
             return []
@@ -111,9 +123,9 @@ class SiteCrawler:
         queue: PriorityQueue[tuple[int, int, str]] = PriorityQueue()
         prio_seq = 0
 
-        import re
-        allow_re = re.compile(url_allow_regex) if url_allow_regex else None
-        deny_re  = re.compile(url_deny_regex)  if url_deny_regex  else None
+        import re as _re
+        allow_re = _re.compile(url_allow_regex) if url_allow_regex else None
+        deny_re  = _re.compile(url_deny_regex)  if url_deny_regex  else None
 
         def _priority(u: str) -> int:
             # 0 for product-like URLs; 1 otherwise
@@ -146,6 +158,9 @@ class SiteCrawler:
 
                 visited.add(url)
                 try:
+                    # in-process pacing (min interval + dynamic 429 penalty)
+                    await self._throttle_if_needed()
+
                     async with self.sem:
                         snap = await self._fetch_and_extract(url, allow_re=allow_re, deny_re=deny_re)
 
@@ -153,6 +168,9 @@ class SiteCrawler:
                         await asyncio.sleep(self.cfg.per_page_delay_ms / 1000.0)
 
                     snapshots[url] = snap
+
+                    # 2xx → decay rate penalty (done inside fetch, but keep an extra gentle decay here)
+                    self._decay_penalty_soft()
 
                     for link in snap.out_links:
                         if max_pages is not None and len(visited) >= max_pages:
@@ -170,6 +188,8 @@ class SiteCrawler:
                     self._attempts[url] = attempts
                     if attempts <= getattr(self, "_max_retries", 3):
                         logger.debug("Transient error on %s (attempt %d/%d): %s", url, attempts, self._max_retries, e)
+                        # small pacing bump before a retry (prevents hammering)
+                        await asyncio.sleep(min(1.0, self._penalty_ms / 1000.0))
                         visited.discard(url)
                         await queue.put((_priority(url), prio_seq, url))
                         prio_seq += 1
@@ -190,10 +210,8 @@ class SiteCrawler:
         logger.info("Crawl finished: %s pages from %s", len(snapshots), host)
         return list(snapshots.values())
 
-    
     def set_if_modified_since(self, last_seen: Optional[Dict[str, float]]):
         self._ims = {normalize_url(k): float(v) for k, v in (last_seen or {}).items() if v}
-
 
     # ----------------- internals -----------------
 
@@ -202,6 +220,62 @@ class SiteCrawler:
             return normalize_url(src) == normalize_url(self._homepage_url or "")
         except Exception:
             return False
+
+    # ----- per-host pacing helpers -----
+
+    async def _throttle_if_needed(self):
+        """
+        Enforce minimum host interval and dynamic penalty (grown on 429, decayed on 2xx).
+        This gate runs before each networked fetch (static or dynamic).
+        """
+        min_interval_s = max(0.0, (getattr(self.cfg, "host_min_interval_ms", 0) or 0) / 1000.0)
+        penalty_s = max(0.0, self._penalty_ms / 1000.0)
+
+        async with self._throttle_lock:
+            now = time.monotonic()
+            delay = 0.0
+            if self._last_request_t > 0 and min_interval_s > 0:
+                elapsed = now - self._last_request_t
+                if elapsed < min_interval_s:
+                    delay += (min_interval_s - elapsed)
+            # add current dynamic penalty
+            delay += penalty_s
+
+            # reserve the slot "in the future" to prevent bursts from other workers
+            self._last_request_t = now + delay
+
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    def _bump_penalty_on_429(self):
+        """
+        Increase penalty sleep; capped by config; multiplicative using backoff_on_429.
+        """
+        max_ms = int(getattr(self.cfg, "throttle_penalty_max_ms", 30000))
+        init_ms = int(getattr(self.cfg, "throttle_penalty_initial_ms", 2000))
+        mult = float(getattr(self.cfg, "backoff_on_429", 1.5) or 1.5)
+
+        if self._penalty_ms <= 0:
+            self._penalty_ms = float(init_ms)
+        else:
+            self._penalty_ms = min(float(max_ms), self._penalty_ms * mult)
+
+    def _decay_penalty_on_success(self):
+        """
+        Multiply penalty by decay factor on 2xx; floor at 0 when small.
+        """
+        decay = float(getattr(self.cfg, "throttle_penalty_decay_mult", 0.66) or 0.66)
+        if self._penalty_ms > 0:
+            self._penalty_ms *= decay
+            if self._penalty_ms < 50:
+                self._penalty_ms = 0.0
+
+    def _decay_penalty_soft(self):
+        # very gentle background decay between pages
+        if self._penalty_ms > 0:
+            self._penalty_ms *= 0.98
+            if self._penalty_ms < 50:
+                self._penalty_ms = 0.0
 
     @staticmethod
     def _extract_canonical_href(html: str) -> Optional[str]:
@@ -250,6 +324,14 @@ class SiteCrawler:
             except Exception as e:
                 logger.debug("on_server_error callback failed: %s", e)
 
+    # generic status signal (for 401/403/429 etc.)
+    def _signal_http_status(self, host: str, path: str, status: int):
+        if self.on_http_status:
+            try:
+                self.on_http_status(host, path, status)
+            except Exception as e:
+                logger.debug("on_http_status callback failed: %s", e)
+
     @retry_async(
         max_attempts=4,
         initial_delay_ms=500,
@@ -265,6 +347,7 @@ class SiteCrawler:
     ) -> PageSnapshot:
         """
         Static-first; fallback to Playwright; emit signals for redirects, canonicals, and backoff/server errors.
+        Throttling is handled before entering this function via _throttle_if_needed().
         """
         if bool(getattr(self.cfg, "enable_static_first", False)):
             try:
@@ -289,10 +372,15 @@ class SiteCrawler:
                 self.cfg.page_load_timeout_ms,
             )
 
-            # status-aware decisions
+            # rate/backoff + status signal
             if status == 429:
                 host = urlparse(url).hostname or ""
                 self._signal_backoff(host)
+                self._bump_penalty_on_429()
+
+            if status is not None:
+                up = urlparse(url)
+                self._signal_http_status(up.hostname or "", up.path or "", int(status))
 
             exc = http_status_to_exc(status)
             if exc:
@@ -346,6 +434,9 @@ class SiteCrawler:
                 on_drop=lambda u, r: dropped.append((u, r)),
             )
 
+            # decay penalty on success (status is None => treated as success here)
+            self._decay_penalty_on_success()
+
             return PageSnapshot(url=final_url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
 
         except NonRetryableHTTPError:
@@ -377,6 +468,11 @@ class SiteCrawler:
             if status == 429:
                 host = urlparse(url).hostname or ""
                 self._signal_backoff(host)
+                self._bump_penalty_on_429()
+
+            if status is not None:
+                up = urlparse(url)
+                self._signal_http_status(up.hostname or "", up.path or "", int(status))
 
             exc = http_status_to_exc(status)
             if exc:
@@ -426,6 +522,9 @@ class SiteCrawler:
                 on_drop=lambda u, r: dropped.append((u, r)),
             )
 
+            # decay penalty on success
+            self._decay_penalty_on_success()
+
             return PageSnapshot(url=final_url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
 
         finally:
@@ -474,12 +573,18 @@ class SiteCrawler:
 
             s = r.status_code
             if s == 304:
-                # Not modified since last crawl — return empty frontier
-                return PageSnapshot(url=url, title=None, html_path=None, out_links=[], dropped=dropped)
+                # no content change; treat as success for decay purposes
+                self._decay_penalty_on_success()
+                return PageSnapshot(url=url, title=None, html_path=None, out_links=[], dropped=[])
 
             if s == 429:
                 host = urlparse(url).hostname or ""
                 self._signal_backoff(host)
+                self._bump_penalty_on_429()
+
+            # always signal status
+            up = urlparse(url)
+            self._signal_http_status(up.hostname or "", up.path or "", int(s))
 
             if s == 404:
                 raise NonRetryableHTTPError(f"HTTP 404 for {url}")
@@ -487,7 +592,6 @@ class SiteCrawler:
                 # try browser; dynamic path will special-case homepage/non-homepage
                 raise NeedsBrowser(f"HTTP {s} for {url}")
             if 500 <= s <= 599:
-                up = urlparse(url)
                 self._signal_server_error(up.hostname or "", up.path or "", s)
                 raise TransientHTTPError(f"HTTP {s} for {url}")
             if s >= 400:
@@ -540,6 +644,9 @@ class SiteCrawler:
             except Exception:
                 content_sha1 = None
 
+            # decay penalty on success
+            self._decay_penalty_on_success()
+
             snap = PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
             setattr(snap, "content_sha1", content_sha1)
 
@@ -553,7 +660,6 @@ class SiteCrawler:
             raise TransientHTTPError(str(e)) from e
         finally:
             await client.aclose()
-
 
     def _save_html(self, url: str, html: str) -> str:
         parsed = urlparse(url)
