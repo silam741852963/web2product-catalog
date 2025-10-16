@@ -5,22 +5,56 @@ from scraper.utils import TransientHTTPError
 
 
 class FakeConfig:
+    # Core fields used by init_browser/new_page
     user_agent = "pytest-UA"
     page_load_timeout_ms = 12345
     navigation_wait_until = "domcontentloaded"
     max_pages_per_domain_parallel = 2
     cache_html = False
     block_heavy_resources = True  # toggleable
-    proxy_server = None           # NEW: pass proxy via config (not env)
-    per_page_delay_ms = 0         # optional
+    proxy_server = None           # set in test
+    per_page_delay_ms = 0
+
+    # Browser flags read by _browser_args / init
+    browser_enable_gpu = True
+    browser_args_extra = None
+    browser_slow_mo_ms = 0
+    browser_bypass_csp = False
+    browser_ignore_https_errors = True
+
+    # Global limits & recycle knobs expected by browser.init_browser
+    max_global_pages_open = 128
+    page_close_timeout_ms = 1500
+    browser_recycle_after_pages = 10_000
+    browser_recycle_after_seconds = 21_600  # 6h
+    watchdog_interval_seconds = 30
+    max_httpx_clients = 1
 
 
 class StubPage:
     def __init__(self):
         self.closed = False
+        self._events = {}
+
+    def on(self, event: str, callback):
+        self._events.setdefault(event, []).append(callback)
+
+    def off(self, event: str, callback):
+        if event in self._events:
+            try:
+                self._events[event].remove(callback)
+            except ValueError:
+                pass
 
     async def close(self):
+        # mark closed
         self.closed = True
+        # emit "close" to trigger the release hook in browser.py
+        for cb in list(self._events.get("close", [])):
+            try:
+                cb()
+            except Exception:
+                pass
 
 
 class StubContext:
@@ -31,6 +65,7 @@ class StubContext:
         self._default_navigation_timeout = None
         self._pages = []
         self._new_page_raises = None
+        self._events = {}  # needed for context.on(...)
 
     async def route(self, pattern, handler):
         self._routes.append((pattern, handler))
@@ -48,8 +83,24 @@ class StubContext:
         self._pages.append(p)
         return p
 
+    @property
+    def pages(self):
+        # mimic Playwright's .pages property used by watchdog/metrics
+        return list(self._pages)
+
     async def close(self):
         self.closed = True
+
+    def on(self, event: str, callback):
+        # minimal event registry used by the 429 response hook
+        self._events.setdefault(event, []).append(callback)
+
+    def off(self, event: str, callback):
+        if event in self._events:
+            try:
+                self._events[event].remove(callback)
+            except ValueError:
+                pass
 
 
 class StubBrowser:
@@ -152,7 +203,7 @@ async def test_init_browser_without_blocking(monkeypatch):
     import scraper.browser as browser_mod
     monkeypatch.setattr(browser_mod, "async_playwright", lambda: async_playwright_factory)
 
-    _, _, ctx = await init_browser(cfg)
+    pw_ret, browser_ret, ctx = await init_browser(cfg)
 
     # no routes installed when blocking disabled
     assert ctx._routes == []
@@ -161,6 +212,12 @@ async def test_init_browser_without_blocking(monkeypatch):
     assert chromium._launch_kwargs is not None
     assert "proxy" in chromium._launch_kwargs
     assert chromium._launch_kwargs["proxy"] is None
+
+    # shutdown
+    await shutdown_browser(pw_ret, browser_ret, ctx)
+    assert ctx.closed is True
+    assert browser_ret.closed is True
+    assert pw.stopped is True
 
 
 @pytest.mark.asyncio
@@ -176,14 +233,24 @@ async def test_new_page_ok_and_error_path(monkeypatch):
     monkeypatch.setattr(browser_mod, "async_playwright", lambda: async_playwright_factory)
 
     # init
-    _, _, ctx = await init_browser(cfg)
+    pw_ret, browser_ret, ctx = await init_browser(cfg)
 
     # success path
     page = await new_page(ctx)
     assert isinstance(page, StubPage)
     assert page.closed is False
 
+    # close to trigger release hook (page.on("close", ...))
+    await page.close()
+    assert page.closed is True
+
     # error path -> ensure TransientHTTPError raised
     ctx._new_page_raises = RuntimeError("boom")
     with pytest.raises(TransientHTTPError):
         await new_page(ctx)
+
+    # shutdown
+    await shutdown_browser(pw_ret, browser_ret, ctx)
+    assert ctx.closed is True
+    assert browser_ret.closed is True
+    assert pw.stopped is True

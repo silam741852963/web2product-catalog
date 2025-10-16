@@ -144,6 +144,20 @@ class Config:
     throttle_penalty_max_ms: int                # upper bound for penalty sleep
     throttle_penalty_decay_mult: float          # multiply penalty by this on 2xx success (0<mult<1)
 
+    # ---------- Global browser/page limits & health ----------
+    max_global_pages_open: int                  # cap Playwright pages across the whole run
+    page_close_timeout_ms: int                  # how long to wait when closing a page
+    browser_recycle_after_pages: int            # recycle Chromium after this many page opens
+    browser_recycle_after_seconds: int          # or after this many seconds (whichever first)
+    watchdog_interval_seconds: int              # watchdog logging/pressure interval
+    max_httpx_clients: int                      # number of shared httpx AsyncClients
+
+    # ---------- Browser extras ----------
+    proxy_server: str | None
+    browser_slow_mo_ms: int
+    browser_bypass_csp: bool
+    browser_args_extra: tuple[str, ...]
+
     # GPU
     browser_enable_gpu: bool
 
@@ -151,14 +165,13 @@ class Config:
 # ---------- Loader ----------
 def load_config() -> Config:
 
-
     cfg = Config(
         timezone=getenv_str("APP_TZ", "Asia/Singapore"),
         env=getenv_str("APP_ENV", "dev"),
 
         # ---------- Tuned for high-throughput workstation ----------
         # Cross-company parallelism is the main throughput lever.
-        max_companies_parallel=getenv_int("MAX_COMPANIES_PARALLEL", 96, 1, 256),
+        max_companies_parallel=getenv_int("MAX_COMPANIES_PARALLEL", 128, 1, 256),
         # Keep per-domain parallelism modest to avoid 429 bursts.
         max_pages_per_domain_parallel=getenv_int("MAX_PAGES_PER_DOMAIN_PARALLEL", 12, 1, 64),
         request_timeout_ms=getenv_int("REQUEST_TIMEOUT_MS", 30000, 5000, 120000),
@@ -167,7 +180,7 @@ def load_config() -> Config:
         navigation_wait_until=getenv_str("NAV_WAIT_UNTIL", "domcontentloaded"),
 
         # retry/backoff
-        retry_max_attempts=getenv_int("RETRY_MAX_ATTEMPTS", 4, 1, 10),
+        retry_max_attempts=getenv_int("RETRY_MAX_ATTEMPTS", 3, 1, 10),
         retry_initial_delay_ms=getenv_int("RETRY_INITIAL_DELAY_MS", 10000, 100, 10000),
         retry_max_delay_ms=getenv_int("RETRY_MAX_DELAY_MS", 60000, 1000, 60000),
         retry_jitter_ms=getenv_int("RETRY_JITTER_MS", 300, 0, 2000),
@@ -270,6 +283,21 @@ def load_config() -> Config:
         throttle_penalty_initial_ms=getenv_int("THROTTLE_PENALTY_INITIAL_MS", 8000, 0, 120000),
         throttle_penalty_max_ms=getenv_int("THROTTLE_PENALTY_MAX_MS", 60000, 100, 300000),
         throttle_penalty_decay_mult=getenv_float("THROTTLE_PENALTY_DECAY_MULT", 0.66),
+
+        # ---------- Global browser/page limits & health ----------
+        # 32GB RAM default: keep this conservative to prevent RAM runaway.
+        max_global_pages_open=getenv_int("MAX_GLOBAL_PAGES_OPEN", 128, 32, 1024),
+        page_close_timeout_ms=getenv_int("PAGE_CLOSE_TIMEOUT_MS", 1500, 100, 10000),
+        browser_recycle_after_pages=getenv_int("BROWSER_RECYCLE_AFTER_PAGES", 10_000, 1_000, 1_000_000),
+        browser_recycle_after_seconds=getenv_int("BROWSER_RECYCLE_AFTER_SECONDS", 21_600, 600, 172_800),
+        watchdog_interval_seconds=getenv_int("WATCHDOG_INTERVAL_SECONDS", 30, 5, 600),
+        max_httpx_clients=getenv_int("MAX_HTTPX_CLIENTS", 3, 1, 16),
+
+        # ---------- Browser extras ----------
+        proxy_server=getenv_str("PROXY_SERVER", "") or None,
+        browser_slow_mo_ms=getenv_int("BROWSER_SLOW_MO_MS", 0, 0, 5000),
+        browser_bypass_csp=getenv_bool("BROWSER_BYPASS_CSP", False),
+        browser_args_extra=getenv_csv("BROWSER_ARGS_EXTRA", ""),
 
         # GPU
         browser_enable_gpu=getenv_bool("BROWSER_ENABLE_GPU", True)

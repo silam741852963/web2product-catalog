@@ -15,8 +15,17 @@ import os
 import tempfile
 import time
 import shutil
-from threading import Lock
+from threading import Lock, Event, Thread
 from collections import deque
+import contextlib
+import queue as _queue
+import gzip
+from logging.handlers import (
+    QueueHandler,
+    QueueListener,
+    MemoryHandler,
+    TimedRotatingFileHandler,
+)
 
 # Make project root importable
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,16 +33,154 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scraper.browser import init_browser, shutdown_browser
-from scraper.crawler import SiteCrawler, NonRetryableHTTPError
+from scraper.crawler import SiteCrawler
 from scraper.config import load_config
 from scraper.utils import (
     prune_html_for_markdown, html_to_markdown, clean_markdown, save_markdown,
     TransientHTTPError, is_http_url, normalize_url, same_site,
-    looks_non_product_url, is_meaningful_markdown, init_logging,
+    looks_non_product_url, is_meaningful_markdown,
     get_base_domain, is_producty_url
 )
 
 log = logging.getLogger("scripts.run_scraper")
+
+# ================================
+# High-throughput logging setup
+# ================================
+
+class _GzipTimedRotator(TimedRotatingFileHandler):
+    """
+    Timed rotating handler that gzips old segments.
+    Rolls over at the configured time (e.g., midnight) and keeps backupCount files.
+    """
+    def __init__(self,
+                 filename: str,
+                 when: str = "midnight",
+                 interval: int = 1,
+                 backupCount: int = 14,
+                 encoding: str | None = "utf-8"):
+        super().__init__(filename, when=when, interval=interval,
+                         backupCount=backupCount, encoding=encoding, delay=True)
+        # Make rotated names end with .gz
+        self.namer = lambda default_name: f"{default_name}.gz"
+        self.rotator = self._gzip_rotator
+
+    @staticmethod
+    def _gzip_rotator(source: str, dest: str) -> None:
+        # dest already has ".gz" because of self.namer
+        try:
+            with open(source, "rb") as sf, gzip.open(dest, "wb", compresslevel=6) as df:
+                shutil.copyfileobj(sf, df)
+        finally:
+            with contextlib.suppress(Exception):
+                os.remove(source)
+
+
+class LogManager:
+    """
+    One queue, one listener thread, one MemoryHandler flushing to a gzipped timed-rotating file.
+    - Producers attach a QueueHandler to the root.
+    - MemoryHandler flushes immediately for WARNING+.
+    - A small timer thread flushes the buffer every flush_interval_s for INFO/DEBUG.
+    """
+    def __init__(
+        self,
+        log_path: Path,
+        *,
+        level: int = logging.INFO,
+        flush_interval_s: int = 5,
+        memory_capacity: int = 2000,
+        console_level: int = logging.WARNING,
+        rotation_when: str = "midnight",
+        rotation_interval: int = 1,
+        rotation_backup_count: int = 14,
+    ) -> None:
+        self.log_path = Path(log_path)
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # File handler with daily rotation + gzip
+        self.file_handler = _GzipTimedRotator(
+            str(self.log_path),
+            when=rotation_when,
+            interval=rotation_interval,
+            backupCount=rotation_backup_count,
+            encoding="utf-8",
+        )
+        file_fmt = logging.Formatter(
+            fmt="%(asctime)s.%(msecs)03d %(levelname)s [%(name)s:%(lineno)d] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        self.file_handler.setFormatter(file_fmt)
+        self.file_handler.setLevel(logging.DEBUG)  # accept all; MemoryHandler decides flush
+
+        # Memory buffer: flush on WARNING+, or when explicitly flushed
+        self.memory_handler = MemoryHandler(
+            capacity=memory_capacity,
+            flushLevel=logging.WARNING,
+            target=self.file_handler,
+        )
+
+        # Optional console (kept minimal to reduce I/O)
+        self.console_handler = logging.StreamHandler(stream=sys.stderr)
+        self.console_handler.setLevel(console_level)
+        self.console_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+
+        # Queue + listener serialize disk writes
+        self.queue: _queue.Queue = _queue.Queue(maxsize=10000)
+        self.queue_handler = QueueHandler(self.queue)
+        self.listener = QueueListener(
+            self.queue,
+            self.memory_handler,   # buffered to file
+            self.console_handler,  # direct to console
+            respect_handler_level=True,
+        )
+
+        # Root logger wiring
+        root = logging.getLogger()
+        root.setLevel(level)
+        # Remove any existing handlers (avoid double logging when re-running)
+        for h in list(root.handlers):
+            root.removeHandler(h)
+        root.addHandler(self.queue_handler)
+
+        # Background periodic flusher for INFO/DEBUG
+        self._stop_evt = Event()
+        self._flush_interval = max(1, int(flush_interval_s))
+        self._flusher = Thread(target=self._flush_loop, name="log-flusher", daemon=True)
+
+    def start(self) -> None:
+        self.listener.start()
+        self._flusher.start()
+
+    def _flush_loop(self) -> None:
+        # Periodically flush buffered INFO/DEBUG
+        while not self._stop_evt.wait(self._flush_interval):
+            try:
+                self.memory_handler.flush()
+            except Exception:
+                # Avoid crash on logging failure
+                pass
+
+    def shutdown(self) -> None:
+        # Stop timer
+        self._stop_evt.set()
+        with contextlib.suppress(Exception):
+            self._flusher.join(timeout=3)
+
+        # Final flushes
+        with contextlib.suppress(Exception):
+            self.memory_handler.flush()
+        with contextlib.suppress(Exception):
+            self.listener.stop()
+        with contextlib.suppress(Exception):
+            self.file_handler.flush()
+        with contextlib.suppress(Exception):
+            self.file_handler.close()
+
+        # Detach queue handler
+        root = logging.getLogger()
+        with contextlib.suppress(Exception):
+            root.removeHandler(self.queue_handler)
 
 
 # ---------------------------- Data Models ----------------------------
@@ -198,12 +345,6 @@ def _load_company_state(path: Path, row: CompanyRow | None) -> dict:
         "visited": [],
         "pending": pending,
         "done": False,
-        # new state buckets (lazy-init where used)
-        # "redirect_counter": {},
-        # "alias_domains": [],
-        # "migrated_to": "",
-        # "temp_allowed_hosts": [],
-        # "sick_prefixes": [],
     }
 
 
@@ -681,7 +822,7 @@ async def _drain_company(
     deny_regex: Optional[str],
     max_pages_per_seed: Optional[int],
     seed_batch: int,
-    run_state: CompanyRunState,          # <<< NEW: per-company fuse state
+    run_state: CompanyRunState,          # fuse state
 ) -> bool:
     homepage = _norm(state.get("homepage") or "")
     allow_subdomains = bool(getattr(cfg, "allow_subdomains", False))
@@ -696,7 +837,7 @@ async def _drain_company(
         log.debug("Company cap already reached (%d). Marking done.", cap_total)
         return True
 
-    # Read fuse knobs (config-driven; cfg stays frozen)
+    # Fuses (config-driven; cfg stays frozen)
     forbidden_thresh = int(getattr(cfg, "forbidden_done_threshold", 0) or 0)
     stall_pending_max = int(getattr(cfg, "stall_pending_max", 2))
     stall_repeat_passes = int(getattr(cfg, "stall_repeat_passes", 3))
@@ -708,11 +849,11 @@ async def _drain_company(
     retried_dynamic: set[str] = set()
 
     while state["pending"] and remaining > 0:
-        # --- fuse A: auth/forbidden (401/403) trip check (early) ---
+        # Fuse A: 401/403 count
         if forbidden_thresh > 0 and run_state.forbidden_count >= forbidden_thresh:
             state["done"] = True
             state["done_reason"] = "403_fuse"
-            state["blocked_reason"] = "forbidden"  # <<< add blocked_reason
+            state["blocked_reason"] = "forbidden"
             state["done_meta"] = {"count": run_state.forbidden_count, "threshold": forbidden_thresh}
             _save_company_state(state_path, state)
             log.info("Fuse trip: 401/403 %d ≥ %d → mark done.", run_state.forbidden_count, forbidden_thresh)
@@ -726,7 +867,7 @@ async def _drain_company(
         if not seeds:
             break
 
-        # --- fuse B: stall detector (tiny, stable frontier) BEFORE crawling this pass
+        # Fuse B: stall detector (small, stable frontier)
         if len(pending_list) <= stall_pending_max:
             fp = _frontier_fingerprint(pending_list, cap=10)
             run_state.pending_fingerprints.append(fp)
@@ -735,14 +876,13 @@ async def _drain_company(
                 if len(set(tail)) == 1:
                     state["done"] = True
                     state["done_reason"] = "stall_fuse"
-                    state["blocked_reason"] = "stalled"  # <<< add blocked_reason
+                    state["blocked_reason"] = "stalled"
                     state["done_meta"] = {"pending": len(pending_list), "repeat": stall_repeat_passes}
                     _save_company_state(state_path, state)
                     log.info("Fuse trip: stall (pending=%d, repeat=%d) → mark done.",
                              len(pending_list), stall_repeat_passes)
                     return True
         else:
-            # keep fingerprint history aligned with configured window (append current fp too)
             fp = _frontier_fingerprint(pending_list, cap=10)
             run_state.pending_fingerprints.append(fp)
 
@@ -820,25 +960,16 @@ async def _drain_company(
         if not progress:
             _save_company_state(state_path, state)
             log.info("No progress this pass for %s (%s).",
-                    state.get("company", ""), _summarize_skips(state))
-            # DEBUG counters snapshot
-            try:
-                sk = (state.get("skipped", {}) or {}).get("reasons", {}) or {}
-                log.debug("Counters: visited=%d, pending=%d, skipped_total=%d (by reason: %s)",
-                        len(state.get("visited", [])),
-                        len(state.get("pending", [])),
-                        sum(int(v) for v in sk.values()),
-                        ", ".join(f"{k}={int(v)}" for k, v in sorted(sk.items())))
-            except Exception:
-                pass
-            # After a no-progress pass, re-check fuses immediately with the new fingerprint
-            pending_list = sorted({_norm(u) for u in state.get("pending", []) if u}, key=lambda u: 0 if is_producty_url(u) else 1)
+                     state.get("company", ""), _summarize_skips(state))
+            # After a no-progress pass, re-check fuses immediately
+            pending_list = sorted({_norm(u) for u in state.get("pending", []) if u},
+                                  key=lambda u: 0 if is_producty_url(u) else 1)
             fp = _frontier_fingerprint(pending_list, cap=10)
             run_state.pending_fingerprints.append(fp)
             if forbidden_thresh > 0 and run_state.forbidden_count >= forbidden_thresh:
                 state["done"] = True
                 state["done_reason"] = "403_fuse"
-                state["blocked_reason"] = "forbidden"  # <<< add blocked_reason
+                state["blocked_reason"] = "forbidden"
                 state["done_meta"] = {"count": run_state.forbidden_count, "threshold": forbidden_thresh}
                 _save_company_state(state_path, state)
                 log.info("Fuse trip: 401/403 %d ≥ %d → mark done.",
@@ -849,7 +980,7 @@ async def _drain_company(
                 if len(set(tail)) == 1:
                     state["done"] = True
                     state["done_reason"] = "stall_fuse"
-                    state["blocked_reason"] = "stalled"  # <<< add blocked_reason
+                    state["blocked_reason"] = "stalled"
                     state["done_meta"] = {"pending": len(pending_list), "repeat": stall_repeat_passes}
                     _save_company_state(state_path, state)
                     log.info("Fuse trip: stall (pending=%d, repeat=%d) → mark done.",
@@ -867,25 +998,24 @@ async def _drain_company(
 
     if finished:
         log.info("Company DONE: %s (visited=%d, pending=%d) — %s",
-                state.get("company",""),
-                len(state.get("visited",[])),
-                len(state.get("pending",[])),
-                _summarize_skips(state))
+                 state.get("company",""),
+                 len(state.get("visited",[])),
+                 len(state.get("pending",[])),
+                 _summarize_skips(state))
     else:
         log.info("Company PASS complete: %s (visited=%d, pending=%d, remaining=%d)",
-                state.get("company",""),
-                len(state.get("visited",[])),
-                len(state.get("pending",[])),
-                remaining)
+                 state.get("company",""),
+                 len(state.get("visited",[])),
+                 len(state.get("pending",[])),
+                 remaining)
 
-    # DEBUG summary snapshot
     try:
         sk = (state.get("skipped", {}) or {}).get("reasons", {}) or {}
         log.debug("End-of-company counters: visited=%d, pending=%d, skipped_total=%d (by reason: %s)",
-                len(state.get("visited", [])),
-                len(state.get("pending", [])),
-                sum(int(v) for v in sk.values()),
-                ", ".join(f"{k}={int(v)}" for k, v in sorted(sk.items())))
+                  len(state.get("visited", [])),
+                  len(state.get("pending", [])),
+                  sum(int(v) for v in sk.values()),
+                  ", ".join(f"{k}={int(v)}" for k, v in sorted(sk.items())))
     except Exception:
         pass
 
@@ -939,7 +1069,7 @@ async def _process_company(
         on_canonical=cb_canonical,
         on_backoff=cb_backoff,
         on_server_error=cb_server_error,
-        on_http_status=cb_http_status,   # <<< NEW: increment 401/403
+        on_http_status=cb_http_status,   # increment 401/403
     )
 
     # --- feed per-URL last-seen (for If-Modified-Since) ---
@@ -951,12 +1081,10 @@ async def _process_company(
                 last_seen[normalize_url(u)] = float(ts)
     except Exception:
         pass
-    # No strict setter required; make it available to crawler
     setattr(crawler, "_ims", last_seen)
 
-    # (Optional) Product-first order for company seeds — helps pick initial seeds
+    # (Optional) Product-first order for company seeds
     try:
-        from scraper.utils import is_producty_url
         pend = [p for p in state.get("pending", []) if p]
         if pend:
             pend_sorted = sorted({normalize_url(p) for p in pend},
@@ -974,7 +1102,7 @@ async def _process_company(
                 deny_regex=deny_regex,
                 max_pages_per_seed=max_pages_per_seed,
                 seed_batch=seed_batch,
-                run_state=run_state,   # <<< pass fuse state
+                run_state=run_state,
             )
             return finished
         except TransientHTTPError as e:
@@ -1082,18 +1210,30 @@ async def main_async(argv: list[str] | None = None) -> None:
     args = _parse_args(argv or sys.argv[1:])
     cfg = load_config()
 
-    init_logging(cfg.log_file, level=(logging.DEBUG if args.debug else logging.INFO))
-    if args.debug:
-        log.debug("Debug logging enabled")
+    # -------- Optimized logging --------
+    # - Daily rotation + gzip
+    # - Buffered writes flushed every 5s or on WARNING+
+    log_mgr = LogManager(
+        log_path=cfg.log_file,
+        level=(logging.DEBUG if args.debug else logging.INFO),
+        flush_interval_s=5,          # periodic batch flush
+        memory_capacity=4000,        # buffer size before forced flush (also flushes on WARNING+)
+        console_level=(logging.INFO if args.debug else logging.WARNING),
+        rotation_when="midnight",
+        rotation_interval=1,
+        rotation_backup_count=14,    # keep two weeks of gz logs
+    )
+    log_mgr.start()
 
     input_glob = args.input_glob or args.pattern or getattr(cfg, "input_glob", None)
 
     files = _discover_input_files(arg_glob=input_glob, cfg=cfg)
     if not files:
-        log.error(
+        logging.getLogger(__name__).error(
             "No input CSVs found. Checked --input-glob (%s), cfg.input_glob (%s), and fallback single file %s",
             args.input_glob or args.pattern, getattr(cfg, "input_glob", None), getattr(cfg, "input_urls_csv", None),
         )
+        log_mgr.shutdown()
         return
 
     log.info("Discovered %d input file(s). Example: %s", len(files), files[0])
@@ -1139,58 +1279,161 @@ async def main_async(argv: list[str] | None = None) -> None:
 
     if total_enqueued == 0:
         log.info("Nothing to do — all companies already completed across %d file(s).", len(files))
+        log_mgr.shutdown()
         return
 
     # 2) Build the global queue of (csv_path, CompanyRow)
-    queue: asyncio.Queue[Tuple[Path, CompanyRow] | None] = asyncio.Queue()
+    work_q: asyncio.Queue[Tuple[Path, CompanyRow] | None] = asyncio.Queue()
     for csv_path, rows in per_file_rows.items():
         for row in rows:
-            queue.put_nowait((csv_path, row))
+            work_q.put_nowait((csv_path, row))
 
     log.info("Global queue initialized with %d companies from %d file(s).", total_enqueued, len(files))
 
     # 3) Spin up cfg.max_companies_parallel workers that pull any row
     pw, browser, context = await init_browser(cfg)
+
+    # -------- Pressure-aware throttling --------
+    concurrency = max(1, int(getattr(cfg, "max_companies_parallel", 6)))
+    throttle_sem = asyncio.Semaphore(concurrency)
+
+    inflight_companies = 0
+    inflight_lock = asyncio.Lock()
+
+    @contextlib.asynccontextmanager
+    async def _inflight_guard():
+        nonlocal inflight_companies
+        async with inflight_lock:
+            inflight_companies += 1
+        try:
+            yield
+        finally:
+            async with inflight_lock:
+                inflight_companies -= 1
+
+    nearcap_streak = 0
+    max_pages_cap = int(getattr(cfg, "max_global_pages_open", 256))
+    nearcap_threshold = max(1, int(max_pages_cap * 0.95))
+
+    monitor_interval = max(30, int(getattr(cfg, "watchdog_interval_seconds", 30)))
+    idle_hold_seconds = monitor_interval  # how long to idle some workers
+
+    idling_task: Optional[asyncio.Task] = None
+
+    async def _pressure_monitor():
+        nonlocal nearcap_streak, idling_task
+        try:
+            while True:
+                await asyncio.sleep(monitor_interval)
+                try:
+                    pages_now = len(context.pages)
+                except Exception:
+                    pages_now = 0
+
+                log.info(
+                    "Pressure: pages_open=%d/%d; inflight_companies=%d; nearcap_streak=%d",
+                    pages_now, max_pages_cap, inflight_companies, nearcap_streak
+                )
+
+                if pages_now >= nearcap_threshold:
+                    nearcap_streak += 1
+                else:
+                    nearcap_streak = 0
+
+                if nearcap_streak >= 3 and idling_task is None:
+                    idle_n = max(1, concurrency // 4)
+                    log.warning(
+                        "High pressure: %d pages ≥ %d (95%% cap). Idling %d worker(s) for %ds.",
+                        pages_now, nearcap_threshold, idle_n, idle_hold_seconds
+                    )
+
+                    async def _idle_for_a_bit(to_idle: int, duration: int):
+                        acquired = 0
+                        for _ in range(to_idle):
+                            try:
+                                await throttle_sem.acquire()
+                                acquired += 1
+                            except Exception:
+                                break
+                        try:
+                            await asyncio.sleep(duration)
+                        finally:
+                            for _ in range(acquired):
+                                throttle_sem.release()
+
+                    idling_task = asyncio.create_task(_idle_for_a_bit(idle_n, idle_hold_seconds))
+
+                    def _clear(_):
+                        nonlocal idling_task
+                        idling_task = None
+
+                    idling_task.add_done_callback(_clear)
+        except asyncio.CancelledError:
+            pass
+
+    pressure_task = asyncio.create_task(_pressure_monitor())
+
     try:
         async def worker_loop(wid: int):
             while True:
-                item = await queue.get()
+                item = await work_q.get()
                 if item is None:
-                    queue.task_done()
+                    work_q.task_done()
                     return
-                csv_path, row = item
-                try:
-                    finished = await _process_company(
-                        cfg,
-                        context,
-                        row,
-                        allow_regex=args.allow,
-                        deny_regex=args.deny,
-                        max_pages_per_seed=args.max_pages_per_seed,
-                        seed_batch=args.seed_batch,
-                        company_attempts=max(2, args.company_attempts),
-                    )
-                    if finished:
-                        per_file_done[csv_path].add(row.key)
-                        _save_csv_checkpoint(cfg.checkpoints_dir, csv_path, per_file_done[csv_path])
-                except Exception:
-                    log.exception("Worker %d: unhandled error while processing %s (%s)", wid, row.company_name, row.url)
-                finally:
-                    queue.task_done()
 
-        concurrency = max(1, int(getattr(cfg, "max_companies_parallel", 6)))
+                await throttle_sem.acquire()
+                try:
+                    csv_path, row = item
+                    try:
+                        async with _inflight_guard():
+                            finished = await _process_company(
+                                cfg,
+                                context,
+                                row,
+                                allow_regex=args.allow,
+                                deny_regex=args.deny,
+                                max_pages_per_seed=args.max_pages_per_seed,
+                                seed_batch=args.seed_batch,
+                                company_attempts=max(2, args.company_attempts),
+                            )
+                        if finished:
+                            per_file_done[csv_path].add(row.key)
+                            _save_csv_checkpoint(cfg.checkpoints_dir, csv_path, per_file_done[csv_path])
+                    except Exception:
+                        log.exception("Worker %d: unhandled error while processing %s (%s)", wid, row.company_name, row.url)
+                    finally:
+                        work_q.task_done()
+                finally:
+                    throttle_sem.release()
+
         workers = [asyncio.create_task(worker_loop(i + 1)) for i in range(concurrency)]
 
-        # Wait for all items to be processed
-        await queue.join()
+        await work_q.join()
 
-        # Send sentinels to stop workers
         for _ in workers:
-            queue.put_nowait(None)
+            work_q.put_nowait(None)
         await asyncio.gather(*workers, return_exceptions=True)
 
     finally:
+        try:
+            if 'pressure_task' in locals() and pressure_task:
+                pressure_task.cancel()
+                with contextlib.suppress(Exception):
+                    await pressure_task
+        except Exception:
+            pass
+
+        try:
+            if 'idling_task' in locals() and idling_task:
+                idling_task.cancel()
+                with contextlib.suppress(Exception):
+                    await idling_task
+        except Exception:
+            pass
+
         await shutdown_browser(pw, browser, context)
+        # Ensure all logs are flushed & files closed
+        log_mgr.shutdown()
 
 
 def main() -> None:

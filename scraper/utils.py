@@ -22,6 +22,16 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from collections import Counter
 
+import asyncio
+from contextlib import suppress
+
+try:
+    # Only if Playwright is available in this env
+    from playwright._impl._errors import Error as PlaywrightError   # type: ignore
+except Exception:
+    PlaywrightError = Exception  # fallback typing
+
+
 
 try:
     from markdownify import markdownify as _markdownify
@@ -1311,6 +1321,57 @@ async def play_links(page) -> list[str]:
     except Exception:
         pass
     return links
+
+async def try_close_page(page, timeout_ms: int = 1500) -> None:
+    """
+    Best-effort, bounded-time page close to avoid dangling Playwright objects
+    when the event loop is under load or the browser is recycling.
+    """
+    if page is None:
+        return
+    try:
+        await asyncio.wait_for(page.close(), timeout=max(0.1, (timeout_ms or 1) / 1000.0))
+    except Exception:
+        # swallow – we're shutting down / recycling; page might already be gone
+        pass
+    
+class PageContext:
+    """
+    Small async context manager used by browser.acquire_page() to ensure
+    a page is always closed within a bounded time and the global semaphore released.
+    """
+    def __init__(self, context, sem, close_timeout_ms: int):
+        self._context = context
+        self._sem = sem
+        self._close_timeout_ms = close_timeout_ms
+        self._page = None
+
+    async def __aenter__(self):
+        await self._sem.acquire()
+        self._page = await self._context.new_page()
+        return self._page
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            await try_close_page(self._page, self._close_timeout_ms)
+        finally:
+            try:
+                self._sem.release()
+            except Exception:
+                pass
+
+async def await_cancelled(task: asyncio.Task, *, timeout: float = 1.0) -> None:
+    """
+    Cancel an asyncio task and await its completion to avoid the
+    'Future exception was never retrieved' warning.
+    """
+    if task.done():
+        with suppress(Exception):
+            _ = task.result()
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError, PlaywrightError, Exception):
+        await asyncio.wait_for(task, timeout=timeout)
 
 
 # ========== Uniform link filtering ==========
