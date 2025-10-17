@@ -184,7 +184,7 @@ class SiteCrawler:
                     attempts = getattr(self, "_attempts", {}).get(url, 0) + 1
                     self._attempts[url] = attempts
                     if attempts <= getattr(self, "_max_retries", 3):
-                        logger.debug("Transient error on %s (attempt %d/%d): %s", url, attempts, self._max_retries, e)
+                        logger.debug("Transient error on %s attempt %d/%d: %s", url, attempts, self._max_retries, e)
                         await asyncio.sleep(min(1.0, self._penalty_ms / 1000.0))
                         visited.discard(url)
                         await queue.put((_priority(url), prio_seq, url))

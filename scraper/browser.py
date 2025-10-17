@@ -208,7 +208,7 @@ async def init_browser(cfg: Config) -> Tuple[Playwright, Browser, BrowserContext
     _ACTIVE["watchdog_task"] = asyncio.create_task(_watchdog_loop(), name="browser_watchdog")
 
     logger.info(
-        "Browser initialized (UA=%s, proxy=%s, gpu=%s, max_global_pages=%d, ignore_https_errors=%s)",
+        "Browser initialized UA=%s proxy=%s gpu=%s max_global_pages=%d ignore_https_errors=%s",
         cfg.user_agent,
         bool(proxy),
         bool(getattr(cfg, "browser_enable_gpu", False)),
@@ -294,6 +294,19 @@ def _active_context() -> BrowserContext:
     return ctx
 
 
+def _ctx_from_param(context: Optional[PageContext]) -> BrowserContext:
+    """
+    Use provided context if it looks like a Playwright context, else fallback to active.
+    """
+    if context is not None:
+        # tests stub a context with new_page attribute; accept that
+        if hasattr(context, "new_page"):
+            return context  # type: ignore[return-value]
+        if hasattr(context, "context") and hasattr(getattr(context, "context"), "new_page"):
+            return getattr(context, "context")
+    return _active_context()
+
+
 def _attach_release_on_close(page: Page) -> None:
     setattr(page, "_pool_release_done", False)
     setattr(page, "_in_use", False)
@@ -314,7 +327,7 @@ def _attach_release_on_close(page: Page) -> None:
                 pass
 
             try:
-                async with _ACTIVE["open_lock"]:
+                async with _ACTIVE["open_lock"] as _:
                     _ACTIVE["open_pages"] = max(0, int(_ACTIVE["open_pages"]) - 1)
             except Exception:
                 pass
@@ -328,6 +341,7 @@ def _attach_release_on_close(page: Page) -> None:
     def _on_close() -> None:
         asyncio.create_task(_release())
 
+    # tests supply a StubPage with .on; real Playwright has .on too
     page.on("close", _on_close)
 
 
@@ -399,7 +413,7 @@ async def _hard_recycle(reason: str) -> None:
             _ACTIVE["context"] = new_ctx
             _ACTIVE["nav_count"] = 0
             _ACTIVE["started_at"] = time.monotonic()
-            logger.info("Hard recycle complete.")
+            logger.info("Hard recycle complete")
         except Exception as e:
             logger.error("Hard recycle failed: %s", e)
         finally:
@@ -436,10 +450,11 @@ async def _maybe_recycle_if_due() -> None:
         _ACTIVE["recycling"] = True
         _ACTIVE["recycle_event"].clear()
         logger.warning(
-            "Recycling Chromium: nav_count=%d elapsed=%.0fs (limits: pages=%d, seconds=%d)",
+            "Recycling Chromium nav_count=%d elapsed=%.0fs limits pages=%d seconds=%d",
             nav_count, elapsed, cfg.browser_recycle_after_pages, cfg.browser_recycle_after_seconds
         )
 
+        # Wait until pool drains
         while int(_ACTIVE["open_pages"]) > 0:
             await asyncio.sleep(0.2)
 
@@ -487,7 +502,7 @@ async def _maybe_recycle_if_due() -> None:
             _ACTIVE["context"] = new_ctx
             _ACTIVE["nav_count"] = 0
             _ACTIVE["started_at"] = time.monotonic()
-            logger.info("Chromium recycled successfully.")
+            logger.info("Chromium recycled successfully")
         finally:
             _ACTIVE["recycling"] = False
             _ACTIVE["recycle_event"].set()
@@ -509,6 +524,7 @@ async def _close_all_pages() -> None:
         pass
     sem: asyncio.Semaphore = _ACTIVE.get("sem")
     if sem and _ACTIVE.get("cfg"):
+        # reset semaphore to full capacity
         _ACTIVE["sem"] = asyncio.Semaphore(_ACTIVE["cfg"].max_global_pages_open)
 
 
@@ -535,6 +551,24 @@ async def _watchdog_loop() -> None:
                 open_pages, ctx_pages, getattr(sem, "_value", "n/a"), int(_ACTIVE["nav_count"])
             )
 
+            # opportunistic cleanup of already-closed pages still in FIFO
+            if _ACTIVE["pages_fifo"]:
+                sweeped = 0
+                for _ in range(len(_ACTIVE["pages_fifo"])):
+                    ts, page = _ACTIVE["pages_fifo"][0]
+                    try:
+                        if page.is_closed():
+                            _ACTIVE["pages_fifo"].popleft()
+                            sweeped += 1
+                            continue
+                    except Exception:
+                        _ACTIVE["pages_fifo"].popleft()
+                        sweeped += 1
+                        continue
+                    _ACTIVE["pages_fifo"].rotate(-1)
+                if sweeped:
+                    logger.debug("[watchdog] swept %d closed pages from FIFO", sweeped)
+
             max_allowed = int(threshold * 1.05)
             if open_pages > max_allowed:
                 to_close = open_pages - threshold
@@ -551,7 +585,7 @@ async def _watchdog_loop() -> None:
                     try:
                         is_closed = page.is_closed()
                     except Exception:
-                        pass
+                        is_closed = True
                     if in_use or is_closed or (now - ts) < idle_age_s:
                         fifo.rotate(-1)
                         continue
@@ -589,13 +623,13 @@ async def acquire_page(context: Optional[PageContext] = None):
         # try to open a page; if the driver is gone, hard recycle once and retry
         for attempt in (1, 2):
             try:
-                ctx = _active_context()
+                ctx = _ctx_from_param(context)
                 page = await ctx.new_page()
                 break
             except Exception as e:
                 msg = str(e)
                 if "Connection closed while reading from the driver" in msg or "Browser has been closed" in msg or "Target closed" in msg:
-                    logger.error("Context.new_page failed (attempt %d): %s", attempt, msg)
+                    logger.error("Context.new_page failed attempt=%d: %s", attempt, msg)
                     await _hard_recycle(msg)
                     if attempt == 2:
                         raise
@@ -638,7 +672,9 @@ async def acquire_page(context: Optional[PageContext] = None):
 
 
 async def new_page(context: Optional[PageContext] = None) -> Page:
-    # prefer acquire_page for RAII; this remains for compat
+    """
+    Compatibility helper. Prefer using acquire_page(...) for RAII.
+    """
     ev: asyncio.Event = _ACTIVE["recycle_event"]
     if ev:
         await ev.wait()
@@ -651,13 +687,13 @@ async def new_page(context: Optional[PageContext] = None) -> Page:
     try:
         for attempt in (1, 2):
             try:
-                ctx = _active_context()
+                ctx = _ctx_from_param(context)
                 page = await ctx.new_page()
                 break
             except Exception as e:
                 msg = str(e)
                 if "Connection closed while reading from the driver" in msg or "Browser has been closed" in msg or "Target closed" in msg:
-                    logger.error("Context.new_page failed (attempt %d): %s", attempt, msg)
+                    logger.error("Context.new_page failed attempt=%d: %s", attempt, msg)
                     await _hard_recycle(msg)
                     if attempt == 2:
                         raise
