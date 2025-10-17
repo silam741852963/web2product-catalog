@@ -631,44 +631,89 @@ def _looks_backend_or_file(u: str) -> bool:
 
 # ========== Language & "productiness" heuristics ==========
 
+_ENGLISH_COUNTRY_ALIASES = {
+    # Common English-country ccTLDs we should accept as English when 'en' is primary
+    "us", "gb", "uk", "ca", "au", "nz", "ie", "sg", "in", "za", "ph"
+}
+
+_LANG_TAG_RE = re.compile(r"^[a-z]{2}(?:-[a-z]{2})?$", re.IGNORECASE)
+
+def _normalize_primary_lang_tags(primary_lang: str | Iterable[str]) -> set[str]:
+    """
+    Normalize PRIMARY_LANG into a set of accepted tags.
+    Accepts a string "en,us,en-gb" or an iterable of tags.
+    If 'en' is present, include common English country aliases as accepted tags.
+    All values are lowercased.
+    """
+    if isinstance(primary_lang, str):
+        raw = [x.strip() for x in primary_lang.split(",") if x.strip()]
+    else:
+        raw = [str(x).strip() for x in (primary_lang or []) if str(x).strip()]
+
+    tags = {t.lower() for t in raw if _LANG_TAG_RE.match(t.lower()) or len(t) == 2}
+    if "en" in tags:
+        tags |= _ENGLISH_COUNTRY_ALIASES  # treat these as English as well
+        # also include a few common regioned forms
+        tags |= {"en-us", "en-gb", "en-au", "en-ca", "en-nz", "en-ie", "en-sg", "en-in", "en-za", "en-ph"}
+    return tags or {"en"}
+
+def _accepts_primary(tag: str, accepted: set[str]) -> bool:
+    """
+    Does a detected lang/locale token count as primary?
+    Accept if it equals any accepted tag, or startswith an accepted language prefix (e.g., 'en-us' startswith 'en').
+    """
+    t = tag.lower()
+    if t in accepted:
+        return True
+    # If an accepted tag is a bare language like 'en', allow 'en-*' forms.
+    for a in accepted:
+        if len(a) == 2 and t.startswith(a + "-"):
+            return True
+    return False
+
+from functools import lru_cache
+
+@lru_cache(maxsize=64)
+def _normalize_primary_lang_tags_cached(primary_lang_csv: str) -> set[str]:
+    return _normalize_primary_lang_tags(primary_lang_csv)
 def is_non_english_url(u: str, primary_lang: str = "en") -> bool:
     """
-    Return True if the URL clearly targets a non-English locale via subdomain,
-    path prefix, or query parameter values.
+    Return True if the URL clearly targets a non-primary locale via subdomain, path prefix, or query values.
+    PRIMARY_LANG can be a comma-separated list, e.g., "en,us" to allow 'us' as English.
+    Examples:
+      - PRIMARY_LANG="en" accepts en, en-US, en-GB, and common English ccTLDs like /us/ or subdomain us.example.com
+      - PRIMARY_LANG="en,us" explicitly also accepts 'us'
     """
     try:
+        accepted = _normalize_primary_lang_tags(primary_lang)
+
         pu = urlparse(u)
         host = (pu.hostname or "").lower()
         path = (pu.path or "/").lower()
         q = dict(parse_qsl(pu.query or "", keep_blank_values=True))
-        primary = (primary_lang or "en").lower()
 
-        # 1) subdomain like fr.example.com, de.example.com, zh-cn.example.com
-        #    (ignore common www)
+        # 1) subdomain like fr.example.com, de.example.com, zh-cn.example.com, us.example.com
         labels = host.split(".")
-        if len(labels) >= 3:  # subdomain present
-            sub = labels[0]
-            if sub in _LANG_CODES and not sub.startswith(primary):
-                return True
-            # accept regioned english (en, en-us) only; anything else is non-en
-            if sub != "www" and re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", sub):
-                if not sub.startswith(primary):
+        if len(labels) >= 3:  # has a subdomain
+            sub = labels[0].lower()
+            # only consider tokens that look like lang/locale or 2-letter cc
+            if sub != "www" and (_LANG_TAG_RE.match(sub) or len(sub) == 2):
+                if not _accepts_primary(sub, accepted):
                     return True
 
-        # 2) path prefix like /fr/, /de-de/, /zh-cn/
+        # 2) path prefix like /fr/, /de-de/, /zh-cn/, /us/
         m = _LANG_PATH_PREFIX_RE.match(path)
         if m:
             tag = m.group("tag").lower()
-            if tag in _LANG_CODES and not tag.startswith(primary):
-                return True
-            if re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", tag) and not tag.startswith(primary):
+            if not _accepts_primary(tag, accepted):
                 return True
 
-        # 3) query keys lang/hl/locale/lc/lr/region set to non-en
+        # 3) query keys lang/hl/locale/lc/lr/region set to a non-accepted value
         for k in ("lang", "hl", "locale", "lc", "lr", "region"):
             v = (q.get(k) or "").lower()
-            if v and not v.startswith(primary):
-                return True
+            if v and (_LANG_TAG_RE.match(v) or len(v) == 2):
+                if not _accepts_primary(v, accepted):
+                    return True
 
         return False
     except Exception:
@@ -816,10 +861,11 @@ def looks_like_js_app(html: str, threshold: int) -> bool:
     if not html:
         return True
     lower = html.lower()
-    if any(sig in lower for sig in _JS_APP_SIGNATURES) and visible_text_len(html) < threshold:
-        return True
+    # cheap substring checks first
     if "enable javascript" in lower or "requires javascript" in lower:
         return True
+    if any(sig in lower for sig in _JS_APP_SIGNATURES):
+        return visible_text_len(html) < threshold
     return False
 
 def extract_links_static(html: str, base_url: str) -> list[str]:
@@ -1060,6 +1106,17 @@ def clean_markdown(md: str, remove_boilerplate: bool = True) -> str:
             blank = False
     return "\n".join(cleaned).strip()
 
+INTERSTITIAL_PATTERNS = (
+    "Just a moment", "Checking your browser", "cf-chl-", "Verifying you are human",
+    "before proceeding", "5 seconds", "DDoS protection by"
+)
+
+def detect_interstitial(html: str) -> bool:
+    low = (html or "").lower()
+    return any(p.lower() in low for p in INTERSTITIAL_PATTERNS)
+
+def is_thin_content(html: str, *, min_visible_chars: int = 1200) -> bool:
+    return visible_text_len(html) < min_visible_chars
 
 # ========== LLM chunking helpers ==========
 
@@ -1090,15 +1147,76 @@ def chunk_text(text: str, max_chars: int) -> Iterable[str]:
 # ========== File I/O ==========
 
 def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    """
+    Write text atomically using a NamedTemporaryFile and os.replace on the same filesystem.
+    Safer than Path.write_text and reduces partial writes.
+    """
+    import os, tempfile
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp.write_text(data, encoding=encoding)
-    tmp.replace(path)
+    with tempfile.NamedTemporaryFile("w", encoding=encoding, dir=str(path.parent), delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        tmp_name = tmp.name
+    os.replace(tmp_name, path)
 
 def append_jsonl(path: Path, json_line: str, encoding: str = "utf-8") -> None:
+    """
+    Fast single-line append using O_APPEND. For bulk writes, prefer BufferedJsonlWriter.
+    """
+    import os
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding=encoding) as f:
-        f.write(json_line.rstrip() + "\n")
+    b = (json_line.rstrip() + "\n").encode(encoding, "utf-8")
+    fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+    try:
+        os.write(fd, b)
+    finally:
+        os.close(fd)
+
+class BufferedJsonlWriter:
+    """Buffered JSONL writer for high-throughput appends.
+
+    Usage:
+        with BufferedJsonlWriter(Path("out.jsonl")) as w:
+            w.write_obj({"a": 1})
+            w.write_line('{"b":2}')
+    """
+    def __init__(self, path: Path, encoding: str = "utf-8", buffer_size: int = 1 << 16):
+        import io
+        self._path = path
+        self._encoding = encoding
+        self._buffer_size = buffer_size
+        self._fd = None
+        self._bio = None
+
+    def __enter__(self):
+        import io, os
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._fd = os.open(self._path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+        raw = os.fdopen(self._fd, "ab", buffering=0)
+        self._bio = io.BufferedWriter(raw, buffer_size=self._buffer_size)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        import os
+        try:
+            if self._bio:
+                self._bio.flush()
+                os.fsync(self._fd)
+        finally:
+            try:
+                if self._bio:
+                    self._bio.close()
+            finally:
+                self._bio = None
+                self._fd = None
+
+    def write_line(self, line: str):
+        self._bio.write((line.rstrip() + "\n").encode(self._encoding, "utf-8"))
+
+    def write_obj(self, obj: dict):
+        import json
+        self.write_line(json.dumps(obj, ensure_ascii=False))
 
 def save_markdown(base_dir: Path, host: str, url_path: str, url: str, md: str) -> Path:
     """
@@ -1374,6 +1492,168 @@ async def await_cancelled(task: asyncio.Task, *, timeout: float = 1.0) -> None:
         await asyncio.wait_for(task, timeout=timeout)
 
 
+
+# ========== Filter config sourcing (env-first, cfg-optional) ==========
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class FilterParams:
+    allow_subdomains: bool = True
+    primary_lang: str = "en"
+    lang_subdomain_deny: tuple[str, ...] = ()
+    lang_path_deny: tuple[str, ...] = ()
+    lang_query_keys: tuple[str, ...] = ()
+
+def _as_tuple_csv(val) -> tuple[str, ...]:
+    try:
+        if isinstance(val, (list, tuple)):
+            return tuple(str(x).strip().lower() for x in val if str(x).strip())
+        if isinstance(val, str):
+            from .utils import getenv_csv  # tolerate intra-module when used elsewhere
+            parts = [x.strip().lower() for x in val.split(",")]
+            return tuple(p for p in parts if p)
+    except Exception:
+        pass
+    return ()
+
+def _get_filter_params(cfg) -> FilterParams:
+    """
+    Source filter knobs from cfg when available, otherwise from env.
+    This decouples filter logic from config.py (per refactor) while keeping BC if
+    older code still sets these on cfg.
+    Env variables honored:
+      - ALLOW_SUBDOMAINS=true|false
+      - PRIMARY_LANG= "en" or "en,us" etc.
+      - LANG_SUBDOMAIN_DENY= "fr.,de." (prefix matches)
+      - LANG_PATH_DENY= "/fr/,/de-de/"
+      - LANG_QUERY_KEYS= "lang,hl,locale"
+    """
+    # Defaults
+    allow_subdomains = True
+    primary_lang = "en"
+    lang_subdomain_deny: tuple[str, ...] = ()
+    lang_path_deny: tuple[str, ...] = ()
+    lang_query_keys: tuple[str, ...] = ()
+
+    # Try cfg first (for backward compatibility)
+    try:
+        if hasattr(cfg, "allow_subdomains"):
+            allow_subdomains = bool(getattr(cfg, "allow_subdomains"))
+    except Exception:
+        pass
+    try:
+        if getattr(cfg, "primary_lang", None):
+            primary_lang = str(getattr(cfg, "primary_lang") or "en")
+    except Exception:
+        pass
+    try:
+        if getattr(cfg, "lang_subdomain_deny", None):
+            lang_subdomain_deny = _as_tuple_csv(getattr(cfg, "lang_subdomain_deny"))
+    except Exception:
+        pass
+    try:
+        if getattr(cfg, "lang_path_deny", None):
+            lang_path_deny = _as_tuple_csv(getattr(cfg, "lang_path_deny"))
+    except Exception:
+        pass
+    try:
+        if getattr(cfg, "lang_query_keys", None):
+            lang_query_keys = _as_tuple_csv(getattr(cfg, "lang_query_keys"))
+    except Exception:
+        pass
+
+    # Fallback to env if cfg not set
+    try:
+        from .utils import getenv_bool, getenv_str, getenv_csv
+    except Exception:
+        # when utils is used as a flat module, getenv_* already defined above
+        getenv_bool = globals().get("getenv_bool")
+        getenv_str = globals().get("getenv_str")
+        getenv_csv = globals().get("getenv_csv")
+
+    if allow_subdomains is True and getenv_bool:
+        # Only override if env explicitly set (preserve cfg override otherwise)
+        try:
+            env_allow = getenv_str("ALLOW_SUBDOMAINS", "").strip().lower()
+            if env_allow in {"true","1","yes","on"}:
+                allow_subdomains = True
+            elif env_allow in {"false","0","no","off"}:
+                allow_subdomains = False
+        except Exception:
+            pass
+
+    try:
+        env_lang = getenv_str("PRIMARY_LANG", "") if getenv_str else ""
+        if env_lang:
+            primary_lang = env_lang
+    except Exception:
+        pass
+
+    # env CSVs
+    try:
+        env_sub = getenv_csv("LANG_SUBDOMAIN_DENY", "") if getenv_csv else ()
+        if env_sub:
+            lang_subdomain_deny = tuple(s.lower() for s in env_sub)
+    except Exception:
+        pass
+    try:
+        env_path = getenv_csv("LANG_PATH_DENY", "") if getenv_csv else ()
+        if env_path:
+            lang_path_deny = tuple(s.lower() for s in env_path)
+    except Exception:
+        pass
+    try:
+        env_q = getenv_csv("LANG_QUERY_KEYS", "") if getenv_csv else ()
+        if env_q:
+            lang_query_keys = tuple(s.lower() for s in env_q)
+    except Exception:
+        pass
+
+    return FilterParams(
+        allow_subdomains=allow_subdomains,
+        primary_lang=primary_lang,
+        lang_subdomain_deny=lang_subdomain_deny,
+        lang_path_deny=lang_path_deny,
+        lang_query_keys=lang_query_keys,
+    )
+
+
+# ========== Static-first rendering decision (reduce Playwright usage) ==========
+def should_render(url: str, html: str, *, js_text_threshold: int | None = None) -> bool:
+    """Return True if a JS render is *likely necessary*.
+    Heuristics:
+      - empty or near-empty visible text while JS-app signatures are present
+      - explicit 'enable javascript' messaging
+      - extremely script-heavy pages
+      - client-only hash routing (/#/)
+    The threshold defaults to env STATIC_JS_APP_TEXT_THRESHOLD or 800.
+    """
+    try:
+        if not html:
+            return True
+        lower = html.lower()
+        if "enable javascript" in lower or "requires javascript" in lower:
+            return True
+        # pick threshold
+        try:
+            if js_text_threshold is None and 'getenv_int' in globals():
+                js_text_threshold = getenv_int("STATIC_JS_APP_TEXT_THRESHOLD", 800, 200, 4000)  # type: ignore
+        except Exception:
+            pass
+        js_text_threshold = js_text_threshold or 800
+        if any(sig in lower for sig in _JS_APP_SIGNATURES):
+            if visible_text_len(html) < js_text_threshold:
+                return True
+        # script density
+        scripts = lower.count("<script")
+        if scripts > 60 and visible_text_len(html) < js_text_threshold * 0.6:
+            return True
+        # client hash routing
+        if "/#/" in url:
+            return True
+        return False
+    except Exception:
+        return False
 # ========== Uniform link filtering ==========
 
 def _trace_enabled(cfg) -> bool:
@@ -1387,6 +1667,73 @@ def _trace_enabled(cfg) -> bool:
 def _reason(counter: Counter, key: str):
     counter[key] += 1
 
+
+# --- fast URL helpers for the filtering hot path ---
+from typing import NamedTuple
+
+class _ParsedURL(NamedTuple):
+    host: str
+    path: str
+    query: str
+    scheme: str
+
+def _parse_url_fast(u: str) -> _ParsedURL:
+    pu = urlparse(u)
+    return _ParsedURL(
+        host=(pu.hostname or "").lower(),
+        path=(pu.path or "").lower(),
+        query=(pu.query or ""),
+        scheme=(pu.scheme or "").lower(),
+    )
+
+def _looks_backend_or_file_fast(parsed: _ParsedURL) -> bool:
+    path = parsed.path
+    for ext in _DENY_FILE_EXTS:
+        if path.endswith(ext):
+            return True
+    for hint in _BACKEND_ENDPOINT_HINTS:
+        if hint in path:
+            return True
+    return False
+
+def _is_producty_path(path: str) -> bool:
+    if _PRODUCT_CORE_RE.search(path):
+        return True
+    segs = [s for s in path.split("/") if s]
+    if 1 < len(segs) <= 5:
+        last = segs[-1]
+        if len(last) >= 3 and last.endswith("s") and "-" not in last and not last.isdigit():
+            return True
+    return False
+
+def _looks_non_product_fast(parsed: _ParsedURL) -> bool:
+    path = parsed.path
+    host = parsed.host
+
+    if path in ("", "/"):
+        return False
+    if _is_producty_path(path):
+        return False
+    if _TEL_PATH_RE.search(path or ""):
+        return True
+    if any(tok in host.split(".") for tok in _NON_PRODUCT_HOST_TOKENS):
+        return True
+    for frag in _NON_PRODUCT_PATH_PARTS:
+        if frag in path:
+            return True
+    if parsed.query:
+        q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        for k in _NON_PRODUCT_QUERY_KEYS:
+            if k in q:
+                return True
+
+    if any(tok in path for tok in _COOKIE_PATH_HINTS):
+        return True
+    if parsed.query:
+        q = q if 'q' in locals() else dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if any(k.lower() in _COOKIE_QUERY_KEYS for k in q):
+            return True
+    return False
 def filter_links(
     source_url: str,
     links: list[str],
@@ -1399,10 +1746,11 @@ def filter_links(
     on_keep: Optional[Callable[[str], None]] = None,
 ) -> list[str]:
     """
-    Apply same-site, language, backend/file, regex, and product heuristics.
-    Collapse "same page, different query" via canonicalization.
-    When tracing is enabled (cfg.debug_filter or SCRAPER_FILTER_TRACE=1),
-    log per-URL decisions (capped) and a final summary.
+    Optimized filtering hot path:
+      - minimize urlparse/parse_qsl, lowercase, and allocations
+      - early hard-stops (non-http, off-site, backend/file, language gates)
+      - canonical dedupe once
+    Behavior is unchanged vs the previous implementation.
     """
     out: list[str] = []
     seen_canon: set[str] = set()
@@ -1411,7 +1759,6 @@ def filter_links(
     trace = _trace_enabled(cfg)
     reasons = Counter()
     kept = 0
-    # cap verbose per-URL logs so we don't flood (per invocation)
     VERBOSE_CAP = 200
     verbose_count = 0
 
@@ -1431,95 +1778,100 @@ def filter_links(
             len(links),
         )
 
-    for u in links:
-        # baseline normalization for logging
-        canon = None
+    params = _get_filter_params(cfg)
+    allow_subdomains = params.allow_subdomains
+    extra_hosts = _collect_extra_hosts(cfg)
+    accepted_langs = _normalize_primary_lang_tags(params.primary_lang)
+    lang_subdomain_deny = set(params.lang_subdomain_deny)
+    lang_path_deny = tuple(params.lang_path_deny)
+    lang_query_keys = tuple(params.lang_query_keys)
 
-        if not is_http_url(u):
-            _reason(reasons, "skip:not-http")
+    for u in links:
+        if not u or u[:4].lower() != "http":
+            reasons["skip:not-http"] += 1
             if on_drop: on_drop(u, "not-http")
             vlog(f"DROP (not-http): {u}")
             continue
 
-        # same-site (respect subdomain policy, incl. aliases/probation via cfg.extra_same_site_hosts)
-        extra_hosts = _collect_extra_hosts(cfg)
-        if not same_site(source_url, u, cfg.allow_subdomains, extra_hosts=extra_hosts):
-            _reason(reasons, "drop:off-site")
+        if not same_site(source_url, u, allow_subdomains, extra_hosts=extra_hosts):
+            reasons["drop:off-site"] += 1
             if on_drop: on_drop(u, "off-site")
             vlog(f"DROP (off-site): {u}")
             continue
 
-        pu = urlparse(u)
-        host = (pu.hostname or "").lower()
-        path = (pu.path or "").lower()
+        p = _parse_url_fast(u)
 
-        # --- HARD language filter (English-only) ---
-        if is_non_english_url(u, getattr(cfg, "primary_lang", "en")):
-            _reason(reasons, "drop:non-english")
-            if on_drop: on_drop(u, "non-english")
-            vlog(f"DROP (non-en): {u}")
-            continue
-
-        # complementary language gates (subdomain/path/query)
-        if any(sub and host.startswith(sub.strip().lower()) for sub in cfg.lang_subdomain_deny):
-            _reason(reasons, "drop:lang-subdomain")
-            if on_drop: on_drop(u, "lang-subdomain")
-            vlog(f"DROP (lang-subdomain): {u}")
-            continue
-        if any(p and p in path for p in cfg.lang_path_deny):
-            _reason(reasons, "drop:lang-path")
-            if on_drop: on_drop(u, "lang-path")
-            vlog(f"DROP (lang-path): {u}")
-            continue
-        if pu.query:
-            q = dict(parse_qsl(pu.query, keep_blank_values=True))
-            if any(k in q for k in cfg.lang_query_keys):
-                _reason(reasons, "drop:lang-query-key")
-                if on_drop: on_drop(u, "lang-query-key")
-                vlog(f"DROP (lang-query-key): {u}")
-                continue
-
-        # backend endpoints & files (hard stop)
-        if _looks_backend_or_file(u):
-            _reason(reasons, "drop:backend-or-file")
+        if _looks_backend_or_file_fast(p):
+            reasons["drop:backend-or-file"] += 1
             if on_drop: on_drop(u, "backend-or-file")
             vlog(f"DROP (backend/file): {u}")
             continue
 
-        # --- Structure-aware productiness (brand-agnostic) ---
-        is_producty = is_producty_url(u)
+        labels = p.host.split(".")
+        if len(labels) >= 3:
+            sub = labels[0]
+            if sub != "www" and (_LANG_TAG_RE.match(sub) or len(sub) == 2):
+                if not _accepts_primary(sub, accepted_langs):
+                    reasons["drop:non-english"] += 1
+                    if on_drop: on_drop(u, "non-english")
+                    vlog(f"DROP (non-en:sub): {u}")
+                    continue
 
-        # allow/deny regex policy (SOFT allow for producty; deny overridden by producty)
-        if allow_re and not allow_re.search(u):
-            if not is_producty:
-                _reason(reasons, "drop:not-match-allow")
-                if on_drop: on_drop(u, "no-allow-match")
-                vlog(f"DROP (no allow match): {u}")
+        m = _LANG_PATH_PREFIX_RE.match(p.path)
+        if m:
+            tag = m.group("tag").lower()
+            if not _accepts_primary(tag, accepted_langs):
+                reasons["drop:non-english"] += 1
+                if on_drop: on_drop(u, "non-english")
+                vlog(f"DROP (non-en:path): {u}")
                 continue
 
-        if deny_re and deny_re.search(u):
-            if not is_producty:  # productiness overrides deny unless hard-stop (handled above)
-                _reason(reasons, "drop:match-deny")
-                if on_drop: on_drop(u, "deny-match")
-                vlog(f"DROP (deny match): {u}")
+        if lang_subdomain_deny and any(sub and p.host.startswith(sub) for sub in lang_subdomain_deny):
+            reasons["drop:lang-subdomain"] += 1
+            if on_drop: on_drop(u, "lang-subdomain")
+            vlog(f"DROP (lang-subdomain): {u}")
+            continue
+        if lang_path_deny and any(tok in p.path for tok in lang_path_deny):
+            reasons["drop:lang-path"] += 1
+            if on_drop: on_drop(u, "lang-path")
+            vlog(f"DROP (lang-path): {u}")
+            continue
+        if lang_query_keys and p.query:
+            q = dict(parse_qsl(p.query, keep_blank_values=True))
+            if any(k in q for k in lang_query_keys):
+                reasons["drop:lang-query-key"] += 1
+                if on_drop: on_drop(u, "lang-query-key")
+                vlog(f"DROP (lang-query-key): {u}")
                 continue
 
-        # product-like heuristic (after SOFT allow/deny): if product_only, drop obvious non-product
-        if product_only and looks_non_product_url(u):
-            _reason(reasons, "drop:non-product")
+        producty = _is_producty_path(p.path)
+
+        if allow_re and not allow_re.search(u) and not producty:
+            reasons["drop:not-match-allow"] += 1
+            if on_drop: on_drop(u, "no-allow-match")
+            vlog(f"DROP (no allow match): {u}")
+            continue
+
+        if deny_re and deny_re.search(u) and not producty:
+            reasons["drop:match-deny"] += 1
+            if on_drop: on_drop(u, "deny-match")
+            vlog(f"DROP (deny match): {u}")
+            continue
+
+        if product_only and _looks_non_product_fast(p):
+            reasons["drop:non-product"] += 1
             if on_drop: on_drop(u, "non-product")
             vlog(f"DROP (non-product): {u}")
             continue
 
-        # canonicalize & dedupe (collapse same page, different query)
         canon = _canonicalize_for_dedupe(u)
         if canon == source_canon:
-            _reason(reasons, "drop:self-canon")
+            reasons["drop:self-canon"] += 1
             if on_drop: on_drop(u, "self-canonical")
             vlog(f"DROP (self-canon): {u} -> {canon}")
             continue
         if canon in seen_canon:
-            _reason(reasons, "drop:dup-canon")
+            reasons["drop:dup-canon"] += 1
             if on_drop: on_drop(u, "dup-canonical")
             vlog(f"DROP (dup-canon): {u} -> {canon}")
             continue
@@ -1530,7 +1882,6 @@ def filter_links(
         if on_keep: on_keep(u)
         vlog(f"KEEP: {u} -> {canon}")
 
-    # Summary line
     if trace:
         logger.info(
             "[filter] kept=%d dropped=%d by_reason=%s",

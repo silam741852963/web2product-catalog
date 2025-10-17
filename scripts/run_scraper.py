@@ -1,8 +1,22 @@
 from __future__ import annotations
+# --- Optional event loop acceleration (uvloop) ---
+try:
+    import uvloop  # type: ignore
+    uvloop.install()
+except Exception:
+    pass
+
+# --- Checkpoint write coalescing: skip identical writes and throttle ---
+_LAST_STATE_DIGEST: dict[str, tuple[str, float]] = {}
+_LAST_CSV_CKPT_DIGEST: dict[str, tuple[str, float]] = {}
+_MIN_WRITE_INTERVAL_S = 0.75  # coalesce bursts of writes per file
+_LAST_CSV_DONE_LEN: dict[str, int] = {}
+
 
 import asyncio
 import csv
 import hashlib
+import re
 import json
 import logging
 import sys
@@ -32,14 +46,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scraper.browser import init_browser, shutdown_browser
+from scraper.browser import init_browser, shutdown_browser, maybe_render_html
 from scraper.crawler import SiteCrawler
 from scraper.config import load_config
 from scraper.utils import (
     prune_html_for_markdown, html_to_markdown, clean_markdown, save_markdown,
     TransientHTTPError, is_http_url, normalize_url, same_site,
     looks_non_product_url, is_meaningful_markdown,
-    get_base_domain, is_producty_url
+    get_base_domain, is_producty_url, detect_interstitial
 )
 
 log = logging.getLogger("scripts.run_scraper")
@@ -261,15 +275,45 @@ def _load_csv_checkpoint(checkpoints_dir: Path, csv_input: Path) -> set[str]:
     return set()
 
 
+
 def _save_csv_checkpoint(checkpoints_dir: Path, csv_input: Path, done_keys: set[str]) -> None:
     ckpt = _csv_checkpoint_path(checkpoints_dir, csv_input)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
+
+    # Skip write if count hasn't increased since last save
+    key = str(ckpt.resolve())
+    prev_len = _LAST_CSV_DONE_LEN.get(key, -1)
+    cur_len = len(done_keys)
+    if cur_len <= prev_len:
+        return
+    _LAST_CSV_DONE_LEN[key] = cur_len
+
     body = {"done": sorted(done_keys)}
+    import re as _hashlib, time as _time
+    try:
+        packed = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = _hashlib.sha1(packed.encode("utf-8")).hexdigest()
+    except Exception:
+        packed = None
+        digest = None
+
+    now = _time.time()
+    prev = _LAST_CSV_CKPT_DIGEST.get(key)
+    if digest and prev:
+        prev_digest, prev_ts = prev
+        # identical within 15 minutes → skip
+        if prev_digest == digest and (now - prev_ts) < 900:
+            return
+        if (now - prev_ts) < _MIN_WRITE_INTERVAL_S and prev_digest == digest:
+            return
 
     fd, tmp_name = tempfile.mkstemp(prefix=ckpt.stem + "_", suffix=".tmp", dir=str(ckpt.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(body, f, ensure_ascii=False, indent=2)
+            if packed is None:
+                json.dump(body, f, ensure_ascii=False, indent=2)
+            else:
+                f.write(packed)
             f.flush()
             os.fsync(f.fileno())
     except Exception:
@@ -289,6 +333,7 @@ def _save_csv_checkpoint(checkpoints_dir: Path, csv_input: Path, done_keys: set[
         for _ in range(8):
             try:
                 os.replace(tmp_name, ckpt)
+                _LAST_CSV_CKPT_DIGEST[key] = (digest or "", now)
                 return
             except PermissionError:
                 time.sleep(backoff)
@@ -307,7 +352,6 @@ def _save_csv_checkpoint(checkpoints_dir: Path, csv_input: Path, done_keys: set[
         except Exception:
             pass
         log.exception("CSV checkpoint backup move also failed for %s", ckpt)
-
 
 def _company_state_path(checkpoints_dir: Path, row: CompanyRow) -> Path:
     host = (urlparse(row.url).hostname or "unknown-host").lower()
@@ -350,12 +394,80 @@ def _load_company_state(path: Path, row: CompanyRow | None) -> dict:
 
 def _save_company_state(path: Path, state: dict) -> None:
     """
-    Robust atomic-ish write:
-      - write to a temp file in the same directory
-      - flush + fsync
-      - try os.replace with exponential backoff on Windows AV/locking
-      - never raise; log and keep a .bak if we couldn't replace
+    Robust atomic-ish write with coalescing:
+      - Avoids disk writes when state content is unchanged.
+      - Coalesces frequent writes within a short interval.
+      - Still writes atomically via temp file + os.replace.
     """
+    import os, tempfile, shutil, time, json as _json, hashlib as _hashlib
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Compute stable digest of content to skip identical writes
+    try:
+        packed = _json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest = _hashlib.sha1(packed.encode("utf-8")).hexdigest()
+    except Exception:
+        packed = None
+        digest = None
+
+    now = time.time()
+    key = str(path.resolve())
+    prev = _LAST_STATE_DIGEST.get(key)
+    if digest and prev:
+        prev_digest, prev_ts = prev
+        if prev_digest == digest and (now - prev_ts) < 900:  # identical within 5 minutes → skip
+            return
+        if (now - prev_ts) < _MIN_WRITE_INTERVAL_S and prev_digest == digest:
+            return
+
+    fd, tmp_name = tempfile.mkstemp(prefix=path.stem + "_", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            if packed is None:
+                _json.dump(state, f, ensure_ascii=False, indent=2)
+            else:
+                f.write(packed)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
+        log.exception("Failed writing temp state for %s", path)
+        return
+
+    with _state_lock(path):
+        backoff = 0.05
+        for _ in range(8):
+            try:
+                os.replace(tmp_name, path)
+                _LAST_STATE_DIGEST[key] = (digest or "", now)
+                return
+            except PermissionError:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 0.8)
+            except Exception:
+                log.exception("State replace failed for %s", path)
+                break
+
+    try:
+        bak = path.with_suffix(path.suffix + ".bak")
+        shutil.move(tmp_name, bak)
+        log.warning("State replace still failing for %s; wrote backup %s", path, bak)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
+        log.exception("State backup move also failed for %s", path)
+
+
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Use a unique temp file (not a fixed .json.tmp) to avoid races
@@ -699,12 +811,14 @@ def _render_markdown_from_html(cfg, url: str, html: str) -> str:
     return md
 
 
-async def _save_markdown_for_snaps(cfg, crawler: SiteCrawler, snaps: list, *, retried_dynamic: set[str]) -> None:
+
+
+async def _save_markdown_for_snaps(cfg, crawler: SiteCrawler, snaps: list, *, retried_dynamic: set[str], retried_interactive: set[str], state: dict) -> None:
     total = len(snaps)
     if total == 0:
         return
-    dyn_budget = int(getattr(cfg, "dynamic_retry_budget_per_pass", 8))
-    dyn_used = 0
+
+    html_min_bytes = int(getattr(cfg, "md_html_min_bytes", 2048))
 
     for idx, snap in enumerate(snaps, start=1):
         if not getattr(snap, "html_path", None):
@@ -714,40 +828,46 @@ async def _save_markdown_for_snaps(cfg, crawler: SiteCrawler, snaps: list, *, re
             continue
 
         if idx == 1 or idx % 10 == 0 or idx == total:
-            log.info("Rendering markdown for batch: %d/%d (dynamic budget remaining=%d)", idx, total, max(0, dyn_budget - dyn_used))
+            log.info("Rendering markdown for batch: %d/%d", idx, total)
 
         try:
             html = p.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             continue
 
+        # Skip tiny HTML blobs early
+        if len(html) < html_min_bytes:
+            _state_add_skips(state, [(snap.url, "html_too_small")])
+            continue
+
+        # If static looks like an interstitial, don't save; let crawler/browser handle escalation next time
+        if detect_interstitial(html):
+            _state_add_skips(state, [(snap.url, "interstitial_static")])
+            continue
+
+        # First pass markdown
         md = _render_markdown_from_html(cfg, snap.url, html)
 
-        want_dynamic_retry = (
-            bool(getattr(cfg, "enable_static_first", False)) and
-            snap.url not in retried_dynamic and
-            dyn_used < dyn_budget and
-            not is_meaningful_markdown(md,
-                                       min_chars=int(getattr(cfg, "md_min_chars", 400)),
-                                       min_words=int(getattr(cfg, "md_min_words", 80)),
-                                       min_uniq_words=int(getattr(cfg, "md_min_uniq", 50)),
-                                       min_lines=int(getattr(cfg, "md_min_lines", 8)))
-        )
+        meaningful = is_meaningful_markdown(md)
+        if not meaningful:
+            # If not meaningful: try a one-shot interactive render if we haven't already for this URL
+            if snap.url not in retried_interactive:
+                retried_interactive.add(snap.url)
+                try:
+                    rendered = await maybe_render_html(snap.url, html, context=crawler.context)
+                except Exception as e:
+                    rendered = None
+                    log.debug("Interactive render attempt failed for %s: %s", snap.url, e)
 
-        if want_dynamic_retry:
-            try:
-                dyn_snap = await crawler.fetch_dynamic_only(snap.url)
-                if dyn_snap.html_path and Path(dyn_snap.html_path).exists():
-                    html = Path(dyn_snap.html_path).read_text(encoding="utf-8", errors="ignore")
-                    md = _render_markdown_from_html(cfg, snap.url, html)
-                    retried_dynamic.add(snap.url)
-                    snap.out_links = dyn_snap.out_links
-                    snap.html_path = dyn_snap.html_path
-                    snap.title = dyn_snap.title
-                    dyn_used += 1
-                    log.info("Dynamic retry ✓ %s (now %d/%d; budget left=%d)", snap.url, idx, total, max(0, dyn_budget - dyn_used))
-            except Exception as e:
-                log.debug("Dynamic retry failed for %s: %s", snap.url, e)
+                if rendered:
+                    md2 = _render_markdown_from_html(cfg, snap.url, rendered)
+                    if is_meaningful_markdown(md2):
+                        md = md2
+                        meaningful = True
+
+        if not meaningful:
+            _state_add_skips(state, [(snap.url, "non_meaningful_markdown")])
+            continue
 
         parsed = urlparse(snap.url)
         host = (parsed.hostname or "unknown-host")
@@ -756,8 +876,6 @@ async def _save_markdown_for_snaps(cfg, crawler: SiteCrawler, snaps: list, *, re
             save_markdown(cfg.markdown_dir, host, url_path, snap.url, md)
         except Exception as e:
             log.warning("save_markdown failed for %s: %s", snap.url, e)
-
-
 def _update_state_from_snaps(state: dict, snaps: list, homepage_url: str, allow_subdomains: bool) -> None:
     visited = set(_norm(u) for u in state.get("visited", []) if u)
     pending = set(_norm(u) for u in state.get("pending", []) if u)
@@ -798,8 +916,12 @@ def _update_state_from_snaps(state: dict, snaps: list, homepage_url: str, allow_
             if same_site(home_norm, lu, allow_subdomains):
                 pending.add(lu)
 
-    state["visited"] = sorted(visited)
-    state["pending"] = sorted(pending)
+    v_sorted = sorted(visited)
+    if state.get("visited") != v_sorted:
+        state["visited"] = v_sorted
+    p_sorted = sorted(pending)
+    if state.get("pending") != p_sorted:
+        state["pending"] = p_sorted
     # company-level crawl timestamp (coarse)
     state["company_last_crawl"] = now
 
@@ -846,7 +968,9 @@ async def _drain_company(
         run_state.set_fp_window(stall_fp_window)
 
     progress = False
-    retried_dynamic: set[str] = set()
+    retried_dynamic: set[str] = set()    
+    retried_interactive: set[str] = set()
+    failed_recently: dict[str, float] = {}
 
     while state["pending"] and remaining > 0:
         # Fuse A: 401/403 count
@@ -917,17 +1041,23 @@ async def _drain_company(
 
         for seed, res in zip(seeds, results):
             if isinstance(res, Exception):
-                # keep failed seed for another pass
-                if seed not in state["pending"]:
-                    state["pending"].append(seed)
-                _save_company_state(state_path, state)
-                log.debug("Seed failed, re-queued: %s", seed)
+                now_ts = time.time()
+                hold = int(getattr(cfg, "seed_retry_cooldown_seconds", 120))
+                until = failed_recently.get(seed, 0.0)
+                if now_ts >= until:
+                    failed_recently[seed] = now_ts + hold
+                    if seed not in state["pending"]:
+                        state["pending"].append(seed)
+                    _save_company_state(state_path, state)
+                    log.debug("Seed failed, re-queued after backoff window: %s", seed)
+                else:
+                    log.debug("Seed failed but within cooldown; not re-queued: %s", seed)
                 continue
 
             snaps = res or []
             prev_visited = len(state.get("visited", []))
 
-            await _save_markdown_for_snaps(cfg, crawler, snaps, retried_dynamic=retried_dynamic)
+            await _save_markdown_for_snaps(cfg, crawler, snaps, retried_dynamic=retried_dynamic, retried_interactive=retried_interactive, state=state)
 
             _update_state_from_snaps(
                 state, snaps,
@@ -1115,74 +1245,7 @@ async def _process_company(
 
     return False
 
-# ------------- (kept for reference/back-compat; no longer used in main) -------------
-async def _process_csv(
-    cfg,
-    csv_path: Path,
-    *,
-    context,
-    allow_regex: Optional[str],
-    deny_regex: Optional[str],
-    resume: bool,
-    limit: Optional[int],
-    max_pages_per_seed: Optional[int],
-    seed_batch: int,
-    company_attempts: int,
-) -> None:
-    """
-    Legacy per-file parallelizer (retained for back-compat or focused runs).
-    The new main() uses a global queue across all files instead.
-    """
-    done = _load_csv_checkpoint(cfg.checkpoints_dir, csv_path)
-    rows_all = list(_read_rows(csv_path))
-
-    rows_all = [
-        r for r in rows_all
-        if r.url and is_http_url(r.url) and (urlparse(r.url).hostname or "").strip()
-    ]
-    if limit:
-        rows_all = rows_all[:limit]
-
-    log.info("CSV %s: loaded %d rows", csv_path.name, len(rows_all))
-    if resume:
-        rows = [r for r in rows_all if r.key not in done]
-        log.info("CSV %s: %d already complete (skipped), %d to process",
-                 csv_path.name, len(rows_all) - len(rows), len(rows))
-    else:
-        rows = rows_all
-        log.info("CSV %s: resume disabled; processing %d rows", csv_path.name, len(rows))
-
-    if not rows:
-        return
-
-    sem = asyncio.Semaphore(cfg.max_companies_parallel)
-    tasks: list[asyncio.Task] = []
-
-    async def worker(row: CompanyRow):
-        if resume and row.key in done:
-            return
-        async with sem:
-            finished = await _process_company(
-                cfg,
-                context,
-                row,
-                allow_regex=allow_regex,
-                deny_regex=deny_regex,
-                max_pages_per_seed=max_pages_per_seed,
-                seed_batch=seed_batch,
-                company_attempts=max(2, company_attempts),
-            )
-            if finished:
-                done.add(row.key)
-                _save_csv_checkpoint(cfg.checkpoints_dir, csv_path, done)
-
-    for row in rows:
-        tasks.append(asyncio.create_task(worker(row)))
-
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
 # ------------------------------------------------------------------------------------
-
 
 def _parse_args(argv: list[str]):
     import argparse
@@ -1209,14 +1272,19 @@ def _parse_args(argv: list[str]):
 async def main_async(argv: list[str] | None = None) -> None:
     args = _parse_args(argv or sys.argv[1:])
     cfg = load_config()
+    try:
+        _ = re.compile(args.allow) if args.allow else None
+        _ = re.compile(args.deny) if args.deny else None
+    except re.error as e:
+        raise SystemExit(f"Invalid regex in --allow/--deny: {e}")
 
     # -------- Optimized logging --------
     # - Daily rotation + gzip
-    # - Buffered writes flushed every 5s or on WARNING+
+    # - Buffered writes flushed every 10s or on WARNING+
     log_mgr = LogManager(
         log_path=cfg.log_file,
         level=(logging.DEBUG if args.debug else logging.INFO),
-        flush_interval_s=5,          # periodic batch flush
+        flush_interval_s=10,          # periodic batch flush
         memory_capacity=4000,        # buffer size before forced flush (also flushes on WARNING+)
         console_level=(logging.INFO if args.debug else logging.WARNING),
         rotation_when="midnight",
@@ -1238,61 +1306,42 @@ async def main_async(argv: list[str] | None = None) -> None:
 
     log.info("Discovered %d input file(s). Example: %s", len(files), files[0])
 
-    # Quick sample count (best-effort)
-    total_rows = 0
-    for pth in files[:5]:
-        try:
-            total_rows += sum(1 for _ in _read_rows(pth))
-        except Exception:
-            pass
-    log.info("Sampling shows at least ~%d rows in first %d file(s).", total_rows, min(5, len(files)))
 
     # -------- Global Work Queue across all files --------
-    # 1) Preload per-file done sets and candidate rows (respect --limit per file)
-    per_file_done: Dict[Path, Set[str]] = {}
-    per_file_rows: Dict[Path, list[CompanyRow]] = {}
-    total_enqueued = 0
-
+    # Stream rows directly into a single queue to keep memory bounded.
     resume = not args.no_resume
-
+    per_file_done: Dict[Path, Set[str]] = {}
+    last_done_count: Dict[Path, int] = {}
+    work_q: asyncio.Queue[Tuple[Path, CompanyRow] | None] = asyncio.Queue()
+    total_enqueued = 0
+    
     for csv_path in files:
         done = _load_csv_checkpoint(cfg.checkpoints_dir, csv_path)
         per_file_done[csv_path] = done
-
-        rows_all = [
-            r for r in _read_rows(csv_path)
-            if r.url and is_http_url(r.url) and (urlparse(r.url).hostname or "").strip()
-        ]
-        if args.limit:
-            rows_all = rows_all[:args.limit]
-
-        if resume:
-            rows = [r for r in rows_all if r.key not in done]
-            log.info("CSV %s: %d already complete (skipped), %d to process",
-                     csv_path.name, len(rows_all) - len(rows), len(rows))
-        else:
-            rows = rows_all
-            log.info("CSV %s: resume disabled; processing %d rows", csv_path.name, len(rows))
-
-        per_file_rows[csv_path] = rows
-        total_enqueued += len(rows)
-
+        last_done_count[csv_path] = len(done)
+        pushed = 0
+        for row in _read_rows(csv_path):
+            if not (row.url and is_http_url(row.url) and (urlparse(row.url).hostname or "").strip()):
+                continue
+            if resume and row.key in done:
+                continue
+            if args.limit and pushed >= args.limit:
+                break
+            work_q.put_nowait((csv_path, row))
+            pushed += 1
+            total_enqueued += 1
+        log.info("CSV %s: queued %d company(ies) (resume=%s)", csv_path.name, pushed, bool(resume))
+    
     if total_enqueued == 0:
         log.info("Nothing to do — all companies already completed across %d file(s).", len(files))
         log_mgr.shutdown()
         return
-
-    # 2) Build the global queue of (csv_path, CompanyRow)
-    work_q: asyncio.Queue[Tuple[Path, CompanyRow] | None] = asyncio.Queue()
-    for csv_path, rows in per_file_rows.items():
-        for row in rows:
-            work_q.put_nowait((csv_path, row))
-
+    
     log.info("Global queue initialized with %d companies from %d file(s).", total_enqueued, len(files))
-
+    
     # 3) Spin up cfg.max_companies_parallel workers that pull any row
     pw, browser, context = await init_browser(cfg)
-
+    
     # -------- Pressure-aware throttling --------
     concurrency = max(1, int(getattr(cfg, "max_companies_parallel", 6)))
     throttle_sem = asyncio.Semaphore(concurrency)
@@ -1313,10 +1362,10 @@ async def main_async(argv: list[str] | None = None) -> None:
 
     nearcap_streak = 0
     max_pages_cap = int(getattr(cfg, "max_global_pages_open", 256))
-    nearcap_threshold = max(1, int(max_pages_cap * 0.95))
+    nearcap_threshold = max(1, int(max_pages_cap * 0.98))
 
     monitor_interval = max(30, int(getattr(cfg, "watchdog_interval_seconds", 30)))
-    idle_hold_seconds = monitor_interval  # how long to idle some workers
+    idle_hold_seconds = monitor_interval // 2  # shorter idle
 
     idling_task: Optional[asyncio.Task] = None
 
@@ -1343,7 +1392,7 @@ async def main_async(argv: list[str] | None = None) -> None:
                 if nearcap_streak >= 3 and idling_task is None:
                     idle_n = max(1, concurrency // 4)
                     log.warning(
-                        "High pressure: %d pages ≥ %d (95%% cap). Idling %d worker(s) for %ds.",
+                        "High pressure: %d pages ≥ %d (~%.0f%% cap). Idling %d worker(s) for %ds.",
                         pages_now, nearcap_threshold, idle_n, idle_hold_seconds
                     )
 
@@ -1398,7 +1447,9 @@ async def main_async(argv: list[str] | None = None) -> None:
                             )
                         if finished:
                             per_file_done[csv_path].add(row.key)
-                            _save_csv_checkpoint(cfg.checkpoints_dir, csv_path, per_file_done[csv_path])
+                            if len(per_file_done[csv_path]) > last_done_count[csv_path]:
+                                last_done_count[csv_path] = len(per_file_done[csv_path])
+                                _save_csv_checkpoint(cfg.checkpoints_dir, csv_path, per_file_done[csv_path])
                     except Exception:
                         log.exception("Worker %d: unhandled error while processing %s (%s)", wid, row.company_name, row.url)
                     finally:
@@ -1434,7 +1485,6 @@ async def main_async(argv: list[str] | None = None) -> None:
         await shutdown_browser(pw, browser, context)
         # Ensure all logs are flushed & files closed
         log_mgr.shutdown()
-
 
 def main() -> None:
     asyncio.run(main_async())

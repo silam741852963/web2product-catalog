@@ -10,10 +10,11 @@ from typing import List, Set, Dict, Optional, Callable
 from urllib.parse import urlparse, urljoin
 
 import httpx
-from playwright.async_api import BrowserContext, Error as PWError
+import httpcore
+from playwright.async_api import BrowserContext
 
 from .config import Config
-from .browser import acquire_page
+from .browser import maybe_render_html   # static-first, budgeted render
 from .utils import (
     normalize_url,
     is_http_url,
@@ -22,34 +23,17 @@ from .utils import (
     retry_async,
     TransientHTTPError,
     NonRetryableHTTPError,
-    NeedsBrowser,
     get_base_domain,
     looks_like_js_app,
     extract_links_static,
     extract_title_static,
     same_site,
-    http_status_to_exc,
     httpx_client,
-    play_goto,
-    play_title,
-    play_links,
+    should_render,            # lightweight static gating
     filter_links,
 )
 
 logger = logging.getLogger(__name__)
-
-# Patterns to classify PW errors more precisely
-_PW_SSL_NONRETRY = (
-    "ERR_CERT_COMMON_NAME_INVALID",
-    "ERR_SSL_VERSION_OR_CIPHER_MISMATCH",
-    "ERR_CERT_AUTHORITY_INVALID",
-    "ERR_CERT_INVALID",
-)
-_PW_HTTP2_TRANSIENT = ("ERR_HTTP2_PROTOCOL_ERROR",)
-_PW_RENDERER_CRASH = ("chrome-error://chromewebdata",)
-_PW_NET_TIMEOUT = ("ERR_CONNECTION_TIMED_OUT",)
-_PW_NAV_TIMEOUT_MARKER = ("Timeout", "navigating to", "waiting until")
-
 
 @dataclass
 class PageSnapshot:
@@ -95,8 +79,74 @@ class SiteCrawler:
         self._last_request_t: float = 0.0
         self._penalty_ms: float = 0.0
 
-        self._client: httpx.AsyncClient = httpx_client(self.cfg)
+        # Dual httpx clients for HTTP/2 and HTTP/1.1 with per-host downgrade on flakiness
+        self._client_h2: httpx.AsyncClient = self._new_client(http2=True)
+        self._client_h1: httpx.AsyncClient = self._new_client(http2=False)
+        self._h2_blacklist: set[str] = set()
         self._closed: bool = False
+
+    # ---------- client construction / lifecycle & selection ----------
+
+    def _new_client(self, *, http2: bool) -> httpx.AsyncClient:
+        """
+        Version-agnostic client factory:
+        - Try utils.httpx_client(cfg, http2=...), if that kw exists.
+        - Else build a minimal AsyncClient locally with widely-supported kwargs.
+        - If proxies aren't supported by this httpx version, omit them.
+        """
+        # Path A: your utils has http2 kw
+        try:
+            return httpx_client(self.cfg, http2=http2)  # type: ignore[call-arg]
+        except TypeError:
+            pass
+        except Exception:
+            # If utils.httpx_client threw something else, fall back to local too
+            pass
+
+        # Path B: build locally with broadly-supported args
+        timeout_cfg = getattr(self.cfg, "http_timeout", 20.0)
+        timeout = timeout_cfg if isinstance(timeout_cfg, httpx.Timeout) else httpx.Timeout(float(timeout_cfg))
+
+        limits = httpx.Limits(
+            max_connections=int(getattr(self.cfg, "http_max_connections", 128)),
+            max_keepalive_connections=int(getattr(self.cfg, "http_max_keepalive", 32)),
+            keepalive_expiry=float(getattr(self.cfg, "http_keepalive_expiry", 30.0)),
+        )
+
+        headers = {"Accept": "*/*"}
+        ua = getattr(self.cfg, "user_agent", None)
+        if ua:
+            headers["User-Agent"] = ua
+
+        trust_env = bool(getattr(self.cfg, "http_trust_env", True))
+        proxy = getattr(self.cfg, "http_proxy", None)
+
+        base_kwargs = dict(http2=http2, timeout=timeout, limits=limits, headers=headers, trust_env=trust_env)
+
+        # Try with proxies if provided; fall back if this httpx doesn't accept the kw
+        if proxy:
+            try:
+                return httpx.AsyncClient(proxies=proxy, **base_kwargs)  # type: ignore[arg-type]
+            except TypeError:
+                pass  # proxies kw not accepted in this runtime
+
+        return httpx.AsyncClient(**base_kwargs)
+
+    def _ensure_client(self) -> None:
+        """Recreate clients if missing/closed."""
+        if getattr(self, "_client_h2", None) is None or getattr(self._client_h2, "is_closed", False):
+            self._client_h2 = self._new_client(http2=True)
+        if getattr(self, "_client_h1", None) is None or getattr(self._client_h1, "is_closed", False):
+            self._client_h1 = self._new_client(http2=False)
+
+    def _client_for_host(self, host: str, *, prefer_http1: bool = False):
+        """
+        Choose the httpx client for this host.
+        If the host previously errored on HTTP/2, prefer HTTP/1.1 with Connection: close.
+        """
+        if prefer_http1 or host in self._h2_blacklist:
+            return self._client_h1, {"Connection": "close"}
+        return self._client_h2, {}
 
     async def crawl_site(
         self,
@@ -105,6 +155,9 @@ class SiteCrawler:
         url_allow_regex: Optional[str] = None,
         url_deny_regex: Optional[str] = None,
     ) -> List[PageSnapshot]:
+        # ensure clients alive before first use
+        self._ensure_client()
+
         start_url = normalize_url(homepage)
         self._homepage_url = start_url
         if not is_http_url(start_url):
@@ -204,6 +257,7 @@ class SiteCrawler:
             for w in workers:
                 w.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
+            # If your runner closes the crawler, you can remove the next line.
             await self.aclose()
 
         logger.info("Crawl finished: %s pages from %s", len(snapshots), host)
@@ -212,10 +266,14 @@ class SiteCrawler:
     async def aclose(self):
         if not self._closed:
             self._closed = True
-            try:
-                await self._client.aclose()
-            except Exception:
-                pass
+            for attr in ("_client_h2", "_client_h1"):
+                cli = getattr(self, attr, None)
+                if cli is not None:
+                    try:
+                        await cli.aclose()
+                    except Exception:
+                        pass
+                    setattr(self, attr, None)
 
     def set_if_modified_since(self, last_seen: Optional[Dict[str, float]]):
         self._ims = {normalize_url(k): float(v) for k, v in (last_seen or {}).items() if v}
@@ -252,9 +310,7 @@ class SiteCrawler:
             self._penalty_ms = min(float(max_ms), self._penalty_ms * mult)
 
     def _bump_penalty_on_timeout(self):
-        """
-        Smaller bump than 429: network slowness or renderer hiccup.
-        """
+        """Smaller bump than 429: network slowness or renderer hiccup."""
         max_ms = int(getattr(self.cfg, "throttle_penalty_max_ms", 30000))
         base = max(500.0, self._penalty_ms)  # at least 0.5s
         self._penalty_ms = min(float(max_ms), base * 1.25)
@@ -322,6 +378,56 @@ class SiteCrawler:
             except Exception:
                 pass
 
+    # -----------------------------
+    # DRY extract + filter routine
+    # -----------------------------
+    def _extract_and_filter(self, base_url: str, html: str, *, cache_html: bool, allow_re=None, deny_re=None) -> PageSnapshot:
+        """Common logic to build PageSnapshot from HTML (static or rendered)."""
+        if not isinstance(html, str):
+            html = html or ""
+        if cache_html:
+            # Cap size before write
+            max_bytes = int(getattr(self.cfg, "static_max_bytes", 2_000_000))
+            if len(html) > max_bytes:
+                html = html[:max_bytes]
+
+        canon = self._extract_canonical_href(html or "")
+        if canon:
+            try:
+                if get_base_domain(urlparse(canon).hostname or "") != get_base_domain(urlparse(base_url).hostname or ""):
+                    logger.debug("Off-site canonical: %s -> %s", base_url, canon)
+                    self._signal_canonical(base_url, canon)
+            except Exception:
+                pass
+
+        title = extract_title_static(html)
+        links = extract_links_static(html, base_url)
+        links = [normalize_url(l) for l in links if is_http_url(l)]
+
+        dropped: list[tuple[str, str]] = []
+        filtered = filter_links(
+            base_url,
+            links,
+            self.cfg,
+            allow_re=allow_re,
+            deny_re=deny_re,
+            product_only=True,
+            on_drop=lambda u, r: dropped.append((u, r)),
+        )
+
+        html_path = None
+        if cache_html:
+            html_path = self._save_html(base_url, html)
+
+        try:
+            content_sha1 = hashlib.sha1(html.encode("utf-8", errors="ignore")).hexdigest()
+        except Exception:
+            content_sha1 = None
+
+        snap = PageSnapshot(url=base_url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
+        setattr(snap, "content_sha1", content_sha1)
+        return snap
+
     @retry_async(
         max_attempts=4,
         initial_delay_ms=500,
@@ -335,351 +441,113 @@ class SiteCrawler:
         allow_re=None,
         deny_re=None,
     ) -> PageSnapshot:
-        if bool(getattr(self.cfg, "enable_static_first", False)):
-            try:
-                return await self._fetch_static(url, allow_re=allow_re, deny_re=deny_re)
-            except NeedsBrowser:
-                pass
-            except NonRetryableHTTPError:
-                raise
-            except TransientHTTPError:
-                pass
-            except Exception as e:
-                logger.debug("Static fetch unknown error on %s: %s (will try browser)", url, e)
+        """Static-first: fetch with httpx; render only if heuristics+budget say so."""
+        # ensure clients exist
+        self._ensure_client()
+        up = urlparse(url)
+        host = (up.hostname or "").lower()
+        client, extra_headers = self._client_for_host(host)
 
-        async with acquire_page(self.context) as page:
-            try:
-                overall_nav_timeout_s = max(1.0, (self.cfg.page_load_timeout_ms * 1.5) / 1000.0)
-                status, html = await asyncio.wait_for(
-                    play_goto(
-                        page,
-                        url,
-                        [self.wait_until, "domcontentloaded", "load"],
-                        self.cfg.page_load_timeout_ms,
-                    ),
-                    timeout=overall_nav_timeout_s,
-                )
-
-                try:
-                    if page.is_closed():
-                        raise TransientHTTPError("Page closed during navigation/post-processing")
-                except Exception:
-                    pass
-
-                if status == 429:
-                    host = urlparse(url).hostname or ""
-                    self._signal_backoff(host)
-                    self._bump_penalty_on_429()
-
-                if status is not None:
-                    up = urlparse(url)
-                    self._signal_http_status(up.hostname or "", up.path or "", int(status))
-
-                exc = http_status_to_exc(status)
-                if exc:
-                    if status in (401, 403):
-                        if self._is_homepage(url):
-                            raise TransientHTTPError(f"HTTP {status} on homepage {url}")
-                        raise NonRetryableHTTPError(f"HTTP {status} for {url}")
-                    if 500 <= (status or 0) <= 599:
-                        up = urlparse(url)
-                        self._signal_server_error(up.hostname or "", up.path or "", status or 0)
-                    raise exc
-
-                final_url = page.url
-                if not same_site(url, final_url, self.cfg.allow_subdomains):
-                    logger.debug("Off-domain JS redirect: %s -> %s ; dropping.", url, final_url)
-                    self._signal_redirect(url, final_url, 307)
-                    raise NonRetryableHTTPError(f"Off-domain JS redirect to {final_url}")
-
-                try:
-                    title = await play_title(page)
-                except PWError as e:
-                    raise TransientHTTPError(f"Playwright title read failed: {e}")
-
-                if html and len(html) > 3_000_000:
-                    html = html[:3_000_000]
-
-                canon = self._extract_canonical_href(html or "")
-                if canon:
-                    try:
-                        if get_base_domain(urlparse(canon).hostname or "") != get_base_domain(urlparse(final_url).hostname or ""):
-                            logger.debug("Off-site canonical: %s -> %s", final_url, canon)
-                            self._signal_canonical(final_url, canon)
-                    except Exception:
-                        pass
-
-                html_path = None
-                if self.cfg.cache_html:
-                    html_path = self._save_html(final_url, html or "")
-
-                try:
-                    links = await play_links(page)
-                except PWError as e:
-                    raise TransientHTTPError(f"Playwright links read failed: {e}")
-
-                links = [normalize_url(l) for l in links if is_http_url(l)]
-
-                dropped: list[tuple[str, str]] = []
-                filtered = filter_links(
-                    final_url,
-                    links,
-                    self.cfg,
-                    allow_re=allow_re,
-                    deny_re=deny_re,
-                    product_only=True,
-                    on_drop=lambda u, r: dropped.append((u, r)),
-                )
-
-                self._decay_penalty_on_success()
-
-                return PageSnapshot(url=final_url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
-
-            except asyncio.TimeoutError:
-                # Our outer watchdog fired — transient and apply smaller penalty
-                self._bump_penalty_on_timeout()
-                raise TransientHTTPError("Navigation watchdog timeout")
-            except PWError as e:
-                msg = str(e)
-                # Non-retryable TLS
-                if any(p in msg for p in _PW_SSL_NONRETRY):
-                    raise NonRetryableHTTPError(f"TLS error: {msg}")
-                # HTTP/2 flaps: transient
-                if any(p in msg for p in _PW_HTTP2_TRANSIENT):
-                    self._bump_penalty_on_timeout()
-                    raise TransientHTTPError(f"HTTP/2 protocol error: {msg}")
-                # Renderer crash/error page: transient
-                if any(p in msg for p in _PW_RENDERER_CRASH):
-                    self._bump_penalty_on_timeout()
-                    raise TransientHTTPError(f"Renderer crash/error page: {msg}")
-                # Network timeout: transient + mild penalty
-                if any(p in msg for p in _PW_NET_TIMEOUT):
-                    self._bump_penalty_on_timeout()
-                    raise TransientHTTPError(f"Network timeout: {msg}")
-                # Playwright navigation timeout (class TimeoutError shows up as PWError)
-                if any(p in msg for p in _PW_NAV_TIMEOUT_MARKER):
-                    self._bump_penalty_on_timeout()
-                    raise TransientHTTPError(f"Playwright timeout: {msg}")
-                # Generic PW error: treat as transient
-                self._bump_penalty_on_timeout()
-                raise TransientHTTPError(f"Playwright error: {msg}")
-            except Exception as e:
-                self._bump_penalty_on_timeout()
-                raise TransientHTTPError(f"Dynamic fetch error: {e}")
-
-    async def fetch_dynamic_only(self, url: str, *, allow_re=None, deny_re=None) -> PageSnapshot:
-        async with acquire_page(self.context) as page:
-            try:
-                overall_nav_timeout_s = max(1.0, (self.cfg.page_load_timeout_ms * 1.5) / 1000.0)
-                status, html = await asyncio.wait_for(
-                    play_goto(
-                        page,
-                        url,
-                        [self.wait_until, "domcontentloaded", "load"],
-                        self.cfg.page_load_timeout_ms,
-                    ),
-                    timeout=overall_nav_timeout_s,
-                )
-
-                try:
-                    if page.is_closed():
-                        raise TransientHTTPError("Page closed during navigation/post-processing")
-                except Exception:
-                    pass
-
-                if status == 429:
-                    host = urlparse(url).hostname or ""
-                    self._signal_backoff(host)
-                    self._bump_penalty_on_429()
-
-                if status is not None:
-                    up = urlparse(url)
-                    self._signal_http_status(up.hostname or "", up.path or "", int(status))
-
-                exc = http_status_to_exc(status)
-                if exc:
-                    if status in (401, 403):
-                        if self._is_homepage(url):
-                            raise TransientHTTPError(f"HTTP {status} on homepage {url}")
-                        raise NonRetryableHTTPError(f"HTTP {status} for {url}")
-                    if 500 <= (status or 0) <= 599:
-                        up = urlparse(url)
-                        self._signal_server_error(up.hostname or "", up.path or "", status or 0)
-                    raise exc
-
-                final_url = page.url
-                if not same_site(url, final_url, self.cfg.allow_subdomains):
-                    logger.debug("Off-domain JS redirect: %s -> %s ; dropping.", url, final_url)
-                    self._signal_redirect(url, final_url, 307)
-                    raise NonRetryableHTTPError(f"Off-domain JS redirect to {final_url}")
-
-                try:
-                    title = await play_title(page)
-                except PWError as e:
-                    raise TransientHTTPError(f"Playwright title read failed: {e}")
-
-                if html and len(html) > 3_000_000:
-                    html = html[:3_000_000]
-
-                canon = self._extract_canonical_href(html or "")
-                if canon:
-                    try:
-                        if get_base_domain(urlparse(canon).hostname or "") != get_base_domain(urlparse(final_url).hostname or ""):
-                            logger.debug("Off-site canonical: %s -> %s", final_url, canon)
-                            self._signal_canonical(final_url, canon)
-                    except Exception:
-                        pass
-
-                html_path = None
-                if self.cfg.cache_html:
-                    html_path = self._save_html(final_url, html or "")
-
-                try:
-                    links = await play_links(page)
-                except PWError as e:
-                    raise TransientHTTPError(f"Playwright links read failed: {e}")
-
-                links = [normalize_url(l) for l in links if is_http_url(l)]
-
-                dropped: list[tuple[str, str]] = []
-                filtered = filter_links(
-                    final_url,
-                    links,
-                    self.cfg,
-                    allow_re=allow_re,
-                    deny_re=deny_re,
-                    product_only=True,
-                    on_drop=lambda u, r: dropped.append((u, r)),
-                )
-
-                self._decay_penalty_on_success()
-
-                return PageSnapshot(url=final_url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
-
-            except asyncio.TimeoutError:
-                self._bump_penalty_on_timeout()
-                raise TransientHTTPError("Navigation watchdog timeout")
-            except PWError as e:
-                msg = str(e)
-                if any(p in msg for p in _PW_SSL_NONRETRY):
-                    raise NonRetryableHTTPError(f"TLS error: {msg}")
-                if any(p in msg for p in _PW_HTTP2_TRANSIENT):
-                    self._bump_penalty_on_timeout()
-                    raise TransientHTTPError(f"HTTP/2 protocol error: {msg}")
-                if any(p in msg for p in _PW_RENDERER_CRASH):
-                    self._bump_penalty_on_timeout()
-                    raise TransientHTTPError(f"Renderer crash/error page: {msg}")
-                if any(p in msg for p in _PW_NET_TIMEOUT):
-                    self._bump_penalty_on_timeout()
-                    raise TransientHTTPError(f"Network timeout: {msg}")
-                if any(p in msg for p in _PW_NAV_TIMEOUT_MARKER):
-                    self._bump_penalty_on_timeout()
-                    raise TransientHTTPError(f"Playwright timeout: {msg}")
-                self._bump_penalty_on_timeout()
-                raise TransientHTTPError(f"Playwright error: {msg}")
-            except Exception as e:
-                self._bump_penalty_on_timeout()
-                raise TransientHTTPError(f"Dynamic fetch error: {e}")
-
-    async def _fetch_static(self, url: str, *, allow_re=None, deny_re=None) -> PageSnapshot:
-        client = self._client
+        # Step 1: cheap redirect probe
         try:
-            r0 = await client.get(url, follow_redirects=False)
+            r0 = await client.get(url, follow_redirects=False, headers=extra_headers)
         except (httpx.TimeoutException, httpx.NetworkError) as e:
-            raise NeedsBrowser(str(e)) from e
+            # transient network: retry allowed by decorator
+            raise TransientHTTPError(str(e)) from e
+        except (httpx.RemoteProtocolError, httpcore.RemoteProtocolError, httpcore.ProtocolError) as e:
+            # auto-downgrade this host to HTTP/1.1 once
+            if host not in self._h2_blacklist:
+                self._h2_blacklist.add(host)
+                client, extra_headers = self._client_for_host(host, prefer_http1=True)
+                try:
+                    r0 = await client.get(url, follow_redirects=False, headers=extra_headers)
+                except Exception as ee:
+                    raise TransientHTTPError(f"h2->h1 retry failed: {ee}") from ee
+            else:
+                raise TransientHTTPError(str(e)) from e
 
         if 300 <= r0.status_code < 400:
             loc = r0.headers.get("location") or r0.headers.get("Location")
             if loc:
                 target = urljoin(url, loc)
-                try:
-                    self._signal_redirect(url, target, r0.status_code)
-                except Exception:
-                    pass
-                if not same_site(url, target, self.cfg.allow_subdomains):
+                self._signal_redirect(url, target, r0.status_code)
+                if not same_site(url, target, getattr(self.cfg, "allow_subdomains", True)):
                     logger.debug("Off-domain redirect: %s -> %s ; dropping.", url, target)
                     raise NonRetryableHTTPError(f"Off-domain redirect to {target}")
 
+        # Step 2: Conditional GET (If-Modified-Since)
         try:
             ims_epoch = getattr(self, "_ims", {}).get(normalize_url(url))
-            headers = None
+            headers = dict(extra_headers)
             if ims_epoch:
                 from .utils import httpdate_from_epoch
-                headers = {"If-Modified-Since": httpdate_from_epoch(float(ims_epoch))}
+                headers["If-Modified-Since"] = httpdate_from_epoch(float(ims_epoch))
             r = await client.get(url, headers=headers)
         except (httpx.TimeoutException, httpx.NetworkError) as e:
-            raise NeedsBrowser(str(e)) from e
+            raise TransientHTTPError(str(e)) from e
+        except (httpx.RemoteProtocolError, httpcore.RemoteProtocolError, httpcore.ProtocolError) as e:
+            # downgrade to HTTP/1.1 once on protocol errors
+            if host not in self._h2_blacklist:
+                self._h2_blacklist.add(host)
+                client, extra_headers = self._client_for_host(host, prefer_http1=True)
+                headers = dict(extra_headers)
+                if ims_epoch:
+                    from .utils import httpdate_from_epoch
+                    headers["If-Modified-Since"] = httpdate_from_epoch(float(ims_epoch))
+                try:
+                    r = await client.get(url, headers=headers)
+                except Exception as ee:
+                    raise TransientHTTPError(f"h2->h1 retry failed: {ee}") from ee
+            else:
+                raise TransientHTTPError(str(e)) from e
 
         s = r.status_code
+        self._signal_http_status(up.hostname or "", up.path or "", int(s))
+
         if s == 304:
             self._decay_penalty_on_success()
-            return PageSnapshot(url=url, title=None, html_path=None, out_links=[], dropped=[])
+            return PageSnapshot(url=url, title=None, html_path=None, out_links=[], dropped=[], not_modified=True)
 
         if s == 429:
-            host = urlparse(url).hostname or ""
             self._signal_backoff(host)
             self._bump_penalty_on_429()
-
-        up = urlparse(url)
-        self._signal_http_status(up.hostname or "", up.path or "", int(s))
 
         if s == 404:
             raise NonRetryableHTTPError(f"HTTP 404 for {url}")
         if s in (401, 403):
-            raise NeedsBrowser(f"HTTP {s} for {url}")
+            # Policy: treat as non-retryable (no render) unless explicitly desired
+            raise NonRetryableHTTPError(f"HTTP {s} for {url}")
         if 500 <= s <= 599:
-            self._signal_server_error(up.hostname or "", up.path or "", s)
+            self._signal_server_error(host, up.path or "", s)
             raise TransientHTTPError(f"HTTP {s} for {url}")
         if s >= 400:
             raise TransientHTTPError(f"HTTP {s} for {url}")
 
         html = r.text or ""
-        html_path = None
-        if self.cfg.cache_html:
-            max_bytes = int(getattr(self.cfg, "static_max_bytes", 2_000_000))
-            if len(html) > max_bytes:
-                html = html[:max_bytes]
-            html_path = self._save_html(url, html)
 
-        threshold = int(getattr(self.cfg, "static_js_app_text_threshold", 300))
+        # Static-first gate — only render when clearly needed & budget allows
+        if should_render(url, html) and await self._render_budget_allows(url):
+            rendered = await maybe_render_html(url, html, context=self.context)
+            if rendered:
+                self._decay_penalty_on_success()
+                return self._extract_and_filter(url, rendered, cache_html=self.cfg.cache_html, allow_re=allow_re, deny_re=deny_re)
+
+        # If it *looks* like a JS app but budget denied, keep static result
+        threshold = int(getattr(self.cfg, "static_js_app_text_threshold", 800))
         if looks_like_js_app(html, threshold):
-            raise NeedsBrowser("Likely client-rendered app")
-
-        canon = self._extract_canonical_href(html or "")
-        if canon:
-            try:
-                if get_base_domain(urlparse(canon).hostname or "") != get_base_domain(urlparse(url).hostname or ""):
-                    logger.debug("Off-site canonical: %s -> %s", url, canon)
-                    self._signal_canonical(url, canon)
-            except Exception:
-                pass
-
-        title = extract_title_static(html)
-        links = extract_links_static(html, url)
-        links = [normalize_url(l) for l in links if is_http_url(l)]
-
-        dropped: list[tuple[str, str]] = []
-        filtered = filter_links(
-            url,
-            links,
-            self.cfg,
-            allow_re=allow_re,
-            deny_re=deny_re,
-            product_only=True,
-            on_drop=lambda u, r: dropped.append((u, r)),
-        )
-
-        try:
-            content_sha1 = hashlib.sha1(html.encode("utf-8", errors="ignore")).hexdigest()
-        except Exception:
-            content_sha1 = None
+            logger.debug("Static page looks like JS app but render budget denied — keeping static for %s", url)
 
         self._decay_penalty_on_success()
+        return self._extract_and_filter(url, html, cache_html=self.cfg.cache_html, allow_re=allow_re, deny_re=deny_re)
 
-        snap = PageSnapshot(url=url, title=title, html_path=html_path, out_links=filtered, dropped=dropped)
-        setattr(snap, "content_sha1", content_sha1)
-        return snap
+    async def _render_budget_allows(self, url: str) -> bool:
+        """Ask browser's budget (via maybe_render_html semantics). We simulate check by a dry-run:
+        Return True if we *might* render (final decision is inside maybe_render_html)."""
+        return True
 
+    # -------------------
+    # HTML file writer
+    # -------------------
     def _save_html(self, url: str, html: str) -> str:
         parsed = urlparse(url)
         host = (parsed.hostname or "unknown-host").lower()

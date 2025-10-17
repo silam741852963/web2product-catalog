@@ -1,15 +1,17 @@
+
 from __future__ import annotations
 
 import asyncio
 import sys
 import time
 import logging
+import re
 from contextlib import asynccontextmanager
-from typing import Tuple, Optional, Deque, Any
-from collections import deque
+from typing import Tuple, Optional, Deque, Any, Dict
+from collections import deque, defaultdict
 from urllib.parse import urlparse
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright, Page
+from playwright.async_api import async_playwright, Browser, BrowserContext, Playwright, Page, Error as PWError
 
 from .config import Config
 from .utils import (
@@ -18,6 +20,8 @@ from .utils import (
     parse_retry_after_header,
     try_close_page,
     PageContext,
+    should_render,
+    getenv_int, getenv_float, getenv_str,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +45,9 @@ _ACTIVE: dict[str, Any] = {
     "recycle_event": None,
     "watchdog_task": None,
     "loop_old_ex_handler": None,
+    # render budgeting
+    "render_sem": None,
+    "render_state": None,
 }
 
 # Benign/expected aborts + site TLS/H2/network quirks we don't want to spam logs for
@@ -82,6 +89,18 @@ def _browser_args(cfg: Config) -> list[str]:
         "--no-sandbox",
         "--disable-features=IsolateOrigins,site-per-process",
         "--headless=new",
+        # keep renderer light
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--mute-audio",
+        "--no-default-browser-check",
+        "--no-first-run",
+        "--disable-client-side-phishing-detection",
+        "--disable-default-apps",
+        "--disable-features=TranslateUI",
     ]
     if disable_h2:
         args.append("--disable-http2")
@@ -129,9 +148,7 @@ def _install_loop_exception_silencer() -> None:
             pass
 
         # Class- or message-based silence
-        if (text and any(p in text for p in _SILENCE_PATTERNS)) \
-           or (cls_name in ("TargetClosedError",)) \
-           or (cls_name in ("TimeoutError",) and text and any(p in text for p in _SILENCE_IF_TIMEOUT_CONTAINS)):
+        if (text and any(p in text for p in _SILENCE_PATTERNS))             or (cls_name in ("TargetClosedError",))             or (cls_name in ("TimeoutError",) and text and any(p in text for p in _SILENCE_IF_TIMEOUT_CONTAINS)):
             logger.debug("Suppressed loop exception: %s", text or cls_name)
             return
 
@@ -201,6 +218,9 @@ async def init_browser(cfg: Config) -> Tuple[Playwright, Browser, BrowserContext
         "recycling": False,
         "recycle_event": asyncio.Event(),
         "watchdog_task": None,
+        # modest render concurrency (further caps usage)
+        "render_sem": asyncio.Semaphore(getenv_int("RENDER_MAX_CONCURRENT", 4, 1, 32)),
+        "render_state": defaultdict(lambda: {"pages_seen": 0, "renders_used": 0}),
     })
     _ACTIVE["recycle_event"].set()
 
@@ -604,6 +624,219 @@ async def _watchdog_loop() -> None:
             logger.debug("Watchdog loop error: %s", e)
 
 
+# ---------------------------
+# Static-first rendering API
+# ---------------------------
+
+def _render_cfg() -> dict:
+    return {
+        "budget_pct": getenv_float("RENDER_BUDGET_PCT", 0.05),
+        "budget_min": getenv_int("RENDER_BUDGET_MIN", 8, 0, 10_000),
+        "max_concurrent": getenv_int("RENDER_MAX_CONCURRENT", 4, 1, 64),
+        "idle_ms": getenv_int("RENDER_NETWORK_IDLE_MS", 1200, 200, 10_000),
+        "max_time_ms": getenv_int("RENDER_MAX_TIME_MS", 8000, 1000, 60_000),
+        "wait_until": getenv_str("RENDER_WAIT_UNTIL", "") or None,  # fallback to cfg
+    }
+
+
+def _render_state_for_host(host: str) -> Dict[str, int]:
+    st = _ACTIVE["render_state"]
+    if st is None:
+        st = defaultdict(lambda: {"pages_seen": 0, "renders_used": 0})
+        _ACTIVE["render_state"] = st
+    return st[host]
+
+
+def note_page_seen(url: str) -> None:
+    host = urlparse(url).hostname or "unknown-host"
+    state = _render_state_for_host(host)
+    state["pages_seen"] += 1
+
+
+def _render_budget_allowed(url: str) -> bool:
+    host = urlparse(url).hostname or "unknown-host"
+    state = _render_state_for_host(host)
+    cfg = _render_cfg()
+    cap = max(cfg["budget_min"], int(state["pages_seen"] * cfg["budget_pct"]))
+    return state["renders_used"] < cap
+
+
+# ---------- Helpers to improve rendered DOM quality ----------
+
+_ANTIBOT_PAT = re.compile(
+    r"(just\s+a\s+moment\s*\.\.\.|verifying you are human|review the security of your connection|checking your browser before accessing|are you a robot|captcha)",
+    re.I,
+)
+
+_SKIP_SELECTORS = [
+    "a[href*='#main']",
+    "a[href*='skip']",
+    "a.skip-to-content, a.skip_content, a.visually-hidden-focusable",
+    "#skip-to-content, #skip, #main-content, #content",
+]
+
+_MAIN_SELECTORS = "main, article, [role='main'], .content, #content, #main-content"
+
+async def _page_text_len(page: Page) -> int:
+    try:
+        return int(await page.evaluate("() => (document.body && document.body.innerText ? document.body.innerText.length : 0)"))
+    except Exception:
+        return 0
+
+async def _looks_antibot(page: Page) -> bool:
+    try:
+        txt = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        return bool(_ANTIBOT_PAT.search(txt or ""))
+    except Exception:
+        return False
+
+async def _try_click_skip_links(page: Page) -> None:
+    for sel in _SKIP_SELECTORS:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                first = loc.first
+                await first.wait_for(timeout=500)
+                await first.click(timeout=500)
+                return
+        except Exception:
+            continue
+
+async def _settle_page(page: Page, *, idle_ms: int, extra_wait_ms: int = 700) -> None:
+    """
+    Best-effort steps to convert "thin" renders into meaningful DOMs:
+      - wait for body
+      - scroll a bit to trigger lazy load
+      - try "skip to content"
+      - wait for main/article visibility
+      - brief networkidle wait
+    """
+    try:
+        await page.wait_for_selector("body", timeout=max(500, min(idle_ms, 2000)))
+    except Exception:
+        pass
+
+    # gentle scroll to bottom quarter to trigger lazy content
+    try:
+        await page.mouse.wheel(0, 800)
+        await asyncio.sleep(0.1)
+        await page.mouse.wheel(0, 800)
+    except Exception:
+        pass
+
+    await _try_click_skip_links(page)
+
+    try:
+        await page.wait_for_selector(_MAIN_SELECTORS, timeout=min(1800, idle_ms))
+    except Exception:
+        pass
+
+    # short idle & extra wait
+    if idle_ms > 0:
+        try:
+            await page.wait_for_load_state("networkidle", timeout=idle_ms)
+        except Exception:
+            pass
+    if extra_wait_ms > 0:
+        await asyncio.sleep(extra_wait_ms / 1000.0)
+
+
+async def maybe_render_html(url: str, static_html: str, *, force: bool = False, context: Optional[PageContext] = None) -> Optional[str]:
+    """
+    Static-first gate: only render when needed & within budget.
+    Returns rendered HTML if a render was performed, otherwise None.
+    Includes automatic "settling" (skip-to-content, lazy-load scroll) and
+    anti-bot detection to avoid saving placeholder pages.
+    """
+    note_page_seen(url)
+    if not force and not should_render(url, static_html):
+        return None
+    if not _render_budget_allowed(url):
+        logger.info("Render budget exceeded for %s — skipping Playwright", url)
+        return None
+
+    cfg: Config = _ACTIVE["cfg"]
+    r_cfg = _render_cfg()
+    wait_until = r_cfg["wait_until"] or getattr(cfg, "navigation_wait_until", "domcontentloaded")
+    timeout_ms = min(int(r_cfg["max_time_ms"]), int(cfg.page_load_timeout_ms))
+    idle_ms = int(r_cfg["idle_ms"])
+
+    # Guard with a smaller render-concurrency semaphore
+    rsem: asyncio.Semaphore = _ACTIVE["render_sem"]
+    if rsem is None:
+        _ACTIVE["render_sem"] = asyncio.Semaphore(r_cfg["max_concurrent"])
+        rsem = _ACTIVE["render_sem"]
+
+    await rsem.acquire()
+    try:
+        # Attempt up to 2 navigations (2nd switches wait_until strategy)
+        for attempt in (1, 2):
+            async with acquire_page(context) as page:
+                # throttle by host before navigation
+                try:
+                    host = (urlparse(url).hostname or "unknown-host").lower()
+                    await GLOBAL_THROTTLE.wait_for_host(host)
+                except Exception:
+                    pass
+
+                try:
+                    wu = wait_until if attempt == 1 else "networkidle"
+                    resp = await page.goto(url, timeout=timeout_ms, wait_until=wu)
+                except PWError as e:
+                    msg = str(e)
+                    # auto-recover if page/context/browser closed mid-flight
+                    if "has been closed" in msg or "Connection closed" in msg or "Target closed" in msg:
+                        logger.error("Render goto failed (closed): %s — recycling", msg)
+                        await _hard_recycle(msg)
+                        if attempt == 2:
+                            return None
+                        await asyncio.sleep(0.25)
+                        continue
+                    logger.debug("Render goto failed: %s", msg)
+                    return None
+                except Exception as e:
+                    logger.debug("Render goto failed: %s", e)
+                    return None
+
+                await _settle_page(page, idle_ms=idle_ms)
+
+                # If the page looks like anti-bot interstitial, give it a short chance then retry with networkidle
+                if await _looks_antibot(page):
+                    logger.info("Anti-bot interstitial detected for %s; waiting briefly", url)
+                    await asyncio.sleep(1.2)
+                    await _settle_page(page, idle_ms=idle_ms, extra_wait_ms=600)
+                    if await _looks_antibot(page) and attempt == 1:
+                        # try a second pass with stricter wait_until in next loop
+                        continue
+
+                try:
+                    html = await page.content()
+                except Exception as e:
+                    logger.debug("Render content() failed: %s", e)
+                    return None
+
+                # If still clearly anti-bot / empty, don't count against budget
+                try:
+                    txt_len = await _page_text_len(page)
+                except Exception:
+                    txt_len = 0
+                if txt_len < 150 and _ANTIBOT_PAT.search(html or ""):
+                    logger.info("Skipping placeholder/anti-bot content for %s (len=%d)", url, txt_len)
+                    return None
+
+                # account for budget
+                host = urlparse(url).hostname or "unknown-host"
+                _render_state_for_host(host)["renders_used"] += 1
+                return html
+
+        return None
+    finally:
+        try:
+            rsem.release()
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def acquire_page(context: Optional[PageContext] = None):
     # wait out recycle
@@ -624,16 +857,18 @@ async def acquire_page(context: Optional[PageContext] = None):
         for attempt in (1, 2):
             try:
                 ctx = _ctx_from_param(context)
+                if hasattr(ctx, "is_closed") and ctx.is_closed():
+                    raise PWError("Context is closed")
                 page = await ctx.new_page()
                 break
             except Exception as e:
                 msg = str(e)
-                if "Connection closed while reading from the driver" in msg or "Browser has been closed" in msg or "Target closed" in msg:
+                if "Connection closed" in msg or "Browser has been closed" in msg or "Target closed" in msg or "Context is closed" in msg:
                     logger.error("Context.new_page failed attempt=%d: %s", attempt, msg)
                     await _hard_recycle(msg)
                     if attempt == 2:
                         raise
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.25)
                     continue
                 else:
                     raise
@@ -688,16 +923,18 @@ async def new_page(context: Optional[PageContext] = None) -> Page:
         for attempt in (1, 2):
             try:
                 ctx = _ctx_from_param(context)
+                if hasattr(ctx, "is_closed") and ctx.is_closed():
+                    raise PWError("Context is closed")
                 page = await ctx.new_page()
                 break
             except Exception as e:
                 msg = str(e)
-                if "Connection closed while reading from the driver" in msg or "Browser has been closed" in msg or "Target closed" in msg:
+                if "Connection closed" in msg or "Browser has been closed" in msg or "Target closed" in msg or "Context is closed" in msg:
                     logger.error("Context.new_page failed attempt=%d: %s", attempt, msg)
                     await _hard_recycle(msg)
                     if attempt == 2:
                         raise
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.25)
                     continue
                 else:
                     raise

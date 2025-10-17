@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Tuple
+from typing import Literal
 from .utils import getenv_bool, getenv_int, getenv_str, getenv_float, getenv_csv
 
 # ---------- Project Paths ----------
@@ -80,17 +80,10 @@ class Config:
     cache_html: bool
     sanitize_markdown: bool
 
-    # Crawler extras
+    # Crawler extras (non-filtering)
     crawler_max_retries: int
     per_page_delay_ms: int
-    allow_subdomains: bool
     max_pages_per_company: int
-
-    # Language/translation policy
-    primary_lang: str
-    lang_path_deny: tuple[str, ...]
-    lang_query_keys: tuple[str, ...]
-    lang_subdomain_deny: tuple[str, ...]
 
     # Static-first HTTP client knobs
     enable_static_first: bool
@@ -100,12 +93,9 @@ class Config:
     static_max_redirects: int
     static_js_app_text_threshold: int
 
-    # Sectionizer / classifier defaults
+    # Sectionizer / tokenizer defaults (non-filtering; parsing-only)
     min_section_chars: int
     max_section_chars: int
-    product_like_url_keywords: tuple[str, ...]
-    non_product_keywords: tuple[str, ...]
-    prefer_detail_url_keywords: tuple[str, ...]
 
     # Extra output dirs
     candidates_dir: Path
@@ -116,21 +106,12 @@ class Config:
     checkpoints_dir: Path
     embeddings_dir: Path
 
-    # --------- Redirect/migration & filtering defaults ----------
-    # Default regexes used by crawler if CLI doesn't supply --allow/--deny
-    default_allow_regex: str | None
-    default_deny_regex: str | None
-
-    # Domain migration / redirect handling
+    # --------- Redirect/migration (kept) ----------
     migration_threshold: int                    # e.g., 2 off-site 301/308 (or homepage once)
-    migration_forbid_hosts: tuple[str, ...]     # known sinkholes, never adopt
 
     # Auth & backoff policies
     deny_on_auth: bool                          # 401/403: suppress frontier (non-homepage)
     backoff_on_429: float                       # multiply delay (and/or reduce seed batch) next pass
-
-    # Same-site expansion for the current run (runner can set per company)
-    extra_same_site_hosts: tuple[str, ...]      # additional eTLD+1 treated as same-site this run
 
     # --------- Fuse / Stall controls (read-only; set via env or defaults) ----------
     forbidden_done_threshold: int               # 403s ≥ this → mark company done
@@ -144,7 +125,7 @@ class Config:
     throttle_penalty_max_ms: int                # upper bound for penalty sleep
     throttle_penalty_decay_mult: float          # multiply penalty by this on 2xx success (0<mult<1)
 
-    # ---------- Global browser/page limits & health ----------
+    # ---------- Global browser/page limits & health (modest defaults) ----------
     max_global_pages_open: int                  # cap Playwright pages across the whole run
     page_close_timeout_ms: int                  # how long to wait when closing a page
     browser_recycle_after_pages: int            # recycle Chromium after this many page opens
@@ -166,24 +147,24 @@ class Config:
 def load_config() -> Config:
 
     cfg = Config(
-        timezone=getenv_str("APP_TZ", "Asia/Singapore"),
+        timezone=getenv_str("APP_TZ", "Asia/Ho_Chi_Minh"),
         env=getenv_str("APP_ENV", "dev"),
 
-        # ---------- Tuned for high-throughput workstation ----------
+        # ---------- Tuned for balanced throughput ----------
         # Cross-company parallelism is the main throughput lever.
-        max_companies_parallel=getenv_int("MAX_COMPANIES_PARALLEL", 128, 1, 256),
+        max_companies_parallel=getenv_int("MAX_COMPANIES_PARALLEL", 96, 1, 256),
         # Keep per-domain parallelism modest to avoid 429 bursts.
-        max_pages_per_domain_parallel=getenv_int("MAX_PAGES_PER_DOMAIN_PARALLEL", 12, 1, 64),
-        request_timeout_ms=getenv_int("REQUEST_TIMEOUT_MS", 30000, 5000, 120000),
-        # Slightly tighter page timeout to avoid hanging SPAs.
-        page_load_timeout_ms=getenv_int("PAGE_LOAD_TIMEOUT_MS", 25000, 5000, 180000),
+        max_pages_per_domain_parallel=getenv_int("MAX_PAGES_PER_DOMAIN_PARALLEL", 8, 1, 32),
+        request_timeout_ms=getenv_int("REQUEST_TIMEOUT_MS", 25000, 5000, 120000),
+        # Tighter page timeout to avoid hanging SPAs.
+        page_load_timeout_ms=getenv_int("PAGE_LOAD_TIMEOUT_MS", 18000, 5000, 180000),
         navigation_wait_until=getenv_str("NAV_WAIT_UNTIL", "domcontentloaded"),
 
         # retry/backoff
         retry_max_attempts=getenv_int("RETRY_MAX_ATTEMPTS", 3, 1, 10),
-        retry_initial_delay_ms=getenv_int("RETRY_INITIAL_DELAY_MS", 10000, 100, 10000),
-        retry_max_delay_ms=getenv_int("RETRY_MAX_DELAY_MS", 60000, 1000, 60000),
-        retry_jitter_ms=getenv_int("RETRY_JITTER_MS", 300, 0, 2000),
+        retry_initial_delay_ms=getenv_int("RETRY_INITIAL_DELAY_MS", 6000, 100, 10000),
+        retry_max_delay_ms=getenv_int("RETRY_MAX_DELAY_MS", 45000, 1000, 60000),
+        retry_jitter_ms=getenv_int("RETRY_JITTER_MS", 250, 0, 2000),
 
         # robots / blocking
         respect_robots_txt=getenv_bool("RESPECT_ROBOTS", False),
@@ -223,18 +204,10 @@ def load_config() -> Config:
         cache_html=getenv_bool("CACHE_HTML", True),
         sanitize_markdown=getenv_bool("SANITIZE_MARKDOWN", True),
 
-        # crawler extras
+        # crawler extras (non-filtering)
         crawler_max_retries=getenv_int("CRAWLER_MAX_RETRIES", 3, 0, 10),
-        # Gentle pacing between pages to reduce burstiness.
-        per_page_delay_ms=getenv_int("PER_PAGE_DELAY_MS", 15, 0, 2000),
-        allow_subdomains=getenv_bool("ALLOW_SUBDOMAINS", True),
+        per_page_delay_ms=getenv_int("PER_PAGE_DELAY_MS", 20, 0, 2000),
         max_pages_per_company=getenv_int("MAX_PAGES_PER_COMPANY", 200, 1, 2000),
-
-        # language policy
-        primary_lang=getenv_str("PRIMARY_LANG", "en"),
-        lang_path_deny=tuple(getenv_str("LANG_PATH_DENY", "/fr,/de,/es,/pt,/it,/ru,/zh,/zh-cn,/ja,/ko").split(",")),
-        lang_query_keys=tuple(getenv_str("LANG_QUERY_KEYS", "lang,locale,hl").split(",")),
-        lang_subdomain_deny=tuple(getenv_str("LANG_SUBDOMAIN_DENY", "fr.,de.,es.,pt.,it.,ru.,zh.,cn.,jp.,kr.").split(",")),
 
         # Static-first HTTP client
         static_timeout_ms=getenv_int("STATIC_TIMEOUT_MS", 9000, 1000, 60000),
@@ -244,52 +217,33 @@ def load_config() -> Config:
         static_max_redirects=getenv_int("STATIC_MAX_REDIRECTS", 8, 1, 20),
         static_js_app_text_threshold=getenv_int("STATIC_JS_APP_TEXT_THRESHOLD", 800, 200, 4000),
 
-        # sectionizer/classifier
+        # sectionizer/tokenizer (parsing only)
         min_section_chars=getenv_int("MIN_SECTION_CHARS", 180, 50, 2000),
         max_section_chars=getenv_int("MAX_SECTION_CHARS", 2400, 400, 6000),
-        product_like_url_keywords=tuple(getenv_str("PRODUCT_URL_KEYWORDS", "/product,/products,/solutions,/services,/catalog").split(",")),
-        non_product_keywords=tuple(getenv_str("NON_PRODUCT_KEYWORDS", "/blog,/news,/legal,/privacy,/careers,/investors").split(",")),
-        prefer_detail_url_keywords=tuple(getenv_str("PREFER_DETAIL_URL_KEYWORDS", "/product,/products").split(",")),
 
-        # --------- Redirect/migration & filtering defaults ----------
-        default_allow_regex=None,
-        default_deny_regex=None,
-
+        # --------- Redirect/migration ----------
         migration_threshold=getenv_int("MIGRATION_THRESHOLD", 2, 1, 10),
-        migration_forbid_hosts=getenv_csv(
-            "MIGRATION_FORBID_HOSTS",
-            "youtube.com,facebook.com,instagram.com,tiktok.com,vimeo.com,shop.app,amazon.com,medium.com,linktr.ee,mailchi.mp,bit.ly"
-        ),
 
         deny_on_auth=getenv_bool("DENY_ON_AUTH", True),
-        # Stronger next-pass backoff factor when we keep hitting auth walls/429.
-        backoff_on_429=getenv_float("BACKOFF_ON_429", 2.5),
-
-        # Runner can set this per company (comma-separated eTLD+1); default empty
-        extra_same_site_hosts=getenv_csv("EXTRA_SAME_SITE_HOSTS", ""),
+        backoff_on_429=getenv_float("BACKOFF_ON_429", 2.0),
 
         # --------- Fuse / Stall controls ----------
-        # Lower threshold so 403-heavy companies finish faster.
         forbidden_done_threshold=getenv_int("FORBIDDEN_DONE_THRESHOLD", 25, 1, 10_000),
         stall_pending_max=getenv_int("STALL_PENDING_MAX", 2, 0, 50),
-        # Fast-finish after 2 consecutive no-progress passes with tiny frontier.
         stall_repeat_passes=getenv_int("STALL_REPEAT_PASSES", 2, 1, 50),
         stall_fingerprint_window=getenv_int("STALL_FINGERPRINT_WINDOW", 4, 2, 50),
 
         # --------- Per-host throttling / 429 handling ----------
-        # Gentle per-host pacing reduces 429 bursts while keeping overall QPS high.
         host_min_interval_ms=getenv_int("HOST_MIN_INTERVAL_MS", 150, 0, 60000),
-        # Stronger penalty after a 429; decays on success.
-        throttle_penalty_initial_ms=getenv_int("THROTTLE_PENALTY_INITIAL_MS", 8000, 0, 120000),
-        throttle_penalty_max_ms=getenv_int("THROTTLE_PENALTY_MAX_MS", 60000, 100, 300000),
+        throttle_penalty_initial_ms=getenv_int("THROTTLE_PENALTY_INITIAL_MS", 6000, 0, 120000),
+        throttle_penalty_max_ms=getenv_int("THROTTLE_PENALTY_MAX_MS", 45000, 100, 300000),
         throttle_penalty_decay_mult=getenv_float("THROTTLE_PENALTY_DECAY_MULT", 0.66),
 
-        # ---------- Global browser/page limits & health ----------
-        # 32GB RAM default: keep this conservative to prevent RAM runaway.
-        max_global_pages_open=getenv_int("MAX_GLOBAL_PAGES_OPEN", 128, 32, 1024),
-        page_close_timeout_ms=getenv_int("PAGE_CLOSE_TIMEOUT_MS", 1500, 100, 10000),
-        browser_recycle_after_pages=getenv_int("BROWSER_RECYCLE_AFTER_PAGES", 10_000, 1_000, 1_000_000),
-        browser_recycle_after_seconds=getenv_int("BROWSER_RECYCLE_AFTER_SECONDS", 21_600, 600, 172_800),
+        # ---------- Global browser/page limits & health (modest) ----------
+        max_global_pages_open=getenv_int("MAX_GLOBAL_PAGES_OPEN", 48, 16, 256),
+        page_close_timeout_ms=getenv_int("PAGE_CLOSE_TIMEOUT_MS", 1000, 100, 10000),
+        browser_recycle_after_pages=getenv_int("BROWSER_RECYCLE_AFTER_PAGES", 2000, 200, 100000),
+        browser_recycle_after_seconds=getenv_int("BROWSER_RECYCLE_AFTER_SECONDS", 7200, 300, 86400),
         watchdog_interval_seconds=getenv_int("WATCHDOG_INTERVAL_SECONDS", 30, 5, 600),
         max_httpx_clients=getenv_int("MAX_HTTPX_CLIENTS", 3, 1, 16),
 
@@ -299,7 +253,7 @@ def load_config() -> Config:
         browser_bypass_csp=getenv_bool("BROWSER_BYPASS_CSP", False),
         browser_args_extra=getenv_csv("BROWSER_ARGS_EXTRA", ""),
 
-        # GPU
-        browser_enable_gpu=getenv_bool("BROWSER_ENABLE_GPU", True)
+        # GPU — disable by default for more predictable headless perf/RAM
+        browser_enable_gpu=getenv_bool("BROWSER_ENABLE_GPU", False),
     )
     return cfg
