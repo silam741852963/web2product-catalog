@@ -199,6 +199,12 @@ Do not include any additional keys, arrays, comments, or surrounding text. Be co
         "www","http","https","com","net","org","io","co","wp","json","api","xmlrpc","cdn",
         "rest","graphql","oembed","feed","feeds","search","results","result","help","support",
     },
+    "CTA_KEYWORDS": {
+        "pricing","plans","plan","quote","get a quote","contact sales","request demo",
+        "book a demo","buy","purchase","subscribe","trial","free trial",
+        "datasheet","brochure","specification","download","get started","get in touch"
+    }
+    
 }
 
 # -------------------------

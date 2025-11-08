@@ -56,6 +56,7 @@ log = logging.getLogger(__name__)
 # Use language_settings for the default product query (language-aware)
 DEFAULT_PRODUCT_QUERY = langcfg.default_product_bm25_query()
 
+# CTA keywords: attempt to read from language settings, otherwise fallback to English set
 CTA_KEYWORDS = set(langcfg.get("CTA_KEYWORDS"))
 
 # PRODUCT-ish URL tokens — get from language settings (SMART include tokens)
