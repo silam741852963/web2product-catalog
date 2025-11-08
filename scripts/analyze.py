@@ -9,13 +9,13 @@ from extensions.stats_analyzer import analyze_and_plot
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Aggregate crawl progress, compute statistics, and generate charts."
+        description="Aggregate crawl_meta.json, compute statistics, and generate charts."
     )
     p.add_argument(
         "--outputs-dir",
         type=Path,
         default=Path("outputs"),
-        help="Root directory containing per-company outputs/*/checkpoints/progress.json",
+        help="Root directory containing per-company outputs/*/checkpoints/crawl_meta.json (and optional url_index.json).",
     )
     p.add_argument(
         "--out-dir",
@@ -42,9 +42,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--interactive",
         action="store_true",
-        help="Also write interactive HTML charts (requires plotly).",
+        help="Also write interactive HTML charts (requires plotly). Interactive charts include hover data to trace each point to a company (bvdid and company_name).",
     )
-    
+    p.add_argument(
+        "--cost-per-1k-tokens",
+        type=float,
+        default=0.03,
+        help="USD cost per 1k tokens to use for LLM extraction cost estimates in the summary (default: 0.03).",
+    )
+
     return p.parse_args()
 
 
@@ -59,6 +65,7 @@ def main() -> None:
         save_csv=not args.no_csv,
         save_json_summary=not args.no_json,
         interactive=args.interactive,
+        cost_per_1k_tokens_usd=args.cost_per_1k_tokens,
     )
 
     # Print a compact console summary and where artifacts went
@@ -67,7 +74,8 @@ def main() -> None:
     print(f"\nArtifacts written to: {args.out_dir.resolve()}")
     print(
         "Key files: "
-        "progress_aggregate.csv, summary.json, and several *.png charts.\n"
+        "crawl_meta_aggregate.csv (if enabled), summary.json (if enabled), and several *.png charts.\n"
+        "Interactive charts (if requested) contain hover info showing bvdid and company_name so you can identify which point belongs to which company.\n"
         "Recommendation → company_max_pages ~= summary['recommendations']['company_max_pages_recommended']"
     )
 

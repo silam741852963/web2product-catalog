@@ -1,4 +1,3 @@
-# extensions/brand_discovery.py
 from __future__ import annotations
 
 import os
@@ -12,7 +11,7 @@ from urllib.parse import urlparse, urljoin
 import httpx
 from bs4 import BeautifulSoup
 
-from .filtering import is_universal_external
+from extensions.filtering import is_universal_external
 
 logger = logging.getLogger("extensions.brand_discovery")
 

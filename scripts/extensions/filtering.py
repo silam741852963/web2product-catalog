@@ -17,6 +17,8 @@ from crawl4ai.deep_crawling.filters import (
 )
 from crawl4ai.deep_crawling.scorers import KeywordRelevanceScorer
 
+from config import language_settings as langcfg
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -58,7 +60,7 @@ UNIVERSAL_EXTERNALS: set[str] = {
     # Social / video / community mega-platforms
     "facebook.com", "instagram.com", "twitter.com", "x.com", "youtube.com",
     "linkedin.com", "tiktok.com", "pinterest.com", "reddit.com", "slack.com",
-    "medium.com", "substack.com", "discord.com",
+    "medium.com", "substack.com", "discord.com", "trustpilot.com",
 
     # Link shorteners / trackers
     "t.co", "goo.gl", "bit.ly", "bitly.com", "tinyurl.com", "ow.ly", "buff.ly",
@@ -168,21 +170,8 @@ def _count_hits(url: str, patterns: List[str]) -> int:
     return c
 
 # --- SMART INCLUDE TOKENS ----------------------------------------------------
-# Helps match path segments like:
-#   /power-solutions/, /solution-brief/, /solutions-hub/, /product-line/,
-#   /managed-services/, /service-plans/, /catalogue/, /data-sheets/ ...
-SMART_INCLUDE_TOKENS: tuple[str, ...] = (
-    "product", "products",
-    "service", "services",
-    "solution", "solutions",
-    "platform", "platforms",
-    "pricing",
-    "catalog", "catalogue",
-    "features", "specs", "specifications",
-    "datasheet", "data-sheet", "sds", "msds",
-    "buy", "quote",
-    "equipment", "industrial", "manufacturing", "technology",
-)
+# Use language-configured tokens (keeps values identical to previous default)
+SMART_INCLUDE_TOKENS: tuple[str, ...] = tuple(langcfg.get("SMART_INCLUDE_TOKENS"))
 
 # precompile a word-ish boundary for tokens inside a path segment
 #   matches token preceded/followed by start/end/[-_./]
@@ -261,137 +250,11 @@ def is_universal_external(url_or_host: Any) -> bool:
 # Default URL pattern heuristics (KEEP / DROP)
 # =============================================================================
 
-DEFAULT_INCLUDE_PATTERNS: List[str] = [
-    # Glob-style (still supported) plus smart token fallback
-    "*/product/*", "*/products/*",
-    "*/service/*", "*/services/*",
-    "*/solution/*", "*/solutions/*",
-    "*/platform/*", "*/platforms/*",
-    "*/capabilities/*", "*/offerings/*",
-    "*/pricing/*", "*/catalog/*",
-    "*/what-we-do/*", "*/technology/*",
-    "*/industr*", "*/manufactur*", "*/equipment*",
+DEFAULT_INCLUDE_PATTERNS: List[str] = list(langcfg.get("DEFAULT_INCLUDE_PATTERNS"))
 
-    # common product-hint sets
-    "*/catalogue/*",
-    "*/portfolio/*",
-    "*/features/*",
-    "*/specs/*",
-    "*/datasheet/*", "*/datasheets/*", "*/data-sheet/*",
-    "*/store/*", "*/shop/*",
-    "*/plans/*",
-    "*/grade/*", "*/grades/*",
-    "*/sds/*", "*/msds/*",
-    "*/safety-data-sheet*", "*/safety-data-sheets*",
-    "*/price/*",
-    "*/buy/*", "*/quote/*",
+DEFAULT_EXCLUDE_PATTERNS: List[str] = list(langcfg.get("DEFAULT_EXCLUDE_PATTERNS"))
 
-    # Regex examples (optional):
-    # "re:/([^/]*)(product|solution|service)([^/]*)/",
-]
-
-DEFAULT_EXCLUDE_PATTERNS: List[str] = [
-    # originals & noise
-    "*/blog/*", "*/news/*", "*/press/*",
-    "*/investor/*", "*/investors/*", "*/ir/*", "*/sec/*",
-    "*/earnings/*", "*/transcript/*",
-    "*/prospectus/*", "*/summaryprospectus/*", "*/factcard/*", "*/sai/*", "*/holdings/*",
-    "*/annual-report/*", "*/semi-annual/*", "*/shareholder/*", "*/premiumdiscount/*",
-    "*/market/*", "*/markets/*",
-
-    "*/privacy*", "*/terms*", "*/legal*",
-    "*/login*", "*/signin*", "*/account*",
-    "*/admin/*", "*/wp-admin/*", "*/auth/*",
-    "*/support/*", "*/help/*",
-    "*/docs/*", "*/developer/*", "*/api/*",
-
-    # CMS/backends/feeds
-    "*/api/*", "*/rest/*", "*/graphql*", "*/oembed*", "*/wp-json/*",
-    "*/feeds/*", "*/feed*", "*/xmlrpc.php*",
-    "*/umbraco/*", "*/cms/*", "*/joomla/*", "*/drupal/*",
-    "*/sitemap*", "*/robots.txt*", "*/rss*", "*/atom*",
-    "*/cdn-cgi/*",
-
-    # classic server handlers not useful for landing content
-    "*.jsp", "*.do", "*.action", "*.ashx", "*.aspx", "*.cfm", "*.cgi",
-
-    # non-product path fragments
-    "*/privacy/*", "*/cookies/*", "*/cookie-policy/*", "*/cookie-preferences/*", "*/cookie-settings/*",
-    "*/terms/*", "*/legal/*", "*/disclaimer/*", "*/compliance/*", "*/accessibility/*",
-    "*/policy/*", "*/policies/*", "*/charter/*", "*/bylaws/*", "*/guidelines/*", "*/ethics/*",
-    "*/anti-bribery/*", "*/sanctions/*", "*/human-rights/*", "*/code-of-conduct/*",
-    "*/governance/*", "*/board/*", "*/leadership/*", "*/management/*", "*/members/*",
-    "*/leader/*", "*/leaders/*", "*/leadership-team/*", "*/our-team/*", "*/team/*",
-
-    # newsroom/comms
-    "*/newsroom/*", "*/press-release/*", "*/press-releases/*", "*/media/*", "*/news/*",
-
-    # lead-gen/forms
-    "*/information-request/*", "*/request-information/*", "*/request-info/*", "*/request/*",
-    "*/contact/*", "*/contact-us/*", "*/form/*", "*/forms/*", "*/subscribe/*", "*/newsletter/*",
-
-    # content marketing / resource hubs
-    "*/whitepaper/*", "*/whitepapers/*",
-    "*/case-study/*", "*/case-studies/*",
-    "*/ebook/*", "*/e-book/*",
-    "*/resources/*", "*/resource-center/*",
-    "*/brochure/*", "*/blogs/*", "*/stories/*",
-    "*/giveaway/*", "*/community/*", "*/explained/*",
-
-    # auth/e-com chrome
-    "*/login/*", "*/log-in/*", "*/signin/*", "*/sign-in/*",
-    "*/signup/*", "*/sign-up/*", "*/register/*",
-    "*/account/*", "*/my-account/*", "*/profile/*",
-    "*/sso/*", "*/oauth/*",
-    "*/cart/*", "*/checkout/*", "*/wishlist/*", "*/compare/*", "*/enrollment/*",
-
-    # site chrome / discovery
-    "*/sitemap/*", "*/search/*", "*/search-results/*", "*/results/*", "*/site-search/*",
-    "*/preferences/*", "*/settings/*", "*/help/*", "*/support/*", "*/faq/*",
-
-    # media libraries
-    "*/wp-login/*",
-    "*/wp-content/uploads/*", "*/media-library/*", "*/document-library/*", "*/asset-library/*",
-
-    # i18n helpers
-    "*/translate/*", "*/lang/*", "*/locale/*",
-
-    # careers
-    "*/careers/*", "*/jobs/*", "*/recruit/*", "*/hiring/*",
-
-    # misc
-    "*/acquire/tel/*",
-
-    # videos/events/archives/training/locators
-    "*/video/*", "*/videos/*", "*/eb-video/*", "*/eb-video-en/*", "*/media-center/*",
-    "*/event/*", "*/events/*", "*/webinar/*", "*/webinars/*",
-    "*/category/*", "*/tag/*", "*/tags/*", "*/archive/*", "*/archives/*", "*/author/*",
-    "*/training/*", "*/education/*", "*/ausbildung/*",
-    "*/locations/*",
-
-    # cookie/consent
-    "*/privacy-center/*", "*/consent/*", "*/cookie*/*",
-
-    # file extensions to drop
-    "*.pdf", "*.jpg", "*.jpeg", "*.png", "*.gif", "*.svg",
-    "*.ps", "*.rtf", "*.doc", "*.docx", "*.ppt", "*.pptx", "*.pps", "*.xls", "*.xlsx",
-    "*.csv", "*.tsv", "*.xml", "*.json", "*.yml", "*.yaml", "*.md", "*.rst",
-    "*.zip", "*.rar", "*.7z", "*.gz", "*.bz2", "*.xz", "*.tar", "*.tgz", "*.dmg", "*.exe", "*.msi", "*.apk",
-    "*.webp", "*.bmp", "*.tif", "*.tiff", "*.ico",
-    "*.mp3", "*.wav", "*.m4a", "*.ogg", "*.flac", "*.aac",
-    "*.mp4", "*.m4v", "*.webm", "*.mov", "*.avi", "*.wmv", "*.mkv",
-    "*.ics", "*.eot", "*.ttf", "*.otf", "*.woff", "*.woff2", "*.map",
-]
-
-DEFAULT_EXCLUDE_QUERY_KEYS: List[str] = [
-    "gclid", "fbclid", "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
-    "session", "sessionid", "token", "auth", "sso", "oauth", "redirect", "ref", "trk", "_gl",
-    "download", "attachment", "attachment_id",
-    "page_id", "p", "post_type", "orderby", "order", "cat", "tag",
-    "lang", "hl", "locale", "lc", "lr", "region",
-    "postid", "reply", "thread", "topic",
-    "optanonconsent", "consent", "gdpr", "euconsent", "cookie",
-]
+DEFAULT_EXCLUDE_QUERY_KEYS: List[str] = list(langcfg.get("DEFAULT_EXCLUDE_QUERY_KEYS"))
 
 # =============================================================================
 # Deep crawling filter helpers (optional)
@@ -557,36 +420,14 @@ def filter_by_patterns(
 # Language filtering (URL-level heuristics)
 # =============================================================================
 
-_LANG_CODES = {
-    "ar","bg","bn","bs","ca","cs","da","de","el","es","et","fa","fi","fil","fr","he","hi",
-    "hr","hu","id","is","it","ja","ko","lt","lv","ms","nb","nl","no","pl","pt","ro","ru",
-    "sk","sl","sq","sr","sv","ta","th","tr","uk","ur","vi","zh"
-}
+# language-sensitive constants imported from language_settings (keeps original values)
+_LANG_CODES = set(langcfg.get("LANG_CODES"))
 
-_REGIONAL_LANG_CODES = {
-    "ar-sa","de-at","de-ch","de-de","el-gr","en-au","en-ca","en-gb","en-ie","en-in","en-nz","en-ph",
-    "en-sg","en-za","en-us","es-419","es-ar","es-cl","es-co","es-es","es-mx","es-pe",
-    "fr-be","fr-ca","fr-ch","fr-fr",
-    "it-it","ja-jp","ko-kr","nl-be","nl-nl","pt-br","pt-pt","ru-ru","sv-se","th-th","tr-tr",
-    "zh-cn","zh-hk","zh-hans","zh-hant","zh-mo","zh-sg","zh-tw"
-}
+_REGIONAL_LANG_CODES = set(langcfg.get("REGIONAL_LANG_CODES"))
 
-_ENGLISH_REGIONS = {"us","uk","gb","au","ca","nz","ie","sg","ph","in","za"}
+_ENGLISH_REGIONS = set(langcfg.get("ENGLISH_REGIONS"))
 
-_CC_TO_LANG = {
-    # East Asia
-    "cn": "zh", "tw": "zh", "hk": "zh", "mo": "zh",
-    "kr": "ko", "jp": "ja",
-    # SE Asia
-    "vn": "vi", "th": "th", "id": "id", "my": "ms",
-    # Europe
-    "ru": "ru", "ua": "uk", "cz": "cs", "gr": "el", "pl": "pl",
-    "pt": "pt", "br": "pt", "es": "es", "mx": "es", "ar": "es",
-    "de": "de", "fr": "fr", "it": "it", "nl": "nl", "be": "nl",
-    "dk": "da", "no": "nb", "se": "sv", "fi": "fi",
-    # Middle East
-    "sa": "ar", "ir": "fa", "il": "he", "tr": "tr",
-}
+_CC_TO_LANG = dict(langcfg.get("CC_TO_LANG"))
 
 def _first_path_segment(path: str) -> str:
     if not path:
@@ -876,7 +717,7 @@ def url_should_keep(
     • If both include & exclude match → KEEP (include wins).
     • If exclude only matches → DROP.
     • If include only matches → KEEP.
-    • If neither matches → KEEP (patterns act as hints unless exclude-only hits).
+    • If neither matches → KEEP (patterns act as hints, not absolute unless exclude-only hits).
 
     Matching supports glob patterns and explicit regex via 're:' prefix.
     Smart include tokens also raise include-likelihood for near misses (/power-solutions/).
@@ -1010,15 +851,5 @@ def default_product_bm25_query() -> str:
     Compact BM25 query string tuned for seeding to favor product/service landing pages.
     Use with SeedingConfig(query=..., scoring_method="bm25").
     """
-    terms = [
-        "product", "products",
-        "service", "services",
-        "solution", "solutions",
-        "platform", "platforms",
-        "pricing", "catalog", "catalogue",
-        "features", "specifications", "specs",
-        "datasheet", "SDS", "MSDS",
-        "buy", "quote",
-        "equipment", "industrial", "manufacturing", "technology",
-    ]
-    return " ".join(terms)
+    # Use language settings provider so this is language-aware and identical to previous defaults
+    return langcfg.default_product_bm25_query()

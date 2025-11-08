@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -45,17 +46,31 @@ def _get(d: Dict[str, Any], path: List[str], default=None):
     return cur
 
 
-def find_progress_files(outputs_root: Path) -> List[Path]:
+def find_crawl_meta_files(outputs_root: Path) -> List[Tuple[Path, Optional[Path]]]:
     """
-    Recursively find all progress.json files under outputs_root/**/checkpoints/.
+    Recursively find all crawl_meta.json files under outputs_root/**/checkpoints/.
+    Returns list of tuples (crawl_meta_path, url_index_path_if_exists_or_None)
     """
-    return sorted(outputs_root.rglob("checkpoints/progress.json"))
+    out: List[Tuple[Path, Optional[Path]]] = []
+    for meta_path in sorted(outputs_root.rglob("checkpoints/crawl_meta.json")):
+        url_index = meta_path.with_name("url_index.json")
+        out.append((meta_path, url_index if url_index.exists() else None))
+    return out
 
 
-def load_progress(fp: Path) -> Dict[str, Any]:
+def load_crawl_meta(fp: Path) -> Dict[str, Any]:
     with fp.open("r", encoding="utf-8") as f:
         return json.load(f)
 
+
+def load_url_index(fp: Optional[Path]) -> Dict[str, Any]:
+    if not fp:
+        return {}
+    try:
+        with fp.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 # ---------------------------
 # Normalization
@@ -63,7 +78,8 @@ def load_progress(fp: Path) -> Dict[str, Any]:
 
 @dataclass
 class CompanyRow:
-    hojin_id: str
+    bvdid: str
+    company_name: Optional[str]
     stage: str
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
@@ -99,6 +115,12 @@ class CompanyRow:
     md_suppressed_total: int
     resumed_skips: int
 
+    # Markdown words summary (from url_index.json entries for this company)
+    md_words_count: int            # number of markdown files with a words value
+    md_words_total: int
+    md_words_mean: float
+    md_words_median: float
+
     # Derived ratios
     drop_ratio_prefilter: float           # 1 - prefilter_kept / discovered_total
     drop_ratio_patterns_lang: float       # filtered_dropped_patterns_lang / discovered_total
@@ -116,8 +138,13 @@ class CompanyRow:
         return d
 
 
-def normalize_progress(doc: Dict[str, Any]) -> CompanyRow:
-    hojin_id = str(doc.get("hojin_id") or "")
+def normalize_crawl_meta(doc: Dict[str, Any], url_index: Dict[str, Any]) -> CompanyRow:
+    """
+    Normalizes the new crawl_meta.json format into the CompanyRow.
+    url_index is optional and used to enrich some counts if available.
+    """
+    bvdid = str(doc.get("bvdid") or "")
+    company_name = doc.get("company_name")
     stage = str(doc.get("stage") or "")
 
     started_at = _parse_dt(doc.get("started_at"))
@@ -137,7 +164,7 @@ def normalize_progress(doc: Dict[str, Any]) -> CompanyRow:
     seeding_source = seeding.get("seeding_source") or doc.get("seed_source")
 
     discovered_total = int(seeding.get("discovered_total") or 0)
-    live_check_enabled = bool(seeding.get("live_check_enabled") or False)
+    live_check_enabled = bool(seeding.get("live_check_enabled") or seeding.get("live_check", False) or False)
     live_checked_total = int(seeding.get("live_checked_total") or 0)
     prefilter_kept = int(seeding.get("prefilter_kept") or 0)
     prefilter_dropped_status = int(seeding.get("prefilter_dropped_status") or 0)
@@ -173,7 +200,57 @@ def normalize_progress(doc: Dict[str, Any]) -> CompanyRow:
     saved_md_total = int(saves.get("saved_md_total") or 0)
     saved_json_total = int(saves.get("saved_json_total") or 0)
     md_suppressed_total = int(saves.get("md_suppressed_total") or 0)
-    resumed_skips = int(saves.get("resumed_skips") or doc.get("resumed_skips") or 0)
+    resumed_skips = int(doc.get("resumed_skips") or 0)
+
+    # If url_index provided, we can override some derived counts if that's more authoritative
+    if url_index and isinstance(url_index, dict):
+        # count url_index entries
+        try:
+            url_index_count = len(url_index)
+            # If filtered_total is zero but url_index exists, set filtered_total to url_index_count
+            if filtered_total == 0:
+                filtered_total = url_index_count
+        except Exception:
+            pass
+
+    # Gather markdown word counts from url_index (if provided)
+    md_word_vals: List[int] = []
+    if url_index and isinstance(url_index, dict):
+        try:
+            for u_ent in url_index.values():
+                mw = None
+                # Prefer explicit recorded markdown_words
+                try:
+                    mw = u_ent.get("markdown_words")
+                except Exception:
+                    mw = None
+
+                if mw is None:
+                    # if missing, try to estimate by reading markdown_path (best-effort)
+                    mdp = u_ent.get("markdown_path")
+                    if mdp:
+                        try:
+                            text = Path(str(mdp)).read_text(encoding="utf-8", errors="ignore")
+                            # simple whitespace tokenization to count words
+                            words = [w for w in re.split(r"\s+", text.strip()) if w]
+                            mw = len(words)
+                        except Exception:
+                            mw = None
+                if mw is not None:
+                    try:
+                        mw_i = int(mw)
+                        if mw_i >= 0:
+                            md_word_vals.append(mw_i)
+                    except Exception:
+                        # ignore malformed
+                        pass
+        except Exception:
+            pass
+
+    md_words_count = int(len(md_word_vals))
+    md_words_total = int(sum(md_word_vals)) if md_word_vals else 0
+    md_words_mean = float(sum(md_word_vals) / len(md_word_vals)) if md_word_vals else 0.0
+    md_words_median = float(np.median(md_word_vals)) if md_word_vals else 0.0
 
     # Derived
     drop_ratio_prefilter = 1.0 - _safe_div(prefilter_kept, max(1, discovered_total))
@@ -185,7 +262,8 @@ def normalize_progress(doc: Dict[str, Any]) -> CompanyRow:
     throughput_urls_per_min = _safe_div(urls_total, (duration_sec / 60.0)) if duration_sec > 0 else 0.0
 
     return CompanyRow(
-        hojin_id=hojin_id,
+        bvdid=bvdid,
+        company_name=company_name,
         stage=stage,
         started_at=started_at,
         finished_at=finished_at,
@@ -214,6 +292,10 @@ def normalize_progress(doc: Dict[str, Any]) -> CompanyRow:
         saved_json_total=saved_json_total,
         md_suppressed_total=md_suppressed_total,
         resumed_skips=resumed_skips,
+        md_words_count=md_words_count,
+        md_words_total=md_words_total,
+        md_words_mean=md_words_mean,
+        md_words_median=md_words_median,
         drop_ratio_prefilter=drop_ratio_prefilter,
         drop_ratio_patterns_lang=drop_ratio_patterns_lang,
         drop_ratio_total=drop_ratio_total,
@@ -222,19 +304,24 @@ def normalize_progress(doc: Dict[str, Any]) -> CompanyRow:
     )
 
 
-def collect_dataframe(progress_files: Iterable[Path]) -> pd.DataFrame:
+def collect_dataframe(crawl_meta_files: Iterable[Tuple[Path, Optional[Path]]]) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    for fp in progress_files:
+    for meta_path, url_index_path in crawl_meta_files:
         try:
-            doc = load_progress(fp)
-            row = normalize_progress(doc)
+            doc = load_crawl_meta(meta_path)
+            url_index = load_url_index(url_index_path) if url_index_path else {}
+            row = normalize_crawl_meta(doc, url_index)
             d = row.as_dict()
-            d["_progress_path"] = str(fp)
+            d["_meta_path"] = str(meta_path)
+            d["_url_index_path"] = str(url_index_path) if url_index_path else None
+            # attach company_name for interactive traceability
+            d["company_name"] = doc.get("company_name")
             rows.append(d)
         except Exception as e:
             # keep going, but record a stub for debugging
             rows.append({
-                "hojin_id": f"__PARSE_ERROR__:{fp.name}",
+                "bvdid": f"__PARSE_ERROR__:{meta_path.name}",
+                "company_name": None,
                 "stage": "unknown",
                 "started_at": None,
                 "finished_at": None,
@@ -268,7 +355,12 @@ def collect_dataframe(progress_files: Iterable[Path]) -> pd.DataFrame:
                 "drop_ratio_total": 0.0,
                 "md_suppression_rate": 0.0,
                 "throughput_urls_per_min": 0.0,
-                "_progress_path": str(fp),
+                "md_words_count": 0,
+                "md_words_total": 0,
+                "md_words_mean": 0.0,
+                "md_words_median": 0.0,
+                "_meta_path": str(meta_path),
+                "_url_index_path": str(url_index_path) if url_index_path else None,
                 "_error": str(e),
             })
     if not rows:
@@ -283,7 +375,9 @@ def collect_dataframe(progress_files: Iterable[Path]) -> pd.DataFrame:
         "per_root_max_discovered","per_root_mean_discovered","saved_html_total","saved_md_total",
         "saved_json_total","md_suppressed_total","resumed_skips",
         "drop_ratio_prefilter","drop_ratio_patterns_lang","drop_ratio_total",
-        "md_suppression_rate","throughput_urls_per_min"
+        "md_suppression_rate","throughput_urls_per_min",
+        # markdown words fields
+        "md_words_count","md_words_total","md_words_mean","md_words_median",
     ]
     for c in numeric_cols:
         if c in df.columns:
@@ -303,9 +397,10 @@ def _percentiles(series: pd.Series, cuts=(50, 75, 80, 90, 95, 97, 99)) -> Dict[s
     return out
 
 
-def compute_summary(df: pd.DataFrame, cap_percentile: float = 0.90) -> Dict[str, Any]:
+def compute_summary(df: pd.DataFrame, cap_percentile: float = 0.90, cost_per_1k_tokens_usd: float = 0.03) -> Dict[str, Any]:
     """
-    Create a JSON-serializable summary of the dataset, with a recommended company cap.
+    Create a JSON-serializable summary of the dataset, with a recommended company cap and
+    additional markdown-word / token cost estimates.
     """
     n = len(df)
     filtered = df["filtered_total"] if "filtered_total" in df else pd.Series(dtype=float)
@@ -353,6 +448,43 @@ def compute_summary(df: pd.DataFrame, cap_percentile: float = 0.90) -> Dict[str,
             "company_max_pages_recommended": recommended_cap,
         }
     }
+
+    # -- Markdown-word global metrics & LLM cost estimates --
+    try:
+        md_words_total_series = pd.Series(dtype=float)
+        if "md_words_total" in df.columns:
+            md_words_total_series = df["md_words_total"].fillna(0).astype(float)
+
+        md_count_companies_with_words = int((df["md_words_count"] > 0).sum()) if "md_words_count" in df.columns else 0
+        md_files_estimated = int(df["md_words_count"].sum()) if "md_words_count" in df.columns else 0
+        md_words_sum = float(md_words_total_series.sum()) if not md_words_total_series.empty else 0.0
+        md_words_mean_per_company = float(md_words_total_series.mean()) if not md_words_total_series.empty else 0.0
+        md_words_median_per_company = float(df["md_words_median"].median()) if "md_words_median" in df.columns else 0.0
+
+        # token estimate and cost estimate
+        # Assumption: tokens ≈ words * token_per_word
+        token_per_word = 1.3333333  # ~ 1 token ≈ 0.75 words → inverse ~1.3333
+        estimated_total_tokens = md_words_sum * token_per_word
+        estimated_cost_usd_total = (estimated_total_tokens / 1000.0) * float(cost_per_1k_tokens_usd)
+        estimated_cost_usd_mean_per_company = ((md_words_sum / max(1, len(df))) * token_per_word / 1000.0) * float(cost_per_1k_tokens_usd)
+
+        summary["markdown"].update({
+            "md_companies_with_word_counts": md_count_companies_with_words,
+            "md_files_estimated_total": md_files_estimated,
+            "md_words_total_sum": float(md_words_sum),
+            "md_words_mean_per_company": float(md_words_mean_per_company),
+            "md_words_median_per_company": float(md_words_median_per_company),
+            "estimated_total_tokens": float(estimated_total_tokens),
+            "estimated_cost_usd_total_at_specified_rate": float(estimated_cost_usd_total),
+            "estimated_cost_usd_mean_per_company_at_specified_rate": float(estimated_cost_usd_mean_per_company),
+            "token_per_word_assumption": float(token_per_word),
+            "cost_per_1k_tokens_usd_used": float(cost_per_1k_tokens_usd),
+        })
+    except Exception:
+        # don't fail if markdown aggregations blow up
+        summary["markdown"].setdefault("md_words_total_sum", 0.0)
+        summary["markdown"].setdefault("estimated_cost_usd_total_at_specified_rate", 0.0)
+
     return summary
 
 
@@ -420,7 +552,7 @@ def plot_scatter_discovered_vs_filtered(df: pd.DataFrame, out: Path):
     x = df["discovered_total"].values
     y = df["filtered_total"].values
     fig, ax = plt.subplots(figsize=(6.4, 6.4))
-    ax.scatter(x, y, s=12, alpha=0.7)
+    sc = ax.scatter(x, y, s=12, alpha=0.7)
     lim = max(1, int(max(np.nanmax(x), np.nanmax(y))))
     ax.plot([0, lim], [0, lim])
     ax.set_aspect("equal", adjustable="box")
@@ -453,6 +585,25 @@ def plot_throughput_vs_filtered(df: pd.DataFrame, out: Path):
     ax.set_ylabel("urls_per_min")
     _savefig(fig, out)
 
+
+def plot_hist_md_words_total(df: pd.DataFrame, out: Path, bins: int = 40):
+    if "md_words_total" not in df:
+        return
+    series = df["md_words_total"].dropna()
+    if series.empty:
+        return
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    ax.hist(series, bins=bins)
+    ax.set_title("Distribution of total markdown words per company")
+    ax.set_xlabel("total markdown words (company)")
+    ax.set_ylabel("companies")
+    for p in (50, 75, 90, 95):
+        v = np.percentile(series, p) if len(series) else 0
+        ax.axvline(v, linestyle="--")
+        ax.text(v, ax.get_ylim()[1]*0.9, f"p{p}={int(v)}", rotation=90, va="top")
+    _savefig(fig, out)
+
+
 def _write_html(fig, out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # include_plotlyjs='cdn' keeps files smaller but offline; switch to 'directory' for totally offline
@@ -461,10 +612,10 @@ def _write_html(fig, out_path: Path):
 def iplot_hist_filtered(df: pd.DataFrame, out: Path):
     if "filtered_total" not in df or df["filtered_total"].dropna().empty or not _PLOTLY_OK:
         return
-    s = df["filtered_total"].dropna()
+    s = df[["bvdid","company_name","filtered_total"]].dropna()
     fig = px.histogram(s, x="filtered_total", nbins=40, title="Distribution of filtered_total per company")
     for p in (80, 90, 95, 97, 99):
-        v = float(np.percentile(s, p))
+        v = float(np.percentile(s["filtered_total"], p))
         fig.add_vline(x=v, line_dash="dash", annotation_text=f"p{p}={int(v)}", annotation_position="top")
     _write_html(fig, out)
 
@@ -472,6 +623,7 @@ def iplot_ecdf_filtered(df: pd.DataFrame, out: Path):
     if "filtered_total" not in df or df["filtered_total"].dropna().empty or not _PLOTLY_OK:
         return
     fig = px.ecdf(df, x="filtered_total", title="ECDF of filtered_total")
+    fig.update_traces(customdata=df[["bvdid","company_name"]].values, hovertemplate="filtered_total=%{x}<br>bvdid=%{customdata[0]}<br>company=%{customdata[1]}")
     _write_html(fig, out)
 
 def iplot_funnel_means(df: pd.DataFrame, out: Path):
@@ -484,7 +636,20 @@ def iplot_funnel_means(df: pd.DataFrame, out: Path):
 
 def iplot_scatter_discovered_vs_filtered(df: pd.DataFrame, out: Path):
     if not _PLOTLY_OK or not {"discovered_total","filtered_total"} <= set(df.columns): return
-    fig = px.scatter(df, x="discovered_total", y="filtered_total", title="Discovered vs Filtered", opacity=0.7)
+    # Ensure interactive points are traceable: include bvdid and company_name in hover
+    fig = px.scatter(
+        df,
+        x="discovered_total",
+        y="filtered_total",
+        hover_data=["bvdid", "company_name", "filtered_total", "discovered_total"],
+        title="Discovered vs Filtered",
+        opacity=0.8
+    )
+    # Tweak hover template for clarity
+    fig.update_traces(marker=dict(size=8), hovertemplate="discovered=%{x}<br>filtered=%{y}<br>bvdid=%{customdata[0]}<br>company=%{customdata[1]}")
+    # attach customdata explicitly so hovertemplate fields map:
+    if "bvdid" in df.columns and "company_name" in df.columns:
+        fig.data[0].customdata = df[["bvdid","company_name"]].values
     _write_html(fig, out)
 
 def iplot_hist_md_suppression(df: pd.DataFrame, out: Path):
@@ -494,7 +659,17 @@ def iplot_hist_md_suppression(df: pd.DataFrame, out: Path):
 
 def iplot_throughput_vs_filtered(df: pd.DataFrame, out: Path):
     if not _PLOTLY_OK or not {"throughput_urls_per_min","filtered_total"} <= set(df.columns): return
-    fig = px.scatter(df, x="filtered_total", y="throughput_urls_per_min", title="Throughput vs filtered_total", opacity=0.7)
+    fig = px.scatter(
+        df,
+        x="filtered_total",
+        y="throughput_urls_per_min",
+        hover_data=["bvdid","company_name","filtered_total","throughput_urls_per_min"],
+        title="Throughput vs filtered_total",
+        opacity=0.8
+    )
+    if "bvdid" in df.columns and "company_name" in df.columns:
+        fig.data[0].customdata = df[["bvdid","company_name"]].values
+        fig.update_traces(hovertemplate="filtered=%{x}<br>urls_per_min=%{y}<br>bvdid=%{customdata[0]}<br>company=%{customdata[1]}")
     _write_html(fig, out)
 
 # ---------------------------
@@ -508,29 +683,30 @@ def analyze_and_plot(
     save_csv: bool = True,
     save_json_summary: bool = True,
     interactive: bool = False,
+    cost_per_1k_tokens_usd: float = 0.03,
 ) -> Dict[str, Any]:
     """
-    Scan outputs_dir for all progress.json, aggregate, plot, and write artifacts.
+    Scan outputs_dir for all crawl_meta.json files, aggregate, plot, and write artifacts.
 
     Returns a dict summary (also optionally saved to JSON).
     """
-    progress_files = find_progress_files(outputs_dir)
-    df = collect_dataframe(progress_files)
+    crawl_meta_files = find_crawl_meta_files(outputs_dir)
+    df = collect_dataframe(crawl_meta_files)
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if len(df) == 0:
-        empty_summary = {"companies_count": 0, "message": "No progress.json found"}
+        empty_summary = {"companies_count": 0, "message": "No crawl_meta.json found"}
         if save_json_summary:
             (out_dir / "summary.json").write_text(json.dumps(empty_summary, indent=2), encoding="utf-8")
         return empty_summary
 
     # Save detailed CSV
     if save_csv:
-        df.to_csv(out_dir / "progress_aggregate.csv", index=False, encoding="utf-8")
+        df.to_csv(out_dir / "crawl_meta_aggregate.csv", index=False, encoding="utf-8")
 
     # Compute summary + recommendations
-    summary = compute_summary(df, cap_percentile=cap_percentile)
+    summary = compute_summary(df, cap_percentile=cap_percentile, cost_per_1k_tokens_usd=cost_per_1k_tokens_usd)
     if save_json_summary:
         (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -541,6 +717,7 @@ def analyze_and_plot(
     plot_scatter_discovered_vs_filtered(df, out_dir / "scatter_discovered_vs_filtered.png")
     plot_hist_md_suppression(df, out_dir / "hist_md_suppression.png")
     plot_throughput_vs_filtered(df, out_dir / "scatter_throughput_vs_filtered.png")
+    plot_hist_md_words_total(df, out_dir / "hist_md_words_total.png")
 
     # Interactive charts (Plotly HTML)
     if interactive and _PLOTLY_OK:
@@ -551,10 +728,15 @@ def analyze_and_plot(
         iplot_scatter_discovered_vs_filtered(df, iout / "scatter_discovered_vs_filtered.html")
         iplot_hist_md_suppression(df, iout / "hist_md_suppression.html")
         iplot_throughput_vs_filtered(df, iout / "scatter_throughput_vs_filtered.html")
-        # optionally annotate summary with where the files are
+        # annotate summary with where the files are
         summary["interactive_dir"] = str(iout.resolve())
     elif interactive and not _PLOTLY_OK:
         summary["interactive_dir"] = None
         summary["interactive_error"] = "plotly not installed"
+
+    # add artifact locations
+    summary["artifacts_dir"] = str(out_dir.resolve())
+    summary["crawl_meta_aggregate"] = str((out_dir / "crawl_meta_aggregate.csv").resolve()) if save_csv else None
+    summary["summary_json"] = str((out_dir / "summary.json").resolve()) if save_json_summary else None
 
     return summary
