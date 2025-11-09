@@ -4,8 +4,10 @@ import os
 import sys
 import asyncio
 import logging
+import json
 from typing import List, Optional, Dict, Any, Iterable, Set, Tuple
 from urllib.parse import urlparse
+from pathlib import Path
 
 from crawl4ai import (
     AsyncUrlSeeder,
@@ -64,6 +66,62 @@ PRODUCTISH_URL_TOKENS = set(langcfg.get("SMART_INCLUDE_TOKENS"))
 
 _DEBUG_SAMPLE_TOP = 10
 _DEBUG_SAMPLE_BOTTOM = 3
+
+# -------------------------
+# Dynamic universal heuristic (persistence)
+# -------------------------
+DYNAMIC_COUNTS_FILE: Path = Path("outputs") / "dynamic_universal_counts.json"
+DYNAMIC_THRESHOLD: int = 1  # If a host is seen in > DYNAMIC_THRESHOLD distinct companies, treat it as universal
+
+def _dyn_counts_path() -> Path:
+    return DYNAMIC_COUNTS_FILE
+
+def _load_dyn_counts() -> Dict[str, List[str]]:
+    p = _dyn_counts_path()
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_dyn_counts(d: Dict[str, List[str]]) -> None:
+    p = _dyn_counts_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        p.write_text(json.dumps(d, indent=2), encoding="utf-8")
+    except Exception:
+        # best-effort; do not crash seeder
+        log.exception("[url_seeder] Failed to save dynamic counts to %s", str(p))
+
+def _increment_hosts_for_company(company_id: str, hosts: Iterable[str]) -> Tuple[Dict[str, int], List[str]]:
+    """
+    Record each host as seen for `company_id` (company_id should be the base hostname of the company).
+    Return (counts_snapshot, newly_blacklisted_hosts)
+    """
+    data = _load_dyn_counts()
+    newly_blacklisted: List[str] = []
+    for h in hosts:
+        if not h:
+            continue
+        lst = data.get(h, [])
+        if company_id not in lst:
+            lst.append(company_id)
+            data[h] = lst
+            # check threshold
+            if len(lst) > DYNAMIC_THRESHOLD:
+                newly_blacklisted.append(h)
+    _save_dyn_counts(data)
+    # return short counts map for convenience
+    counts_snapshot = {k: len(v) for k, v in data.items()}
+    return counts_snapshot, newly_blacklisted
+
+def _is_host_dynamically_universal(host: str) -> bool:
+    data = _load_dyn_counts()
+    lst = data.get(host, [])
+    return len(lst) > DYNAMIC_THRESHOLD
+
+# -------------------------
 
 def _build_monitor() -> object | None:
     if os.name == "nt" or sys.platform.startswith("win"):
@@ -155,10 +213,40 @@ async def _collect_roots(base_url: str, *, discover_brands: bool = True) -> List
             log.info("[url_seeder] Brand discovery for %s", preferred)
             brand_sites_raw = await discover_brand_sites(preferred)
             brand_sites = _normalize_brand_sites(brand_sites_raw, require_valid_status=True)
+
+            # Filter out canonical universal externals first
             brand_sites = [u for u in brand_sites if not is_universal_external(u)]
-            for b in brand_sites:
+
+            # Now dynamic-universal logic:
+            # compute candidate hosts (unique) and map to company_id (preferred_host)
+            company_id = (urlparse(preferred).hostname or "").lower() or preferred
+            candidate_hosts = set((urlparse(u).hostname or "").lower() for u in brand_sites if u)
+            # increment persistent counts for these hosts for this company
+            counts_snapshot, newly_blacklisted = _increment_hosts_for_company(company_id, candidate_hosts)
+
+            # Any hosts currently dynamically blacklisted (counts > threshold) should be omitted
+            filtered_brand_sites: List[str] = []
+            skipped_due_to_dynamic: List[Tuple[str, int]] = []
+            for u in brand_sites:
+                host = (urlparse(u).hostname or "").lower()
+                # Skip if sandboxed by static universal list or dynamic counts
+                if is_universal_external(u) or _is_host_dynamically_universal(host):
+                    # If dynamic skip, produce special log entry for review, include current count
+                    curr_count = counts_snapshot.get(host, 0)
+                    skipped_due_to_dynamic.append((u, curr_count))
+                    continue
+                filtered_brand_sites.append(u)
+
+            # Emit special logs for those skipped due to dynamic blacklist
+            for root_u, curr_count in skipped_due_to_dynamic:
+                log.warning("[url_seeder.dynamic-skip] Skipped candidate brand root=%s for base=%s because host=%s seen_in_companies=%d",
+                            root_u, preferred, (urlparse(root_u).hostname or ""), int(curr_count))
+
+            # Use filtered_brand_sites as brand roots to add
+            for b in filtered_brand_sites:
                 if b not in seen:
                     seen.add(b); roots.append(b)
+
             if len(roots) > 1:
                 log.info("[url_seeder]   %d brand root(s)", len(roots) - 1)
             if log.isEnabledFor(logging.DEBUG):
