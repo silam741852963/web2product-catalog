@@ -57,47 +57,91 @@ __all__ = [
 # =============================================================================
 
 UNIVERSAL_EXTERNALS: set[str] = {
-    # Social / video / community mega-platforms
+    # --- Social / community / media mega-platforms ---
     "facebook.com", "instagram.com", "twitter.com", "x.com", "youtube.com",
     "linkedin.com", "tiktok.com", "pinterest.com", "reddit.com", "slack.com",
-    "medium.com", "substack.com", "discord.com", "trustpilot.com",
+    "medium.com", "substack.com", "discord.com", "quora.com", "trustpilot.com",
+    "glassdoor.com", "crunchbase.com",
 
-    # Link shorteners / trackers
+    # --- Link shorteners / trackers ---
     "t.co", "goo.gl", "bit.ly", "bitly.com", "tinyurl.com", "ow.ly", "buff.ly",
-    "rebrand.ly", "lnkd.in", "mailchi.mp", "hubspotlinks.com",
+    "rebrand.ly", "lnkd.in", "mailchi.mp", "hubspotlinks.com", "adobe.ly",
+    "shorturl.at", "urlr.me", "clickfunnels.com",
 
-    # App stores
+    # --- App stores ---
     "apps.apple.com", "itunes.apple.com", "play.google.com",
-    "appgallery.huawei.com", "galaxy.store",
-    "microsoft.com/store", "apps.microsoft.com",
+    "appgallery.huawei.com", "galaxy.store", "microsoft.com/store",
+    "apps.microsoft.com",
 
-    # SSO / identity providers
+    # --- SSO / identity providers ---
     "accounts.google.com", "login.microsoftonline.com", "auth0.com", "okta.com",
-    "onelogin.com", "pingidentity.com",
+    "onelogin.com", "pingidentity.com", "appleid.apple.com", "login.salesforce.com",
 
-    # Docs/KB SaaS & hosted help centers
-    "intercom.help", "zendesk.com", "freshdesk.com", "readme.io", "gitbook.io",
+    # --- Docs / KB SaaS & hosted help centers ---
+    "intercom.help", "zendesk.com", "freshdesk.com", "helpscoutdocs.com",
+    "readme.io", "gitbook.io", "document360.io", "service-now.com",
+    "notion.site", "confluence.com", "knowledgeowl.com", "zoho.com",
+    "helpjuice.com", "deskera.com",
 
-    # Atlassian cloud
-    "atlassian.net", "statuspage.io",
+    # --- Atlassian cloud ---
+    "atlassian.net", "statuspage.io", "jira.com", "confluence.net",
 
-    # Dev hosting / code forges
-    "github.com", "gitlab.com", "bitbucket.org",
+    # --- Dev hosting / code forges ---
+    "github.com", "gitlab.com", "bitbucket.org", "sourceforge.net",
+    "stackblitz.com", "codesandbox.io", "replit.com",
 
-    # Google properties typically not brand sites for discovery
-    "developers.google.com", "support.google.com", "docs.google.com", "drive.google.com",
-    "forms.gle", "maps.google.com", "maps.app.goo.gl",
+    # --- Google properties (not product sites) ---
+    "developers.google.com", "support.google.com", "docs.google.com",
+    "drive.google.com", "forms.gle", "maps.google.com", "maps.app.goo.gl",
+    "calendar.google.com", "photos.google.com", "accounts.google.com",
 
-    # General news / media large outlets (not first-party product pages)
+    # --- General news / media ---
     "newsweek.com", "cnn.com", "bbc.co.uk", "reuters.com", "bloomberg.com",
     "nytimes.com", "washingtonpost.com", "theguardian.com", "forbes.com",
+    "yahoo.com", "nbcnews.com", "cnbc.com", "businessinsider.com", "techcrunch.com",
 
-    # Common “status” host providers/vanity domains
-    "status.io", "statuspal.io",
+    # --- Status / uptime / monitoring ---
+    "status.io", "statuspal.io", "statuspage.io", "uptime.com", "pingdom.com",
+    "betteruptime.com", "freshstatus.io",
 
-    # Frequent false positives seen in logs
+    # --- E-commerce / hosting / site builders ---
+    "shopify.com", "myshopify.com", "bigcommerce.com", "magento.com",
+    "woocommerce.com", "wix.com", "squarespace.com", "weebly.com",
+    "webflow.io", "wordpress.com", "godaddy.com", "strikingly.com",
+    "ecwid.com", "prestashop.com", "3dcart.com", "shopbase.com",
+    "shift4shop.com", "lightspeedhq.com", "zohocommerce.com",
+
+    # --- Marketing / CRM / analytics / ads ---
+    "mailchimp.com", "campaignmonitor.com", "activecampaign.com", "hubspot.com",
+    "salesforce.com", "pardot.com", "marketo.com", "keap.com", "sendgrid.com",
+    "constantcontact.com", "convertkit.com", "drip.com", "klaviyo.com",
+    "adobe.com", "doubleclick.net", "googletagmanager.com", "google-analytics.com",
+    "analytics.google.com", "tagmanager.google.com", "mixpanel.com",
+    "segment.com", "hotjar.com", "fullstory.com", "crazyegg.com",
+    "facebook.net", "fbcdn.net", "twitteranalytics.com",
+
+    # --- CDN / asset / security ---
+    "cloudflare.com", "cdn.cloudflare.net", "akamaihd.net", "akamaized.net",
+    "fastly.net", "vercel.app", "netlify.app", "edgekey.net", "edgesuite.net",
+    "stackpathcdn.com", "azureedge.net", "firebaseapp.com", "cloudfront.net",
+
+    # --- Payment / checkout platforms ---
+    "stripe.com", "paypal.com", "braintreepayments.com", "squareup.com",
+    "adyen.com", "authorize.net", "klarna.com", "afterpay.com", "affirm.com",
+
+    # --- Booking / ticketing / delivery SaaS ---
+    "eventbrite.com", "ticketmaster.com", "opentable.com", "resy.com",
+    "doordash.com", "ubereats.com", "postmates.com", "grubhub.com",
+
+    # --- Survey / forms / scheduling ---
+    "surveymonkey.com", "typeform.com", "jotform.com", "googleforms.com",
+    "calendly.com", "doodle.com", "wufoo.com",
+
+    # --- Other frequent false positives ---
     "sproutsocialstatus.com", "newswhip.com", "mozilla.org", "google.com",
-    "microsoft.com",
+    "microsoft.com", "apple.com", "amazon.com", "aws.amazon.com", "adobe.io",
+    "creativecommons.org", "ietf.org", "w3.org", "archive.org", "who.int",
+    "un.org", "europa.eu", "g2.com", "capterra.com", "producthunt.com",
 }
 
 FUNCTIONAL_SUBDOMAIN_PREFIXES: tuple[str, ...] = (
