@@ -1,11 +1,12 @@
-# generate_url_index.py
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 from extensions.url_index import discover_and_write_url_index
 from extensions.global_state import GlobalState
@@ -36,6 +37,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--limit", type=int, default=None, help="Max companies to process")
 
+    # Per-company crawler knobs
     p.add_argument("--max-pages", type=int, default=8000)
     p.add_argument("--max-depth", type=int, default=3)
     p.add_argument("--per-host-cap", type=int, default=4000)
@@ -43,7 +45,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pos-query", default=None)
     p.add_argument("--neg-query", default=None)
 
-    # NEW: scoring thresholds
+    # Scoring thresholds
     p.add_argument("--score-threshold", type=float, default=0.25,
                    help="Drop discovered URLs whose dual-BM25 score is below this value. Set to a negative value to disable.")
     seeds_meg = p.add_mutually_exclusive_group()
@@ -52,25 +54,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
     seeds_meg.add_argument("--no-score-threshold-on-seeds", dest="score_threshold_on_seeds", action="store_false",
                            help="Do NOT apply score threshold to seed roots.")
 
+    # Language / externals
     p.add_argument("--lang-primary", default="en")
     p.add_argument("--accept-en-regions", default=None, help="Comma list like 'us,gb,uk,ca,au'")
     p.add_argument("--strict-cctld", action="store_true")
-    # Keep legacy switch; name kept for backward compat
     p.add_argument("--no-drop-universal", action="store_true", help="Do NOT drop universal externals")
     p.add_argument("--include", nargs="*", default=None, help="Override include patterns (space-separated)")
     p.add_argument("--exclude", nargs="*", default=None, help="Override exclude patterns (space-separated)")
     p.add_argument("--dynamic-counts-file", type=Path, default=None)
 
+    # Concurrency controls
+    p.add_argument("--company-concurrency", type=int, default=6,
+                   help="Max number of companies processed in parallel.")
+    p.add_argument("--crawl-concurrency", type=int, default=8,
+                   help="Worker tasks per company (parallel page expansion).")
+
+    # Progress tracking
+    p.add_argument("--progress-file", type=Path, default=Path("outputs") / "url_index_progress.json",
+                   help="Where to write rolling progress (JSON).")
+
     # Logging
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
 
+# ---------- Small helper for safe writes ----------
+
+def _atomic_write_json(path: Path, obj) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
 # ---------- Runner ----------
 
-async def _run_for_company(ci: CompanyInput, args: argparse.Namespace, state: GlobalState) -> None:
+async def _run_for_company(ci: CompanyInput, args: argparse.Namespace, state: GlobalState) -> Tuple[str, int]:
+    """
+    Returns: (bvdid, seeded_count)
+    """
     logging.getLogger("generate_url_index").info("→ [%s] %s (%s)", ci.bvdid, ci.name, ci.url)
     try:
-        await discover_and_write_url_index(
+        res = await discover_and_write_url_index(
             company_id=ci.bvdid,
             company_name=ci.name,
             base_url=ci.url,
@@ -90,9 +113,41 @@ async def _run_for_company(ci: CompanyInput, args: argparse.Namespace, state: Gl
             score_threshold_on_seeds=args.score_threshold_on_seeds,
             dynamic_counts_file=args.dynamic_counts_file,
             state=state,
+            concurrency=int(args.crawl_concurrency),
         )
+        return (ci.bvdid, int(res.get("seeded", 0)))
     except Exception as e:
         logging.getLogger("generate_url_index").exception("[%s] failed: %s", ci.bvdid, e)
+        return (ci.bvdid, 0)
+
+class _Progress:
+    def __init__(self, total: int, progress_path: Path, logger: logging.Logger) -> None:
+        self.total = max(0, int(total))
+        self.done = 0
+        self.seeded_total = 0
+        self.completed_ids: List[str] = []
+        self.path = progress_path
+        self._lock = asyncio.Lock()
+        self._log = logger
+
+    async def mark_done(self, bvdid: str, seeded_count: int) -> None:
+        async with self._lock:
+            self.done += 1
+            self.seeded_total += max(0, int(seeded_count))
+            self.completed_ids.append(bvdid)
+            payload = {
+                "total_companies": self.total,
+                "completed_companies": self.done,
+                "completed_ratio": round((self.done / self.total) if self.total else 1.0, 4),
+                "seeded_urls_total": self.seeded_total,
+                # keep recent tail to avoid unbounded growth
+                "recent_completed_ids": self.completed_ids[-500:],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _atomic_write_json(self.path, payload)
+            pct = (100.0 * self.done / self.total) if self.total else 100.0
+            self._log.info("Progress: %d/%d (%.1f%%) | seeded_urls_total=%d",
+                           self.done, self.total, pct, self.seeded_total)
 
 async def main_async() -> None:
     parser = build_arg_parser()
@@ -104,7 +159,7 @@ async def main_async() -> None:
     )
     log = logging.getLogger("generate_url_index")
 
-    # Load companies list via source_loader (I/O aligned with run_crawl)
+    # Load companies list
     if getattr(args, "source_dir", None):
         patterns = [p.strip() for p in (args.source_pattern or "").split(",") if p.strip()]
         companies: List[CompanyInput] = load_companies_from_dir(args.source_dir, patterns=patterns, recursive=True)
@@ -118,15 +173,23 @@ async def main_async() -> None:
         log.error("No companies to process.")
         return
 
-    log.info("Loaded %d companies. Begin discovery…", len(companies))
+    log.info("Loaded %d companies. Begin discovery… (company_concurrency=%d, crawl_concurrency=%d)",
+             len(companies), int(args.company_concurrency), int(args.crawl_concurrency))
 
-    state = GlobalState()  # records has_url_index + resume_mode for reuse_index
+    state = GlobalState()
+    progress = _Progress(total=len(companies), progress_path=Path(args.progress_file), logger=log)
 
-    # Sequential is OK (per-company discovery is light); can be parallelized if needed
-    for ci in companies:
-        await _run_for_company(ci, args, state)
+    sem = asyncio.Semaphore(max(1, int(args.company_concurrency)))
 
-    log.info("All done.")
+    async def _guarded(ci: CompanyInput):
+        async with sem:
+            bvdid, seeded = await _run_for_company(ci, args, state)
+            await progress.mark_done(bvdid, seeded)
+
+    tasks = [asyncio.create_task(_guarded(ci)) for ci in companies]
+    await asyncio.gather(*tasks)
+
+    log.info("All done. Final progress written to: %s", args.progress_file)
 
 if __name__ == "__main__":
     asyncio.run(main_async())

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
+from collections import defaultdict
 
 # Crawl4AI
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
@@ -36,11 +38,12 @@ from extensions.checkpoint import CompanyCheckpoint
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
-# Dynamic "universal external" persistence (compatible with prior use)
+# Dynamic "universal external" persistence (with async file-level lock)
 # ---------------------------------------------------------------------
 
 DYNAMIC_COUNTS_FILE: Path = Path("outputs") / "dynamic_universal_counts.json"
 DYNAMIC_THRESHOLD: int = 1  # >1 distinct companies -> considered universal
+_DYN_COUNTS_LOCK = asyncio.Lock()  # guards read-modify-write of the shared file
 
 def _dyn_counts_path() -> Path:
     return DYNAMIC_COUNTS_FILE
@@ -62,21 +65,25 @@ def _save_dyn_counts(d: Dict[str, List[str]]) -> None:
     except Exception:
         log.exception("[url_index] Failed to save dynamic counts: %s", str(p))
 
-def _increment_hosts_for_company(company_id: str, hosts: Iterable[str]) -> Tuple[Dict[str, int], List[str]]:
-    data = _load_dyn_counts()
+async def _increment_hosts_for_company_async(company_id: str, hosts: Iterable[str]) -> Tuple[Dict[str, int], List[str]]:
     newly_blacklisted: List[str] = []
-    for h in {h for h in hosts if h}:
-        lst = data.get(h, [])
-        if company_id not in lst:
-            lst.append(company_id)
-            data[h] = lst
-            if len(lst) > DYNAMIC_THRESHOLD:
+    async with _DYN_COUNTS_LOCK:
+        data = _load_dyn_counts()
+        for h in {h for h in hosts if h}:
+            lst = data.get(h, [])
+            if company_id not in lst:
+                lst.append(company_id)
+                data[h] = lst
+        _save_dyn_counts(data)
+        # compute results after write
+        counts_snapshot = {k: len(v) for k, v in data.items()}
+        for h, lst in data.items():
+            if len(lst) > DYNAMIC_THRESHOLD and h in hosts:
                 newly_blacklisted.append(h)
-    _save_dyn_counts(data)
-    counts_snapshot = {k: len(v) for k, v in data.items()}
     return counts_snapshot, newly_blacklisted
 
 def _is_host_dynamically_universal(host: str) -> bool:
+    # Read-only; race-safe without lock
     data = _load_dyn_counts()
     lst = data.get((host or "").lower(), [])
     return len(lst) > DYNAMIC_THRESHOLD
@@ -159,7 +166,7 @@ def _host(url: str) -> str:
     return (urlparse(url).hostname or "").lower()
 
 # ---------------------------------------------------------------------
-# Main discoverer
+# Main discoverer (now concurrent)
 # ---------------------------------------------------------------------
 
 @dataclass
@@ -170,7 +177,7 @@ class GenConfig:
     output_dir: Optional[Path] = None
     max_pages: int = 8000
     max_depth: int = 3
-    concurrency: int = 8
+    concurrency: int = 8              # number of worker tasks
     include: Optional[List[str]] = None
     exclude: Optional[List[str]] = None
     lang_primary: str = "en"
@@ -199,15 +206,23 @@ class GenConfig:
             globals()["DYNAMIC_COUNTS_FILE"] = Path(self.dynamic_counts_file)
 
 class URLIndexer:
-    """Internal discoverer; records filtered reasons + scores into url_index with explicit statuses."""
+    """Concurrent discoverer; records filtered reasons + scores into url_index with explicit statuses."""
 
     def __init__(self, cfg: GenConfig) -> None:
         self.cfg = cfg
         self.cfg.normalize()
 
+        # shared state
         self.visited: Set[str] = set()
         self.frontier: List[FrontierItem] = []
         self.seen_hosts_for_dynamic: Set[str] = set()
+        self.host_visit_count: Dict[str, int] = defaultdict(int)
+
+        # locks
+        self._frontier_lock = asyncio.Lock()
+        self._visited_lock = asyncio.Lock()
+        self._metrics_lock = asyncio.Lock()
+        self._out_lock = asyncio.Lock()
 
         self.comb = DualBM25Combiner(_bm25_lite, DualBM25Config(alpha=float(self.cfg.dual_alpha)))
 
@@ -219,15 +234,12 @@ class URLIndexer:
         }
         self.filtered_breakdown: Dict[str, int] = {}
 
+        # collected output (visited pages only)
+        self._out_urls: List[Dict[str, Any]] = []
+
     def _dual_score(self, url: str, anchor: str) -> float:
         doc = " ".join([url, anchor or ""])
         return self.comb.score(doc, pos_query=self.cfg.pos_query, neg_query=self.cfg.neg_query)
-
-    def _is_blocked_external(self, url: str) -> bool:
-        h = _host(url)
-        if self.cfg.drop_universal_externals and _is_host_dynamically_universal(h):
-            return True
-        return False
 
     async def _fetch_html(self, crawler: AsyncWebCrawler, url: str) -> str:
         cfg = CrawlerRunConfig(
@@ -252,37 +264,177 @@ class URLIndexer:
             pass
         return ""
 
-    def _enqueue(self, url: str, depth: int, parent: Optional[str], seed_root: Optional[str], anchor: str) -> None:
-        # If we've already visited, don't enqueue again (status should have been written earlier)
-        if url in self.visited:
-            return
+    async def _enqueue(self, url: str, depth: int, parent: Optional[str], seed_root: Optional[str], anchor: str) -> None:
+        # Do not enqueue duplicates
+        async with self._visited_lock:
+            if url in self.visited:
+                return
 
         s = self._dual_score(url, anchor)
 
-        # Threshold: skip enqueue if below cutoff (always allow seed roots unless flagged)
+        # Threshold: skip enqueue if below cutoff (allow roots unless configured)
         if self.cfg.score_threshold is not None:
             if depth == 0 and not self.cfg.score_threshold_on_seeds:
-                pass  # let roots through unconditionally
+                pass
             elif s < float(self.cfg.score_threshold):
-                # Explicitly record filtered status here
                 try:
                     upsert_url_index(self.cfg.company_id, url, status="filtered_score_below_threshold", score=s)
                 except Exception:
                     pass
+                async with self._metrics_lock:
+                    self.metrics["filtered_total"] += 1
+                    self.filtered_breakdown["score_below_threshold"] = self.filtered_breakdown.get("score_below_threshold", 0) + 1
                 return
 
-        # Enqueue + write queued status
-        self.frontier.append(FrontierItem(score=s, url=url, depth=depth, parent=parent, seed_root=seed_root, anchor=anchor))
+        async with self._frontier_lock:
+            self.frontier.append(FrontierItem(score=s, url=url, depth=depth, parent=parent, seed_root=seed_root, anchor=anchor))
         try:
             upsert_url_index(self.cfg.company_id, url, status="queued", score=s)
         except Exception:
             pass
 
-    def _pop_best(self) -> Optional[FrontierItem]:
-        if not self.frontier:
-            return None
-        best_i = max(range(len(self.frontier)), key=lambda i: self.frontier[i].score)
-        return self.frontier.pop(best_i)
+    async def _pop_best(self) -> Optional[FrontierItem]:
+        async with self._frontier_lock:
+            if not self.frontier:
+                return None
+            best_i = max(range(len(self.frontier)), key=lambda i: self.frontier[i].score)
+            return self.frontier.pop(best_i)
+
+    async def _record_visit(self, url: str, score: float, preferred: str) -> Tuple[bool, int]:
+        """Mark as visited and return (ok_to_process, host_count_after)."""
+        h = (urlparse(url).hostname or "").lower()
+        async with self._visited_lock:
+            # cap check by host
+            if self.host_visit_count[h] >= max(1, int(self.cfg.per_host_page_cap)):
+                return (False, self.host_visit_count[h])
+            if url in self.visited:
+                return (False, self.host_visit_count[h])
+            self.visited.add(url)
+            self.host_visit_count[h] += 1
+            self.seen_hosts_for_dynamic.add(h)
+        # seed status immediately
+        try:
+            upsert_url_index(self.cfg.company_id, url, status="seeded", score=score)
+        except Exception:
+            pass
+        return (True, self.host_visit_count[h])
+
+    async def _add_out_url(self, node: FrontierItem, preferred: str) -> None:
+        rec = {
+            "url": node.url,
+            "seed_root": node.seed_root or preferred,
+            "parent": node.parent,
+            "depth": node.depth,
+            "score": round(float(node.score), 6),
+            "stage": "seeded",
+        }
+        async with self._out_lock:
+            self._out_urls.append(rec)
+
+    async def _worker(self, crawler: AsyncWebCrawler, preferred: str) -> None:
+        while True:
+            if len(self.visited) >= self.cfg.max_pages:
+                return
+            node = await self._pop_best()
+            if node is None:
+                return
+
+            # per-host cap check & visit mark
+            ok, count_after = await self._record_visit(node.url, node.score, preferred)
+            if not ok:
+                try:
+                    upsert_url_index(self.cfg.company_id, node.url, status="filtered_per_host_cap", score=node.score)
+                except Exception:
+                    pass
+                async with self._metrics_lock:
+                    self.metrics["filtered_total"] += 1
+                    self.filtered_breakdown["per_host_cap"] = self.filtered_breakdown.get("per_host_cap", 0) + 1
+                continue
+
+            await self._add_out_url(node, preferred)
+
+            if node.depth >= self.cfg.max_depth:
+                # depth cap reached; don't expand children
+                continue
+
+            # fetch & parse
+            try:
+                html = await self._fetch_html(crawler, node.url)
+            except Exception as e:
+                log.debug("[url_index] [%s] fetch error %s: %s", self.cfg.company_id, node.url, e)
+                continue
+
+            links = _extract_links(html, node.url)
+            if not links:
+                continue
+
+            # score candidates; early threshold drop
+            candidates_scored: List[Dict[str, Any]] = []
+            score_by_url: Dict[str, float] = {}
+            for cand, anchor in links:
+                async with self._metrics_lock:
+                    self.metrics["discovered_total"] += 1
+                s = self._dual_score(cand, anchor or "")
+
+                if self.cfg.score_threshold is not None and s < float(self.cfg.score_threshold):
+                    try:
+                        upsert_url_index(self.cfg.company_id, cand, status="filtered_score_below_threshold", score=s)
+                    except Exception:
+                        pass
+                    async with self._metrics_lock:
+                        self.metrics["filtered_total"] += 1
+                        self.filtered_breakdown["score_below_threshold"] = self.filtered_breakdown.get("score_below_threshold", 0) + 1
+                    continue
+
+                candidates_scored.append({"url": cand, "anchor": anchor, "score_hint": s})
+                score_by_url[cand] = s
+
+            if not candidates_scored:
+                continue
+
+            kept_sorted, dropped = apply_url_filters(
+                candidates_scored,
+                include=self.cfg.include,
+                exclude=self.cfg.exclude,
+                drop_universal_externals=self.cfg.drop_universal_externals,
+                lang_primary=self.cfg.lang_primary,
+                lang_accept_en_regions=self.cfg.accept_en_regions,
+                lang_strict_cctld=self.cfg.strict_cctld,
+                include_overrides_language=False,
+                sort_by_priority=True,
+                base_url=node.url,
+                return_reasons=True,
+            )  # type: ignore
+
+            # record filtered with reason
+            if dropped:
+                async with self._metrics_lock:
+                    self.metrics["filtered_total"] += len(dropped)
+                for d in dropped:
+                    reason = d.get("reason") or "unknown"
+                    u = d.get("url")
+                    if not u:
+                        continue
+                    try:
+                        upsert_url_index(self.cfg.company_id, u, status=f"filtered_{reason}", score=score_by_url.get(u))
+                    except Exception:
+                        pass
+                    async with self._metrics_lock:
+                        self.filtered_breakdown[reason] = self.filtered_breakdown.get(reason, 0) + 1
+
+            # enqueue kept children
+            if kept_sorted:
+                async with self._metrics_lock:
+                    self.metrics["kept_total"] += len(kept_sorted)
+                for it in kept_sorted:
+                    cand = it["url"]
+                    anc = ""
+                    for u2, a2 in links:
+                        if u2 == cand:
+                            anc = a2
+                            break
+                    seed_for_child = (node.seed_root or preferred) if same_registrable_domain(preferred, cand) else cand
+                    await self._enqueue(cand, depth=node.depth + 1, parent=node.url, seed_root=seed_for_child, anchor=anc)
 
     async def run(self) -> Dict[str, Any]:
         roots = _with_scheme_variants(self.cfg.base_url)
@@ -310,7 +462,7 @@ class URLIndexer:
         except Exception:
             cp = None
 
-        # seed frontier: score + queued status
+        # seed frontier
         seed_roots: List[str] = []
         for u in roots:
             s = self._dual_score(u, "")
@@ -318,134 +470,20 @@ class URLIndexer:
                 upsert_url_index(self.cfg.company_id, u, status="queued", score=s)
             except Exception:
                 pass
-            self.frontier.append(FrontierItem(score=s, url=u, depth=0, parent=None, seed_root=u, anchor=""))
+            async with self._frontier_lock:
+                self.frontier.append(FrontierItem(score=s, url=u, depth=0, parent=None, seed_root=u, anchor=""))
             seed_roots.append(u)
 
         host_cap = max(1, int(self.cfg.per_host_page_cap))
-        out_urls: List[Dict[str, Any]] = []
+        comp_log.debug("[url_index] [%s] start discovery: base=%s seed_roots=%d cap=%d workers=%d",
+                       self.cfg.company_id, self.cfg.base_url, len(seed_roots), host_cap, int(self.cfg.concurrency))
 
-        comp_log.debug("[url_index] [%s] start discovery: base=%s seed_roots=%d",
-                       self.cfg.company_id, self.cfg.base_url, len(seed_roots))
-
+        # Run worker pool
         async with AsyncWebCrawler(config=None) as crawler:
-            while self.frontier and len(self.visited) < self.cfg.max_pages:
-                node = self._pop_best()
-                if node is None:
-                    break
-                url, depth = node.url, node.depth
-                if url in self.visited:
-                    continue
+            workers = [asyncio.create_task(self._worker(crawler, preferred)) for _ in range(max(1, int(self.cfg.concurrency)))]
+            await asyncio.gather(*workers)
 
-                h = (urlparse(url).hostname or "").lower()
-                if sum(1 for v in self.visited if (urlparse(v).hostname or "").lower() == h) >= host_cap:
-                    # per-host limit -> record as filtered
-                    try:
-                        upsert_url_index(self.cfg.company_id, url, status="filtered_per_host_cap", score=node.score)
-                    except Exception:
-                        pass
-                    self.metrics["filtered_total"] += 1
-                    self.filtered_breakdown["per_host_cap"] = self.filtered_breakdown.get("per_host_cap", 0) + 1
-                    continue
-
-                # mark visited and write SEEEDED status immediately
-                self.visited.add(url)
-                self.seen_hosts_for_dynamic.add(h)
-                try:
-                    upsert_url_index(self.cfg.company_id, url, status="seeded", score=node.score)
-                except Exception:
-                    pass
-
-                out_urls.append({
-                    "url": url,
-                    "seed_root": node.seed_root or preferred,
-                    "parent": node.parent,
-                    "depth": depth,
-                    "score": round(float(node.score), 6),
-                    "stage": "seeded",
-                })
-
-                if depth >= self.cfg.max_depth:
-                    # Depth cap reached—don’t expand children. (Status already 'seeded'.)
-                    continue
-
-                # fetch & parse children
-                try:
-                    html = await self._fetch_html(crawler, url)
-                except Exception as e:
-                    comp_log.debug("[url_index] [%s] fetch error %s: %s", self.cfg.company_id, url, e)
-                    # keep it 'seeded'; we simply won't expand children on fetch failure
-                    continue
-
-                links = _extract_links(html, url)
-                if not links:
-                    continue
-
-                # Build candidate list with scores and anchors; count discoveries
-                candidates_scored: List[Dict[str, Any]] = []
-                score_by_url: Dict[str, float] = {}
-                for cand, anchor in links:
-                    self.metrics["discovered_total"] += 1
-                    s = self._dual_score(cand, anchor or "")
-
-                    # Threshold: drop early and record explicit filtered status
-                    if self.cfg.score_threshold is not None and s < float(self.cfg.score_threshold):
-                        try:
-                            upsert_url_index(self.cfg.company_id, cand, status="filtered_score_below_threshold", score=s)
-                        except Exception:
-                            pass
-                        self.metrics["filtered_total"] += 1
-                        self.filtered_breakdown["score_below_threshold"] = self.filtered_breakdown.get("score_below_threshold", 0) + 1
-                        continue
-
-                    candidates_scored.append({"url": cand, "anchor": anchor, "score_hint": s})
-                    score_by_url[cand] = s
-
-                if not candidates_scored:
-                    continue
-
-                # apply filters with REASONS
-                kept_sorted, dropped = apply_url_filters(
-                    candidates_scored,
-                    include=self.cfg.include,
-                    exclude=self.cfg.exclude,
-                    drop_universal_externals=self.cfg.drop_universal_externals,
-                    lang_primary=self.cfg.lang_primary,
-                    lang_accept_en_regions=self.cfg.accept_en_regions,
-                    lang_strict_cctld=self.cfg.strict_cctld,
-                    include_overrides_language=False,
-                    sort_by_priority=True,
-                    base_url=url,
-                    return_reasons=True,
-                )  # type: ignore
-
-                # record drops with reason + score (explicit filtered_* statuses)
-                if dropped:
-                    self.metrics["filtered_total"] += len(dropped)
-                    for d in dropped:
-                        reason = d.get("reason") or "unknown"
-                        u = d.get("url")
-                        if not u:
-                            continue
-                        try:
-                            upsert_url_index(self.cfg.company_id, u, status=f"filtered_{reason}", score=score_by_url.get(u))
-                        except Exception:
-                            pass
-                        self.filtered_breakdown[reason] = self.filtered_breakdown.get(reason, 0) + 1
-
-                # enqueue children from kept list (write queued here)
-                if kept_sorted:
-                    self.metrics["kept_total"] += len(kept_sorted)
-                    for it in kept_sorted:
-                        cand = it["url"]
-                        anc = ""
-                        for u2, a2 in links:
-                            if u2 == cand:
-                                anc = a2
-                                break
-                        seed_for_child = (node.seed_root or preferred) if same_registrable_domain(preferred, cand) else cand
-                        self._enqueue(cand, depth=depth + 1, parent=url, seed_root=seed_for_child, anchor=anc)
-
-        counts_snapshot, newly_blacklisted = _increment_hosts_for_company(root_host, self.seen_hosts_for_dynamic)
+        counts_snapshot, newly_blacklisted = await _increment_hosts_for_company_async(root_host, self.seen_hosts_for_dynamic)
 
         meta = {
             "company_id": self.cfg.company_id,
@@ -454,8 +492,8 @@ class URLIndexer:
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "seed_roots": seed_roots,
             "stats": {
-                "total_urls": len(out_urls),
-                "unique_hosts": len({ (urlparse(x["url"]).hostname or "").lower() for x in out_urls }),
+                "total_urls": len(self._out_urls),
+                "unique_hosts": len({ (urlparse(x["url"]).hostname or "").lower() for x in self._out_urls }),
                 "max_depth": self.cfg.max_depth,
                 "max_pages": self.cfg.max_pages,
                 "per_host_cap": self.cfg.per_host_page_cap,
@@ -492,14 +530,14 @@ class URLIndexer:
                     "kept_total": self.metrics.get("kept_total", 0),
                     "filtered_total": self.metrics.get("filtered_total", 0),
                     "filtered_breakdown": self.filtered_breakdown,
-                    "seeded_count": len(out_urls),
+                    "seeded_count": len(self._out_urls),
                 })
                 await cp.set_seeding_stats(seeding_meta)
         except Exception as e:
             comp_log.debug("[url_index] [%s] failed writing seeding stats: %s", self.cfg.company_id, e)
 
         comp_log.info("[url_index] [%s] discovery done: urls=%d hosts=%d",
-                      self.cfg.company_id, len(out_urls), meta["stats"]["unique_hosts"])
+                      self.cfg.company_id, len(self._out_urls), meta["stats"]["unique_hosts"])
 
         # reset logging context if any
         if _LE and _ctx_token is not None:
@@ -508,7 +546,7 @@ class URLIndexer:
             except Exception:
                 pass
 
-        return {"meta": meta, "urls": out_urls}
+        return {"meta": meta, "urls": list(self._out_urls)}
 
 # ---------------------------------------------------------------------
 # Public helper to discover + persist into url_index.json via upsert
@@ -536,6 +574,8 @@ async def discover_and_write_url_index(
     # NEW: threshold knobs
     score_threshold: Optional[float] = 0.25,
     score_threshold_on_seeds: bool = True,
+    # NEW: worker pool size (per-company)
+    concurrency: int = 8,
 ) -> Dict[str, Any]:
     """
     Runs discovery and writes entries into outputs/{bvdid}/checkpoints/url_index.json
@@ -591,9 +631,10 @@ async def discover_and_write_url_index(
         dynamic_counts_file=dynamic_counts_file,
         score_threshold=score_threshold,
         score_threshold_on_seeds=score_threshold_on_seeds,
+        concurrency=concurrency,
     )
 
-    log.info("[url_index] [%s] starting discovery: %s", safe_id, base_url)
+    log.info("[url_index] [%s] starting discovery: %s (workers=%d)", safe_id, base_url, int(concurrency))
     indexer = URLIndexer(cfg)
     result = await indexer.run()
     items = result.get("urls", []) or []
