@@ -7,7 +7,12 @@ from typing import Dict, Tuple, Optional
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from crawl4ai.content_filter_strategy import PruningContentFilter
 
-from config import language_settings as langcfg
+from configs import language_settings as lang_cfg
+
+from extensions.interstitials import (
+    detect_and_reason,
+    InterstitialThresholds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -15,11 +20,9 @@ logger = logging.getLogger(__name__)
 # Language-provided compiled regexes
 # ---------------------------------------------------------------------------
 
-_INTERSTITIAL_RE = langcfg.get_interstitial_re()
+_INTERSTITIAL_RE = lang_cfg.get_interstitial_re()
 
-_COOKIEISH_RE = langcfg.get_cookieish_re()
-
-_PRODUCT_TOKENS_RE = langcfg.get_product_tokens_re()
+_PRODUCT_TOKENS_RE = lang_cfg.get_product_tokens_re()
 
 _WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
 _HEADING_RE = re.compile(r"(?m)^\s*#{1,6}\s+\S")
@@ -125,87 +128,60 @@ def should_save_markdown(
     return True, "ok"
 
 def evaluate_markdown(
-    markdown: Optional[str],
+    markdown_text: str,
     *,
-    url: Optional[str] = None,
-    allow_retry: bool = True,
-    min_meaningful_words: int = 5,
-    interstitial_max_share: float = 0.60,
-    interstitial_min_hits: int = 2,
-    cookie_max_fraction: float = 0.15,
-    require_structure: bool = True,
-    generator_ignores_links: bool = True,
-) -> tuple[str, str, Dict[str, float]]:
+    allow_retry: bool,
+    min_meaningful_words: int,
+    cookie_max_fraction: float,      # used to gently tune cookie threshold
+    require_structure: bool,
+):
     """
-    Stronger quality gate with "save|suppress|retry" semantics.
+    Decide whether to SAVE, RETRY (run JS-only interstitial playbook), or SUPPRESS.
 
-    Returns: (action, reason, stats_dict)
-      action ∈ {"save", "suppress", "retry"}
-      reason is a stable code for logging/metrics
-      stats include: total_words, interstitial_share, cookie_fraction, headings, links, product_token
-
-    Retry is suggested when content looks cookie/overlay-gated rather than truly empty/short.
+    Returns:
+        (action, reason, md_stats)
+        - action ∈ {"save","retry","suppress"}
+        - reason ∈ {"ok","cookie-dominant","legal-dominant","age-dominant","login-required","too-short","no-structure",...}
+        - md_stats: diagnostic counters (total_words, shares/hits)
     """
-    if not markdown:
-        logger.debug("[md.qgate] suppress empty url=%s", url)
-        return "suppress", "empty", {"total_words": 0}
+    text = (markdown_text or "").strip()
+    stats = {}
 
-    md = str(markdown).strip()
-    total_words = _word_count(md)
-    if total_words < min_meaningful_words:
-        logger.debug("[md.qgate] suppress too_short url=%s words=%d min=%d",
-                     url, total_words, min_meaningful_words)
-        return "suppress", "too_short", {"total_words": total_words}
+    if not text:
+        return ("suppress", "empty", {"total_words": 0})
 
-    # Interstitial dominance
-    inter_stats = _interstitial_stats(md)
-    # Cookie fraction (more targeted)
-    cookie_hits, cookie_frac = _fraction_words(_COOKIEISH_RE, md)
+    # Structure / minimal useful length gate
+    total_words = len(re.findall(r"[a-z0-9’']+", text, re.IGNORECASE))
+    stats["total_words"] = total_words
 
-    # Structure check
-    headings = len(_HEADING_RE.findall(md))
-    links = len(_MARKDOWN_LINK_RE.findall(md)) if not generator_ignores_links else 0
-    has_product_tokens = bool(_PRODUCT_TOKENS_RE.search(md))
+    if require_structure:
+        has_heading = re.search(r"^#{1,6}\s+\S", text, re.MULTILINE) is not None
+        has_list = re.search(r"^\s*[-*+]\s+\S", text, re.MULTILINE) is not None
+        if not (has_heading or has_list or total_words >= max(5, int(min_meaningful_words))):
+            return ("suppress", "no-structure", stats)
 
-    structure_ok = _structure_ok(
-        md,
-        require_structure=require_structure,
-        ignore_links=generator_ignores_links,
-    )
+    if total_words < max(5, int(min_meaningful_words)):
+        return ("suppress", "too-short", stats)
 
-    stats = {
-        "total_words": float(total_words),
-        "interstitial_share": float(inter_stats["share"]),
-        "interstitial_hits": float(inter_stats["hits"]),
-        "cookie_fraction": float(cookie_frac),
-        "cookie_hits": float(cookie_hits),
-        "headings": float(headings),
-        "links": float(links),
-        "product_token": 1.0 if has_product_tokens else 0.0,
-    }
+    # Interstitial detection (centralized)
+    # We lightly respect the older cookie_max_fraction by *capping* our cookie threshold,
+    # so a user-specified very small value can make detection even more sensitive.
+    cookie_share_cap = min(0.02, max(0.001, float(cookie_max_fraction or 0.02)))
+    th = InterstitialThresholds(cookie_share_threshold=cookie_share_cap)
 
-    # If cookie language dominates, try a retry (if allowed)
-    if cookie_frac >= cookie_max_fraction and inter_stats["hits"] >= interstitial_min_hits:
-        reason = "cookie_dominant"
-        logger.debug("[md.qgate] %s url=%s cookie_frac=%.2f >= %.2f",
-                     ("retry" if allow_retry else "suppress"), url, cookie_frac, cookie_max_fraction)
-        return ("retry" if allow_retry else "suppress"), reason, stats
+    kind, reason, istats = detect_and_reason(text, thresholds=th)
+    stats.update(istats)
 
-    # Generic interstitial dominance (WAF, JS required, etc.)
-    if inter_stats["share"] >= interstitial_max_share and inter_stats["hits"] >= interstitial_min_hits:
-        reason = "interstitial_dominant"
-        logger.debug("[md.qgate] %s url=%s interstitial_share=%.2f >= %.2f",
-                     ("retry" if allow_retry else "suppress"), url, inter_stats["share"], interstitial_max_share)
-        return ("retry" if allow_retry else "suppress"), reason, stats
+    if kind in ("cookie", "legal", "age"):
+        # These are safe to attempt a JS-only retry to click through
+        return (("retry" if allow_retry else "suppress"), reason, stats)
 
-    if not structure_ok:
-        reason = "structure_weak"
-        logger.debug("[md.qgate] %s url=%s reason=%s", ("retry" if allow_retry else "suppress"), url, reason)
-        return ("retry" if allow_retry else "suppress"), reason, stats
+    if kind in ("login", "paywall"):
+        # Not clickable automatically; let the caller decide next step (likely suppress)
+        return ("suppress", reason, stats)
 
-    logger.debug("[md.qgate] save url=%s words=%d inter=%.2f cookie=%.2f headings=%d product=%s",
-                 url, total_words, inter_stats["share"], cookie_frac, headings, str(has_product_tokens))
-    return "save", "ok", stats
+    # Otherwise the page looks fine
+    return ("save", "ok", stats)
 
 # ---------------------------------------------------------------------------
 # Markdown generator factory (respects --log-level via standard logging)
@@ -213,9 +189,9 @@ def evaluate_markdown(
 
 def build_default_md_generator(
     *,
-    threshold: float = 0.48,
+    threshold: float = 0.24,
     threshold_type: str = "dynamic",  # or "fixed"
-    min_word_threshold: int = 5,
+    min_word_threshold: int = 50,
     body_width: int = 0,
     ignore_links: bool = True,
     ignore_images: bool = True,

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, StringConstraints, ValidationError
 from crawl4ai import LLMExtractionStrategy
 from crawl4ai import LLMConfig
 
-from config import language_settings as langcfg
+from configs import language_settings as lang_cfg
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class PresencePayload(BaseModel):
 
 
 # ---------- Instructions (pull from language settings if available) ----------
-_instructions = langcfg.get("INSTRUCTIONS", {}) or {}
+_instructions = lang_cfg.get("INSTRUCTIONS", {}) or {}
 _DEFAULT_INSTRUCTION = _instructions.get("full")
 
 _PRESENCE_INSTRUCTION = _instructions.get("presence")

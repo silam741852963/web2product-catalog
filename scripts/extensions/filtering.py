@@ -4,7 +4,7 @@ import fnmatch
 import logging
 import re
 from functools import lru_cache
-from typing import Optional, List, Iterable, Dict, Any, Tuple
+from typing import Optional, List, Iterable, Dict, Any, Tuple, Union
 from urllib.parse import urlparse, parse_qsl
 
 from crawl4ai.deep_crawling.filters import (
@@ -17,7 +17,7 @@ from crawl4ai.deep_crawling.filters import (
 )
 from crawl4ai.deep_crawling.scorers import KeywordRelevanceScorer
 
-from config import language_settings as langcfg
+from configs import language_settings as lang_cfg
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,7 @@ UNIVERSAL_EXTERNALS: set[str] = {
     "developers.google.com", "support.google.com", "docs.google.com",
     "drive.google.com", "forms.gle", "maps.google.com", "maps.app.goo.gl",
     "calendar.google.com", "photos.google.com", "accounts.google.com",
+    "fonts.googleapis.com", "maps.googleapis.com",
 
     # --- General news / media ---
     "newsweek.com", "cnn.com", "bbc.co.uk", "reuters.com", "bloomberg.com",
@@ -109,7 +110,7 @@ UNIVERSAL_EXTERNALS: set[str] = {
     "woocommerce.com", "wix.com", "squarespace.com", "weebly.com",
     "webflow.io", "wordpress.com", "godaddy.com", "strikingly.com",
     "ecwid.com", "prestashop.com", "3dcart.com", "shopbase.com",
-    "shift4shop.com", "lightspeedhq.com", "zohocommerce.com",
+    "shift4shop.com", "lightspeedhq.com", "zohocommerce.com", "shop.app",
 
     # --- Marketing / CRM / analytics / ads ---
     "mailchimp.com", "campaignmonitor.com", "activecampaign.com", "hubspot.com",
@@ -118,12 +119,28 @@ UNIVERSAL_EXTERNALS: set[str] = {
     "adobe.com", "doubleclick.net", "googletagmanager.com", "google-analytics.com",
     "analytics.google.com", "tagmanager.google.com", "mixpanel.com",
     "segment.com", "hotjar.com", "fullstory.com", "crazyegg.com",
-    "facebook.net", "fbcdn.net", "twitteranalytics.com",
+    "facebook.net", "fbcdn.net", "twitteranalytics.com", "yuvedtech.com",
 
-    # --- CDN / asset / security ---
+    # --- CDN / asset / security / storage / fonts / icons ---
     "cloudflare.com", "cdn.cloudflare.net", "akamaihd.net", "akamaized.net",
     "fastly.net", "vercel.app", "netlify.app", "edgekey.net", "edgesuite.net",
     "stackpathcdn.com", "azureedge.net", "firebaseapp.com", "cloudfront.net",
+    "storage.googleapis.com", "ajax.googleapis.com", "s1.wp.com", "s2.wp.com",
+    "kit.fontawesome.com", "cdn-cookieyes.com", "cdn.relay", "fonts.bunny.net",
+    "dt-cdn.net", "dtcdn.net", "cdn.dynamicyield.com", "dynamicyield.com",
+    "maxcdn.bootstrapcdn.com",
+
+    # --- Ad/marketing/monitoring vendors (observed) ---
+    "criteo.com", "gum.criteo.com", "static.criteo.net", "sslwidget.criteo.com",
+    "crwdcntrl.net", "match.adsrvr.org", "adsrvr.org",
+    "appsflyer.com", "useinsider.com", "segment.api.useinsider.com",
+    "newrelic.com", "js-agent.newrelic.com", "dynatrace.com",
+
+    # --- Plugin / SaaS widget hosts ---
+    "pages.dev", "pages.github.com", "lp.constantcontactpages.com",
+    "list-manage.com", "statcounter.com", "s.gravatar.com",
+    "assets.website-files.com", "googleadservices.com", "cdn2.hubspot.net",
+    "cdn2.hubspot.com", "s.w.org",
 
     # --- Payment / checkout platforms ---
     "stripe.com", "paypal.com", "braintreepayments.com", "squareup.com",
@@ -137,13 +154,13 @@ UNIVERSAL_EXTERNALS: set[str] = {
     "surveymonkey.com", "typeform.com", "jotform.com", "googleforms.com",
     "calendly.com", "doodle.com", "wufoo.com",
 
-    # --- Other frequent false positives ---
-    "sproutsocialstatus.com", "newswhip.com", "mozilla.org", "google.com",
-    "microsoft.com", "apple.com", "amazon.com", "aws.amazon.com", "adobe.io",
+    # --- Corporate catch-alls / standards ---
+    "microsoft.com", "google.com", "apple.com", "amazon.com", "aws.amazon.com", "adobe.io",
     "creativecommons.org", "ietf.org", "w3.org", "archive.org", "who.int",
     "un.org", "europa.eu", "g2.com", "capterra.com", "producthunt.com",
 }
 
+# Functional subdomain prefixes (indicate 3P/docs/status etc.)
 FUNCTIONAL_SUBDOMAIN_PREFIXES: tuple[str, ...] = (
     "community", "status", "learning", "learn", "docs", "developer", "developers",
     "help", "support", "kb", "academy", "login", "signin", "auth", "accounts",
@@ -154,21 +171,13 @@ FUNCTIONAL_SUBDOMAIN_PREFIXES: tuple[str, ...] = (
 # Robust pattern matching (glob-to-regex + native regex)
 # =============================================================================
 
-# Prefix to declare an explicit regex pattern (case-insensitive).
 REGEX_PREFIX = ("re:", "regex:")
 
 @lru_cache(maxsize=4096)
 def _compile_one(pattern: str) -> re.Pattern:
-    """
-    Compile a single pattern. Supports:
-    - Glob patterns (default), translated via fnmatch.translate
-    - Regex patterns if prefixed with 're:' or 'regex:' (case-insensitive)
-    """
     p = (pattern or "").strip()
     if not p:
         return re.compile(r"^$")  # never matches
-
-    # Explicit regex
     lower = p.lower()
     for prefix in REGEX_PREFIX:
         if lower.startswith(prefix):
@@ -178,10 +187,7 @@ def _compile_one(pattern: str) -> re.Pattern:
             except re.error as e:
                 logger.warning("Invalid regex pattern '%s': %s. Falling back to no-op.", p, e)
                 return re.compile(r"^$")
-
-    # Glob → regex
     try:
-        # fnmatch.translate already anchors ^...$, we add re.IGNORECASE
         return re.compile(fnmatch.translate(p), re.IGNORECASE)
     except re.error as e:
         logger.warning("Failed to compile glob '%s': %s. Falling back to literal-safe regex.", p, e)
@@ -191,7 +197,6 @@ def _compile_many(patterns: List[str]) -> List[re.Pattern]:
     return [_compile_one(p) for p in (patterns or []) if p and p.strip()]
 
 def _url_for_match(url: str) -> str:
-    # Case-insensitive match against full URL string
     return (url or "").strip()
 
 def _match_any(url: str, patterns: List[str]) -> bool:
@@ -214,18 +219,12 @@ def _count_hits(url: str, patterns: List[str]) -> int:
     return c
 
 # --- SMART INCLUDE TOKENS ----------------------------------------------------
-# Use language-configured tokens (keeps values identical to previous default)
-SMART_INCLUDE_TOKENS: tuple[str, ...] = tuple(langcfg.get("SMART_INCLUDE_TOKENS"))
-
-# precompile a word-ish boundary for tokens inside a path segment
-#   matches token preceded/followed by start/end/[-_./]
-#   keeps it lenient enough to catch hyphen/underscore compounds
+SMART_INCLUDE_TOKENS: tuple[str, ...] = tuple(lang_cfg.get("SMART_INCLUDE_TOKENS"))
 SMART_TOKEN_RX_CACHE: Dict[str, re.Pattern] = {}
 
 def _token_rx(tok: str) -> re.Pattern:
     rx = SMART_TOKEN_RX_CACHE.get(tok)
     if rx is None:
-        # Allow forms like: foo-token, token-foo, /token/, /token-foo/, foo_token, token.html
         rx = re.compile(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", re.IGNORECASE)
         SMART_TOKEN_RX_CACHE[tok] = rx
     return rx
@@ -294,11 +293,9 @@ def is_universal_external(url_or_host: Any) -> bool:
 # Default URL pattern heuristics (KEEP / DROP)
 # =============================================================================
 
-DEFAULT_INCLUDE_PATTERNS: List[str] = list(langcfg.get("DEFAULT_INCLUDE_PATTERNS"))
-
-DEFAULT_EXCLUDE_PATTERNS: List[str] = list(langcfg.get("DEFAULT_EXCLUDE_PATTERNS"))
-
-DEFAULT_EXCLUDE_QUERY_KEYS: List[str] = list(langcfg.get("DEFAULT_EXCLUDE_QUERY_KEYS"))
+DEFAULT_INCLUDE_PATTERNS: List[str] = list(lang_cfg.get("DEFAULT_INCLUDE_PATTERNS"))
+DEFAULT_EXCLUDE_PATTERNS: List[str] = list(lang_cfg.get("DEFAULT_EXCLUDE_PATTERNS"))
+DEFAULT_EXCLUDE_QUERY_KEYS: List[str] = list(lang_cfg.get("DEFAULT_EXCLUDE_QUERY_KEYS"))
 
 # =============================================================================
 # Deep crawling filter helpers (optional)
@@ -387,11 +384,7 @@ def filter_seeded_urls(
 
 # -----------------------------------------------------------------------------
 
-
 def keep_patterns(urls: Iterable[Dict[str, Any]], patterns: List[str]) -> List[Dict[str, Any]]:
-    """
-    Keep only URLs matching any of the provided patterns (glob or regex with 're:' prefix).
-    """
     out = []
     for u in urls:
         url = str(u.get("final_url") or u.get("url") or "")
@@ -401,18 +394,12 @@ def keep_patterns(urls: Iterable[Dict[str, Any]], patterns: List[str]) -> List[D
         logger.debug("[filtering] keep_patterns -> kept=%d", len(out))
     return out
 
-
 def exclude_patterns(
     urls: Iterable[Dict[str, Any]],
     patterns: List[str],
     *,
     include_override: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Exclude URLs matching any of the provided patterns — BUT if a URL also
-    matches any pattern in `include_override` OR the smart include tokens,
-    we KEEP it (include wins).
-    """
     include_override = include_override or []
     out = []
     for u in urls:
@@ -426,23 +413,12 @@ def exclude_patterns(
         logger.debug("[filtering] exclude_patterns -> kept=%d", len(out))
     return out
 
-
 def filter_by_patterns(
     urls: Iterable[Dict[str, Any]],
     *,
     include: Optional[List[str]] = None,
     exclude: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Unified include/exclude pass with **include-over-exclude precedence**.
-    - If a URL matches both include and exclude → KEEP.
-    - If it matches exclude only → DROP.
-    - If it matches include only → KEEP.
-    - If neither matches → KEEP (patterns act as hints, not absolute unless exclude hits).
-
-    Supports glob patterns and explicit regex ('re:' prefix) and also
-    uses smart include tokens to rescue near-misses like '/power-solutions/'.
-    """
     include = include or []
     exclude = exclude or []
     out: List[Dict[str, Any]] = []
@@ -464,14 +440,10 @@ def filter_by_patterns(
 # Language filtering (URL-level heuristics)
 # =============================================================================
 
-# language-sensitive constants imported from language_settings (keeps original values)
-_LANG_CODES = set(langcfg.get("LANG_CODES"))
-
-_REGIONAL_LANG_CODES = set(langcfg.get("REGIONAL_LANG_CODES"))
-
-_ENGLISH_REGIONS = set(langcfg.get("ENGLISH_REGIONS"))
-
-_CC_TO_LANG = dict(langcfg.get("CC_TO_LANG"))
+_LANG_CODES = set(lang_cfg.get("LANG_CODES"))
+_REGIONAL_LANG_CODES = set(lang_cfg.get("REGIONAL_LANG_CODES"))
+_ENGLISH_REGIONS = set(lang_cfg.get("ENGLISH_REGIONS"))
+_CC_TO_LANG = dict(lang_cfg.get("CC_TO_LANG"))
 
 def _first_path_segment(path: str) -> str:
     if not path:
@@ -548,7 +520,6 @@ def is_non_english_url(
     strict_cctld: bool = False,
 ) -> bool:
     acc = set(accept_en_regions or _ENGLISH_REGIONS)
-
     try:
         pu = urlparse(u)
     except Exception:
@@ -558,7 +529,7 @@ def is_non_english_url(
     path = (pu.path or "/").lower()
     q = {k.lower(): _normalize_token(v) for k, v in parse_qsl(pu.query or "", keep_blank_values=True)}
 
-    # 1) Subdomain markers (only DROP on explicit non-en; never early-keep)
+    # 1) Subdomain markers
     labels = _host_labels(host)
     if len(labels) >= 3:
         sub = labels[0]
@@ -567,14 +538,14 @@ def is_non_english_url(
                 logger.debug("[filtering.lang] sub=%s -> non_en=True url=%s", sub, u)
             return True
 
-    # 2) First path segment (only DROP on explicit non-en; never early-keep)
+    # 2) First path segment
     first_seg = _first_path_segment(path)
     if first_seg and _token_is_non_english(first_seg, acc, primary_lang):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[filtering.lang] path-seg=%s -> non_en=True url=%s", first_seg, u)
         return True
 
-    # 3) Query param language hints (DROP on explicit non-en)
+    # 3) Query param language hints
     for k in {"lang", "hl", "locale", "lc", "lr", "region"}:
         v = q.get(k, "")
         if not v:
@@ -722,11 +693,10 @@ def classify_external(
     return "external"
 
 # =============================================================================
-# Priority scoring & composite filtering
+# Priority scoring & composite filtering (with REASONS)
 # =============================================================================
 
 def _pattern_hits(url: str, patterns: List[str]) -> int:
-    # Use compiled regex counting
     return _count_hits(url, patterns)
 
 def url_priority(
@@ -753,19 +723,6 @@ def url_should_keep(
     lang_strict_cctld: bool = False,
     include_overrides_language: bool = False,
 ) -> bool:
-    """
-    Decide if a URL should be crawled:
-
-    • Drop universal externals outright.
-    • Language filter applies first (include does NOT override unless include_overrides_language=True).
-    • If both include & exclude match → KEEP (include wins).
-    • If exclude only matches → DROP.
-    • If include only matches → KEEP.
-    • If neither matches → KEEP (patterns act as hints, not absolute unless exclude-only hits).
-
-    Matching supports glob patterns and explicit regex via 're:' prefix.
-    Smart include tokens also raise include-likelihood for near misses (/power-solutions/).
-    """
     include = include or []
     exclude = exclude or []
 
@@ -776,7 +733,6 @@ def url_should_keep(
 
     score, inc_hit, exc_hit = url_priority(url, include=include, exclude=exclude)
 
-    # Language gate (unless explicitly overridden by include)
     if not (include_overrides_language and inc_hit):
         if should_drop_for_language(
             url,
@@ -788,7 +744,6 @@ def url_should_keep(
                 logger.debug("[filtering.keep] language drop -> %s (score=%d inc=%s exc=%s)", url, score, inc_hit, exc_hit)
             return False
 
-    # Exclude is hard drop unless include also hits
     if exc_hit and not inc_hit:
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[filtering.keep] exclude hit without include -> drop: %s (score=%d)", url, score)
@@ -812,17 +767,17 @@ def apply_url_filters(
     base_url: Optional[str] = None,
     keep_brand_domains: bool = False,
     allowed_brand_hosts: Optional[set[str]] = None,
-) -> List[str] | List[Dict[str, Any]]:
+    return_reasons: bool = False,
+) -> Union[List[str], List[Dict[str, Any]], Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
     """
     Apply language policy (first), then include/exclude, then optional brand allowance.
 
-    Key behaviors:
-      • Include-pattern hit overrides exclude-pattern hit (KEEP if both match).
-      • Same-registrable-domain is considered first-party, but it does NOT bypass path excludes.
-      • Explicitly allowed brand hosts (allowed_brand_hosts) may bypass path excludes.
-      • Language drop has precedence unless include_overrides_language=True.
-
-    Matching supports glob and 're:' regex patterns + smart include tokens.
+    If `return_reasons=True`, returns a tuple:
+      (kept_items, dropped_with_reasons)
+    where each dropped item is { "url": <str>, "reason": <str> } with reasons:
+      - "universal_external"
+      - "language"
+      - "exclude"  (matched exclude without include/override)
     """
     include = include or []
     exclude = exclude or []
@@ -832,18 +787,21 @@ def apply_url_filters(
     is_dict_items = bool(items and isinstance(items[0], dict))
 
     kept: List[Tuple[int, bool, bool, Any]] = []
+    dropped: List[Dict[str, Any]] = []
 
     for item in items:
         u = item["url"] if is_dict_items else str(item)
         score, inc_hit, exc_hit = url_priority(u, include=include, exclude=exclude)
 
-        # Universal externals are dropped regardless
+        # 1) Universal externals
         if drop_universal_externals and is_universal_external(u):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("[filtering.apply] DROP universal external: %s", u)
+            if return_reasons:
+                dropped.append({"url": u, "reason": "universal_external"})
             continue
 
-        # Language drop (unless include override)
+        # 2) Language
         lang_drop = not (include_overrides_language and inc_hit) and should_drop_for_language(
             u,
             primary_lang=lang_primary,
@@ -853,47 +811,54 @@ def apply_url_filters(
         if lang_drop:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("[filtering.apply] DROP by language: %s", u)
+            if return_reasons:
+                dropped.append({"url": u, "reason": "language"})
             continue
 
-        # Brand classification
+        # 3) Brand classification
         brand_allowed_host = False
-        brand_first_party = False
         if keep_brand_domains:
-            if base_url:
-                brand_first_party = same_registrable_domain(base_url, u)
             host = (urlparse(u).hostname or "").lower()
+            if base_url:
+                # same site is implicitly allowed, but path excludes still apply later
+                _ = same_registrable_domain(base_url, u)
             if host in allowed_brand_hosts:
                 brand_allowed_host = True
 
-        # Exclude without include is a hard drop (unless explicitly allowed host)
+        # 4) Exclude-only (unless brand-allowed host)
         if exc_hit and not inc_hit and not brand_allowed_host:
             if logger.isEnabledFor(logging.DEBUG):
-                why = "exclude (same-reg first-party but no include)" if brand_first_party else "exclude"
-                logger.debug("[filtering.apply] DROP by %s: %s", why, u)
+                logger.debug("[filtering.apply] DROP by exclude: %s", u)
+            if return_reasons:
+                dropped.append({"url": u, "reason": "exclude"})
             continue
 
         kept.append((score, inc_hit, exc_hit, item))
 
     if sort_by_priority and kept:
-        # Sort: include-hit first, then by score descending
-        kept.sort(key=lambda t: (not t[1], -t[0]))
+        kept.sort(key=lambda t: (not t[1], -t[0]))  # include-hit first, then by score desc
 
-    result = [t[3] for t in kept]
+    kept_items = [t[3] for t in kept]
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
             "[filtering.apply] kept=%d / total=%d (sorted=%s, keep_brand=%s)",
-            len(result), len(items), bool(sort_by_priority), bool(keep_brand_domains),
+            len(kept_items), len(items), bool(sort_by_priority), bool(keep_brand_domains),
         )
-    return result
+
+    if return_reasons:
+        # Always return dict items for clarity in the tuple form
+        if not is_dict_items:
+            kept_items = [{"url": str(x)} for x in kept_items]  # type: ignore
+        return kept_items, dropped
+
+    # Back-compat: preserve outbound type
+    if is_dict_items:
+        return kept_items  # type: ignore
+    return [x["url"] for x in kept_items]  # type: ignore
 
 # =============================================================================
 # Seeding convenience: universal BM25 query for product/service pages
 # =============================================================================
 
 def default_product_bm25_query() -> str:
-    """
-    Compact BM25 query string tuned for seeding to favor product/service landing pages.
-    Use with SeedingConfig(query=..., scoring_method="bm25").
-    """
-    # Use language settings provider so this is language-aware and identical to previous defaults
-    return langcfg.default_product_bm25_query()
+    return lang_cfg.default_product_bm25_query()

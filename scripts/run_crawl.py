@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import os
 import argparse
 import asyncio
 import contextlib
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 # --- Windows stdio bump to reduce EMFILE (best effort)
 try:
@@ -21,9 +20,10 @@ except Exception:
 
 from crawl4ai import AsyncWebCrawler
 
-from config.language_settings import load_lang
+from configs.language_settings import load_lang
+from configs.browser_settings import browser_cfg
 
-from components.csv_loader import CompanyInput, load_companies_from_csv
+from components.source_loader import CompanyInput, load_companies_from_source, load_companies_from_dir
 from components.url_seeder import seed_urls
 from components.md_generator import evaluate_markdown
 from components.llm_extractor import parse_presence_result, _short_preview
@@ -45,7 +45,6 @@ from extensions.run_utils import (
     mk_llm_config,
     aggregate_seed_by_root,
     classify_failure,
-    per_company_slots,
     prefer_local_html,
     prefer_local_md,
     load_url_index,
@@ -59,10 +58,59 @@ from extensions.run_utils import (
     is_llm_extracted_empty,
     get_default_include_patterns,
     get_default_exclude_patterns,
+    build_seeder_kwargs,
 )
+
+from extensions.slot_allocator import SlotAllocator, SlotConfig, SessionSnapshot, CompanySnapshot
 
 # Page interaction: use both first + retry configs
 from extensions.page_interaction import PageInteractionPolicy, first_pass_config, retry_pass_config
+
+
+# --------------------------------------------------------------------------------------
+# Compatibility shim: make sure Crawl4AI config objects expose the attributes
+# arun_many() expects across versions (e.g., "stream", "js_code", etc.).
+# --------------------------------------------------------------------------------------
+def _ensure_c4a_config_defaults(cfg: Any, *, default_stream: bool = True) -> Any:
+    """
+    Idempotently attach required attributes if missing. Works with both real
+    Crawl4AI CrawlerRunConfig and our _Dummy fallback from run_utils.
+    """
+    if cfg is None:
+        class _Bare:  # ultra-safe fallback
+            pass
+        cfg = _Bare()
+
+    # Whether arun_many will yield an async stream (typical) or return a list.
+    if not hasattr(cfg, "stream"):
+        setattr(cfg, "stream", default_stream)
+
+    # JS/scroll knobs used by page interaction recipes
+    for a in ("js_code", "wait_for", "virtual_scroll_config"):
+        if not hasattr(cfg, a):
+            setattr(cfg, a, None)
+
+    # HTML delay knob (float)
+    if not hasattr(cfg, "delay_before_return_html"):
+        setattr(cfg, "delay_before_return_html", 0.0)
+
+    # Common flags (don’t force values; just ensure attrs exist for older versions)
+    for a in ("extract_markdown", "llm_extraction", "llm_presence_only"):
+        if not hasattr(cfg, a):
+            setattr(cfg, a, False)
+
+    return cfg
+
+
+def _prune_redundant_seeding_fields(cp) -> None:
+    """
+    Delete legacy top-level seeding keys that duplicate cp.data['seeding'].
+    Keeps all details inside cp.data['seeding'] only.
+    """
+    if not hasattr(cp, "data") or not isinstance(cp.data, dict):
+        return
+    for k in ("seed_counts_by_root", "seed_roots", "seed_brand_roots", "seed_brand_count"):
+        cp.data.pop(k, None)
 
 
 def _save_result_for_pipeline(
@@ -76,6 +124,7 @@ def _save_result_for_pipeline(
     save_html_ref: bool = True,
     md_gate_opts: Optional[Dict[str, Any]] = None,
     presence_only: bool = False,
+    html_saved_urls: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """
     Save artifacts based on pipeline and evaluate_markdown() gate.
@@ -96,29 +145,33 @@ def _save_result_for_pipeline(
     html_path = md_path = json_path = None
 
     if save_html_ref and html:
-        save_stage_output(bvdid, url, html, stage="html")
-        stats["saved_html"] = True
         from extensions.run_utils import find_existing_artifact
-        html_path = find_existing_artifact(bvdid, url, "html")
-        # persist status
+        # de-dupe: skip saving if already recorded this run or exists on disk
+        already_written = (html_saved_urls is not None and url in html_saved_urls)
+        existing = find_existing_artifact(bvdid, url, "html")
+        if not already_written and not existing:
+            save_stage_output(bvdid, url, html, stage="html")
+            stats["saved_html"] = True
+            if html_saved_urls is not None:
+                html_saved_urls.add(url)
+            existing = find_existing_artifact(bvdid, url, "html")
+        html_path = existing
+
         try:
-            upsert_url_index(bvdid, url, html_path=html_path, status="html_saved")
+            # record path; status precedence handled in upsert_url_index
+            upsert_url_index(bvdid, url, html_path=html_path)
         except Exception as e:
-            logger.debug("[%s] url_index upsert (html_saved) failed for %s: %s", bvdid, url, e)
+            logger.debug("[%s] url_index upsert (html) failed for %s: %s", bvdid, url, e)
 
     if ("markdown" in pipeline or "llm" in pipeline):
         chosen_md = (fit_md or "").strip()
         if chosen_md:
             action, reason, md_stats = evaluate_markdown(
                 chosen_md,
-                url=url,
                 allow_retry=True,
                 min_meaningful_words=max(1, int(md_min_words)),
-                interstitial_max_share=0.60,
-                interstitial_min_hits=2,
                 cookie_max_fraction=(md_gate_opts or {}).get("cookie_max_fraction", 0.15),
                 require_structure=bool((md_gate_opts or {}).get("require_structure", True)),
-                generator_ignores_links=True,
             )
             stats["md_reason"] = reason
             if action == "save":
@@ -129,13 +182,13 @@ def _save_result_for_pipeline(
                 metrics.incr("markdown.saved", bvdid=bvdid)
                 metrics.observe("markdown.words", float(md_stats.get("total_words", 0.0)), bvdid=bvdid)
                 try:
-                    # pass markdown_words into url_index for later resume/insight
                     upsert_url_index(
                         bvdid,
                         url,
                         markdown_path=md_path,
-                        status="markdown_saved",
                         markdown_words=int(md_stats.get("total_words", 0) or 0),
+                        status="markdown_saved",
+                        reason=reason,
                     )
                 except Exception as e:
                     logger.debug("[%s] url_index upsert (markdown_saved) failed for %s: %s", bvdid, url, e)
@@ -144,48 +197,40 @@ def _save_result_for_pipeline(
                 stats["md_retry_suggested"] = True
                 metrics.incr("markdown.retry_suggested", bvdid=bvdid, reason=reason)
                 try:
-                    # persist retry status so operators can inspect and resume behavior
-                    upsert_url_index(bvdid, url, status="markdown_retry")
+                    upsert_url_index(bvdid, url, status="markdown_retry", reason=reason)
                 except Exception as e:
                     logger.debug("[%s] url_index upsert (markdown_retry) failed for %s: %s", bvdid, url, e)
             else:
                 stats["md_suppressed"] = True
                 metrics.incr("markdown.suppressed", bvdid=bvdid, reason=reason)
                 try:
-                    upsert_url_index(bvdid, url, status="markdown_suppressed")
+                    upsert_url_index(bvdid, url, status="markdown_suppressed", reason=reason)
                 except Exception as e:
                     logger.debug("[%s] url_index upsert (markdown_suppressed) failed for %s: %s", bvdid, url, e)
         else:
             stats["md_suppressed"] = True
             stats["md_reason"] = "empty"
             try:
-                upsert_url_index(bvdid, url, status="markdown_suppressed")
+                upsert_url_index(bvdid, url, status="markdown_suppressed", reason="empty")
             except Exception as e:
                 logger.debug("[%s] url_index upsert (markdown_suppressed-empty) failed for %s: %s", bvdid, url, e)
 
-    # LLM stage: presence-only handling
     if "llm" in pipeline and extracted is not None:
         if presence_only:
-            # parse presence result (0 or 1)
             has, _conf, _rat = parse_presence_result(extracted, default=False)
             has_int = 1 if has else 0
             try:
-                # write presence flag into url_index.json (checkpoints) and mark presence_checked
                 upsert_url_index(bvdid, url, has_offering=has_int, presence_checked=True, status="presence_checked")
             except Exception as e:
                 logger.debug("[%s] url_index upsert failed while writing presence for %s: %s", bvdid, url, e)
             stats["presence_written"] = True
-            # Do not write separate llm artifact file in presence-only mode
             stats["saved_json"] = False
         else:
-            # original behavior: save extracted content as llm artifact
-            # save LLM artifacts under the 'json' stage (extensions.output_paths expects html|markdown|json)
-            save_stage_output(bvdid, url, extracted, stage="json")
+            save_stage_output(bvdid, url, extracted, stage="llm")
             stats["saved_json"] = True
             from extensions.run_utils import find_existing_artifact
             json_path = find_existing_artifact(bvdid, url, "llm")
             metrics.incr("llm.saved", bvdid=bvdid)
-            # detect empty-extraction semantics (offerings empty)
             try:
                 empty = is_llm_extracted_empty(extracted)
                 if empty:
@@ -222,9 +267,9 @@ async def _crawl_company(
     lang_accept_en_regions: set[str],
     lang_strict_cctld: bool,
     args: argparse.Namespace,
-    scanner: ArtifactScanner,
     state: GlobalState,
     net: ConnectivityGuard,
+    slot_alloc: SlotAllocator,
 ) -> None:
     bvdid = company.bvdid
     logger = log_ext.get_company_logger(bvdid)
@@ -238,6 +283,13 @@ async def _crawl_company(
     await cp.mark_start(stage="|".join(pipeline), total_urls=0)
     logger.info("[%s] Start: %s (%s) pipeline=%s", bvdid, company.name, company.url, pipeline)
     metrics.incr("company.start", bvdid=bvdid)
+
+    processed_once: set[str] = set()
+
+    async def mark_done_once(u: str) -> None:
+        if u and u not in processed_once:
+            processed_once.add(u)
+            await cp.mark_url_done(u)
 
     plan: ResumePlan = await state.recommend_resume(
         bvdid,
@@ -272,27 +324,42 @@ async def _crawl_company(
         metrics.incr("company.skipped", bvdid=bvdid, stage=completion_stage)
         return
 
-    # 1) URL set (index vs network)
+    # 1) URL discovery (seeder) or resume from url_index
     seeded_items: List[Dict[str, Any]] = []
     seed_stats: Dict[str, Any] = {}
     used_index_for_urls = False
     url_index: Dict[str, Any] = {}
 
+    pipeline_set = set(pipeline)
+
+    # --- Shortcut: resume using url_index when plan says so
     if plan.skip_seeding_entirely:
         url_index = load_url_index(bvdid)
         used_index_for_urls = True
-        urls_from_index = list(url_index.keys())
+
+        # Determine desired statuses based on requested pipeline
+        if ("llm" in pipeline_set) and plan.skip_markdown:
+            desired_statuses = {"markdown_saved"}
+        elif "markdown" in pipeline_set:
+            desired_statuses = {"seeded", "html_saved"}
+        else:
+            desired_statuses = {"seeded"}
+
+        urls_from_index = [
+            u for u, ent in (url_index or {}).items()
+            if str(ent.get("status", "")).lower() in desired_statuses
+        ]
         seeded_items = [{"url": u, "status": "valid"} for u in urls_from_index]
+        # minimal resume summary (avoid clashing with seeding_metrics)
         seed_stats = {
-            "discovered_total": len(seeded_items),
-            "filtered_total": len(seeded_items),
             "seed_roots": [company.url],
             "seed_brand_count": 0,
-            "resume_mode": "url_index",
+            "resume_mode": f"url_index[{','.join(sorted(desired_statuses))}]",
         }
         await state.set_resume_mode(bvdid, "url_index")
-        logger.info("[%s] Using url_index.json with %d URL(s).", bvdid, len(seeded_items))
+        logger.info("[%s] Using url_index.json with %d URL(s) filtered by status in %s.", bvdid, len(seeded_items), sorted(desired_statuses))
 
+    # --- Discovery path (seeder only)
     if not used_index_for_urls:
         while True:
             await net.wait_until_healthy()
@@ -301,23 +368,13 @@ async def _crawl_company(
                 with metrics.time("seeding.duration_s", bvdid=bvdid):
                     seeded_items, seed_stats = await seed_urls(
                         company.url,
-                        source=seeding_source,
-                        include=include_patterns,
-                        exclude=exclude_patterns,
-                        query=bm25_query,
-                        score_threshold=bm25_score_threshold,
-                        live_check=args.live_check,
-                        force=force_seeder_cache,
-                        max_urls=max_urls,
-                        company_max_pages=company_max_pages,
-                        hits_per_sec=hits_per_sec,
-                        drop_universal_externals=drop_universal_externals,
-                        lang_primary=lang_primary,
-                        lang_accept_en_regions=lang_accept_en_regions,
-                        lang_strict_cctld=lang_strict_cctld,
-                        discover_brands=discover_brands,
-                        use_dual_bm25=bool(args.use_dual_bm25),
-                        dual_alpha=float(args.dual_alpha),
+                        **build_seeder_kwargs(args) | dict(
+                            include=include_patterns,
+                            exclude=exclude_patterns,
+                            max_urls=max_urls,
+                            company_max_pages=company_max_pages,
+                            hits_per_sec=hits_per_sec,
+                        )
                     )
                 net.record_success()
             except Exception as e:
@@ -344,12 +401,14 @@ async def _crawl_company(
                 continue
             break
 
+    # keep all seed summaries under 'seeding'
     cp.data.setdefault("seeding", {}).update(seed_stats)
-    cp.data.update(aggregate_seed_by_root(seeded_items, base_root=company.url))
+    cp.data["seeding"].update(aggregate_seed_by_root(seeded_items, base_root=company.url))
+    _prune_redundant_seeding_fields(cp)
     await cp.save()
 
     logger.info(
-        "[%s] Seeding: discovered=%s, filtered=%s, roots=%d, brands=%d",
+        "[%s] Discovery: discovered=%s, filtered=%s, roots=%d, brands=%d",
         bvdid,
         seed_stats.get("discovered_total", 0),
         seed_stats.get("filtered_total", 0),
@@ -358,15 +417,15 @@ async def _crawl_company(
     )
     metrics.set("seeding.filtered", float(seed_stats.get("filtered_total", 0)), bvdid=bvdid)
 
+    # If pipeline is just seed, finalize now
     if pipeline == ["seed"]:
         seeded_urls_for_index = [it.get("final_url") or it.get("url") for it in seeded_items if (it.get("final_url") or it.get("url"))]
         total_index = write_url_index_seed_only(bvdid, seeded_urls_for_index)
         await state.record_url_index(bvdid, count=total_index)
-        cp.data.update({"urls_total": int(seed_stats.get("filtered_total", 0)), "seed_source": seeding_source})
-        cp.data.update(aggregate_seed_by_root(seeded_items, base_root=company.url))
+        cp.data.setdefault("seeding", {}).update({"urls_total": int(seed_stats.get("filtered_total", 0)), "seed_source": "seeder"})
+        cp.data["seeding"].update(aggregate_seed_by_root(seeded_items, base_root=company.url))
+        _prune_redundant_seeding_fields(cp)
         await cp.save()
-        await cp.mark_finished()
-        write_last_crawl_date(bvdid)
         await cp.mark_finished()
         write_last_crawl_date(bvdid)
         await state.mark_done(
@@ -378,6 +437,7 @@ async def _crawl_company(
         metrics.incr("company.done", bvdid=bvdid, stage="seed")
         return
 
+    # If discovery used network, mirror to url_index
     if not used_index_for_urls:
         seeded_urls_for_index = [it.get("final_url") or it.get("url") for it in seeded_items if (it.get("final_url") or it.get("url"))]
         total_index = write_url_index_seed_only(bvdid, seeded_urls_for_index)
@@ -386,6 +446,7 @@ async def _crawl_company(
         except Exception:
             pass
 
+    # Build URL list
     seeded = list(seeded_items)
     if respect_crawl_date and not used_index_for_urls:
         last_dt = read_last_crawl_date(bvdid)
@@ -402,8 +463,7 @@ async def _crawl_company(
             url_to_item[url] = u
             seeded_urls.append(url)
 
-    # If require_presence flag is set and we used the index, filter URLs that do not
-    # have both presence_checked==True and has_offering==1.
+    # Presence gating
     if getattr(args, "require_presence", False) and used_index_for_urls and url_index:
         filtered = []
         for url in seeded_urls:
@@ -417,7 +477,7 @@ async def _crawl_company(
         seeded_urls = filtered
         logger.info("[%s] After require-presence gating: %d URLs remain", bvdid, len(seeded_urls))
     elif getattr(args, "require_presence", False) and not used_index_for_urls:
-        # conservative approach: if we don't have the index we cannot satisfy presence gating
+        # First-time runs with require_presence set intentionally skip processing
         logger.info("[%s] --require-presence used but no url_index.json available; skipping all processing for this company", bvdid)
         seeded_urls = []
 
@@ -438,11 +498,10 @@ async def _crawl_company(
             stage=",".join(pipeline),
             presence_only=bool(getattr(args, "presence_only", False))
         )
-        logger.info("[%s] No URLs after seeding/resume. DONE.", bvdid)
+        logger.info("[%s] No URLs after discovery/resume. DONE.", bvdid)
         metrics.incr("company.done", bvdid=bvdid, stage="none")
         return
 
-    pipeline_set = set(pipeline)
     llm_in_pipeline = ("llm" in pipeline_set)
 
     logger.info("[%s] Resume check: plan.skip_markdown=%s used_index_for_urls=%s",
@@ -451,7 +510,7 @@ async def _crawl_company(
     completion_stage = pipeline[-1]
     if (completion_stage == "llm" and plan.skip_llm) or (completion_stage == "markdown" and plan.skip_markdown):
         for url in seeded_urls:
-            await cp.mark_url_done(url)
+            await mark_done_once(url)
         await cp.mark_finished()
         write_last_crawl_date(bvdid)
         try:
@@ -472,11 +531,43 @@ async def _crawl_company(
         metrics.incr("company.done", bvdid=bvdid, stage=completion_stage)
         return
 
-    # Build list of local HTML files to run markdown generation over (existing local HTML)
+    # ---------- Slot allocator helpers (dynamic tail boosting) ----------
+    async def _session_snapshot() -> SessionSnapshot:
+        try:
+            summary = await cp_mgr.summary()
+        except Exception:
+            summary = {}
+        total = max(1, len(summary))  # avoid zero division
+        finished = sum(1 for s in summary.values() if bool(s.get("finished")))
+        running = max(1, total - finished)
+        return SessionSnapshot(total_companies=total, finished_companies=finished, running_companies=running)
+
+    async def _company_snapshot() -> CompanySnapshot:
+        try:
+            cpi = await cp_mgr.get(bvdid, company_name=company.name)
+            urls_total = int(cpi.data.get("urls_total") or 0)
+            urls_done  = int(cpi.data.get("urls_done")  or 0)
+        except Exception:
+            urls_total = urls_done = 0
+        return CompanySnapshot(
+            urls_total=urls_total if urls_total > 0 else None,
+            urls_done=urls_done if urls_done > 0 else None,
+            timeout_rate=None,
+        )
+
+    def _apply_max_permit(dispatcher, new_permit: int) -> None:
+        try:
+            if hasattr(dispatcher, "set_max_session_permit"):
+                dispatcher.set_max_session_permit(int(new_permit))
+            elif hasattr(dispatcher, "max_session_permit"):
+                setattr(dispatcher, "max_session_permit", int(new_permit))
+        except Exception:
+            pass
+
+    # ---------- Local HTML → MD -----------------------------------------
     local_html_needed: List[Tuple[str, Path]] = []
     if (("markdown" in pipeline_set) or llm_in_pipeline) and not plan.skip_markdown and not bypass_local:
         for url in seeded_urls:
-            # If require_presence true, ensure url_index entry satisfies it
             if getattr(args, "require_presence", False) and used_index_for_urls and url_index:
                 ent = url_index.get(url, {})
                 if int(ent.get("has_offering", 0) or 0) != 1 or not bool(ent.get("presence_checked", False)):
@@ -485,10 +576,8 @@ async def _crawl_company(
             if html_local:
                 local_html_needed.append((url, html_local))
 
-    need_remote_fetch = not plan.skip_markdown
-
-    if llm_in_pipeline and ("markdown" not in pipeline_set) and (not need_remote_fetch):
-        logger.info("[%s] Skipping remote fetch: plan.skip_markdown=%s", bvdid, plan.skip_markdown)
+    # Remote fetch needed if plan doesn't skip
+    need_remote_fetch = (not plan.skip_markdown)
 
     saved_html_run = 0
     saved_md_run = 0
@@ -496,14 +585,11 @@ async def _crawl_company(
     md_suppressed_run = 0
     md_retry_suggested_run = 0
 
-    # --- Local HTML → MD ----------------------------------------------------
     if local_html_needed:
-        async with AsyncWebCrawler() as local_crawler:
+        async with AsyncWebCrawler(config=browser_cfg) as local_crawler:
             file_urls = [f"file://{p.resolve()}" for _, p in local_html_needed]
-
-            md_cfg = mk_md_config(args)
+            md_cfg = _ensure_c4a_config_defaults(mk_md_config(args))
             results = await local_crawler.arun_many(file_urls, config=md_cfg)
-
             file2orig = {f"file://{p.resolve()}": u for (u, p) in local_html_needed}
             for r in (results or []):
                 file_url = getattr(r, "url", None)
@@ -519,25 +605,19 @@ async def _crawl_company(
                     saved_md_run += int(s["saved_md"])
                     md_suppressed_run += int(s["md_suppressed"])
                     md_retry_suggested_run += int(s["md_retry_suggested"])
-
-                    # Mark as processed for checkpointing if this run is not doing LLM.
-                    # Treat saved / suppressed / retry as "processed" so future runs won't re-seed/re-fetch.
                     if not llm_in_pipeline:
                         if s.get("saved_md") or s.get("md_suppressed") or s.get("md_retry_suggested"):
-                            await cp.mark_url_done(url)
-
+                            await mark_done_once(url)
                 else:
                     err = getattr(r, "error_message", "local-md-fail")
                     logger.warning("[%s] Local HTML→MD failed: %s err=%s", bvdid, url, err)
                     await cp.mark_url_failed(url, f"local-md-error: {err}")
 
-    # --- Remote fetch for Markdown (+ AUTO JS-only retry on retry/suppress) --
+    # ---------- Remote fetch for Markdown (+ JS-only retry) --------------
     if need_remote_fetch:
         local_set = {u for (u, _) in local_html_needed}
-        # Build all_remote only for seeded_urls not present locally
         all_remote = [(url_to_item.get(url) or {"url": url, "final_url": url}) for url in seeded_urls if url not in local_set]
 
-        # If require_presence and using index, filter remote targets to only presence==1 and presence_checked
         if getattr(args, "require_presence", False) and used_index_for_urls and url_index:
             filtered_remote = []
             for it in all_remote:
@@ -556,17 +636,17 @@ async def _crawl_company(
         if pending:
             logger.info("[%s] Remote fetch for Markdown (and HTML reference): %d URL(s)", bvdid, len(pending))
 
-            md_cfg = mk_md_config(args)
+            md_cfg = _ensure_c4a_config_defaults(mk_md_config(args))
 
+            # Use page-timeout-ms (not company-timeout) for per-page waits
             ipol = PageInteractionPolicy(
                 enable_cookie_playbook=True,
-                max_in_session_retries=0,  # we'll manage second pass explicitly below
-                wait_timeout_ms=max(60000, int(args.company_timeout * 1000)),
+                max_in_session_retries=0,
+                wait_timeout_ms=max(60000, int(getattr(args, "page_timeout_ms", 120000))),
                 delay_before_return_sec=1.5,
             )
             icfg = first_pass_config("about:blank", ipol)
 
-            # Merge interaction into md_cfg so the normal remote pass waits correctly
             md_cfg.js_code = icfg.js_code
             md_cfg.wait_for = icfg.wait_for
             md_cfg.delay_before_return_html = max(
@@ -574,13 +654,9 @@ async def _crawl_company(
                 icfg.delay_before_return_html
             )
             md_cfg.virtual_scroll_config = icfg.virtual_scroll_config
-            # Keep md_cfg.cache_mode as provided by mk_md_config; override only if you want enabled:
-            # md_cfg.cache_mode = CacheMode.ENABLED
 
-            # Prepare explicit JS-only retry config (for batch retries) — base it on mk_md_config too
-            js_retry_cfg = mk_md_config(args)
+            js_retry_cfg = _ensure_c4a_config_defaults(mk_md_config(args))
             rcfg2 = retry_pass_config("about:blank", ipol)
-            # merge retry policy bits into js_retry_cfg
             js_retry_cfg.js_code = rcfg2.js_code
             js_retry_cfg.wait_for = rcfg2.wait_for
             js_retry_cfg.delay_before_return_html = max(
@@ -593,24 +669,90 @@ async def _crawl_company(
             except Exception:
                 pass
 
+            # initial per-company slots provided by caller (already capped by SlotAllocator.initial_per_company)
             dispatcher = make_dispatcher(max_concurrency_for_company)
+            html_saved_urls: Set[str] = set()
+
+            async def _session_snapshot() -> SessionSnapshot:
+                try:
+                    summary = await cp_mgr.summary()
+                except Exception:
+                    summary = {}
+                total = max(1, len(summary))  # avoid zero division
+                finished = sum(1 for s in summary.values() if bool(s.get("finished")))
+                running = max(1, total - finished)
+                return SessionSnapshot(total_companies=total, finished_companies=finished, running_companies=running)
+
+            async def _company_snapshot() -> CompanySnapshot:
+                try:
+                    cpi = await cp_mgr.get(bvdid, company_name=company.name)
+                    urls_total = int(cpi.data.get("urls_total") or 0)
+                    urls_done  = int(cpi.data.get("urls_done")  or 0)
+                except Exception:
+                    urls_total = urls_done = 0
+                return CompanySnapshot(
+                    urls_total=urls_total if urls_total > 0 else None,
+                    urls_done=urls_done if urls_done > 0 else None,
+                    timeout_rate=None,
+                )
+
+            def _apply_max_permit(dispatcher, new_permit: int) -> None:
+                try:
+                    if hasattr(dispatcher, "set_max_session_permit"):
+                        dispatcher.set_max_session_permit(int(new_permit))
+                    elif hasattr(dispatcher, "max_session_permit"):
+                        setattr(dispatcher, "max_session_permit", int(new_permit))
+                except Exception:
+                    pass
+
+            async def _maybe_resize_dispatcher(disp) -> None:
+                try:
+                    ss = await _session_snapshot()
+                    # recompute using this company's checkpoint
+                    cpi = await cp_mgr.get(bvdid, company_name=company.name)
+                    urls_total = int(cpi.data.get("urls_total") or 0)
+                    urls_done  = int(cpi.data.get("urls_done")  or 0)
+                    cs = CompanySnapshot(
+                        urls_total=urls_total if urls_total > 0 else None,
+                        urls_done=urls_done if urls_done > 0 else None,
+                        timeout_rate=None,
+                    )
+                    new_slots = slot_alloc.recommend_for_company(bvdid, ss, cs)
+                    _apply_max_permit(disp, new_slots)
+                    logger.debug("[%s] SlotAllocator recommend: running=%d finished=%d/%d → per-company=%d",
+                                 bvdid, ss.running_companies, ss.finished_companies, ss.total_companies, new_slots)
+                except Exception:
+                    pass
 
             attempts_by_url: Dict[str, int] = {}
             max_trans = int(args.retry_transport)
             max_soft = int(args.retry_soft_timeout)
 
+            # NEW: batched remote fetch
+            batch_size = max(8, int(getattr(args, "remote_batch_size", 64)))
+            logger.info("[%s] Remote fetch batching: batch_size=%d page_timeout_ms=%d",
+                        bvdid, batch_size, int(getattr(args, "page_timeout_ms", 120000)))
+
+            def _pop_some(p: set[str], n: int) -> List[str]:
+                out = []
+                for _ in range(min(n, len(p))):
+                    out.append(p.pop())
+                return out
+
             attempt = 0
             while pending:
                 await net.wait_until_healthy()
                 attempt += 1
-                logger.info("[%s] Remote fetch pass #%d: %d URL(s) pending", bvdid, attempt, len(pending))
-                urls_this_round = list(pending)
-                pending.clear()
+                urls_this_round = _pop_some(pending, batch_size)
+                logger.info("[%s] Remote fetch pass #%d: processing %d of %d pending",
+                            bvdid, attempt, len(urls_this_round), len(pending) + len(urls_this_round))
                 to_retry: set[str] = set()
                 cookie_js_retry: set[str] = set()
 
-                async with AsyncWebCrawler() as crawler:
-                    # Use md_cfg (markdown-enabled) for the normal remote pass
+                # resize permits based on current tail state before each batch
+                await _maybe_resize_dispatcher(dispatcher)
+
+                async with AsyncWebCrawler(config=browser_cfg) as crawler:
                     stream = await crawler.arun_many(urls=urls_this_round, config=md_cfg, dispatcher=dispatcher)
 
                     async def _handle_result(r):
@@ -622,7 +764,8 @@ async def _crawl_company(
                             s = _save_result_for_pipeline(
                                 bvdid, url, ["markdown"], r, logger, args.md_min_words, save_html_ref=True,
                                 md_gate_opts={"cookie_max_fraction": args.md_cookie_max_frac, "require_structure": args.md_require_structure},
-                                presence_only=bool(args.presence_only)
+                                presence_only=bool(args.presence_only),
+                                html_saved_urls=html_saved_urls,
                             )
                             saved_html_run += int(s["saved_html"])
                             saved_md_run += int(s["saved_md"])
@@ -630,19 +773,16 @@ async def _crawl_company(
                             md_retry_suggested_run += int(s["md_retry_suggested"])
                             net.record_success()
 
-                            # Mark as processed for checkpointing if this run is not doing LLM.
-                            # Count pages that are saved, suppressed, or marked retry as "done" so future runs will skip them.
-                            if not llm_in_pipeline:
-                                if s.get("saved_md") or s.get("md_suppressed") or s.get("md_retry_suggested"):
-                                    await cp.mark_url_done(url)
-
-                            # If gate suggested retry/suppression due to cookie-dominant, schedule JS-only retry in batch
-                            if (s.get("md_retry_suggested") or (s.get("md_suppressed") and ("cookie" in (s.get("md_reason") or "").lower()))):
+                            cookie_case = (s.get("md_retry_suggested") or (s.get("md_suppressed") and ("cookie" in (s.get("md_reason") or "").lower())))
+                            if cookie_case:
                                 cookie_js_retry.add(url)
                                 metrics.incr("markdown.cookie_retry_scheduled", bvdid=bvdid, url=url)
+                            else:
+                                if not llm_in_pipeline and (s.get("saved_md") or s.get("md_suppressed")):
+                                    await mark_done_once(url)
                             return
 
-
+                        # fallthrough for failure
                         err = getattr(r, "error_message", "") or ""
                         code = getattr(r, "status_code", None)
                         kind = classify_failure(err, code, treat_timeouts_as_transport=bool(args.treat_timeouts_as_transport))
@@ -650,7 +790,7 @@ async def _crawl_company(
                         if kind == "download":
                             logger.info("[%s] Download navigation; skipping: %s", bvdid, url)
                             await cp.add_note(f"download-skip: {url}")
-                            await cp.mark_url_done(url)
+                            await mark_done_once(url)
                             net.record_success()
                             return
 
@@ -680,7 +820,6 @@ async def _crawl_company(
                         logger.warning("[%s] Failed (non-transport): %s status=%s err=%s", bvdid, url, code, err)
                         await cp.mark_url_failed(url, f"http-error: {code} {err}")
 
-                    # iterate the stream (async generator or list)
                     if hasattr(stream, "__aiter__"):
                         async for r in stream:
                             if not net.is_healthy():
@@ -700,12 +839,12 @@ async def _crawl_company(
                                 logger.info("[%s] Connectivity restored — resuming.", bvdid)
                             await _handle_result(r)
 
-                    # ---- AUTO JS-only second pass for cookie/interstitial cases (batch)
+                    # JS-only cookie/interstitial retry batch
                     if cookie_js_retry:
                         logger.info("[%s] JS-only retry for %d URL(s) due to cookie/interstitial dominance",
                                     bvdid, len(cookie_js_retry))
-
-                        # Use js_retry_cfg for the batch retry (it includes markdown_generator)
+                        # Resize again before retry; tail may have advanced
+                        await _maybe_resize_dispatcher(dispatcher)
                         retry_results = await crawler.arun_many(
                             urls=list(cookie_js_retry), config=js_retry_cfg, dispatcher=dispatcher
                         )
@@ -719,20 +858,17 @@ async def _crawl_company(
                                 s2 = _save_result_for_pipeline(
                                     bvdid, u, ["markdown"], rr, logger, args.md_min_words, save_html_ref=True,
                                     md_gate_opts={"cookie_max_fraction": args.md_cookie_max_frac, "require_structure": args.md_require_structure},
-                                    presence_only=bool(args.presence_only)
+                                    presence_only=bool(args.presence_only),
+                                    html_saved_urls=html_saved_urls,
                                 )
                                 saved_html_run += int(s2["saved_html"])
                                 saved_md_run += int(s2["saved_md"])
                                 md_suppressed_run += int(s2["md_suppressed"])
                                 md_retry_suggested_run += int(s2["md_retry_suggested"])
                                 net.record_success()
-
-                                # Count this URL as done for checkpointing if not running LLM in this pass.
-                                if not llm_in_pipeline:
-                                    if s2.get("saved_md") or s2.get("md_suppressed") or s2.get("md_retry_suggested"):
-                                        await cp.mark_url_done(u)
+                                if not llm_in_pipeline and (s2.get("saved_md") or s2.get("md_suppressed") or s2.get("md_retry_suggested")):
+                                    await mark_done_once(u)
                                 metrics.incr("markdown.retry_performed", bvdid=bvdid, url=u)
-
                             else:
                                 err2 = getattr(rr, "error_message", "js-retry-fail")
                                 logger.warning("[%s] JS-only retry failed: %s err=%s", bvdid, u, err2)
@@ -747,10 +883,10 @@ async def _crawl_company(
                         cookie_js_retry.clear()
 
                 if to_retry:
-                    logger.info("[%s] %d URL(s) scheduled for transport/soft-timeout retry.", bvdid, len(to_retry))
+                    logger.info("[%s] %d URL(s) scheduled for transport/soft-timeout retry (will be re-queued).", bvdid, len(to_retry))
                     pending |= to_retry
 
-    # --- Local LLM over Markdown -------------------------------------------
+    # ---------- Local LLM over Markdown ---------------------------------
     if llm_in_pipeline and not plan.skip_llm:
         llm_targets: List[Tuple[str, Path]] = []
 
@@ -758,11 +894,13 @@ async def _crawl_company(
         if used_index_for_urls_flag:
             for url in seeded_urls:
                 ent = url_index.get(url, {})
+                # Only accept URLs whose current status is markdown_saved when reusing index for LLM
+                if str(ent.get("status", "")).lower() != "markdown_saved":
+                    continue
                 md_path = ent.get("markdown_path")
                 if md_path:
                     p = Path(md_path)
                     if p.exists():
-                        # If require_presence is set, ensure ent satisfies gating
                         if getattr(args, "require_presence", False):
                             if int(ent.get("has_offering", 0) or 0) != 1 or not bool(ent.get("presence_checked", False)):
                                 continue
@@ -770,7 +908,6 @@ async def _crawl_company(
 
         if not llm_targets:
             for url in seeded_urls:
-                # If require_presence is set and we don't have index use conservative skip
                 if getattr(args, "require_presence", False) and not used_index_for_urls:
                     continue
                 md_path = prefer_local_md(bvdid, url)
@@ -783,7 +920,7 @@ async def _crawl_company(
         if not llm_targets:
             logger.warning("[%s] No Markdown files found for LLM stage. Skipping.", bvdid)
         else:
-            async with AsyncWebCrawler() as local_crawler:
+            async with AsyncWebCrawler(config=browser_cfg) as local_crawler:
                 raw_inputs: List[str] = []
                 ordered_urls: List[str] = []
                 skipped_urls: List[str] = []
@@ -799,30 +936,23 @@ async def _crawl_company(
                     if not text.strip():
                         logger.debug("[%s] Empty Markdown, skip LLM for %s", bvdid, url)
                         skipped_urls.append(url)
-                        await cp.mark_url_done(url)
+                        await mark_done_once(url)
                         continue
 
                     action, reason, md_stats = evaluate_markdown(
-                        text, url=url, allow_retry=False,
+                        text, allow_retry=False,
                         min_meaningful_words=max(1, int(args.md_min_words)),
-                        interstitial_max_share=0.60, interstitial_min_hits=2,
                         cookie_max_fraction=args.md_cookie_max_frac,
                         require_structure=args.md_require_structure,
-                        generator_ignores_links=True,
                     )
 
                     if action != "save":
                         logger.debug("[%s] Markdown gated (%s); skipping LLM for %s", bvdid, reason, url)
                         skipped_urls.append(url)
-                        await cp.mark_url_done(url)
+                        await mark_done_once(url)
                         md_suppressed_run += 1
                         continue
 
-                    logger.debug(
-                        "[%s] Queuing for LLM (len=%d words≈%d): %s",
-                        bvdid, len(text), md_stats.get("total_words", 0), url
-                    )
-                    # prefix "raw:" works with the crawler/processor to mark inline input
                     raw_inputs.append(f"raw:{text}")
                     ordered_urls.append(url)
 
@@ -831,15 +961,9 @@ async def _crawl_company(
                     logger.info("[%s] No valid Markdown to feed into LLM after gating. Skipped=%d",
                                 bvdid, len(skipped_urls))
                 else:
-                    llm_cfg = mk_llm_config(args)
+                    llm_cfg = _ensure_c4a_config_defaults(mk_llm_config(args))
                     logger.info("[%s] Starting LLM local run for %d input(s)...", bvdid, total_inputs)
-                    logger.debug("[%s] LLM config preview: provider=%s base_url=%s stream=%s",
-                                 bvdid,
-                                 getattr(getattr(llm_cfg, "extraction_strategy", None), "llm_config", None) and getattr(llm_cfg.extraction_strategy.llm_config, "provider", None),
-                                 getattr(getattr(llm_cfg, "extraction_strategy", None), "llm_config", None) and getattr(llm_cfg.extraction_strategy.llm_config, "base_url", None),
-                                 getattr(llm_cfg, "stream", None))
 
-                    # Timeout per-LUN run so we do not stall the whole company run if model hangs.
                     try:
                         LLM_PER_RUN_TIMEOUT = int(getattr(args, "llm_per_run_timeout", None) or 900)
                     except Exception:
@@ -862,24 +986,19 @@ async def _crawl_company(
                         if cor is None:
                             results_list = []
                         elif hasattr(cor, "__aiter__"):
-                            results_iter = cor.__aiter__()
-                            logger.debug("[%s] arun_many returned async generator (direct).", bvdid)
+                            results_iter = cor.__aiter__()  # type: ignore[attr-defined]
                         elif hasattr(cor, "__await__"):
                             try:
                                 resolved = await asyncio.wait_for(cor, timeout=float(LLM_PER_RUN_TIMEOUT))
                                 if hasattr(resolved, "__aiter__"):
-                                    results_iter = resolved.__aiter__()
-                                    logger.debug("[%s] arun_many resolved to async generator.", bvdid)
+                                    results_iter = resolved.__aiter__()  # type: ignore[attr-defined]
                                 else:
                                     results_list = list(resolved or [])
-                                    logger.debug("[%s] arun_many resolved to list (items=%d).", bvdid, len(results_list))
                             except asyncio.TimeoutError:
                                 logger.exception("[%s] LLM local run timed out after %ss", bvdid, LLM_PER_RUN_TIMEOUT)
                                 for u in ordered_urls:
-                                    try:
+                                    with contextlib.suppress(Exception):
                                         await cp.mark_url_failed(u, f"local-llm-timeout-{LLM_PER_RUN_TIMEOUT}s")
-                                    except Exception:
-                                        pass
                                 results_list = []
                             except Exception as e:
                                 logger.exception("[%s] LLM local crawler run failed: %s", bvdid, e)
@@ -888,7 +1007,7 @@ async def _crawl_company(
                             try:
                                 resolved = await asyncio.wait_for(cor, timeout=float(LLM_PER_RUN_TIMEOUT))
                                 if hasattr(resolved, "__aiter__"):
-                                    results_iter = resolved.__aiter__()
+                                    results_iter = resolved.__aiter__()  # type: ignore[attr-defined]
                                 else:
                                     results_list = list(resolved or [])
                             except Exception as e:
@@ -917,11 +1036,7 @@ async def _crawl_company(
                                 )
                                 saved_json_run += int(s["saved_json"])
                                 success_count += 1
-                                extracted = getattr(r, "extracted_content", "")
-                                snippet = str(extracted)[:200].replace("\n", " ") if extracted else ""
-                                logger.debug("[%s] LLM OK: %s | extracted_preview=\"%s\"", bvdid, url, snippet[:200])
-                                # mark as done for checkpointing
-                                await cp.mark_url_done(url)
+                                await mark_done_once(url)
                             else:
                                 err = getattr(r, "error_message", "local-llm-fail")
                                 logger.warning("[%s] LLM failed for %s err=%s", bvdid, url, err)
@@ -929,10 +1044,8 @@ async def _crawl_company(
                                 fail_count += 1
                         except Exception as e:
                             logger.exception("[%s] Error while processing LLM result for %s: %s", bvdid, url, e)
-                            try:
+                            with contextlib.suppress(Exception):
                                 await cp.mark_url_failed(url, f"local-llm-result-processing-error: {e}")
-                            except Exception:
-                                pass
                             fail_count += 1
 
                     success_count = fail_count = 0
@@ -945,7 +1058,7 @@ async def _crawl_company(
                         i = 0
                         while True:
                             try:
-                                r = await asyncio.wait_for(results_iter.__anext__(), timeout=float(PER_ITEM_TIMEOUT))
+                                r = await asyncio.wait_for(results_iter.__anext__(), timeout=float(PER_ITEM_TIMEOUT))  # type: ignore[union-attr]
                                 await _process_result_at_index(i, r)
                                 i += 1
                                 if i >= len(ordered_urls):
@@ -953,17 +1066,10 @@ async def _crawl_company(
                             except StopAsyncIteration:
                                 break
                             except asyncio.TimeoutError:
-                                logger.exception("[%s] LLM streaming item #%d timed out after %ss (marking this URL failed, continuing)", bvdid, i, PER_ITEM_TIMEOUT)
-                                try:
-                                    raw_in_preview = _short_preview(raw_inputs[i] if i < len(raw_inputs) else "<no-input>", length=800)
-                                    logger.debug("[%s] LLM timed-out input preview idx=%d: %s", bvdid, i, raw_in_preview)
-                                except Exception:
-                                    pass
-                                if i < len(ordered_urls):
-                                    try:
+                                logger.exception("[%s] LLM streaming item #%d timed out after %ss (continuing)", bvdid, i, PER_ITEM_TIMEOUT)
+                                with contextlib.suppress(Exception):
+                                    if i < len(ordered_urls):
                                         await cp.mark_url_failed(ordered_urls[i], f"local-llm-stream-item-timeout-{PER_ITEM_TIMEOUT}s")
-                                    except Exception:
-                                        pass
                                 i += 1
                                 continue
                             except asyncio.CancelledError:
@@ -971,11 +1077,9 @@ async def _crawl_company(
                                 break
                             except Exception as e:
                                 logger.exception("[%s] Exception while iterating LLM stream: %s", bvdid, e)
-                                if i < len(ordered_urls):
-                                    try:
+                                with contextlib.suppress(Exception):
+                                    if i < len(ordered_urls):
                                         await cp.mark_url_failed(ordered_urls[i], f"local-llm-stream-iteration-exc: {e}")
-                                    except Exception:
-                                        pass
                                 i += 1
                                 continue
 
@@ -994,7 +1098,7 @@ async def _crawl_company(
     prev["md_retry_suggested_total"] = prev.get("md_retry_suggested_total", 0) + md_retry_suggested_run
     await cp.save()
 
-    try:
+    with contextlib.suppress(Exception):
         await state.update_artifacts(
             bvdid,
             saved_html_total=prev["saved_html_total"],
@@ -1007,8 +1111,6 @@ async def _crawl_company(
             urls_done=int(cp.data.get("urls_done", 0)),
             urls_failed=int(cp.data.get("urls_failed", 0)),
         )
-    except Exception:
-        pass
 
     await cp.mark_finished()
     write_last_crawl_date(bvdid)
@@ -1058,31 +1160,43 @@ async def main_async() -> None:
         args.md_content_source, bool(args.md_ignore_links), bool(args.md_ignore_images),
         float(args.md_cookie_max_frac), bool(args.md_require_structure),
     )
+    root_logger.info("Fetch tuning: page_timeout_ms=%d remote_batch_size=%d",
+                     int(getattr(args, "page_timeout_ms", 120000)),
+                     int(getattr(args, "remote_batch_size", 64)))
     root_logger.info("LLM config: presence_only=%s require_presence=%s", args.presence_only, getattr(args, "require_presence", False))
 
-    if getattr(args, "csv_dir", None):
-        csv_dir: Path = args.csv_dir
-        if not csv_dir.exists() or not csv_dir.is_dir():
-            root_logger.error("--csv-dir is not a directory: %s", csv_dir)
+    # --- Load input companies (multi-format) ---
+    if getattr(args, "source_dir", None):
+        src_dir: Path = args.source_dir
+        if not src_dir.exists() or not src_dir.is_dir():
+            root_logger.error("--source-dir is not a directory: %s", src_dir)
             log_ext.close()
             return
-        files = sorted(p for p in csv_dir.rglob("*.csv") if p.is_file())
-        if not files:
-            root_logger.error("No CSV files found under: %s", csv_dir)
+
+        patterns = [p.strip() for p in (args.source_pattern or "").split(",") if p.strip()]
+        companies: List[CompanyInput] = load_companies_from_dir(src_dir, patterns=patterns, recursive=True)
+
+        if not companies:
+            root_logger.error("No supported data files (or no valid rows) found under: %s", src_dir)
             log_ext.close()
             return
-        root_logger.info("Discovered %d CSV file(s) in %s", len(files), csv_dir)
-        companies: List[CompanyInput] = []
-        for f in files:
-            companies.extend(load_companies_from_csv(f, limit=None))
+
         if args.limit is not None and args.limit > 0:
-            companies = companies[:args.limit]
+            companies = companies[: args.limit]
             root_logger.info("Applied global limit: %d", args.limit)
+
+        root_logger.info("Loaded %d companies from %s", len(companies), src_dir)
+
     else:
-        companies = load_companies_from_csv(args.csv, limit=args.limit)
+        companies = load_companies_from_source(args.source, limit=args.limit)
+        if not companies:
+            root_logger.error("No valid rows in source: %s", args.source)
+            log_ext.close()
+            return
+        root_logger.info("Loaded %d companies from %s", len(companies), args.source)
 
     if not companies:
-        root_logger.error("No valid rows in CSV input. Exiting.")
+        root_logger.error("No valid rows in input. Exiting.")
         log_ext.close()
         return
 
@@ -1092,23 +1206,41 @@ async def main_async() -> None:
     lang_regions = set(x.strip().lower() for x in args.lang_accept_en_regions.split(",") if x.strip())
 
     n = len(companies)
-    per_company = per_company_slots(n, args.max_slots)
-    root_logger.info("Loaded %d companies | global slots=%d → per-company=%d", n, args.max_slots, per_company)
+
+    # Build SlotAllocator from CLI
+    slot_cfg = SlotConfig(
+        max_slots=int(args.max_slots),
+        per_company_cap=int(args.slot_cap_per_company),
+        per_company_min=int(args.slot_min_per_company),
+        tail_start_fraction=float(args.slot_tail_frac),
+        tail_boost_cap=(int(args.slot_tail_cap) if int(args.slot_tail_cap) > 0 else None),
+    )
+    slot_alloc = SlotAllocator(slot_cfg)
+
+    per_company_initial = slot_alloc.initial_per_company(total_companies=n)
+    root_logger.info(
+        "Loaded %d companies | global slots=%d → per-company(initial)=%d [cap=%d, min=%d, tail_frac=%.2f, tail_cap=%s]",
+        n, args.max_slots, per_company_initial,
+        slot_cfg.per_company_cap, slot_cfg.per_company_min,
+        slot_cfg.tail_start_fraction,
+        (slot_cfg.tail_boost_cap if slot_cfg.tail_boost_cap is not None else "reuse-cap"),
+    )
     root_logger.debug("Include patterns: %s", include_patterns)
     root_logger.debug("Exclude patterns: %s", exclude_patterns)
     metrics.set("session.company_count", float(n))
-    metrics.set("session.per_company_slots", float(per_company))
+    metrics.set("session.per_company_slots", float(per_company_initial))
 
     cp_mgr = CheckpointManager()
     await cp_mgr.mark_global_start()
     scanner = ArtifactScanner()
     state = GlobalState()
 
+    # Connectivity guard
     net = ConnectivityGuard(
+        probe_host="8.8.8.8",
+        probe_port=53,
         interval_s=5.0,
         trip_heartbeats=2,
-        error_ratio_threshold=0.6,
-        error_window=20,
         connect_timeout_s=2.5,
         base_cooloff_s=5.0,
         max_cooloff_s=300.0,
@@ -1132,7 +1264,7 @@ async def main_async() -> None:
                                 c,
                                 pipeline=pipeline,
                                 seeding_source=args.seeding_source,
-                                max_concurrency_for_company=per_company,
+                                max_concurrency_for_company=per_company_initial,
                                 include_patterns=include_patterns,
                                 exclude_patterns=exclude_patterns,
                                 respect_crawl_date=args.respect_crawl_date,
@@ -1151,9 +1283,9 @@ async def main_async() -> None:
                                 lang_accept_en_regions=lang_regions,
                                 lang_strict_cctld=args.lang_strict_cctld,
                                 args=args,
-                                scanner=scanner,
                                 state=state,
                                 net=net,
+                                slot_alloc=slot_alloc,
                             ),
                             timeout=float(timeout_s),
                         )
@@ -1260,6 +1392,7 @@ async def main_async() -> None:
                 h.flush()
         metrics.set("session.finished_companies", float(len(summary)))
         log_ext.close()
+
 
 def main() -> None:
     asyncio.run(main_async())

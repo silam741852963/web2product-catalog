@@ -19,13 +19,15 @@ from crawl4ai import (
 )
 from crawl4ai.deep_crawling import BestFirstCrawlingStrategy
 from crawl4ai.async_dispatcher import MemoryAdaptiveDispatcher
+from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
 
 try:
     from crawl4ai import CrawlerMonitor  # type: ignore
 except Exception:  # pragma: no cover
     CrawlerMonitor = None  # type: ignore
 
-from config import language_settings as langcfg
+from configs import language_settings as lang_cfg
+from configs.browser_settings import browser_cfg
 
 from extensions.filtering import (
     DEFAULT_INCLUDE_PATTERNS,
@@ -56,13 +58,13 @@ metrics = _NullMetrics()  # type: ignore
 log = logging.getLogger(__name__)
 
 # Use language_settings for the default product query (language-aware)
-DEFAULT_PRODUCT_QUERY = langcfg.default_product_bm25_query()
+DEFAULT_PRODUCT_QUERY = lang_cfg.default_product_bm25_query()
 
 # CTA keywords: attempt to read from language settings, otherwise fallback to English set
-CTA_KEYWORDS = set(langcfg.get("CTA_KEYWORDS"))
+CTA_KEYWORDS = set(lang_cfg.get("CTA_KEYWORDS"))
 
 # PRODUCT-ish URL tokens — get from language settings (SMART include tokens)
-PRODUCTISH_URL_TOKENS = set(langcfg.get("SMART_INCLUDE_TOKENS"))
+PRODUCTISH_URL_TOKENS = set(lang_cfg.get("SMART_INCLUDE_TOKENS"))
 
 _DEBUG_SAMPLE_TOP = 10
 _DEBUG_SAMPLE_BOTTOM = 3
@@ -161,6 +163,7 @@ def _stage_run_config(stage: str) -> CrawlerRunConfig:
         cache_mode=CacheMode.ENABLED,
         markdown_generator=md_gen,
         extraction_strategy=extraction,
+        scraping_strategy=LXMLWebScrapingStrategy(),
         stream=True,
     )
 
@@ -169,11 +172,19 @@ def _with_scheme_variants(url_or_host: str) -> List[str]:
     if not s:
         return []
     lower = s.lower()
-    if lower.startswith("http://") or lower.startswith("https://"):
+    if lower.startswith("https://"):
         return [s]
     while s.startswith("/"):
         s = s[1:]
-    return [f"https://{s}", f"http://{s}"]
+    return [f"https://{s}"]
+
+def _domain_variants(host: str) -> List[str]:
+    h = (host or "").lower().strip().rstrip(".")
+    if not h:
+        return []
+    base = h[4:] if h.startswith("www.") else h
+    out = {h, base, f"www.{base}"}
+    return sorted(out)
 
 def _same_netloc(a: str, b: str) -> bool:
     return (urlparse(a).netloc or "").lower() == (urlparse(b).netloc or "").lower()
@@ -204,10 +215,22 @@ def _normalize_brand_sites(items: Iterable[Any], *, require_valid_status: bool =
 async def _collect_roots(base_url: str, *, discover_brands: bool = True) -> List[str]:
     roots: List[str] = []
     seen: Set[str] = set()
+
+    # Always include scheme variants of the input
     for v in _with_scheme_variants(base_url):
         if v and v not in seen:
             seen.add(v); roots.append(v)
+
+    # Add apex/www host variants as roots too
     preferred = roots[0] if roots else None
+    if preferred:
+        host = (urlparse(preferred).hostname or "").lower()
+        for host_variant in _domain_variants(host):
+            for v in _with_scheme_variants(host_variant):
+                if v and v not in seen:
+                    seen.add(v); roots.append(v)
+
+    # Brand discovery (with dynamic universal host suppression)
     if discover_brands and preferred and not is_universal_external(preferred):
         try:
             log.info("[url_seeder] Brand discovery for %s", preferred)
@@ -217,32 +240,25 @@ async def _collect_roots(base_url: str, *, discover_brands: bool = True) -> List
             # Filter out canonical universal externals first
             brand_sites = [u for u in brand_sites if not is_universal_external(u)]
 
-            # Now dynamic-universal logic:
-            # compute candidate hosts (unique) and map to company_id (preferred_host)
+            # Dynamic-universal logic
             company_id = (urlparse(preferred).hostname or "").lower() or preferred
             candidate_hosts = set((urlparse(u).hostname or "").lower() for u in brand_sites if u)
-            # increment persistent counts for these hosts for this company
             counts_snapshot, newly_blacklisted = _increment_hosts_for_company(company_id, candidate_hosts)
 
-            # Any hosts currently dynamically blacklisted (counts > threshold) should be omitted
             filtered_brand_sites: List[str] = []
             skipped_due_to_dynamic: List[Tuple[str, int]] = []
             for u in brand_sites:
                 host = (urlparse(u).hostname or "").lower()
-                # Skip if sandboxed by static universal list or dynamic counts
                 if is_universal_external(u) or _is_host_dynamically_universal(host):
-                    # If dynamic skip, produce special log entry for review, include current count
                     curr_count = counts_snapshot.get(host, 0)
                     skipped_due_to_dynamic.append((u, curr_count))
                     continue
                 filtered_brand_sites.append(u)
 
-            # Emit special logs for those skipped due to dynamic blacklist
             for root_u, curr_count in skipped_due_to_dynamic:
                 log.warning("[url_seeder.dynamic-skip] Skipped candidate brand root=%s for base=%s because host=%s seen_in_companies=%d",
                             root_u, preferred, (urlparse(root_u).hostname or ""), int(curr_count))
 
-            # Use filtered_brand_sites as brand roots to add
             for b in filtered_brand_sites:
                 if b not in seen:
                     seen.add(b); roots.append(b)
@@ -253,6 +269,7 @@ async def _collect_roots(base_url: str, *, discover_brands: bool = True) -> List
                 log.debug("[url_seeder]   Brand roots discovered: %s", ", ".join(roots[1:]))
         except Exception as e:
             log.exception("[url_seeder] Brand discovery failed: %s", e)
+
     return roots
 
 def _url_has_productish_tokens(u: str) -> bool:
@@ -431,7 +448,7 @@ def _prefilter_stepwise(
 async def seed_urls(
     base_url: str,
     *,
-    source: str = "sitemap",
+    source: str = "cc",
     include: Optional[List[str]] = None,
     exclude: Optional[List[str]] = None,
     query: Optional[str] = None,
@@ -513,7 +530,8 @@ async def seed_urls(
                   eff_threshold, auto_query_used)
 
     roots = await _collect_roots(preferred, discover_brands=discover_brands)
-    for v in base_variants:
+    # Ensure the original scheme variants are also included at the front
+    for v in base_variants[::-1]:
         if v not in roots:
             roots.insert(0, v)
 
@@ -581,6 +599,10 @@ async def seed_urls(
                 raw = await seeder.urls(root, cfg)
                 for r in raw:
                     r.setdefault("seed_root", root)
+                    # Ensure downstream filters always have "url"
+                    u = str(r.get("final_url") or r.get("url") or "").strip()
+                    if u:
+                        r["url"] = u
                 all_discovered.extend(raw)
                 grand_total += len(raw)
                 log.info("[url_seeder] %s -> %d URL(s); total=%d", root, len(raw), grand_total)
@@ -725,10 +747,17 @@ async def crawl_seeded(
         run_cfg = _stage_run_config(stage)
         dispatcher = _make_dispatcher(max_concurrency)
         results: List[Any] = []
-        async with AsyncWebCrawler() as crawler:
+        async with AsyncWebCrawler(config=browser_cfg) as crawler:
             try:
-                async for r in await crawler.arun_many(urls=urls, config=run_cfg, dispatcher=dispatcher):
-                    results.append(r)
+                res = await crawler.arun_many(urls=urls, config=run_cfg, dispatcher=dispatcher)
+                if hasattr(res, "__aiter__"):
+                    async for r in res:
+                        results.append(r)
+                else:
+                    if isinstance(res, list):
+                        results.extend(res)
+                    elif res is not None:
+                        results.append(res)
             except Exception as e:
                 log.exception("[url_seeder] Crawler stream error: %s", e)
         return results
@@ -744,7 +773,7 @@ async def crawl_seeded(
     sem = asyncio.Semaphore(max_concurrency)
     out_results: List[Any] = []
 
-    async with AsyncWebCrawler() as crawler:
+    async with AsyncWebCrawler(config=browser_cfg) as crawler:
         async def _one(url: str):
             async with sem:
                 try:
@@ -808,7 +837,7 @@ async def deep_crawl_fallback(
     host = (urlparse(start_url).hostname or "").lower()
     scorer = make_keyword_scorer(keywords or [], weight=0.7)
     filter_chain = make_basic_filter_chain(
-        allowed_domains=[host],
+        allowed_domains=_domain_variants(host),
         patterns=None,
         content_types=["text/html"],
     )
@@ -822,9 +851,16 @@ async def deep_crawl_fallback(
     )
     dispatcher = _make_dispatcher(max_concurrency)
     results: List[Any] = []
-    async with AsyncWebCrawler() as crawler:
-        async for r in await crawler.arun(start_url, config=run_cfg, dispatcher=dispatcher):
-            results.append(r)
+    async with AsyncWebCrawler(config=browser_cfg) as crawler:
+        res = await crawler.arun(start_url, config=run_cfg, dispatcher=dispatcher)
+        if hasattr(res, "__aiter__"):
+            async for r in res:
+                results.append(r)
+        else:
+            if isinstance(res, list):
+                results.extend(res)
+            elif res is not None:
+                results.append(res)
     return results
 
 async def discover_and_crawl(
@@ -832,7 +868,7 @@ async def discover_and_crawl(
     *,
     stage: str,
     max_concurrency: int = 10,
-    seeding_source: str = "sitemap",
+    seeding_source: str = "cc",
     include: Optional[List[str]] = None,
     exclude: Optional[List[str]] = None,
     query: Optional[str] = None,

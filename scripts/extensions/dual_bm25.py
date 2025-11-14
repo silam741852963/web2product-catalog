@@ -1,4 +1,3 @@
-# dual_bm25.py
 from __future__ import annotations
 
 import math
@@ -12,7 +11,7 @@ from extensions.filtering import (
     DEFAULT_EXCLUDE_QUERY_KEYS,
     UNIVERSAL_EXTERNALS,
 )
-from config import language_settings as langcfg
+from configs import language_settings as lang_cfg
 
 __all__ = [
     "build_default_negative_terms",
@@ -33,7 +32,7 @@ _FILE_EXT_STOP = { "pdf","ps","rtf","doc","docx","ppt","pptx","pps","xls","xlsx"
                   "wav","m4a","ogg","flac","aac","mp4","m4v","webm","mov","avi",
                   "wmv","mkv", "ics","eot","ttf","otf","woff","woff2","map", }
 
-_STOPWORDS: Set[str] = set(langcfg.get_stopwords())
+_STOPWORDS: Set[str] = set(lang_cfg.get_stopwords())
 
 _SPLIT_RX = re.compile(r"[^a-z0-9]+")
 
@@ -148,7 +147,7 @@ def build_default_negative_query(**kwargs) -> str:
 
 @dataclass
 class DualBM25Config:
-    alpha: float = 0.6
+    alpha: float = 0.5
     score_norm: Callable[[float], float] = staticmethod(lambda s: 1.0 - math.exp(-max(0.0, float(s))))
     clamp: bool = True
 
