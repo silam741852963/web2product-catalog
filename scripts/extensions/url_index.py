@@ -76,18 +76,11 @@ async def _increment_hosts_for_company_async(company_id: str, hosts: Iterable[st
                 lst.append(company_id)
                 data[h] = lst
         _save_dyn_counts(data)
-        # compute results after write
         counts_snapshot = {k: len(v) for k, v in data.items()}
         for h, lst in data.items():
             if len(lst) > DYNAMIC_THRESHOLD and h in hosts:
                 newly_blacklisted.append(h)
     return counts_snapshot, newly_blacklisted
-
-def _is_host_dynamically_universal(host: str) -> bool:
-    # Read-only; race-safe without lock
-    data = _load_dyn_counts()
-    lst = data.get((host or "").lower(), [])
-    return len(lst) > DYNAMIC_THRESHOLD
 
 # ---------------------------------------------------------------------
 # Tiny BM25-lite for URL/anchor text (document = url + anchor)
@@ -163,9 +156,6 @@ def _with_scheme_variants(url_or_host: str) -> List[str]:
         s = s[1:]
     return [f"https://{s}"]
 
-def _host(url: str) -> str:
-    return (urlparse(url).hostname or "").lower()
-
 # ---------------------------------------------------------------------
 # Main discoverer (now concurrent + connectivity-guarded)
 # ---------------------------------------------------------------------
@@ -192,7 +182,7 @@ class GenConfig:
     dynamic_counts_file: Optional[Path] = None  # if provided, override default file path
     score_threshold: Optional[float] = 0.25
     score_threshold_on_seeds: bool = True
-    # NEW: optional connectivity guard (if None, a private one will be created)
+    # optional connectivity guard (if None, a private one will be created)
     guard: Optional[ConnectivityGuard] = None
 
     def normalize(self) -> None:
@@ -210,7 +200,7 @@ class GenConfig:
 
 class URLIndexer:
     """Concurrent discoverer; records filtered reasons + scores into url_index with explicit statuses.
-       ConnectivityGuard ensures polite backoff during internet outages.
+       ConnectivityGuard ensures polite backoff during *actual* outages.
     """
 
     def __init__(self, cfg: GenConfig) -> None:
@@ -341,14 +331,17 @@ class URLIndexer:
             self._out_urls.append(rec)
 
     async def _ensure_connectivity(self) -> None:
-        """Pause workers while guard reports unhealthy."""
-        if self._guard is None:
+        """Only block when the guard is actually OPEN; HALF_OPEN is non-blocking."""
+        if not self._guard:
             return
-        if not self._guard.is_healthy():
-            # Log once per wait
-            log.info("[url_index] [%s] connectivity unhealthy; waiting…", self.cfg.company_id)
-            await self._guard.wait_until_healthy()
-            log.info("[url_index] [%s] connectivity restored; resuming.", self.cfg.company_id)
+        try:
+            if getattr(self._guard, "state", None) and self._guard.state() == "open":
+                log.info("[url_index] [%s] connectivity OPEN; waiting…", self.cfg.company_id)
+                await self._guard.wait_until_healthy()
+                log.info("[url_index] [%s] connectivity restored; resuming.", self.cfg.company_id)
+        except Exception:
+            # never fail the worker because of guard checks
+            pass
 
     async def _worker(self, crawler: AsyncWebCrawler, preferred: str) -> None:
         while True:
@@ -373,10 +366,9 @@ class URLIndexer:
             await self._add_out_url(node, preferred)
 
             if node.depth >= self.cfg.max_depth:
-                # depth cap reached; don't expand children
                 continue
 
-            # --- CONNECTIVITY GUARD: wait if offline
+            # Guard (soft): only blocks if state == OPEN
             await self._ensure_connectivity()
 
             # fetch & parse
@@ -507,12 +499,22 @@ class URLIndexer:
         # --- CONNECTIVITY GUARD lifecycle
         guard = self._guard
         if guard is None:
-            guard = ConnectivityGuard(logger=comp_log)
+            # Prefer HTTPS-like path by default for fewer false negatives
+            guard = ConnectivityGuard(
+                probe_endpoints=("1.1.1.1:443", "8.8.8.8:443", "9.9.9.9:443"),
+                interval_s=10.0,
+                trip_heartbeats=4,
+                connect_timeout_s=2.0,
+                base_cooloff_s=8.0,
+                max_cooloff_s=180.0,
+                backoff_factor=2.0,
+                jitter_s=0.35,
+                logger=comp_log,
+            )
             self._guard = guard
             self._owns_guard = True
         await guard.start()
-        # If we start while offline, pause until healthy before first network op
-        await guard.wait_until_healthy()
+        # NOTE: no initial wait_until_healthy(); workers will soft-check per page
 
         # Run worker pool
         try:
@@ -520,12 +522,11 @@ class URLIndexer:
                 workers = [asyncio.create_task(self._worker(crawler, preferred)) for _ in range(max(1, int(self.cfg.concurrency)))]
                 await asyncio.gather(*workers)
         finally:
-            # stop our private guard if we created it
             if self._owns_guard and self._guard:
                 with contextlib.suppress(Exception):
                     await self._guard.stop()
 
-        counts_snapshot, newly_blacklisted = await _increment_hosts_for_company_async(root_host, self.seen_hosts_for_dynamic)
+        counts_snapshot, newly_blacklisted = await _increment_hosts_for_company_async(self.cfg.company_id, self.seen_hosts_for_dynamic)
 
         meta = {
             "company_id": self.cfg.company_id,
@@ -552,12 +553,10 @@ class URLIndexer:
                 "score_threshold": self.cfg.score_threshold,
                 "score_threshold_on_seeds": bool(self.cfg.score_threshold_on_seeds),
             },
-            # NEW: connectivity diagnostics
             "connectivity": {
                 "open_events": self._guard.snapshot_open_events() if self._guard else 0,
                 "final_state": self._guard.state() if self._guard else "unknown",
-                "probe": {"host": getattr(self._guard, "cfg", None).probe_host if self._guard else None,
-                          "port": getattr(self._guard, "cfg", None).probe_port if self._guard else None},
+                "probe": {"targets": list(getattr(self._guard, "targets", [])) if self._guard else []},
             },
             "filters": {
                 "include": self.cfg.include,
@@ -569,7 +568,6 @@ class URLIndexer:
             },
         }
 
-        # persist seeding metrics into crawl_meta.json
         try:
             if cp is not None:
                 seeding_meta = dict(meta)
@@ -588,7 +586,6 @@ class URLIndexer:
         comp_log.info("[url_index] [%s] discovery done: urls=%d hosts=%d",
                       self.cfg.company_id, len(self._out_urls), meta["stats"]["unique_hosts"])
 
-        # reset logging context if any
         if _LE and _ctx_token is not None:
             try:
                 _LE.reset_company_context(_ctx_token)
@@ -598,7 +595,7 @@ class URLIndexer:
         return {"meta": meta, "urls": list(self._out_urls)}
 
 # ---------------------------------------------------------------------
-# Public helper to discover + persist into url_index.json via upsert
+# Public helper
 # ---------------------------------------------------------------------
 
 async def discover_and_write_url_index(
@@ -620,26 +617,16 @@ async def discover_and_write_url_index(
     neg_query: Optional[str] = None,
     dynamic_counts_file: Optional[Path] = None,
     state: Optional[GlobalState] = None,
-    # threshold knobs
     score_threshold: Optional[float] = 0.25,
     score_threshold_on_seeds: bool = True,
-    # worker pool size (per-company)
     concurrency: int = 8,
-    # optional externally managed guard (shared across companies)
     guard: Optional[ConnectivityGuard] = None,
 ) -> Dict[str, Any]:
-    """
-    Runs discovery and writes entries into outputs/{bvdid}/checkpoints/url_index.json
-    using upsert_url_index(..., status='seeded') per URL for visited pages,
-    'queued' for enqueued pages, and 'filtered_*' for drops.
-    """
     safe_id = sanitize_bvdid(company_id)
     ensure_company_dirs(safe_id)
 
-    # Ensure a state instance
     st = state or GlobalState()
 
-    # --- Reuse-index short-circuit via GlobalState ---
     try:
         row = await st.get_company(safe_id)
         resume_mode = (row or {}).get("resume_mode")
@@ -656,7 +643,6 @@ async def discover_and_write_url_index(
     except Exception:
         pass
 
-    # record pending in global state
     try:
         await st.upsert_company(safe_id, company_name, base_url, stage="seed", status="pending")
         await st.mark_in_progress(safe_id, stage="seed")
@@ -683,7 +669,7 @@ async def discover_and_write_url_index(
         score_threshold=score_threshold,
         score_threshold_on_seeds=score_threshold_on_seeds,
         concurrency=concurrency,
-        guard=guard,  # ← allow a shared guard to be passed in
+        guard=guard,
     )
 
     log.info("[url_index] [%s] starting discovery: %s (workers=%d)", safe_id, base_url, int(concurrency))
@@ -691,7 +677,6 @@ async def discover_and_write_url_index(
     result = await indexer.run()
     items = result.get("urls", []) or []
 
-    # Items were recorded during run(); ensure scores present and final status 'seeded' for visited
     seed_count = 0
     for it in items:
         u = it.get("url")

@@ -10,6 +10,7 @@ from typing import List, Optional, Set, Tuple
 
 from extensions.url_index import discover_and_write_url_index
 from extensions.global_state import GlobalState
+from extensions.connectivity_guard import ConnectivityGuard
 from components.source_loader import (
     CompanyInput,
     load_companies_from_source,
@@ -73,6 +74,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--progress-file", type=Path, default=Path("outputs") / "url_index_progress.json",
                    help="Where to write rolling progress (JSON).")
 
+    # Connectivity guard (shared, process-wide)
+    p.add_argument("--probe-host", default="1.1.1.1", help="Guard probe host (HTTPS recommended).")
+    p.add_argument("--probe-port", type=int, default=443, help="Guard probe port (use 443 to mirror crawler traffic).")
+    p.add_argument("--probe-interval", type=float, default=15.0, help="Seconds between probe cycles.")
+    p.add_argument("--probe-trip", type=int, default=3, help="Consecutive failed probes to open circuit.")
+    p.add_argument("--probe-timeout", type=float, default=2.5, help="TCP connect timeout for probe.")
+    p.add_argument("--probe-cooloff-base", type=float, default=5.0, help="Base cooloff seconds before half-open retry.")
+    p.add_argument("--probe-max-cooloff", type=float, default=300.0, help="Max cooloff seconds.")
+    p.add_argument("--probe-backoff", type=float, default=2.0, help="Exponential backoff factor.")
+    p.add_argument("--probe-jitter", type=float, default=0.25, help="Random jitter added to cooloff.")
+
     # Logging
     p.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -87,7 +99,7 @@ def _atomic_write_json(path: Path, obj) -> None:
 
 # ---------- Runner ----------
 
-async def _run_for_company(ci: CompanyInput, args: argparse.Namespace, state: GlobalState) -> Tuple[str, int]:
+async def _run_for_company(ci: CompanyInput, args: argparse.Namespace, state: GlobalState, *, guard: ConnectivityGuard) -> Tuple[str, int]:
     """
     Returns: (bvdid, seeded_count)
     """
@@ -114,6 +126,7 @@ async def _run_for_company(ci: CompanyInput, args: argparse.Namespace, state: Gl
             dynamic_counts_file=args.dynamic_counts_file,
             state=state,
             concurrency=int(args.crawl_concurrency),
+            guard=guard,  # shared single guard
         )
         return (ci.bvdid, int(res.get("seeded", 0)))
     except Exception as e:
@@ -176,6 +189,25 @@ async def main_async() -> None:
     log.info("Loaded %d companies. Begin discovery… (company_concurrency=%d, crawl_concurrency=%d)",
              len(companies), int(args.company_concurrency), int(args.crawl_concurrency))
 
+    # Shared, process-wide connectivity guard
+    guard = ConnectivityGuard(
+        probe_host=args.probe_host,
+        probe_port=int(args.probe_port),
+        interval_s=float(args.probe_interval),
+        trip_heartbeats=int(args.probe_trip),
+        connect_timeout_s=float(args.probe_timeout),
+        base_cooloff_s=float(args.probe_cooloff_base),
+        max_cooloff_s=float(args.probe_max_cooloff),
+        backoff_factor=float(args.probe_backoff),
+        jitter_s=float(args.probe_jitter),
+        logger=log,
+    )
+    await guard.start()
+    # If starting while offline, pause once up-front to avoid a burst of failing tasks.
+    await guard.wait_until_healthy()
+    log.info("ConnectivityGuard started (probe=%s:%s, interval=%.2fs, trip=%d).",
+             args.probe_host, int(args.probe_port), float(args.probe_interval), int(args.probe_trip))
+
     state = GlobalState()
     progress = _Progress(total=len(companies), progress_path=Path(args.progress_file), logger=log)
 
@@ -183,11 +215,15 @@ async def main_async() -> None:
 
     async def _guarded(ci: CompanyInput):
         async with sem:
-            bvdid, seeded = await _run_for_company(ci, args, state)
+            bvdid, seeded = await _run_for_company(ci, args, state, guard=guard)
             await progress.mark_done(bvdid, seeded)
 
-    tasks = [asyncio.create_task(_guarded(ci)) for ci in companies]
-    await asyncio.gather(*tasks)
+    try:
+        tasks = [asyncio.create_task(_guarded(ci)) for ci in companies]
+        await asyncio.gather(*tasks)
+    finally:
+        # Stop the shared guard once all companies are done
+        await guard.stop()
 
     log.info("All done. Final progress written to: %s", args.progress_file)
 
