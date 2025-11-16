@@ -104,11 +104,11 @@ DEFAULT_LANG_SPEC: Dict[str, Any] = {
         "*/blog/*", "*/news/*", "*/press/*",
         "*/investor/*", "*/investors/*", "*/ir/*",
         "*/privacy*", "*/terms*", "*/legal*",
-        "*/login*", "*/signin*", "*/account*",
+        "*/login*", "*/signin*", "*/account*", "*/people/*", "*/story/*",
         "*/support/*", "*/help/*", "*/docs/*", "*/developer/*", "*/api/*",
         "*/sitemap*", "*/robots.txt*", "*/rss*", "*/xmlrpc.php*",
         "*.pdf", "*.jpg", "*.jpeg", "*.png", "*.gif", "*.svg",
-        "*.zip", "*.rar", "*.7z", "*.gz", "*.csv", "*.json",
+        "*.zip", "*.rar", "*.7z", "*.gz", "*.csv", "*.json", 
     ],
 
     # URL query keys that should be ignored / treated as noise

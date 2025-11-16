@@ -99,9 +99,9 @@ def _atomic_write_json(path: Path, obj) -> None:
 
 # ---------- Runner ----------
 
-async def _run_for_company(ci: CompanyInput, args: argparse.Namespace, state: GlobalState, *, guard: ConnectivityGuard) -> Tuple[str, int]:
+async def _run_for_company(ci: CompanyInput, args: argparse.Namespace, state: GlobalState, *, guard: ConnectivityGuard) -> Tuple[str, int, List[dict]]:
     """
-    Returns: (bvdid, seeded_count)
+    Returns: (bvdid, seeded_count, urls_list)
     """
     logging.getLogger("generate_url_index").info("→ [%s] %s (%s)", ci.bvdid, ci.name, ci.url)
     try:
@@ -128,10 +128,10 @@ async def _run_for_company(ci: CompanyInput, args: argparse.Namespace, state: Gl
             concurrency=int(args.crawl_concurrency),
             guard=guard,  # shared single guard
         )
-        return (ci.bvdid, int(res.get("seeded", 0)))
+        return (ci.bvdid, int(res.get("seeded", 0)), list(res.get("urls", [])))
     except Exception as e:
         logging.getLogger("generate_url_index").exception("[%s] failed: %s", ci.bvdid, e)
-        return (ci.bvdid, 0)
+        return (ci.bvdid, 0, [])
 
 class _Progress:
     def __init__(self, total: int, progress_path: Path, logger: logging.Logger) -> None:
@@ -153,7 +153,6 @@ class _Progress:
                 "completed_companies": self.done,
                 "completed_ratio": round((self.done / self.total) if self.total else 1.0, 4),
                 "seeded_urls_total": self.seeded_total,
-                # keep recent tail to avoid unbounded growth
                 "recent_completed_ids": self.completed_ids[-500:],
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -203,7 +202,6 @@ async def main_async() -> None:
         logger=log,
     )
     await guard.start()
-    # If starting while offline, pause once up-front to avoid a burst of failing tasks.
     await guard.wait_until_healthy()
     log.info("ConnectivityGuard started (probe=%s:%s, interval=%.2fs, trip=%d).",
              args.probe_host, int(args.probe_port), float(args.probe_interval), int(args.probe_trip))
@@ -215,14 +213,13 @@ async def main_async() -> None:
 
     async def _guarded(ci: CompanyInput):
         async with sem:
-            bvdid, seeded = await _run_for_company(ci, args, state, guard=guard)
+            bvdid, seeded, _urls = await _run_for_company(ci, args, state, guard=guard)
             await progress.mark_done(bvdid, seeded)
 
     try:
         tasks = [asyncio.create_task(_guarded(ci)) for ci in companies]
         await asyncio.gather(*tasks)
     finally:
-        # Stop the shared guard once all companies are done
         await guard.stop()
 
     log.info("All done. Final progress written to: %s", args.progress_file)

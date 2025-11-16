@@ -135,9 +135,12 @@ class CompanyProgress:
 
     def as_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        if d.get("seeding") is None: d["seeding"] = {}
-        if d.get("saves") is None: d["saves"] = {}
-        if d.get("notes") is None: d["notes"] = []
+        if d.get("seeding") is None:
+            d["seeding"] = {}
+        if d.get("saves") is None:
+            d["saves"] = {}
+        if d.get("notes") is None:
+            d["notes"] = []
         return d
 
 
@@ -282,17 +285,22 @@ class CheckpointManager:
     Maintains in-memory map of CompanyCheckpoint and a single
     session file (outputs/session_checkpoint.json) for the current run.
 
-    New saved format for session_checkpoint.json:
+    New saved format for session_checkpoint.json (extended with global progress):
+
       {
         "started_at": "...",
         "companies": {
-           "<bvdid>": "<company name>",
+           "<bvdid>": "<company name>|\"\"|null",
            ...
-        }
+        },
+        "total_companies": 58200,
+        "completed_companies": 1240,
+        "completion_pct": 2.13,
+        "last_company_bvdid": "US123456789",
+        "last_updated": "..."
       }
 
-    This replaces the previous shape that used "companies": [ ... ] plus a separate
-    "company_names" mapping. The loader is tolerant to the older format and will
+    The loader is tolerant to the older format and will
     migrate entries into the new structure on update.
     """
     def __init__(self, outputs_dir: Path = OUTPUTS_DIR) -> None:
@@ -300,6 +308,44 @@ class CheckpointManager:
         self.session_path = self.outputs_dir / SESSION_NAME
         self._checkpoints: Dict[str, CompanyCheckpoint] = {}
         self._lock = asyncio.Lock()
+
+    # ---- internal helpers ----
+
+    def _load_session_locked(self) -> Dict[str, Any]:
+        """
+        Load and normalize the session JSON.
+        Must be called with self._lock held.
+        """
+        cur: Dict[str, Any] = {}
+        if self.session_path.exists():
+            try:
+                cur = json.loads(self.session_path.read_text(encoding="utf-8"))
+            except Exception:
+                cur = {}
+
+        companies_field = cur.get("companies")
+        company_names_map = cur.get("company_names", {})
+
+        # Migrate older list-based format into dict[{bvdid: name}]
+        if isinstance(companies_field, list):
+            migrated: Dict[str, Optional[str]] = {}
+            for bid in companies_field:
+                name = company_names_map.get(bid) or None
+                migrated[bid] = name
+            cur["companies"] = migrated
+            cur.pop("company_names", None)
+        elif companies_field is None:
+            cur["companies"] = {}
+        elif isinstance(companies_field, dict):
+            # already in new format
+            pass
+        else:
+            # unknown shape -> reset
+            cur["companies"] = {}
+
+        return cur
+
+    # ---- per-company checkpoints ----
 
     async def get(self, bvdid: str, company_name: Optional[str] = None) -> CompanyCheckpoint:
         """
@@ -320,6 +366,8 @@ class CheckpointManager:
                     await cp.set_company_name(company_name)
             return cp
 
+    # ---- session: company list & names ----
+
     async def append_company(self, bvdid: str, company_name: Optional[str] = None, **_ignored) -> None:
         """
         Append a company ID (and optionally its name) to session_checkpoint.json.
@@ -329,40 +377,13 @@ class CheckpointManager:
         This function will also migrate older list-based files into the new dict form.
         """
         async with self._lock:
-            # load existing session if present
-            cur: Dict[str, Any] = {}
-            if self.session_path.exists():
-                try:
-                    cur = json.loads(self.session_path.read_text(encoding="utf-8"))
-                except Exception:
-                    cur = {}
-
-            # Normalize/migrate older formats
-            # If "companies" is a list, convert into a dict using any available company_names mapping.
-            companies_field = cur.get("companies")
-            company_names_map = cur.get("company_names", {})
-            if isinstance(companies_field, list):
-                migrated: Dict[str, Optional[str]] = {}
-                for bid in companies_field:
-                    name = company_names_map.get(bid) or None
-                    migrated[bid] = name
-                cur["companies"] = migrated
-                # drop old company_names key to avoid ambiguity
-                cur.pop("company_names", None)
-            elif companies_field is None:
-                cur["companies"] = {}
-            elif isinstance(companies_field, dict):
-                # already in new format; nothing to do
-                pass
-            else:
-                # unknown shape -> reset to empty dict
-                cur["companies"] = {}
+            cur = self._load_session_locked()
 
             # ensure started_at exists (keep existing if present)
             cur.setdefault("started_at", datetime.now(timezone.utc).isoformat())
 
             # update/insert the current bvdid entry
-            if company_name:
+            if company_name is not None:
                 cur["companies"][bvdid] = company_name
             else:
                 # if no name provided and entry missing, set empty string (so presence is recorded)
@@ -372,13 +393,95 @@ class CheckpointManager:
             await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
 
     async def mark_global_start(self) -> None:
+        """
+        Initialize / reset the session checkpoint for a new run.
+        This mirrors the old behavior (fresh structure) but now also zeros
+        global progress counters so completion_pct starts from 0.
+        """
         async with self._lock:
-            cur = {
-                "started_at": datetime.now(timezone.utc).isoformat(),
+            now = datetime.now(timezone.utc).isoformat()
+            cur: Dict[str, Any] = {
+                "started_at": now,
                 "companies": {},
+                "total_companies": 0,
+                "completed_companies": 0,
+                "completion_pct": 0.0,
+                "last_company_bvdid": None,
+                "last_updated": now,
             }
             payload = json.dumps(cur, indent=2, ensure_ascii=False)
             await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
+
+    # ---- session: global progress (percentage) ----
+
+    async def set_total_companies(self, total: int) -> None:
+        """
+        Set the total number of companies in this run.
+        Safe to call multiple times; last value wins.
+        """
+        async with self._lock:
+            cur = self._load_session_locked()
+            now = datetime.now(timezone.utc).isoformat()
+
+            cur.setdefault("started_at", now)
+            cur["total_companies"] = int(total)
+            completed = int(cur.get("completed_companies") or 0)
+
+            if cur["total_companies"] > 0:
+                cur["completion_pct"] = (completed / cur["total_companies"]) * 100.0
+            else:
+                cur["completion_pct"] = 0.0
+
+            cur["last_updated"] = now
+
+            payload = json.dumps(cur, indent=2, ensure_ascii=False)
+            await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
+
+    async def mark_company_completed(self, bvdid: str) -> None:
+        """
+        Increment the global completed_companies counter and recompute completion_pct.
+        Intended to be called once per company when its crawl pipeline finishes
+        (regardless of success/failure, as long as it's 'done').
+        """
+        async with self._lock:
+            cur = self._load_session_locked()
+            now = datetime.now(timezone.utc).isoformat()
+
+            total = int(cur.get("total_companies") or 0)
+            completed = int(cur.get("completed_companies") or 0) + 1
+
+            cur["completed_companies"] = completed
+            cur.setdefault("total_companies", total)
+
+            if cur["total_companies"] > 0:
+                cur["completion_pct"] = (completed / cur["total_companies"]) * 100.0
+            else:
+                # If total is unknown, leave pct as 0 or None; caller can still log (done, total)
+                cur["completion_pct"] = 0.0
+
+            cur["last_company_bvdid"] = bvdid
+            cur["last_updated"] = now
+
+            payload = json.dumps(cur, indent=2, ensure_ascii=False)
+            await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
+
+    async def get_session_progress(self) -> Dict[str, Any]:
+        """
+        Convenience helper to read the latest global progress snapshot.
+        This reads directly from disk, without relying on in-memory state.
+        """
+        async with self._lock:
+            cur = self._load_session_locked()
+            return {
+                "total_companies": int(cur.get("total_companies") or 0),
+                "completed_companies": int(cur.get("completed_companies") or 0),
+                "completion_pct": float(cur.get("completion_pct") or 0.0),
+                "last_company_bvdid": cur.get("last_company_bvdid"),
+                "started_at": cur.get("started_at"),
+                "last_updated": cur.get("last_updated"),
+            }
+
+    # ---- misc summary of in-memory company checkpoints ----
 
     async def summary(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}

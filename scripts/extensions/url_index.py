@@ -12,17 +12,22 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 from collections import defaultdict
 
-# Crawl4AI
-from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
+from crawl4ai import AsyncWebCrawler, CacheMode
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
 
 from configs import language_settings as lang_cfg
+from configs.browser_settings import browser_cfg
+from configs.crawler_settings import crawler_base_cfg
+
 from extensions.filtering import (
     DEFAULT_INCLUDE_PATTERNS,
     DEFAULT_EXCLUDE_PATTERNS,
     apply_url_filters,
     same_registrable_domain,
+    should_block_external_for_dataset,
+    is_in_dataset_externals,
 )
+
 from extensions.dual_bm25 import (
     DualBM25Combiner,
     DualBM25Config,
@@ -33,13 +38,14 @@ from extensions.output_paths import ensure_company_dirs, sanitize_bvdid
 from extensions.run_utils import upsert_url_index
 from extensions.global_state import GlobalState
 from extensions.logging import LoggingExtension
-from extensions.checkpoint import CompanyCheckpoint
+from extensions.checkpoints import CompanyCheckpoint
 from extensions.connectivity_guard import ConnectivityGuard
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------
 # Dynamic "universal external" persistence (with async file-level lock)
+# IMPORTANT: dataset externals are NEVER blacklisted by this mechanism.
 # ---------------------------------------------------------------------
 
 DYNAMIC_COUNTS_FILE: Path = Path("outputs") / "dynamic_universal_counts.json"
@@ -66,21 +72,50 @@ def _save_dyn_counts(d: Dict[str, List[str]]) -> None:
     except Exception:
         log.exception("[url_index] Failed to save dynamic counts: %s", str(p))
 
-async def _increment_hosts_for_company_async(company_id: str, hosts: Iterable[str]) -> Tuple[Dict[str, int], List[str]]:
+async def _increment_hosts_for_company_async(
+    company_id: str,
+    hosts: Iterable[str]
+) -> Tuple[Dict[str, int], List[str], List[str]]:
+    """
+    Update dynamic-universal counts for the given company.
+    Returns:
+      - counts_snapshot: host -> distinct_company_count
+      - newly_blacklisted: hosts newly considered 'dynamic universal'
+      - skipped_dataset_hosts: hosts excluded because they belong to dataset externals
+    """
     newly_blacklisted: List[str] = []
+    skipped_dataset: List[str] = []
+    host_set = {h for h in hosts if h}
+
+    # Filter out dataset externals BEFORE mutating the counts file
+    filtered_hosts: Set[str] = set()
+    for h in host_set:
+        if is_in_dataset_externals(h):
+            skipped_dataset.append(h)
+            log.debug("[url_index.dynamic] skip dataset external host from dynamic counting: %s", h)
+            continue
+        filtered_hosts.add(h)
+
     async with _DYN_COUNTS_LOCK:
         data = _load_dyn_counts()
-        for h in {h for h in hosts if h}:
+        for h in filtered_hosts:
             lst = data.get(h, [])
             if company_id not in lst:
                 lst.append(company_id)
                 data[h] = lst
         _save_dyn_counts(data)
+
         counts_snapshot = {k: len(v) for k, v in data.items()}
+
+        # Only consider non-dataset hosts for blacklisting
         for h, lst in data.items():
-            if len(lst) > DYNAMIC_THRESHOLD and h in hosts:
+            if len(lst) > DYNAMIC_THRESHOLD and h in filtered_hosts:
                 newly_blacklisted.append(h)
-    return counts_snapshot, newly_blacklisted
+
+    if skipped_dataset:
+        log.info("[url_index.dynamic] skipped dataset hosts from blacklisting: %d", len(skipped_dataset))
+    return counts_snapshot, newly_blacklisted, skipped_dataset
+
 
 # ---------------------------------------------------------------------
 # Tiny BM25-lite for URL/anchor text (document = url + anchor)
@@ -118,6 +153,7 @@ def _bm25_lite(text: str, query: str) -> float:
             score += (f ** 0.5)
     return score
 
+
 @dataclass
 class FrontierItem:
     score: float
@@ -127,19 +163,21 @@ class FrontierItem:
     seed_root: Optional[str] = None
     anchor: Optional[str] = None
 
+
 _HREF_RX = re.compile(r"""<a\s+[^>]*href\s*=\s*(['"])(.*?)\1[^>]*>(.*?)</a>""", re.IGNORECASE | re.DOTALL)
 
-def _extract_links(html: str, base_url: str) -> List[Tuple[str, str]]:
+def _extract_links_from_html(html: str, base_url: str) -> List[Tuple[str, str]]:
+    """Fallback: parse anchors from literal HTML (not preferred if CrawlResult.links is available)."""
     out: List[Tuple[str, str]] = []
     for _, href, text in _HREF_RX.findall(html or ""):
-        href = href.strip()
+        href = (href or "").strip()
         if not href:
             continue
-        if href.startswith("#") or href.lower().startswith("javascript:") or href.lower().startswith("mailto:"):
+        if href.startswith("#") or href.lower().startswith(("javascript:", "mailto:")):
             continue
         absu = urljoin(base_url, href)
         p = urlparse(absu)
-        if p.scheme not in {"https"}:
+        if p.scheme != "https":  # restrict to https like previous behavior
             continue
         atxt = re.sub(r"\s+", " ", (text or "").strip())
         out.append((absu, atxt))
@@ -149,15 +187,50 @@ def _with_scheme_variants(url_or_host: str) -> List[str]:
     s = (url_or_host or "").strip()
     if not s:
         return []
-    lower = s.lower()
-    if lower.startswith("https://"):
+    if s.lower().startswith("https://"):
         return [s]
     while s.startswith("/"):
         s = s[1:]
     return [f"https://{s}"]
 
+
 # ---------------------------------------------------------------------
-# Main discoverer (now concurrent + connectivity-guarded)
+# Crawl4AI helpers (Container → CrawlResult, structured links first)
+# ---------------------------------------------------------------------
+
+_HEX_ID_RX = re.compile(r"^[0-9a-f]{16,64}$", re.IGNORECASE)
+
+def _unwrap_first_result(res: Any) -> Any:
+    """Return the first CrawlResult from a CrawlResultContainer or the value itself if already a CrawlResult."""
+    try:
+        item = res[0]  # type: ignore[index]
+        return item
+    except Exception:
+        return res
+
+def _structured_links(result_obj: Any) -> List[Tuple[str, str]]:
+    """Read links from CrawlResult.links per Crawl4AI docs."""
+    links_out: List[Tuple[str, str]] = []
+    rl: Dict[str, List[Dict[str, Any]]] = getattr(result_obj, "links", {}) or {}
+    for bucket in ("internal", "external"):
+        for it in rl.get(bucket, []) or []:
+            href = (it.get("href") or "").strip()
+            if not href:
+                continue
+            if href.startswith("#") or href.lower().startswith(("javascript:", "mailto:")):
+                continue
+            p = urlparse(href)
+            if not p.scheme:
+                continue
+            if p.scheme != "https":
+                continue
+            txt = re.sub(r"\s+", " ", (it.get("text") or "").strip())
+            links_out.append((href, txt))
+    return links_out
+
+
+# ---------------------------------------------------------------------
+# Main discoverer (concurrent + connectivity-guarded)
 # ---------------------------------------------------------------------
 
 @dataclass
@@ -182,7 +255,6 @@ class GenConfig:
     dynamic_counts_file: Optional[Path] = None  # if provided, override default file path
     score_threshold: Optional[float] = 0.25
     score_threshold_on_seeds: bool = True
-    # optional connectivity guard (if None, a private one will be created)
     guard: Optional[ConnectivityGuard] = None
 
     def normalize(self) -> None:
@@ -198,22 +270,22 @@ class GenConfig:
             global DYNAMIC_COUNTS_FILE
             globals()["DYNAMIC_COUNTS_FILE"] = Path(self.dynamic_counts_file)
 
+
 class URLIndexer:
-    """Concurrent discoverer; records filtered reasons + scores into url_index with explicit statuses.
+    """Link discoverer using Crawl4AI result.links (preferred) with HTML regex fallback.
        ConnectivityGuard ensures polite backoff during *actual* outages.
+       Dataset externals are respected across filtering and dynamic-universal detection.
     """
 
     def __init__(self, cfg: GenConfig) -> None:
         self.cfg = cfg
         self.cfg.normalize()
 
-        # shared state
         self.visited: Set[str] = set()
         self.frontier: List[FrontierItem] = []
         self.seen_hosts_for_dynamic: Set[str] = set()
         self.host_visit_count: Dict[str, int] = defaultdict(int)
 
-        # locks
         self._frontier_lock = asyncio.Lock()
         self._visited_lock = asyncio.Lock()
         self._metrics_lock = asyncio.Lock()
@@ -221,7 +293,6 @@ class URLIndexer:
 
         self.comb = DualBM25Combiner(_bm25_lite, DualBM25Config(alpha=float(self.cfg.dual_alpha)))
 
-        # seeding metrics
         self.metrics: Dict[str, int] = {
             "discovered_total": 0,
             "kept_total": 0,
@@ -229,49 +300,41 @@ class URLIndexer:
         }
         self.filtered_breakdown: Dict[str, int] = {}
 
-        # collected output (visited pages only)
         self._out_urls: List[Dict[str, Any]] = []
 
-        # connectivity
         self._guard: Optional[ConnectivityGuard] = self.cfg.guard
-        self._owns_guard: bool = False  # whether we should stop it on exit
+        self._owns_guard: bool = False
 
     def _dual_score(self, url: str, anchor: str) -> float:
         doc = " ".join([url, anchor or ""])
         return self.comb.score(doc, pos_query=self.cfg.pos_query, neg_query=self.cfg.neg_query)
 
-    async def _fetch_html(self, crawler: AsyncWebCrawler, url: str) -> str:
-        cfg = CrawlerRunConfig(
+    async def _fetch_page(self, crawler: AsyncWebCrawler, url: str) -> Tuple[str, List[Tuple[str, str]]]:
+        run_cfg = crawler_base_cfg.clone(
             cache_mode=CacheMode.ENABLED,
             scraping_strategy=LXMLWebScrapingStrategy(),
             stream=False,
         )
-        res = await crawler.arun(url=url, config=cfg)
+        res = await crawler.arun(url=url, config=run_cfg)
         if res is None:
-            return ""
-        for k in ("html", "raw_html", "content", "page_html"):
-            try:
-                v = getattr(res, k, None)
-                if isinstance(v, str) and v.strip():
-                    return v
-            except Exception:
-                pass
-        try:
-            if isinstance(res, dict):
-                return str(res.get("html") or res.get("raw_html") or "")  # type: ignore
-        except Exception:
-            pass
-        return ""
+            return "", []
+
+        r = _unwrap_first_result(res)
+        links = _structured_links(r)
+        html = getattr(r, "cleaned_html", None) or getattr(r, "html", None) or ""
+        if isinstance(html, str) and _HEX_ID_RX.match(html or ""):
+            html = ""
+        if not links and html:
+            links = _extract_links_from_html(html, getattr(r, "url", url) or url)
+        return html, links
 
     async def _enqueue(self, url: str, depth: int, parent: Optional[str], seed_root: Optional[str], anchor: str) -> None:
-        # Do not enqueue duplicates
         async with self._visited_lock:
             if url in self.visited:
                 return
 
         s = self._dual_score(url, anchor)
 
-        # Threshold: skip enqueue if below cutoff (allow roots unless configured)
         if self.cfg.score_threshold is not None:
             if depth == 0 and not self.cfg.score_threshold_on_seeds:
                 pass
@@ -300,10 +363,8 @@ class URLIndexer:
             return self.frontier.pop(best_i)
 
     async def _record_visit(self, url: str, score: float, preferred: str) -> Tuple[bool, int]:
-        """Mark as visited and return (ok_to_process, host_count_after)."""
         h = (urlparse(url).hostname or "").lower()
         async with self._visited_lock:
-            # cap check by host
             if self.host_visit_count[h] >= max(1, int(self.cfg.per_host_page_cap)):
                 return (False, self.host_visit_count[h])
             if url in self.visited:
@@ -311,7 +372,6 @@ class URLIndexer:
             self.visited.add(url)
             self.host_visit_count[h] += 1
             self.seen_hosts_for_dynamic.add(h)
-        # seed status immediately
         try:
             upsert_url_index(self.cfg.company_id, url, status="seeded", score=score)
         except Exception:
@@ -331,7 +391,6 @@ class URLIndexer:
             self._out_urls.append(rec)
 
     async def _ensure_connectivity(self) -> None:
-        """Only block when the guard is actually OPEN; HALF_OPEN is non-blocking."""
         if not self._guard:
             return
         try:
@@ -340,7 +399,6 @@ class URLIndexer:
                 await self._guard.wait_until_healthy()
                 log.info("[url_index] [%s] connectivity restored; resuming.", self.cfg.company_id)
         except Exception:
-            # never fail the worker because of guard checks
             pass
 
     async def _worker(self, crawler: AsyncWebCrawler, preferred: str) -> None:
@@ -351,7 +409,6 @@ class URLIndexer:
             if node is None:
                 return
 
-            # per-host cap check & visit mark
             ok, _ = await self._record_visit(node.url, node.score, preferred)
             if not ok:
                 try:
@@ -368,12 +425,10 @@ class URLIndexer:
             if node.depth >= self.cfg.max_depth:
                 continue
 
-            # Guard (soft): only blocks if state == OPEN
             await self._ensure_connectivity()
 
-            # fetch & parse
             try:
-                html = await self._fetch_html(crawler, node.url)
+                html, links = await self._fetch_page(crawler, node.url)
                 if self._guard:
                     self._guard.record_success()
             except Exception as e:
@@ -382,18 +437,16 @@ class URLIndexer:
                     self._guard.record_transport_error()
                 continue
 
-            links = _extract_links(html, node.url)
             if not links:
                 continue
 
-            # score candidates; early threshold drop
+            # First pass: score all candidates
             candidates_scored: List[Dict[str, Any]] = []
             score_by_url: Dict[str, float] = {}
             for cand, anchor in links:
                 async with self._metrics_lock:
                     self.metrics["discovered_total"] += 1
                 s = self._dual_score(cand, anchor or "")
-
                 if self.cfg.score_threshold is not None and s < float(self.cfg.score_threshold):
                     try:
                         upsert_url_index(self.cfg.company_id, cand, status="filtered_score_below_threshold", score=s)
@@ -403,15 +456,38 @@ class URLIndexer:
                         self.metrics["filtered_total"] += 1
                         self.filtered_breakdown["score_below_threshold"] = self.filtered_breakdown.get("score_below_threshold", 0) + 1
                     continue
-
                 candidates_scored.append({"url": cand, "anchor": anchor, "score_hint": s})
                 score_by_url[cand] = s
 
             if not candidates_scored:
                 continue
 
+            # NEW: block externals that belong to the dataset (cross-company links)
+            dataset_blocked: List[Dict[str, Any]] = []
+            filtered_for_apply: List[Dict[str, Any]] = []
+            for it in candidates_scored:
+                u = it["url"]
+                if should_block_external_for_dataset(node.url, u):
+                    dataset_blocked.append(it)
+                else:
+                    filtered_for_apply.append(it)
+
+            if dataset_blocked:
+                async with self._metrics_lock:
+                    self.metrics["filtered_total"] += len(dataset_blocked)
+                    self.filtered_breakdown["dataset_external"] = self.filtered_breakdown.get("dataset_external", 0) + len(dataset_blocked)
+                for it in dataset_blocked:
+                    try:
+                        upsert_url_index(self.cfg.company_id, it["url"], status="filtered_dataset_external", score=score_by_url.get(it["url"]))
+                    except Exception:
+                        pass
+
+            if not filtered_for_apply:
+                continue
+
+            # Standard filtering (language, universal externals, pattern include/exclude, etc.)
             kept_sorted, dropped = apply_url_filters(
-                candidates_scored,
+                filtered_for_apply,
                 include=self.cfg.include,
                 exclude=self.cfg.exclude,
                 drop_universal_externals=self.cfg.drop_universal_externals,
@@ -424,7 +500,6 @@ class URLIndexer:
                 return_reasons=True,
             )  # type: ignore
 
-            # record filtered with reason
             if dropped:
                 async with self._metrics_lock:
                     self.metrics["filtered_total"] += len(dropped)
@@ -440,17 +515,13 @@ class URLIndexer:
                     async with self._metrics_lock:
                         self.filtered_breakdown[reason] = self.filtered_breakdown.get(reason, 0) + 1
 
-            # enqueue kept children
             if kept_sorted:
                 async with self._metrics_lock:
                     self.metrics["kept_total"] += len(kept_sorted)
+                anchor_map = {it["url"]: it.get("anchor", "") for it in filtered_for_apply}
                 for it in kept_sorted:
                     cand = it["url"]
-                    anc = ""
-                    for u2, a2 in links:
-                        if u2 == cand:
-                            anc = a2
-                            break
+                    anc = anchor_map.get(cand, "")
                     seed_for_child = (node.seed_root or preferred) if same_registrable_domain(preferred, cand) else cand
                     await self._enqueue(cand, depth=node.depth + 1, parent=node.url, seed_root=seed_for_child, anchor=anc)
 
@@ -459,9 +530,7 @@ class URLIndexer:
         if not roots:
             return {"meta": {"error": "invalid_base"}, "urls": []}
         preferred = roots[0]
-        root_host = (urlparse(preferred).hostname or self.cfg.company_id).lower()
 
-        # persistent logger + checkpoint
         _LE = LoggingExtension() if 'LoggingExtension' in globals() and LoggingExtension else None
         comp_log = log
         _ctx_token = None
@@ -480,7 +549,6 @@ class URLIndexer:
         except Exception:
             cp = None
 
-        # seed frontier
         seed_roots: List[str] = []
         for u in roots:
             s = self._dual_score(u, "")
@@ -496,10 +564,8 @@ class URLIndexer:
         comp_log.debug("[url_index] [%s] start discovery: base=%s seed_roots=%d cap=%d workers=%d",
                        self.cfg.company_id, self.cfg.base_url, len(seed_roots), host_cap, int(self.cfg.concurrency))
 
-        # --- CONNECTIVITY GUARD lifecycle
         guard = self._guard
         if guard is None:
-            # Prefer HTTPS-like path by default for fewer false negatives
             guard = ConnectivityGuard(
                 probe_endpoints=("1.1.1.1:443", "8.8.8.8:443", "9.9.9.9:443"),
                 interval_s=10.0,
@@ -514,11 +580,9 @@ class URLIndexer:
             self._guard = guard
             self._owns_guard = True
         await guard.start()
-        # NOTE: no initial wait_until_healthy(); workers will soft-check per page
 
-        # Run worker pool
         try:
-            async with AsyncWebCrawler(config=None) as crawler:
+            async with AsyncWebCrawler(config=browser_cfg) as crawler:
                 workers = [asyncio.create_task(self._worker(crawler, preferred)) for _ in range(max(1, int(self.cfg.concurrency)))]
                 await asyncio.gather(*workers)
         finally:
@@ -526,7 +590,9 @@ class URLIndexer:
                 with contextlib.suppress(Exception):
                     await self._guard.stop()
 
-        counts_snapshot, newly_blacklisted = await _increment_hosts_for_company_async(self.cfg.company_id, self.seen_hosts_for_dynamic)
+        counts_snapshot, newly_blacklisted, skipped_dataset = await _increment_hosts_for_company_async(
+            self.cfg.company_id, self.seen_hosts_for_dynamic
+        )
 
         meta = {
             "company_id": self.cfg.company_id,
@@ -544,6 +610,7 @@ class URLIndexer:
             "dynamic_universal": {
                 "file": str(_dyn_counts_path()),
                 "newly_blacklisted_hosts": newly_blacklisted,
+                "skipped_dataset_hosts": skipped_dataset,  # NEW: visibility for debugging
                 "counts_snapshot": counts_snapshot,
             },
             "scoring": {
@@ -562,24 +629,22 @@ class URLIndexer:
                 "include": self.cfg.include,
                 "exclude": self.cfg.exclude,
                 "lang_primary": self.cfg.lang_primary,
-                "accept_en_regions": sorted(list(self.cfg.accept_en_regions or set())),
+                "accept_en_regions": sorted(list(self.accept_en_regions or set())) if hasattr(self, "accept_en_regions") else [],
                 "strict_cctld": bool(self.cfg.strict_cctld),
                 "drop_universal_externals": bool(self.cfg.drop_universal_externals),
+            },
+            "seeding_metrics": {
+                "discovered_total": self.metrics.get("discovered_total", 0),
+                "kept_total": self.metrics.get("kept_total", 0),
+                "filtered_total": self.metrics.get("filtered_total", 0),
+                "filtered_breakdown": dict(self.filtered_breakdown),
+                "seeded_count": len(self._out_urls),
             },
         }
 
         try:
             if cp is not None:
-                seeding_meta = dict(meta)
-                seeding_meta.setdefault("seeding_metrics", {})
-                seeding_meta["seeding_metrics"].update({
-                    "discovered_total": self.metrics.get("discovered_total", 0),
-                    "kept_total": self.metrics.get("kept_total", 0),
-                    "filtered_total": self.metrics.get("filtered_total", 0),
-                    "filtered_breakdown": self.filtered_breakdown,
-                    "seeded_count": len(self._out_urls),
-                })
-                await cp.set_seeding_stats(seeding_meta)
+                await cp.set_seeding_stats(meta)
         except Exception as e:
             comp_log.debug("[url_index] [%s] failed writing seeding stats: %s", self.cfg.company_id, e)
 
@@ -593,6 +658,7 @@ class URLIndexer:
                 pass
 
         return {"meta": meta, "urls": list(self._out_urls)}
+
 
 # ---------------------------------------------------------------------
 # Public helper
@@ -609,9 +675,9 @@ async def discover_and_write_url_index(
     accept_en_regions: Optional[Set[str]] = None,
     strict_cctld: bool = False,
     drop_universal_externals: bool = True,
-    max_pages: int = 500,
+    max_pages: int = 8000,
     max_depth: int = 3,
-    per_host_page_cap: int = 250,
+    per_host_page_cap: int = 4000,
     dual_alpha: float = 0.5,
     pos_query: Optional[str] = None,
     neg_query: Optional[str] = None,
@@ -632,12 +698,12 @@ async def discover_and_write_url_index(
         resume_mode = (row or {}).get("resume_mode")
         if resume_mode == "url_index":
             log.info("[url_index] [%s] GlobalState indicates reuse 'url_index' — skipping discovery", safe_id)
-            return {"meta": {"company_id": safe_id, "base_url": base_url, "skipped": True, "reason": "reuse:url_index"}, "seeded": 0}
+            return {"meta": {"company_id": safe_id, "base_url": base_url, "skipped": True, "reason": "reuse:url_index"}, "seeded": 0, "urls": []}
         try:
             plan = await st.recommend_resume(safe_id, requested_pipeline=["seed"], force_seeder_cache=False, bypass_local=False)
             if getattr(plan, "skip_seeding_entirely", False):
                 log.info("[url_index] [%s] Resume plan says to skip seeding entirely — skipping discovery", safe_id)
-                return {"meta": {"company_id": safe_id, "base_url": base_url, "skipped": True, "reason": getattr(plan, "reason", "resume-plan")}, "seeded": 0}
+                return {"meta": {"company_id": safe_id, "base_url": base_url, "skipped": True, "reason": getattr(plan, "reason", "resume-plan")}, "seeded": 0, "urls": []}
         except Exception:
             pass
     except Exception:
@@ -697,4 +763,4 @@ async def discover_and_write_url_index(
         pass
 
     log.info("[url_index] [%s] wrote url_index: seeded=%d", safe_id, seed_count)
-    return {"meta": result.get("meta", {}), "seeded": seed_count}
+    return {"meta": result.get("meta", {}), "seeded": seed_count, "urls": items}

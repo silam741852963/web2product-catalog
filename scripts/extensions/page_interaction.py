@@ -6,6 +6,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Iterable, List, Tuple, Optional
 
+from configs.crawler_settings import crawler_base_cfg
+
 from crawl4ai import CrawlerRunConfig, CacheMode, VirtualScrollConfig
 
 logger = logging.getLogger(__name__)
@@ -301,7 +303,7 @@ def _base_config(policy: PageInteractionPolicy, *, js_only: bool, session_id: st
             wait_after_scroll=policy.wait_after_scroll_sec
         )
 
-    cfg = CrawlerRunConfig(
+    cfg = crawler_base_cfg.clone(
         js_code=js_snippets if js_snippets else None,
         wait_for=wait_for,
         page_timeout=policy.wait_timeout_ms,

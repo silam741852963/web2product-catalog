@@ -31,46 +31,6 @@ _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\([^)]+\)")
 def _word_count(s: str) -> int:
     return len(_WORD_RE.findall(s or ""))
 
-def _fraction_words(pattern: re.Pattern, text: str) -> Tuple[int, float]:
-    hits = 0
-    matched = 0
-    for m in pattern.finditer(text or ""):
-        hits += 1
-        matched += _word_count(m.group(0))
-    total = max(_word_count(text), 1)
-    return hits, matched / total
-
-def _interstitial_stats(md: str) -> Dict[str, float]:
-    """
-    Return {'hits': int, 'matched_words': int, 'share': float, 'total_words': int}
-    """
-    hits = list(_INTERSTITIAL_RE.finditer(md or ""))
-    matched_words = 0
-    for m in hits:
-        matched_words += _word_count(m.group(0))
-    total_words = max(_word_count(md), 1)  # avoid div by zero
-    share = matched_words / total_words
-    return {
-        "hits": len(hits),
-        "matched_words": matched_words,
-        "share": share,
-        "total_words": total_words,
-    }
-
-def _structure_ok(md: str, *, require_structure: bool, ignore_links: bool) -> bool:
-    if not require_structure:
-        return True
-    # Headings in MD are most reliable (DefaultMarkdownGenerator preserves them)
-    if len(_HEADING_RE.findall(md)) >= 2:
-        return True
-    # Links signal some body depth, but may be disabled by generator options
-    if not ignore_links and len(_MARKDOWN_LINK_RE.findall(md)) >= 5:
-        return True
-    # Product-ish vocabulary
-    if _PRODUCT_TOKENS_RE.search(md or ""):
-        return True
-    return False
-
 # ---------------------------------------------------------------------------
 # Backward-compatible gating & quality gate 
 # ---------------------------------------------------------------------------
@@ -189,9 +149,9 @@ def evaluate_markdown(
 
 def build_default_md_generator(
     *,
-    threshold: float = 0.24,
-    threshold_type: str = "dynamic",  # or "fixed"
-    min_word_threshold: int = 50,
+    threshold: float = 0.12,
+    threshold_type: str = "fixed",  # or "dynamic"
+    min_word_threshold: int = 30,
     body_width: int = 0,
     ignore_links: bool = True,
     ignore_images: bool = True,

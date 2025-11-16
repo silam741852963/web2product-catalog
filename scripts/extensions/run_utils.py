@@ -11,13 +11,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from collections import deque
 import re
+from urllib.parse import urlparse
+
 
 from crawl4ai import CacheMode, CrawlerRunConfig, RateLimiter
 from crawl4ai.async_dispatcher import MemoryAdaptiveDispatcher
 
 from components.llm_extractor import build_llm_extraction_strategy
 from components.md_generator import build_default_md_generator
+
 from configs import language_settings as lang_cfg
+from configs.crawler_settings import crawler_base_cfg
 
 from extensions.filtering import (
     DEFAULT_EXCLUDE_PATTERNS as FALLBACK_EXCLUDE_PATTERNS,
@@ -201,6 +205,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lang", type=str, default="en",
                    help="2-letter language code to use for language-sensitive constants (e.g. en, ja, vi)")
 
+
+    # Dataset externals list (full universe), distinct from the current --source batch
+    egrp = p.add_mutually_exclusive_group()
+    egrp.add_argument("--use-externals-list", dest="use_externals_list", action="store_true", default=True,
+                    help="If set, build an externals list of company hosts from a separate full dataset "
+                        "and use it to block cross-company externals only in brand discovery and url_index.")
+    egrp.add_argument("--no-use-externals-list", dest="use_externals_list", action="store_false")
+    p.add_argument("--externals-list-source", type=Path,
+                help="Full dataset file (supported formats) whose company URLs form the externals list.")
+    p.add_argument("--externals-list-dir", type=Path,
+                help="Directory containing one or more supported data files for the externals list.")
+    p.add_argument("--externals-list-pattern", type=str,
+                default="*.csv,*.tsv,*.xlsx,*.xls,*.json,*.jsonl,*.ndjson,*.parquet,*.feather,*.dta,*.sas7bdat,*.sav",
+                help="Comma-separated glob(s) to scan inside --externals-list-dir.")
+
     # Mutually exclusive toggles for brand discovery (default: True)
     dgrp = p.add_mutually_exclusive_group()
     dgrp.add_argument("--discover-brands", dest="discover_brands", action="store_true", default=True)
@@ -226,9 +245,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- Markdown generator knobs ---
     p.add_argument("--md-min-words", type=int, default=5)
-    p.add_argument("--md-threshold", type=float, default=0.24)
-    p.add_argument("--md-threshold-type", choices=["dynamic", "fixed"], default="dynamic")
-    p.add_argument("--md-min-block-words", type=int, default=50)
+    p.add_argument("--md-threshold", type=float, default=0.12)
+    p.add_argument("--md-threshold-type", choices=["dynamic", "fixed"], default="fixed")
+    p.add_argument("--md-min-block-words", type=int, default=30)
     p.add_argument("--md-content-source", choices=["cleaned_html", "fit_html", "raw_html"], default="fit_html")
     p.add_argument("--md-ignore-links", action="store_true")
     p.add_argument("--md-ignore-images", action="store_true")
@@ -585,7 +604,7 @@ def build_md_generator_from_args(args: argparse.Namespace):
     )
 
 def mk_md_config(args: argparse.Namespace) -> CrawlerRunConfig:
-    return CrawlerRunConfig(
+    return crawler_base_cfg.clone(
         markdown_generator=build_md_generator_from_args(args),
         cache_mode=CacheMode.BYPASS,
         stream=False,
@@ -604,7 +623,7 @@ def mk_llm_config(args: argparse.Namespace) -> CrawlerRunConfig:
         "schema_type": getattr(extraction, "schema", None),
         "input_format": getattr(extraction, "input_format", None),
     })
-    return CrawlerRunConfig(
+    return crawler_base_cfg.clone(
         extraction_strategy=extraction,
         cache_mode=CacheMode.BYPASS,
         stream=True,
@@ -626,17 +645,88 @@ def make_dispatcher(max_concurrency: int) -> MemoryAdaptiveDispatcher:
 # -----------------------
 # Discovery helpers (seed stats)
 # -----------------------
+def _normalize_seed_root(url: str) -> str:
+    """
+    Normalize any seed_root URL to a canonical site root:
+
+        "https://www.example.com/foo/bar"  -> "https://example.com/"
+        "example.com/path"                 -> "https://example.com/"
+        "//example.com"                    -> "https://example.com/"
+
+    Used for seed aggregation so that all subpages under the same host
+    collapse into a single root entry.
+    """
+    s = (url or "").strip()
+    if not s:
+        return ""
+
+    # Ensure we have a scheme so urlparse works consistently
+    if s.startswith("//"):
+        s = "https:" + s
+    elif "://" not in s:
+        s = "https://" + s.lstrip("/")
+
+    try:
+        pu = urlparse(s)
+    except Exception:
+        return ""
+
+    host = (pu.hostname or "").lower().strip(".")
+    if host.startswith("www.") and len(host) > 4:
+        host = host[4:]
+    if not host:
+        return ""
+
+    # We intentionally normalize scheme to https for aggregation
+    return f"https://{host}/"
+
 def aggregate_seed_by_root(items: Iterable[Dict[str, Any]], base_root: str) -> Dict[str, Any]:
+    """
+    Aggregate seed statistics by canonical site root, not by individual page.
+
+    Example:
+        seed_root values:
+            https://marleycoffee.com/
+            https://marleycoffee.com/where-to-buy-usa/
+            https://www.marleycoffee.com/where-to-buy-canada/
+
+        -> all collapse to:
+            https://marleycoffee.com/
+
+    Returned structure:
+        {
+          "seed_counts_by_root": {
+              "https://mother-parkers.com/": 50,
+              "https://marleycoffee.com/": 3,
+          },
+          "seed_roots": [
+              "https://marleycoffee.com/",
+              "https://mother-parkers.com/"
+          ],
+          "seed_brand_roots": [
+              # everything except the normalized base_root
+          ],
+          "seed_brand_count": <len(seed_brand_roots)>
+        }
+    """
     counts: Dict[str, int] = {}
     roots: List[str] = []
+
+    norm_base = _normalize_seed_root(base_root)
+
     for it in items:
-        r = str(it.get("seed_root") or "").strip()
+        raw_root = str(it.get("seed_root") or "").strip()
+        if not raw_root:
+            continue
+        r = _normalize_seed_root(raw_root)
         if not r:
             continue
         counts[r] = counts.get(r, 0) + 1
         roots.append(r)
+
     unique_roots = sorted(set(roots))
-    brand_roots = [r for r in unique_roots if r != base_root]
+    brand_roots = [r for r in unique_roots if r != norm_base]
+
     return {
         "seed_counts_by_root": counts,
         "seed_roots": unique_roots,

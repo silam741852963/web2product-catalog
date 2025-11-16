@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import inspect
 import logging
 import time
 from pathlib import Path
@@ -24,20 +25,20 @@ from configs.language_settings import load_lang
 from configs.browser_settings import browser_cfg
 
 from components.source_loader import CompanyInput, load_companies_from_source, load_companies_from_dir
-from components.url_seeder import seed_urls
 from components.md_generator import evaluate_markdown
 from components.llm_extractor import parse_presence_result, _short_preview
 
+from components.url_seeder import ExternalsUniverse
+
 from extensions.artifact_scanner import ArtifactScanner
-from extensions.checkpoint import CheckpointManager
+from extensions.checkpoints import CheckpointManager
 from extensions.connectivity_guard import ConnectivityGuard
 from extensions.global_state import GlobalState, ResumePlan
 from extensions.logging import LoggingExtension
 from extensions.output_paths import save_stage_output, ensure_company_dirs
 
-from extensions.run_utils import metrics
-
 from extensions.run_utils import (
+    metrics,
     build_parser,
     parse_pipeline,
     make_dispatcher,
@@ -58,13 +59,21 @@ from extensions.run_utils import (
     is_llm_extracted_empty,
     get_default_include_patterns,
     get_default_exclude_patterns,
-    build_seeder_kwargs,
 )
+
+from components.url_seeder import seed_urls
 
 from extensions.slot_allocator import SlotAllocator, SlotConfig, SessionSnapshot, CompanySnapshot
 
 # Page interaction: use both first + retry configs
 from extensions.page_interaction import PageInteractionPolicy, first_pass_config, retry_pass_config
+
+# NEW externals-list support
+from extensions.dataset_externals import DatasetExternals
+from extensions.filtering import (
+    set_dataset_externals,
+    set_universal_external_runtime_exclusions,
+)
 
 
 # --------------------------------------------------------------------------------------
@@ -270,6 +279,7 @@ async def _crawl_company(
     state: GlobalState,
     net: ConnectivityGuard,
     slot_alloc: SlotAllocator,
+    externals_universe: Any | None = None,   # <-- NEW: pass down the externals universe for the seeder
 ) -> None:
     bvdid = company.bvdid
     logger = log_ext.get_company_logger(bvdid)
@@ -322,6 +332,7 @@ async def _crawl_company(
         )
         logger.info("[%s] %s already complete per global DB. Skipping.", bvdid, completion_stage.upper())
         metrics.incr("company.skipped", bvdid=bvdid, stage=completion_stage)
+        await cp_mgr.mark_company_completed(bvdid)
         return
 
     # 1) URL discovery (seeder) or resume from url_index
@@ -366,16 +377,32 @@ async def _crawl_company(
             opened_before = net.snapshot_open_events()
             try:
                 with metrics.time("seeding.duration_s", bvdid=bvdid):
-                    seeded_items, seed_stats = await seed_urls(
-                        company.url,
-                        **build_seeder_kwargs(args) | dict(
-                            include=include_patterns,
-                            exclude=exclude_patterns,
-                            max_urls=max_urls,
-                            company_max_pages=company_max_pages,
-                            hits_per_sec=hits_per_sec,
-                        )
+                    # Build kwargs dynamically to be compatible with multiple seeder versions
+                    seed_kwargs: Dict[str, Any] = dict(
+                        company_id=bvdid,
+                        base_url=company.url,
+                        include=include_patterns,
+                        exclude=exclude_patterns,
+                        query=bm25_query,
+                        score_threshold=bm25_score_threshold,
+                        company_max_pages=company_max_pages,
+                        discover_brands=discover_brands,
+                        lang_primary=lang_primary,
+                        lang_accept_en_regions=set(lang_accept_en_regions or set()),
+                        lang_strict_cctld=lang_strict_cctld,
+                        drop_universal_externals=drop_universal_externals,
+                        use_dual_bm25=bool(getattr(args, "use_dual_bm25", True)),
+                        dual_alpha=float(getattr(args, "dual_alpha", 0.65)),
+                        same_site_only=True,
+                        homepage_only=bool(getattr(args, "homepage_only", False)),
                     )
+                    sig = inspect.signature(seed_urls)
+                    if "externals_universe" in sig.parameters:
+                        seed_kwargs["externals_universe"] = externals_universe
+                    if "exclude_externals_in_universe" in sig.parameters:
+                        seed_kwargs["exclude_externals_in_universe"] = bool(getattr(args, "exclude_externals_in_universe", True))
+
+                    seeded_items, seed_stats = await seed_urls(**seed_kwargs)
                 net.record_success()
             except Exception as e:
                 logger.error("[%s] Seeding error (network?): %s", bvdid, e)
@@ -435,8 +462,10 @@ async def _crawl_company(
         )
         logger.info("[%s] SEED stage complete. url_index.json now has %d URL(s).", bvdid, total_index)
         metrics.incr("company.done", bvdid=bvdid, stage="seed")
+        # Seed-only company is fully done in this session
+        await cp_mgr.mark_company_completed(bvdid)
         return
-
+    
     # If discovery used network, mirror to url_index
     if not used_index_for_urls:
         seeded_urls_for_index = [it.get("final_url") or it.get("url") for it in seeded_items if (it.get("final_url") or it.get("url"))]
@@ -500,6 +529,7 @@ async def _crawl_company(
         )
         logger.info("[%s] No URLs after discovery/resume. DONE.", bvdid)
         metrics.incr("company.done", bvdid=bvdid, stage="none")
+        await cp_mgr.mark_company_completed(bvdid)
         return
 
     llm_in_pipeline = ("llm" in pipeline_set)
@@ -529,6 +559,7 @@ async def _crawl_company(
         )
         logger.info("[%s] %s already complete per global DB. Skipping work.", bvdid, completion_stage.upper())
         metrics.incr("company.done", bvdid=bvdid, stage=completion_stage)
+        await cp_mgr.mark_company_completed(bvdid)
         return
 
     # ---------- Slot allocator helpers (dynamic tail boosting) ----------
@@ -1126,7 +1157,7 @@ async def _crawl_company(
         saved_html_run, saved_md_run, saved_json_run, md_suppressed_run, md_retry_suggested_run,
     )
     metrics.incr("company.done", bvdid=bvdid, stage=",".join(pipeline))
-
+    await cp_mgr.mark_company_completed(bvdid)
 
 async def main_async() -> None:
     parser = build_parser()
@@ -1144,16 +1175,20 @@ async def main_async() -> None:
 
     try:
         load_lang(args.lang or "en")
-        root_logger.info("Loaded language settings for: %s", args.lang or "en")
+        root_logger.info("Loaded language settings for: %s", (args.lang or "en"))
     except Exception as e:
         root_logger.warning("Failed to load language settings for '%s': %s — falling back to default", args.lang, e)
 
     pipeline = parse_pipeline(args.pipeline)
     root_logger.info("Pipeline=%s", pipeline)
+    # guard in case older parsers don't have these flags
+    live_check_flag = getattr(args, "live_check", False)
+    use_dual_bm25 = getattr(args, "use_dual_bm25", True)
+    dual_alpha = float(getattr(args, "dual_alpha", 0.65))
     root_logger.info("Seeder live-check: %s | DualBM25=%s α=%.2f",
-                     "ON" if args.live_check else "OFF",
-                     "ON" if args.use_dual_bm25 else "OFF",
-                     float(args.dual_alpha))
+                     "ON" if live_check_flag else "OFF",
+                     "ON" if use_dual_bm25 else "OFF",
+                     dual_alpha)
     root_logger.info(
         "MD config: min_words=%d threshold=%.2f thresh_type=%s min_block_words=%d src=%s ignore_links=%s ignore_images=%s cookie_max_frac=%.2f require_structure=%s",
         args.md_min_words, args.md_threshold, args.md_threshold_type, args.md_min_block_words,
@@ -1163,9 +1198,14 @@ async def main_async() -> None:
     root_logger.info("Fetch tuning: page_timeout_ms=%d remote_batch_size=%d",
                      int(getattr(args, "page_timeout_ms", 120000)),
                      int(getattr(args, "remote_batch_size", 64)))
-    root_logger.info("LLM config: presence_only=%s require_presence=%s", args.presence_only, getattr(args, "require_presence", False))
+    root_logger.info("LLM config: presence_only=%s require_presence=%s",
+                     bool(getattr(args, "presence_only", False)),
+                     bool(getattr(args, "require_presence", False)))
 
     # --- Load input companies (multi-format) ---
+    externals_universe = None
+    companies: List[CompanyInput] = []
+
     if getattr(args, "source_dir", None):
         src_dir: Path = args.source_dir
         if not src_dir.exists() or not src_dir.is_dir():
@@ -1174,19 +1214,15 @@ async def main_async() -> None:
             return
 
         patterns = [p.strip() for p in (args.source_pattern or "").split(",") if p.strip()]
-        companies: List[CompanyInput] = load_companies_from_dir(src_dir, patterns=patterns, recursive=True)
-
+        companies = load_companies_from_dir(src_dir, patterns=patterns, recursive=True)
         if not companies:
             root_logger.error("No supported data files (or no valid rows) found under: %s", src_dir)
             log_ext.close()
             return
-
         if args.limit is not None and args.limit > 0:
             companies = companies[: args.limit]
             root_logger.info("Applied global limit: %d", args.limit)
-
         root_logger.info("Loaded %d companies from %s", len(companies), src_dir)
-
     else:
         companies = load_companies_from_source(args.source, limit=args.limit)
         if not companies:
@@ -1200,10 +1236,79 @@ async def main_async() -> None:
         log_ext.close()
         return
 
+    # ======================================================================
+    # Build externals list / universe ONCE (works for both source/file + dir)
+    # ======================================================================
+    try:
+        use_externals_list = bool(getattr(args, "use_externals_list", True))
+        if use_externals_list:
+            externals_src_dir: Optional[Path] = getattr(args, "externals_list_dir", None)
+            externals_src_file: Optional[Path] = getattr(args, "externals_list_source", None)
+            externals_pattern: str = getattr(
+                args,
+                "externals_list_pattern",
+                "*.csv,*.tsv,*.xlsx,*.xls,*.json,*.jsonl,*.ndjson,*.parquet,*.feather,*.dta,*.sas7bdat,*.sav",
+            )
+
+            try:
+                if externals_src_dir or externals_src_file:
+                    ds_ext = DatasetExternals.from_sources(
+                        source=externals_src_file,
+                        source_dir=externals_src_dir,
+                        pattern=externals_pattern,
+                        limit=None,
+                    )
+                else:
+                    ds_ext = DatasetExternals.from_companies(companies)
+            except Exception as e:
+                ds_ext = None
+                root_logger.warning("Failed to build externals list: %s", e)
+
+            if ds_ext:
+                # Feed dataset externals into runtime policy
+                set_dataset_externals(ds_ext.registrable_domains)
+                if bool(getattr(args, "demote_universal_by_externals", True)):
+                    set_universal_external_runtime_exclusions(ds_ext.registrable_domains)
+
+                # Build ExternalsUniverse for the seeder (if supported)
+                try:
+                    if externals_src_dir or externals_src_file:
+                        if externals_src_dir:
+                            uni_companies = load_companies_from_dir(
+                                externals_src_dir,
+                                patterns=[p.strip() for p in (externals_pattern or "").split(",") if p.strip()],
+                                recursive=True,
+                            )
+                        else:
+                            uni_companies = load_companies_from_source(externals_src_file, limit=None)
+                    else:
+                        uni_companies = list(companies)
+
+                    if ExternalsUniverse is not None:
+                        externals_universe = ExternalsUniverse.from_companies(uni_companies)  # type: ignore
+                        # Best-effort stats
+                        dom_count = getattr(externals_universe, "__len__", None)
+                        dom_n = int(externals_universe.__len__()) if callable(dom_count) else 0
+                        hosts_n = len(getattr(externals_universe, "hosts", [])) if hasattr(externals_universe, "hosts") else 0
+                        root_logger.info(
+                            "Externals universe ready (dataset): %d registrable domains / %d raw hosts (input companies: %d)",
+                            dom_n, hosts_n, len(uni_companies)
+                        )
+                    else:
+                        root_logger.info("Seeder does not expose ExternalsUniverse; dataset externals still registered.")
+                except Exception as e:
+                    root_logger.warning("Failed to assemble ExternalsUniverse from externals list: %s", e)
+            else:
+                root_logger.info("Externals list not available or empty; brand/url_index externals filter disabled.")
+        else:
+            root_logger.info("--no-use-externals-list specified; brand/url_index externals filter disabled.")
+    except Exception as e:
+        root_logger.warning("Externals list setup encountered an issue: %s", e)
+
     # Use language-aware defaults (load_lang has been called above)
-    include_patterns = get_default_include_patterns() + ([p.strip() for p in args.include.split(",") if p.strip()] if args.include else [])
-    exclude_patterns = get_default_exclude_patterns() + ([p.strip() for p in args.exclude.split(",") if p.strip()] if args.exclude else [])
-    lang_regions = set(x.strip().lower() for x in args.lang_accept_en_regions.split(",") if x.strip())
+    include_patterns = get_default_include_patterns() + ([p.strip() for p in (args.include or "").split(",") if p.strip()])
+    exclude_patterns = get_default_exclude_patterns() + ([p.strip() for p in (args.exclude or "").split(",") if p.strip()])
+    lang_regions = set(x.strip().lower() for x in (getattr(args, "lang_accept_en_regions", "") or "").split(",") if x.strip())
 
     n = len(companies)
 
@@ -1232,6 +1337,8 @@ async def main_async() -> None:
 
     cp_mgr = CheckpointManager()
     await cp_mgr.mark_global_start()
+    await cp_mgr.set_total_companies(n)
+
     scanner = ArtifactScanner()
     state = GlobalState()
 
@@ -1279,13 +1386,14 @@ async def main_async() -> None:
                                 log_ext=log_ext,
                                 discover_brands=args.discover_brands,
                                 drop_universal_externals=args.drop_universal_externals,
-                                lang_primary=args.lang_primary.lower(),
+                                lang_primary=(getattr(args, "lang_primary", (args.lang or "en"))).lower(),
                                 lang_accept_en_regions=lang_regions,
                                 lang_strict_cctld=args.lang_strict_cctld,
                                 args=args,
                                 state=state,
                                 net=net,
                                 slot_alloc=slot_alloc,
+                                externals_universe=externals_universe,  # <-- pass through
                             ),
                             timeout=float(timeout_s),
                         )
@@ -1362,7 +1470,7 @@ async def main_async() -> None:
                 last_progress = now
 
             with contextlib.suppress(Exception):
-                summary = await CheckpointManager().summary()
+                summary = await cp_mgr.summary()
                 for bvdid, s in summary.items():
                     cur = int(s.get("done") or 0)
                     prev = last_done_by_bvdid.get(bvdid, -1)
@@ -1378,12 +1486,24 @@ async def main_async() -> None:
                     await asyncio.gather(*pending, return_exceptions=True)
                 break
     finally:
-        summary = await CheckpointManager().summary()
+        summary = await cp_mgr.summary()
         logging.getLogger("run_crawl").info("Session summary:")
         for hid, s in summary.items():
             logging.getLogger("run_crawl").info(
                 "  %s: %s/%s done, %s failed, ratio=%.2f%%, finished=%s",
                 hid, s["done"], s["total"], s["failed"], 100.0 * s["ratio"], s["finished"]
+            )
+         # Log the global session progress snapshot from session_checkpoint.json
+        with contextlib.suppress(Exception):
+            sp = await cp_mgr.get_session_progress()
+            logging.getLogger("run_crawl").info(
+                "Global progress: %d/%d companies completed (%.2f%%). Last company=%s, started_at=%s, last_updated=%s",
+                sp.get("completed_companies", 0),
+                sp.get("total_companies", 0),
+                sp.get("completion_pct", 0.0),
+                sp.get("last_company_bvdid"),
+                sp.get("started_at"),
+                sp.get("last_updated"),
             )
         with contextlib.suppress(Exception):
             await net.stop()

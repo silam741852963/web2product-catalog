@@ -1,327 +1,200 @@
 from __future__ import annotations
 
-import os
-import sys
 import asyncio
 import logging
-import json
-from typing import List, Optional, Dict, Any, Iterable, Set, Tuple
-from urllib.parse import urlparse
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import List, Optional, Dict, Any, Iterable, Set, Tuple
+from urllib.parse import urlparse, urlunparse, urljoin
 
-from crawl4ai import (
-    AsyncUrlSeeder,
-    AsyncWebCrawler,
-    CacheMode,
-    CrawlerRunConfig,
-    RateLimiter,
-    SeedingConfig,
-)
-from crawl4ai.deep_crawling import BestFirstCrawlingStrategy
-from crawl4ai.async_dispatcher import MemoryAdaptiveDispatcher
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
-
-try:
-    from crawl4ai import CrawlerMonitor  # type: ignore
-except Exception:  # pragma: no cover
-    CrawlerMonitor = None  # type: ignore
 
 from configs import language_settings as lang_cfg
 from configs.browser_settings import browser_cfg
+from configs.crawler_settings import crawler_base_cfg
 
+from extensions.dataset_externals import DatasetExternals
 from extensions.filtering import (
     DEFAULT_INCLUDE_PATTERNS,
     DEFAULT_EXCLUDE_PATTERNS,
-    filter_seeded_urls,
     apply_url_filters,
-    make_basic_filter_chain,
-    make_keyword_scorer,
-    is_universal_external,
+    same_registrable_domain,
+    set_dataset_externals,
+    set_universal_external_runtime_exclusions,
+    should_block_external_for_dataset,
 )
+
 from extensions.brand_discovery import discover_brand_sites
-from components.md_generator import build_default_md_generator, evaluate_markdown
-from components.llm_extractor import build_llm_extraction_strategy
-
 from extensions.dual_bm25 import DualBM25Combiner, DualBM25Config, build_default_negative_query
-from extensions.page_interaction import (
-    PageInteractionPolicy,
-    make_interaction_plan,
-)
-
-class _NullMetrics:
-        def incr(self, name: str, value: float = 1.0, **labels: Any) -> None: ...
-        def observe(self, name: str, value: float, **labels: Any) -> None: ...
-        def set(self, name: str, value: float, **labels: Any) -> None: ...
-
-metrics = _NullMetrics()  # type: ignore
+from extensions.sitemap_hunter import discover_from_sitemaps
+from extensions.url_index import discover_and_write_url_index
+from extensions.run_utils import upsert_url_index
 
 log = logging.getLogger(__name__)
 
-# Use language_settings for the default product query (language-aware)
-DEFAULT_PRODUCT_QUERY = lang_cfg.default_product_bm25_query()
 
-# CTA keywords: attempt to read from language settings, otherwise fallback to English set
-CTA_KEYWORDS = set(lang_cfg.get("CTA_KEYWORDS"))
+# =====================================================================
+# ExternalsUniverse: central loader/registrar for dataset externals
+# =====================================================================
 
-# PRODUCT-ish URL tokens — get from language settings (SMART include tokens)
-PRODUCTISH_URL_TOKENS = set(lang_cfg.get("SMART_INCLUDE_TOKENS"))
+@dataclass
+class ExternalsUniverse:
+    """Holds dataset externals and installs runtime policies in filtering.py."""
+    hosts: Set[str]
+    registrable_domains: Set[str]
+    allowed_brand_hosts: Set[str]
 
-_DEBUG_SAMPLE_TOP = 10
-_DEBUG_SAMPLE_BOTTOM = 3
+    @classmethod
+    def from_sources(
+        cls,
+        *,
+        source: Optional[Path] = None,
+        source_dir: Optional[Path] = None,
+        pattern: str = "*.csv,*.tsv,*.xlsx,*.xls,*.json,*.jsonl,*.ndjson,*.parquet,*.feather,*.dta,*.sas7bdat,*.sav",
+        limit: Optional[int] = None,
+        allowed_brand_hosts: Optional[Iterable[str]] = None,
+    ) -> "ExternalsUniverse":
+        ds = DatasetExternals.from_sources(source=source, source_dir=source_dir, pattern=pattern, limit=limit)
+        return cls(
+            hosts=set(ds.hosts or set()),
+            registrable_domains=set(ds.registrable_domains or set()),
+            allowed_brand_hosts=set(allowed_brand_hosts or ()),
+        )
 
-# -------------------------
-# Dynamic universal heuristic (persistence)
-# -------------------------
-DYNAMIC_COUNTS_FILE: Path = Path("outputs") / "dynamic_universal_counts.json"
-DYNAMIC_THRESHOLD: int = 1  # If a host is seen in > DYNAMIC_THRESHOLD distinct companies, treat it as universal
+    @classmethod
+    def from_companies(
+        cls,
+        companies: Iterable,
+        allowed_brand_hosts: Optional[Iterable[str]] = None,
+    ) -> "ExternalsUniverse":
+        ds = DatasetExternals.from_companies(companies)
+        return cls(
+            hosts=set(ds.hosts or set()),
+            registrable_domains=set(ds.registrable_domains or set()),
+            allowed_brand_hosts=set(allowed_brand_hosts or ()),
+        )
 
-def _dyn_counts_path() -> Path:
-    return DYNAMIC_COUNTS_FILE
+    def install(self) -> None:
+        """
+        Register dataset externals in filtering module and demote any overlaps
+        from UNIVERSAL_EXTERNALS at runtime so they aren't auto-dropped.
+        """
+        set_dataset_externals(self.registrable_domains or self.hosts)
+        set_universal_external_runtime_exclusions(self.registrable_domains or self.hosts)
+        log.info(
+            "[externals] Installed dataset externals: hosts=%d registrable=%d, allowed_brand_hosts=%d",
+            len(self.hosts), len(self.registrable_domains), len(self.allowed_brand_hosts),
+        )
 
-def _load_dyn_counts() -> Dict[str, List[str]]:
-    p = _dyn_counts_path()
-    if not p.exists():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-def _save_dyn_counts(d: Dict[str, List[str]]) -> None:
-    p = _dyn_counts_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        p.write_text(json.dumps(d, indent=2), encoding="utf-8")
-    except Exception:
-        # best-effort; do not crash seeder
-        log.exception("[url_seeder] Failed to save dynamic counts to %s", str(p))
-
-def _increment_hosts_for_company(company_id: str, hosts: Iterable[str]) -> Tuple[Dict[str, int], List[str]]:
-    """
-    Record each host as seen for `company_id` (company_id should be the base hostname of the company).
-    Return (counts_snapshot, newly_blacklisted_hosts)
-    """
-    data = _load_dyn_counts()
-    newly_blacklisted: List[str] = []
-    for h in hosts:
-        if not h:
-            continue
-        lst = data.get(h, [])
-        if company_id not in lst:
-            lst.append(company_id)
-            data[h] = lst
-            # check threshold
-            if len(lst) > DYNAMIC_THRESHOLD:
-                newly_blacklisted.append(h)
-    _save_dyn_counts(data)
-    # return short counts map for convenience
-    counts_snapshot = {k: len(v) for k, v in data.items()}
-    return counts_snapshot, newly_blacklisted
-
-def _is_host_dynamically_universal(host: str) -> bool:
-    data = _load_dyn_counts()
-    lst = data.get(host, [])
-    return len(lst) > DYNAMIC_THRESHOLD
 
 # -------------------------
-
-def _build_monitor() -> object | None:
-    if os.name == "nt" or sys.platform.startswith("win"):
-        return None
-    try:
-        import termios  # noqa: F401
-    except Exception:
-        return None
-    if CrawlerMonitor is None:
-        return None
-    for kwargs in ({"max_visible_rows": 15}, {}):
-        try:
-            return CrawlerMonitor(**kwargs)  # type: ignore[arg-type]
-        except TypeError:
-            continue
-        except Exception:
-            break
-    return None
-
-def _make_dispatcher(max_concurrency: int) -> MemoryAdaptiveDispatcher:
-    return MemoryAdaptiveDispatcher(
-        memory_threshold_percent=85.0,
-        check_interval=1.0,
-        max_session_permit=max_concurrency,
-        rate_limiter=RateLimiter(base_delay=(0.5, 1.2), max_delay=20.0, max_retries=2),
-        monitor=_build_monitor(),
-    )
-
-def _stage_run_config(stage: str) -> CrawlerRunConfig:
-    md_gen = None
-    extraction = None
-    if stage in ("markdown", "llm"):
-        md_gen = build_default_md_generator()
-    if stage == "llm":
-        extraction = build_llm_extraction_strategy()
-    return CrawlerRunConfig(
-        cache_mode=CacheMode.ENABLED,
-        markdown_generator=md_gen,
-        extraction_strategy=extraction,
-        scraping_strategy=LXMLWebScrapingStrategy(),
-        stream=True,
-    )
-
-def _with_scheme_variants(url_or_host: str) -> List[str]:
+# Helpers (HTTPS-only)
+# -------------------------
+def _with_https_only(url_or_host: str) -> List[str]:
     s = (url_or_host or "").strip()
     if not s:
         return []
-    lower = s.lower()
-    if lower.startswith("https://"):
+    s = s.lstrip("/")
+    if s.startswith("https://"):
         return [s]
-    while s.startswith("/"):
-        s = s[1:]
+    if s.startswith("http://"):
+        return [f"https://{s[len('http://'):] }"]
     return [f"https://{s}"]
+
 
 def _domain_variants(host: str) -> List[str]:
     h = (host or "").lower().strip().rstrip(".")
     if not h:
         return []
     base = h[4:] if h.startswith("www.") else h
-    out = {h, base, f"www.{base}"}
-    return sorted(out)
+    return sorted({h, base, f"www.{base}"})
 
-def _same_netloc(a: str, b: str) -> bool:
-    return (urlparse(a).netloc or "").lower() == (urlparse(b).netloc or "").lower()
 
-def _normalize_brand_sites(items: Iterable[Any], *, require_valid_status: bool = True) -> List[str]:
-    out: List[str] = []
+def _ensure_https_root(url_or_host: str) -> str:
+    s = (url_or_host or "").strip()
+    if not s:
+        return "https://"
+    if "://" not in s:
+        s = f"https://{s}"
+    p = urlparse(s)
+    return urlunparse(("https", (p.netloc or p.path), "/", "", "", ""))
+
+
+def _apex_root(u: str) -> str:
+    p = urlparse(_ensure_https_root(u))
+    host = (p.netloc or "").lower().strip().rstrip(".")
+    base = host[4:] if host.startswith("www.") else host
+    return f"https://{base}/"
+
+
+def _www_root(u: str) -> str:
+    p = urlparse(_ensure_https_root(u))
+    host = (p.netloc or "").lower().strip().rstrip(".")
+    if host.startswith("www."):
+        return f"https://{host}/"
+    return f"https://www.{host}/"
+
+
+def _normalized_root_key(root: str) -> str:
+    """
+    Normalize any root/base URL for per_root_discovered stats:
+      - https scheme
+      - apex host (no 'www.')
+      - trailing slash
+    e.g.  https://mother-parkers.com,
+          https://mother-parkers.com/,
+          https://www.mother-parkers.com
+      -> https://mother-parkers.com/
+    """
+    return _apex_root(root)
+
+
+def _normalize_abs_https(link: str, base: str) -> str:
+    if not link:
+        return ""
+    if link.startswith(("mailto:", "javascript:", "tel:", "data:")):
+        return ""
+    absu = urljoin(base, link)
+    p = urlparse(absu)
+    if not p.netloc:
+        return ""
+    if p.scheme == "http":
+        absu = urlunparse(("https", p.netloc, p.path, p.params, p.query, p.fragment))
+    if "#" in absu:
+        absu = absu.split("#", 1)[0]
+    return absu
+
+
+def _dedupe(seq: Iterable[str]) -> List[str]:
     seen: Set[str] = set()
-    for it in items or []:
-        raw = None
-        status_ok = True
-        if isinstance(it, str):
-            raw = it.strip()
-        elif isinstance(it, dict):
-            raw = (it.get("root") or it.get("url") or it.get("homepage") or it.get("href") or it.get("link") or "")
-            raw = str(raw).strip()
-            if require_valid_status:
-                st = str(it.get("status") or "unknown").lower()
-                status_ok = (st in {"valid","unknown"})
-        else:
-            raw = str(it).strip()
-        if not raw or not status_ok:
-            continue
-        for v in _with_scheme_variants(raw):
-            if v and v not in seen:
-                seen.add(v); out.append(v)
+    out: List[str] = []
+    for u in seq:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
     return out
 
-async def _collect_roots(base_url: str, *, discover_brands: bool = True) -> List[str]:
-    roots: List[str] = []
-    seen: Set[str] = set()
 
-    # Always include scheme variants of the input
-    for v in _with_scheme_variants(base_url):
-        if v and v not in seen:
-            seen.add(v); roots.append(v)
-
-    # Add apex/www host variants as roots too
-    preferred = roots[0] if roots else None
-    if preferred:
-        host = (urlparse(preferred).hostname or "").lower()
-        for host_variant in _domain_variants(host):
-            for v in _with_scheme_variants(host_variant):
-                if v and v not in seen:
-                    seen.add(v); roots.append(v)
-
-    # Brand discovery (with dynamic universal host suppression)
-    if discover_brands and preferred and not is_universal_external(preferred):
-        try:
-            log.info("[url_seeder] Brand discovery for %s", preferred)
-            brand_sites_raw = await discover_brand_sites(preferred)
-            brand_sites = _normalize_brand_sites(brand_sites_raw, require_valid_status=True)
-
-            # Filter out canonical universal externals first
-            brand_sites = [u for u in brand_sites if not is_universal_external(u)]
-
-            # Dynamic-universal logic
-            company_id = (urlparse(preferred).hostname or "").lower() or preferred
-            candidate_hosts = set((urlparse(u).hostname or "").lower() for u in brand_sites if u)
-            counts_snapshot, newly_blacklisted = _increment_hosts_for_company(company_id, candidate_hosts)
-
-            filtered_brand_sites: List[str] = []
-            skipped_due_to_dynamic: List[Tuple[str, int]] = []
-            for u in brand_sites:
-                host = (urlparse(u).hostname or "").lower()
-                if is_universal_external(u) or _is_host_dynamically_universal(host):
-                    curr_count = counts_snapshot.get(host, 0)
-                    skipped_due_to_dynamic.append((u, curr_count))
-                    continue
-                filtered_brand_sites.append(u)
-
-            for root_u, curr_count in skipped_due_to_dynamic:
-                log.warning("[url_seeder.dynamic-skip] Skipped candidate brand root=%s for base=%s because host=%s seen_in_companies=%d",
-                            root_u, preferred, (urlparse(root_u).hostname or ""), int(curr_count))
-
-            for b in filtered_brand_sites:
-                if b not in seen:
-                    seen.add(b); roots.append(b)
-
-            if len(roots) > 1:
-                log.info("[url_seeder]   %d brand root(s)", len(roots) - 1)
-            if log.isEnabledFor(logging.DEBUG):
-                log.debug("[url_seeder]   Brand roots discovered: %s", ", ".join(roots[1:]))
-        except Exception as e:
-            log.exception("[url_seeder] Brand discovery failed: %s", e)
-
-    return roots
-
-def _url_has_productish_tokens(u: str) -> bool:
-    p = u.lower()
-    return any(tok in p for tok in PRODUCTISH_URL_TOKENS)
-
-def _head_meta_hits(head: Optional[Dict[str, Any]]) -> Tuple[int, int]:
-    if not head or not isinstance(head, dict):
-        return (0, 0)
-    fields: List[str] = []
-    title = head.get("title");  fields.append(str(title)) if title else None
-    meta = head.get("meta") or {}
-    if isinstance(meta, dict):
-        for v in meta.values():
-            if isinstance(v, str):
-                fields.append(v)
-    for node in head.get("jsonld", []) or []:
-        if isinstance(node, dict):
-            for v in node.values():
-                if isinstance(v, str):
-                    fields.append(v)
-    blob = " ".join(fields).lower()
-    prod = sum(k in blob for k in (
-        "product","service","solution","platform","catalog","catalogue","specification","datasheet",
-        "features","capabilities"
-    ))
-    cta = sum(c in blob for c in CTA_KEYWORDS)
-    return (prod, cta)
-
-def _product_signal_score(item: Dict[str, Any]) -> float:
-    url = str(item.get("final_url") or item.get("url") or "").strip()
-    head = item.get("head_data") if isinstance(item.get("head_data"), dict) else None
-    score = 0.0
-    if url and _url_has_productish_tokens(url):
-        score += 0.4
-    p_hits, c_hits = _head_meta_hits(head)
-    score += min(p_hits, 3) * 0.1
-    score += min(c_hits, 2) * 0.2
-    return min(score, 1.0)
-
+# -------------------------
+# Very light BM25 scoring utilities
+# -------------------------
 def _tok(s: str) -> List[str]:
     s = (s or "").lower()
     out: List[str] = []
-    cur = []
+    cur: List[str] = []
     for ch in s:
         if ch.isalnum():
             cur.append(ch)
         else:
             if cur:
-                out.append("".join(cur)); cur = []
-    if cur: out.append("".join(cur))
+                out.append("".join(cur))
+                cur = []
+    if cur:
+        out.append("".join(cur))
     return out
+
 
 def _bm25_lite(text: str, query: str) -> float:
     if not text or not query:
@@ -342,595 +215,536 @@ def _bm25_lite(text: str, query: str) -> float:
             score += (f ** 0.5)
     return score
 
-def _doc_text_for_item(it: Dict[str, Any]) -> str:
-    parts: List[str] = []
-    u = it.get("final_url") or it.get("url") or ""
-    parts.append(str(u))
-    h = it.get("head_data") or {}
-    t = h.get("title")
-    if t: parts.append(str(t))
-    meta = h.get("meta") or {}
-    if isinstance(meta, dict):
-        for v in meta.values():
-            if isinstance(v, str): parts.append(v)
-    for node in h.get("jsonld", []) or []:
-        if isinstance(node, dict):
-            for v in node.values():
-                if isinstance(v, str): parts.append(v)
-    return " ".join(parts)
 
-def _compute_dual_scores(items: List[Dict[str, Any]], pos_query: Optional[str], alpha: float) -> None:
-    comb = DualBM25Combiner(_bm25_lite, DualBM25Config(alpha=alpha))
-    neg_q = build_default_negative_query()
-    for it in items:
-        doc = _doc_text_for_item(it)
-        it["dual_bm25"] = comb.score(doc, pos_query=pos_query, neg_query=neg_q)
+def _dual_score(doc: str, comb: DualBM25Combiner, pos_q: Optional[str], neg_q: Optional[str]) -> float:
+    return comb.score(doc, pos_query=pos_q, neg_query=neg_q)
 
-def _aggregate_roots(items: Iterable[Dict[str, Any]]) -> Tuple[Dict[str, int], List[str]]:
-    per_root: Dict[str, int] = {}
+
+# -------------------------
+# Roots (+ optional brands on homepage)
+# -------------------------
+async def _collect_roots_https(
+    base_url: str,
+    *,
+    discover_brands: bool,
+    allowed_brand_hosts: Optional[Set[str]] = None,
+) -> List[str]:
     roots: List[str] = []
-    for it in items:
-        r = str(it.get("seed_root") or "").strip()
-        if r:
-            per_root[r] = per_root.get(r, 0) + 1
-            roots.append(r)
-    return per_root, sorted(set(roots))
+    for v in _with_https_only(base_url):
+        if v not in roots:
+            roots.append(v)
 
-def _dedupe_seeded(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen: Set[str] = set()
-    out: List[Dict[str, Any]] = []
-    for it in items:
-        key = str(it.get("final_url") or it.get("url") or "").strip()
-        if key and key not in seen:
-            seen.add(key); out.append(it)
+    preferred = roots[0] if roots else None
+    if preferred:
+        host = (urlparse(preferred).hostname or "").lower()
+        for host_variant in _domain_variants(host):
+            for v in _with_https_only(host_variant):
+                if v and v not in roots:
+                    roots.append(v)
+
+    if discover_brands and preferred:
+        try:
+            log.info("[url_seeder] Brand discovery for %s", preferred)
+            raw = await discover_brand_sites(preferred)
+            for u in (raw or []):
+                for v in _with_https_only(str(u).strip()):
+                    # Guard: do not add dataset externals as brand roots unless explicitly allowed
+                    if should_block_external_for_dataset(preferred, v, allowed_brand_hosts=allowed_brand_hosts or set()):
+                        log.debug("[url_seeder] skip brand root due to dataset externals policy: %s", v)
+                        continue
+                    if v and v not in roots:
+                        roots.append(v)
+            if len(roots) > 1:
+                log.info("[url_seeder]   %d brand root(s)", len(roots) - 1)
+        except Exception as e:
+            log.debug("[url_seeder] brand discovery failed: %s", e)
+
+    return roots
+
+
+# -------------------------
+# Crawl4AI homepage link discovery
+# -------------------------
+def _stage_run_config_for_discovery() -> CrawlerRunConfig:
+    return crawler_base_cfg.clone(
+        cache_mode=CacheMode.ENABLED,
+        scraping_strategy=LXMLWebScrapingStrategy(),
+        stream=False,
+    )
+
+
+async def _discover_with_crawl4ai(root: str) -> List[str]:
+    run_cfg = _stage_run_config_for_discovery()
+    homepage = _ensure_https_root(root)
+
+    try:
+        async with AsyncWebCrawler(config=browser_cfg) as crawler:
+            r = await crawler.arun(url=homepage, config=run_cfg)
+    except Exception as e:
+        log.debug("[url_seeder] Crawl4AI fetch failed for %s: %s", homepage, e)
+        return []
+
+    html = getattr(r, "html", None) or getattr(r, "cleaned_html", None) or ""
+    if not html:
+        return []
+
+    try:
+        from lxml import html as LH
+        doc = LH.fromstring(html)
+        hrefs = [el.get("href") for el in doc.findall(".//a") if el.get("href")]
+    except Exception as e:
+        log.debug("[url_seeder] lxml parse failed for %s: %s", homepage, e)
+        hrefs = []
+
+    abs_urls = []
+    for h in hrefs:
+        u = _normalize_abs_https(h, homepage)
+        if u:
+            abs_urls.append(u)
+
+    abs_urls = [u for u in _dedupe(abs_urls) if same_registrable_domain(homepage, u)]
+    return abs_urls
+
+
+# -------------------------
+# Fallback wrapper (parallel variants + timing)
+# -------------------------
+async def _sitemap_fallback_all_variants(root: str, *, timeout_s: float = 45.0) -> List[str]:
+    start = time.perf_counter()
+    canon = _ensure_https_root(root)
+    apex = _apex_root(root)
+    www = _www_root(root)
+
+    variants = []
+    for v in (canon, apex, www):
+        if v not in variants:
+            variants.append(v)
+
+    log.info("[url_seeder] [sitemaps] start root=%s variants=%s", root, ", ".join(variants))
+
+    async def _one(v: str):
+        try:
+            return await discover_from_sitemaps(v, timeout_s=timeout_s)
+        except Exception as e:
+            log.debug("[url_seeder] [sitemaps] error for %s: %s", v, e)
+            return []
+
+    results = await asyncio.gather(*(_one(v) for v in variants))
+    merged = []
+    for lst in results:
+        merged.extend(lst or [])
+
+    merged = [u for u in _dedupe(merged) if same_registrable_domain(canon, u)]
+
+    elapsed = (time.perf_counter() - start)
+    log.info("[url_seeder] [sitemaps] done root=%s urls=%d (%.2fs)", root, len(merged), elapsed)
+    return merged
+
+
+# -------------------------
+# Brand detection heuristic (within a domain)
+# -------------------------
+def _looks_like_brand_page(u: str, root: str) -> bool:
+    if not same_registrable_domain(root, u):
+        return False
+    path = (urlparse(u).path or "").lower()
+    tokens = ("brand", "brands", "our-brands", "brand-portfolio", "portfolio/brands")
+    return any(t in path for t in tokens)
+
+
+# -------------------------
+# Brand-root seeding: seed discovered brand roots, then append their URLs
+# -------------------------
+async def _seed_brand_roots(
+    brand_roots: List[str],
+    *,
+    preferred_root: str,
+    allowed_brand_hosts: Optional[Set[str]],
+) -> Dict[str, List[str]]:
+    """
+    For each brand root, run homepage link discovery + sitemap variants;
+    return dict[root] -> list[urls] (all in-domain, deduped).
+    Dataset externals are blocked unless explicitly allowed via allowed_brand_hosts.
+    """
+    out: Dict[str, List[str]] = {}
+
+    async def _seed_one(root: str) -> Tuple[str, List[str]]:
+        # Guard: drop if dataset-external relative to preferred
+        if should_block_external_for_dataset(preferred_root, root, allowed_brand_hosts=allowed_brand_hosts or set()):
+            log.debug("[url_seeder] block brand root (dataset externals): %s", root)
+            return (root, [])
+
+        try:
+            c4 = await _discover_with_crawl4ai(root)
+            sm = await _sitemap_fallback_all_variants(root, timeout_s=45.0)
+            merged = _dedupe(list(c4 or []) + list(sm or []))
+            canon = _ensure_https_root(root)
+            merged = [u for u in merged if same_registrable_domain(canon, u)]
+            return (root, merged)
+        except Exception as e:
+            log.debug("[url_seeder] brand seeding failed for %s: %s", root, e)
+            return (root, [])
+
+    results = await asyncio.gather(*(_seed_one(r) for r in _dedupe(brand_roots)))
+    for root, urls in results:
+        out[root] = urls
     return out
 
-def _prefilter_stepwise(
-    items: List[Dict[str, Any]],
-    *,
-    live_check: bool,
-    min_score: Optional[float],
-    score_field: str,
-    drop_universal_externals: bool,
-    min_product_signal: Optional[float],
-) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    drops = {"dropped_status": 0, "dropped_external": 0, "dropped_score": 0, "dropped_product_signal": 0}
-    cur = list(items)
 
-    if live_check:
-        before = len(cur)
-        after = filter_seeded_urls(cur, require_status="valid", min_score=None, drop_universal_externals=False)
-        drops["dropped_status"] = before - len(after)
-        cur = after
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug("[url_seeder.prefilter] live_check: %d -> %d (dropped=%d)",
-                      before, len(cur), drops["dropped_status"])
+# -------------------------
+# (Fallback-only) simple brand expansion: append brand roots without further seeding
+# -------------------------
+async def _expand_with_brand_pages_simple(
+    kept: List[Dict[str, Any]],
+    preferred_root: str,
+    company_id: Optional[str],
+    allowed_brand_hosts: Optional[Set[str]],
+) -> List[Dict[str, Any]]:
+    if not kept:
+        return kept
+    brand_page_urls = [it["url"] for it in kept if _looks_like_brand_page(it["url"], preferred_root)]
+    if not brand_page_urls:
+        return kept
 
-    before = len(cur)
-    if drop_universal_externals:
-        after = filter_seeded_urls(cur, require_status=None, min_score=None, drop_universal_externals=True)
-        drops["dropped_external"] = before - len(after)
-        cur = after
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug("[url_seeder.prefilter] externals: %d -> %d (dropped=%d)",
-                      before, len(cur), drops["dropped_external"])
+    extras: List[Dict[str, Any]] = []
+    seen_existing = {it["url"] for it in kept}
 
-    if min_score is not None:
-        before = len(cur)
-        kept: List[Dict[str, Any]] = []
-        for it in cur:
-            s = float(it.get("dual_bm25") if score_field == "dual_bm25" else it.get("score") or 0.0)
-            if s >= float(min_score):
-                kept.append(it)
-        drops["dropped_score"] = before - len(kept)
-        cur = kept
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug("[url_seeder.prefilter] score('%s'>=%.3f): %d -> %d (dropped=%d)",
-                      score_field, float(min_score), before, len(cur), drops["dropped_score"])
+    for bp in _dedupe(brand_page_urls):
+        try:
+            brand_roots = await discover_brand_sites(bp)
+        except Exception as e:
+            log.debug("[url_seeder] brand_discovery (fallback) failed on %s: %s", bp, e)
+            brand_roots = []
 
-    if min_product_signal is not None and min_product_signal > 0:
-        before = len(cur)
-        kept: List[Dict[str, Any]] = []
-        dropped = 0
-        for it in cur:
-            if _product_signal_score(it) >= min_product_signal:
-                kept.append(it)
-            else:
-                dropped += 1
-        drops["dropped_product_signal"] = dropped
-        cur = kept
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug("[url_seeder.prefilter] product_signal(>=%.2f): %d -> %d (dropped=%d)",
-                      float(min_product_signal), before, len(cur), dropped)
+        for root in (brand_roots or []):
+            for v in _with_https_only(root):
+                # Guard: block dataset externals unless allowed
+                if should_block_external_for_dataset(preferred_root, v, allowed_brand_hosts=allowed_brand_hosts or set()):
+                    log.debug("[url_seeder] skip fallback brand root (dataset externals): %s", v)
+                    continue
+                if v in seen_existing:
+                    continue
+                rec = {
+                    "url": v,
+                    "seed_root": (preferred_root if same_registrable_domain(preferred_root, v) else v),
+                    "score": None,
+                    "source": "brand_discovery_root",
+                }
+                extras.append(rec)
+                seen_existing.add(v)
+                if company_id:
+                    try:
+                        upsert_url_index(company_id, v, status="seeded", score=None)
+                    except Exception:
+                        pass
+    if extras:
+        log.info("[url_seeder] (fallback) brand roots appended: %d", len(extras))
+        kept = kept + extras
+    return kept
 
-    return cur, drops
 
+# -------------------------
+# Seeding with SIMPLE fallback (+ final url_index with dataset-aware guards)
+# -------------------------
 async def seed_urls(
     base_url: str,
     *,
-    source: str = "cc",
     include: Optional[List[str]] = None,
     exclude: Optional[List[str]] = None,
     query: Optional[str] = None,
-    score_threshold: Optional[float] = None,
-    pattern: str = "*",
-    extract_head: bool = True,
-    live_check: bool = False,
-    max_urls: int = -1,
+    score_threshold: Optional[float] = 0.25,
     company_max_pages: int = -1,
-    concurrency: int = 10,
-    hits_per_sec: Optional[int] = 5,
-    force: bool = False,
-    verbose: bool = False,
-    drop_universal_externals: bool = True,
+    discover_brands: bool = True,
     lang_primary: str = "en",
     lang_accept_en_regions: Optional[set[str]] = None,
     lang_strict_cctld: bool = False,
-    discover_brands: bool = True,
-    auto_product_query: bool = True,
-    product_signal_threshold: Optional[float] = 0.3,
-    default_score_threshold_if_query: float = 0.25,
+    drop_universal_externals: bool = True,
     use_dual_bm25: bool = True,
     dual_alpha: float = 0.65,
+    company_id: Optional[str] = None,
+    company_name: str = "",
+    url_index_fallback: bool = True,
+    url_index_max_pages: int = 500,
+    url_index_max_depth: int = 3,
+    url_index_concurrency: int = 8,
+    externals_universe: Optional[ExternalsUniverse] = None,
+    **_ignore,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug(
-            "[url_seeder] begin base=%s src=%s query=%s thresh=%s auto_q=%s dual=%s alpha=%.2f extract_head=%s live=%s include=%d exclude=%d "
-            "max_urls=%d company_cap=%d lang_primary=%s en_regions=%s strict_cctld=%s",
-            base_url, source, (query[:64] + "…") if query and len(query) > 64 else query,
-            score_threshold, auto_product_query, use_dual_bm25, float(dual_alpha),
-            bool(extract_head), bool(live_check), len(include or []), len(exclude or []),
-            int(max_urls), int(company_max_pages), lang_primary, sorted(list(lang_accept_en_regions or set())),
-            bool(lang_strict_cctld),
-        )
 
-    base_variants = _with_scheme_variants(base_url)
-    if not base_variants:
-        return [], {
-            "discovered_total": 0,
-            "live_check_enabled": bool(live_check),
-            "filtered_total": 0,
-            "seed_roots": [],
-            "seed_brand_roots": [],
-            "seed_brand_count": 0,
-            "per_root_discovered": {},
-            "company_cap": company_max_pages if (company_max_pages and company_max_pages > 0) else None,
-            "company_cap_applied": False,
-            "seeding_source": source,
-            "auto_query_used": False,
-        }
+    # If an externals universe is provided, install its protections.
+    if externals_universe:
+        externals_universe.install()
+    allowed_brand_hosts = (externals_universe.allowed_brand_hosts if externals_universe else set())
 
-    preferred = base_variants[0]
-    if is_universal_external(preferred):
-        return [], {
-            "discovered_total": 0,
-            "live_check_enabled": bool(live_check),
-            "filtered_total": 0,
-            "seed_roots": base_variants,
-            "seed_brand_roots": [],
-            "seed_brand_count": 0,
-            "per_root_discovered": {},
-            "company_cap": company_max_pages if (company_max_pages and company_max_pages > 0) else None,
-            "company_cap_applied": False,
-            "seeding_source": source,
-            "auto_query_used": False,
-        }
+    include = include or DEFAULT_INCLUDE_PATTERNS
+    exclude = exclude or DEFAULT_EXCLUDE_PATTERNS
 
-    auto_query_used = False
-    eff_query = query
-    eff_threshold = score_threshold
-    if auto_product_query and not query:
-        eff_query = DEFAULT_PRODUCT_QUERY
-        auto_query_used = True
-        if eff_threshold is None:
-            eff_threshold = default_score_threshold_if_query
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug("[url_seeder] effective query: %s | eff_threshold=%s | auto_query_used=%s",
-                  (eff_query[:120] + "…") if eff_query and len(eff_query) > 120 else eff_query,
-                  eff_threshold, auto_query_used)
+    pos_q = query or lang_cfg.default_product_bm25_query()
+    neg_q = build_default_negative_query()
+    comb = DualBM25Combiner(_bm25_lite, DualBM25Config(alpha=float(dual_alpha))) if use_dual_bm25 else None
 
-    roots = await _collect_roots(preferred, discover_brands=discover_brands)
-    # Ensure the original scheme variants are also included at the front
-    for v in base_variants[::-1]:
-        if v not in roots:
-            roots.insert(0, v)
-
-    log.info("[url_seeder] Roots(%d) [live-check %s]: %s",
-             len(roots), "ON" if live_check else "OFF", ", ".join(roots))
-    
-    scoring_method = "bm25" if eff_query else None
-    base_cfg = SeedingConfig(
-        source=source,
-        pattern=pattern,
-        extract_head=extract_head,
-        live_check=live_check,
-        max_urls=max_urls,
-        concurrency=concurrency,
-        hits_per_sec=hits_per_sec,
-        force=force,
-        verbose=verbose,
-        query=eff_query,
-        scoring_method=scoring_method,
-        score_threshold=None if use_dual_bm25 else eff_threshold,
-        filter_nonsense_urls=True,
+    roots = await _collect_roots_https(
+        base_url,
+        discover_brands=discover_brands,
+        allowed_brand_hosts=allowed_brand_hosts,
     )
+    if not roots:
+        return [], {
+            "seed_roots": [],
+            "per_root_discovered": {},
+            "discovered_total": 0,
+            "kept_total": 0,
+            "filtered_total": 0,
+            "filtered_breakdown": {},
+            "seeding_source": "none",
+        }
+    preferred = roots[0]
+    log.info("[url_seeder] Roots(%d): %s", len(roots), ", ".join(roots))
 
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug("[url_seeder] base_cfg=%s", base_cfg)
+    # Track discovered URLs per canonical root (apex, no www) as sets
+    root_to_urls: Dict[str, Set[str]] = {}
+    raw_pairs: List[Tuple[str, str]] = []
+    used_fallback = False
 
-    grand_total = 0
-    cap_enabled = company_max_pages is not None and company_max_pages > 0
-    all_discovered: List[Dict[str, Any]] = []
+    # 1) Primary seeding on each root (homepage links, then sitemaps)
+    for r in roots:
+        c4_urls = await _discover_with_crawl4ai(r)
+        urls: List[str] = []
+        if c4_urls:
+            urls = _dedupe(c4_urls)
+        else:
+            log.info("[url_seeder] 0 URLs from Crawl4AI on %s → fallback to sitemap_hunter", r)
+            sm_urls = await _sitemap_fallback_all_variants(r, timeout_s=45.0)
+            used_fallback = used_fallback or bool(sm_urls)
+            urls = _dedupe(sm_urls or [])
 
-    async with AsyncUrlSeeder() as seeder:
-        for root in roots:
-            if cap_enabled and grand_total >= company_max_pages:
-                log.info("[url_seeder] Cap reached (cap=%d); stop before %s", company_max_pages, root)
-                break
+        if not urls:
+            continue
 
-            effective_max = base_cfg.max_urls
-            if cap_enabled:
-                remaining = company_max_pages - grand_total
-                if effective_max is None or effective_max < 0:
-                    effective_max = remaining
-                else:
-                    effective_max = max(0, min(effective_max, remaining))
+        root_key = _normalized_root_key(r)
+        bucket = root_to_urls.setdefault(root_key, set())
+        for u in urls:
+            bucket.add(u)
+            raw_pairs.append((u, r))
 
-            cfg = SeedingConfig(
-                source=base_cfg.source,
-                pattern=base_cfg.pattern,
-                extract_head=base_cfg.extract_head,
-                live_check=base_cfg.live_check,
-                max_urls=effective_max,
-                concurrency=base_cfg.concurrency,
-                hits_per_sec=base_cfg.hits_per_sec,
-                force=base_cfg.force,
-                verbose=base_cfg.verbose,
-                query=base_cfg.query,
-                scoring_method=base_cfg.scoring_method,
-                score_threshold=base_cfg.score_threshold,
-                filter_nonsense_urls=base_cfg.filter_nonsense_urls,
+    # 2) Brand-root discovery & seeding (PRE-FILTER)
+    if raw_pairs:
+        brand_page_urls: List[str] = []
+        for u, seed_root in raw_pairs:
+            if _looks_like_brand_page(u, seed_root):
+                brand_page_urls.append(u)
+        if brand_page_urls:
+            log.info("[url_seeder] brand pages detected=%d — discovering external brand roots", len(brand_page_urls))
+            brand_roots_set: Set[str] = set()
+
+            async def _discover_from_page(bp: str) -> List[str]:
+                try:
+                    return await discover_brand_sites(bp)
+                except Exception as e:
+                    log.debug("[url_seeder] discover_brand_sites failed on %s: %s", bp, e)
+                    return []
+
+            discovered_lists = await asyncio.gather(*(_discover_from_page(bp) for bp in _dedupe(brand_page_urls)))
+            for lst in discovered_lists:
+                for root in (lst or []):
+                    for v in _with_https_only(root):
+                        # Guard with dataset externals policy here too
+                        if should_block_external_for_dataset(preferred, v, allowed_brand_hosts=allowed_brand_hosts):
+                            log.debug("[url_seeder] skip discovered brand root (dataset externals): %s", v)
+                            continue
+                        brand_roots_set.add(v)
+
+            if brand_roots_set:
+                log.info("[url_seeder] unique brand roots discovered=%d — seeding them", len(brand_roots_set))
+                seeded_map = await _seed_brand_roots(
+                    sorted(brand_roots_set),
+                    preferred_root=preferred,
+                    allowed_brand_hosts=allowed_brand_hosts,
+                )
+                for root, urls in seeded_map.items():
+                    if not urls:
+                        continue
+                    root_key = _normalized_root_key(root)
+                    bucket = root_to_urls.setdefault(root_key, set())
+                    for u in urls:
+                        bucket.add(u)
+                        raw_pairs.append((u, root))
+                log.info("[url_seeder] brand-root seeding appended urls=%d", sum(len(v) for v in seeded_map.values()))
+
+    # --- FINAL FALLBACK: url_index (dataset aware) ---
+    total_discovered = sum(len(v) for v in root_to_urls.values())
+    if total_discovered == 0 and url_index_fallback:
+        log.info("[url_seeder] discovery empty → final fallback to url_index")
+        try:
+            idx_res = await discover_and_write_url_index(
+                company_id=company_id or (urlparse(preferred).hostname or "unknown"),
+                company_name=company_name or "",
+                base_url=preferred,
+                include=include,
+                exclude=exclude,
+                lang_primary=lang_primary,
+                accept_en_regions=lang_accept_en_regions,
+                strict_cctld=lang_strict_cctld,
+                drop_universal_externals=drop_universal_externals,
+                max_pages=int(url_index_max_pages),
+                max_depth=int(url_index_max_depth),
+                per_host_page_cap=max(50, url_index_max_pages),
+                dual_alpha=float(dual_alpha),
+                pos_query=pos_q,
+                neg_query=neg_q,
+                score_threshold=score_threshold,
+                score_threshold_on_seeds=True,
+                concurrency=int(url_index_concurrency),
+            )
+            idx_urls: List[Dict[str, Any]] = idx_res.get("urls", []) or []
+
+            kept = []
+            seen_k: Set[str] = set()
+            for it in idx_urls:
+                u = str(it.get("url") or "").strip()
+                if not u or u in seen_k:
+                    continue
+                seen_k.add(u)
+                seed_root = it.get("seed_root") or (preferred if same_registrable_domain(preferred, u) else u)
+                kept.append({
+                    "url": u,
+                    "seed_root": seed_root,
+                    "score": it.get("score"),
+                })
+
+            kept = await _expand_with_brand_pages_simple(
+                kept,
+                preferred_root=preferred,
+                company_id=company_id,
+                allowed_brand_hosts=allowed_brand_hosts,
             )
 
-            if log.isEnabledFor(logging.DEBUG):
-                log.debug("[url_seeder] seeding %s with cfg=%s", root, cfg)
+            if company_max_pages and company_max_pages > 0 and len(kept) > company_max_pages:
+                trimmed = kept[company_max_pages:]
+                kept = kept[:company_max_pages]
+                if company_id:
+                    for it in trimmed:
+                        try:
+                            upsert_url_index(company_id, it["url"], status="filtered_company_cap", score=it.get("score"))
+                        except Exception:
+                            pass
 
-            try:
-                raw = await seeder.urls(root, cfg)
-                for r in raw:
-                    r.setdefault("seed_root", root)
-                    # Ensure downstream filters always have "url"
-                    u = str(r.get("final_url") or r.get("url") or "").strip()
-                    if u:
-                        r["url"] = u
-                all_discovered.extend(raw)
-                grand_total += len(raw)
-                log.info("[url_seeder] %s -> %d URL(s); total=%d", root, len(raw), grand_total)
+            meta = idx_res.get("meta", {}) or {}
+            idx_stats = dict(meta.get("stats", {}))
+            idx_metrics = dict(meta.get("seeding_metrics", {}))
 
-                if log.isEnabledFor(logging.DEBUG) and raw:
-                    sample = raw[:_DEBUG_SAMPLE_TOP]
-                    log.debug("[url_seeder]   sample(%d) first=%s", len(sample),
-                              [ (str(x.get("status") or "?"), round(float(x.get("score") or 0.0), 4), x.get("final_url") or x.get("url"))
-                                for x in sample ])
-            except Exception as e:
-                log.exception("[url_seeder] Seeding failed for %s: %s", root, e)
+            root_key = _normalized_root_key(preferred)
+            per_root_discovered = {
+                root_key: idx_stats.get("total_urls", len(idx_urls))
+            }
 
-            if cap_enabled and grand_total >= company_max_pages:
-                log.info("[url_seeder] Cap reached after %s (cap=%d)", root, company_max_pages)
-                break
+            stats = {
+                "seed_roots": meta.get("seed_roots", [preferred]),
+                "per_root_discovered": per_root_discovered,
+                "discovered_total": idx_stats.get("total_urls", len(idx_urls)),
+                "kept_total": len(kept),
+                "filtered_total": idx_metrics.get("filtered_total", 0),
+                "filtered_breakdown": idx_metrics.get("filtered_breakdown", {}),
+                "dual_used": bool(use_dual_bm25),
+                "dual_alpha": float(dual_alpha) if use_dual_bm25 else None,
+                "pos_query_used": bool(pos_q),
+                "seeding_source": "url_index",
+            }
+            return kept, stats
 
-    all_discovered = _dedupe_seeded(all_discovered)
-    per_root, unique_roots = _aggregate_roots(all_discovered)
-    brand_roots = [r for r in unique_roots if not _same_netloc(r, preferred)]
+        except Exception as e:
+            log.debug("[url_seeder] url_index fallback failed: %s", e)
 
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug("[url_seeder] discovered_total=%d (unique after dedupe)", len(all_discovered))
-        if all_discovered:
-            log.debug("[url_seeder] discovered sample=%s",
-                      [(x.get("final_url") or x.get("url")) for x in all_discovered[:_DEBUG_SAMPLE_TOP]])
+    # ---- Normal path: dedupe → score → filter → (company cap)
+    seen: Set[str] = set()
+    merged: List[Tuple[str, str]] = []
+    for u, root in raw_pairs:
+        if u not in seen:
+            seen.add(u)
+            merged.append((u, root))
 
-    if not all_discovered:
-        return [], {
-            "discovered_total": 0,
-            "live_check_enabled": bool(live_check),
-            "prefilter_kept": 0,
-            "prefilter_dropped_status": 0,
-            "prefilter_dropped_external": 0,
-            "prefilter_dropped_score": 0,
-            "prefilter_dropped_product_signal": 0,
-            "filtered_total": 0,
-            "filtered_dropped_patterns_lang": 0,
-            "seed_roots": unique_roots or base_variants,
-            "seed_brand_roots": brand_roots,
-            "seed_brand_count": len(brand_roots),
-            "per_root_discovered": per_root,
-            "company_cap": company_max_pages if (company_max_pages and company_max_pages > 0) else None,
-            "company_cap_applied": False,
-            "seeding_source": source,
-            "auto_query_used": auto_query_used,
-            "dual_used": bool(use_dual_bm25),
-        }
+    filtered_breakdown: Dict[str, int] = {}
+    kept: List[Dict[str, Any]] = []
+    thr = float(score_threshold) if score_threshold is not None else None
 
-    if use_dual_bm25:
-        _compute_dual_scores(all_discovered, pos_query=eff_query, alpha=float(dual_alpha))
-        if log.isEnabledFor(logging.DEBUG):
-            scores = [float(it.get("dual_bm25") or 0.0) for it in all_discovered]
-            if scores:
-                mn = min(scores); mx = max(scores); avg = sum(scores) / len(scores)
-                log.debug("[url_seeder.dual] alpha=%.2f n=%d min=%.4f avg=%.4f max=%.4f",
-                          float(dual_alpha), len(scores), mn, avg, mx)
+    for u, seed_root in merged:
+        s = _dual_score(u, comb, pos_q, neg_q) if comb else _bm25_lite(u, pos_q or "")
+        if thr is not None and s < thr:
+            filtered_breakdown["score_below_threshold"] = filtered_breakdown.get("score_below_threshold", 0) + 1
+            if company_id:
                 try:
-                    ranked = sorted(all_discovered, key=lambda x: float(x.get("dual_bm25") or 0.0), reverse=True)
-                    top = [ (round(float(x.get("dual_bm25") or 0.0), 4), x.get("final_url") or x.get("url")) for x in ranked[:_DEBUG_SAMPLE_TOP] ]
-                    bot = [ (round(float(x.get("dual_bm25") or 0.0), 4), x.get("final_url") or x.get("url")) for x in ranked[-_DEBUG_SAMPLE_BOTTOM:] ]
-                    log.debug("[url_seeder.dual] top=%s", top)
-                    log.debug("[url_seeder.dual] bottom=%s", bot)
+                    upsert_url_index(company_id, u, status="filtered_score_below_threshold", score=s)
+                except Exception:
+                    pass
+            continue
+        kept.append({"url": u, "seed_root": seed_root, "score": s})
+        if company_id:
+            try:
+                upsert_url_index(company_id, u, status="queued", score=s)
+            except Exception:
+                pass
+
+    if kept:
+        pre = [{"url": it["url"], "score_hint": it["score"]} for it in kept]
+        kept_sorted, dropped = apply_url_filters(
+            pre,
+            include=include,
+            exclude=exclude,
+            drop_universal_externals=drop_universal_externals,
+            lang_primary=lang_primary,
+            lang_accept_en_regions=lang_accept_en_regions,
+            lang_strict_cctld=lang_strict_cctld,
+            include_overrides_language=False,
+            sort_by_priority=True,
+            base_url=preferred,
+            return_reasons=True,
+        )  # type: ignore
+
+        if dropped:
+            for d in (dropped or []):
+                reason = d.get("reason") or "unknown"
+                u = d.get("url")
+                filtered_breakdown[reason] = filtered_breakdown.get(reason, 0) + 1
+                if company_id and u:
+                    try:
+                        upsert_url_index(company_id, u, status=f"filtered_{reason}", score=None)
+                    except Exception:
+                        pass
+
+        kmap = {it["url"]: it for it in kept}
+        kept = []
+        for k in kept_sorted:
+            u = k["url"]
+            src = kmap.get(u) or {"score": k.get("score_hint", 0.0)}
+            seed_root = preferred if same_registrable_domain(preferred, u) else u
+            kept.append({"url": u, "seed_root": seed_root, "score": float(src.get("score", 0.0))})
+
+    if company_max_pages and company_max_pages > 0 and len(kept) > company_max_pages:
+        trimmed = kept[company_max_pages:]
+        kept = kept[:company_max_pages]
+        filtered_breakdown["company_cap"] = filtered_breakdown.get("company_cap", 0) + len(trimmed)
+        if company_id:
+            for it in trimmed:
+                try:
+                    upsert_url_index(company_id, it["url"], status="filtered_company_cap", score=it.get("score"))
                 except Exception:
                     pass
 
-    prefiltered, drop_counts = _prefilter_stepwise(
-        all_discovered,
-        live_check=live_check,
-        min_score=eff_threshold,
-        score_field="dual_bm25" if use_dual_bm25 else "seeder_score",
-        drop_universal_externals=drop_universal_externals,
-        min_product_signal=(product_signal_threshold if extract_head else None),
-    )
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug("[url_seeder.prefilter] kept=%d drops=%s", len(prefiltered), drop_counts)
-
-    filtered = apply_url_filters(
-        prefiltered,
-        include=include or DEFAULT_INCLUDE_PATTERNS,
-        exclude=exclude or DEFAULT_EXCLUDE_PATTERNS,
-        drop_universal_externals=drop_universal_externals,
-        lang_primary=lang_primary,
-        lang_accept_en_regions=lang_accept_en_regions,
-        lang_strict_cctld=lang_strict_cctld,
-        include_overrides_language=False,
-        sort_by_priority=True,
-    )
-    patterns_lang_dropped = len(prefiltered) - len(filtered)
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug("[url_seeder.filters] patterns/lang dropped=%d (from %d → %d)",
-                  patterns_lang_dropped, len(prefiltered), len(filtered))
-        if filtered:
-            log.debug("[url_seeder.filters] kept sample=%s",
-                      [(x.get("final_url") or x.get("url")) for x in filtered[:_DEBUG_SAMPLE_TOP]])
-
-    cap_applied = False
-    if company_max_pages is not None and company_max_pages > 0 and len(filtered) > company_max_pages:
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug("[url_seeder.cap] applying company cap %d on %d items", company_max_pages, len(filtered))
-        filtered = filtered[:company_max_pages]; cap_applied = True
+    # Build per_root_counts from normalized root_to_urls
+    per_root_counts: Dict[str, int] = {
+        root_key: len(urls) for root_key, urls in sorted(root_to_urls.items(), key=lambda kv: kv[0])
+    }
 
     stats = {
-        "discovered_total": len(all_discovered),
-        "live_check_enabled": bool(live_check),
-        "prefilter_kept": len(prefiltered),
-        "prefilter_dropped_status": int(drop_counts.get("dropped_status", 0)),
-        "prefilter_dropped_external": int(drop_counts.get("dropped_external", 0)),
-        "prefilter_dropped_score": int(drop_counts.get("dropped_score", 0)),
-        "prefilter_dropped_product_signal": int(drop_counts.get("dropped_product_signal", 0)),
-        "filtered_total": len(filtered),
-        "filtered_dropped_patterns_lang": patterns_lang_dropped,
-        "seed_roots": unique_roots,
-        "seed_brand_roots": brand_roots,
-        "seed_brand_count": len(brand_roots),
-        "per_root_discovered": per_root,
-        "company_cap": company_max_pages if (company_max_pages and company_max_pages > 0) else None,
-        "company_cap_applied": cap_applied,
-        "seeding_source": source,
-        "auto_query_used": auto_query_used,
+        "seed_roots": roots,
+        "per_root_discovered": per_root_counts,
+        "discovered_total": sum(per_root_counts.values()),
+        "kept_total": len(kept),
+        "filtered_total": sum(filtered_breakdown.values()),
+        "filtered_breakdown": filtered_breakdown,
         "dual_used": bool(use_dual_bm25),
         "dual_alpha": float(dual_alpha) if use_dual_bm25 else None,
+        "pos_query_used": bool(pos_q),
+        "seeding_source": ("crawl4ai+fallback_sitemaps" if used_fallback else "crawl4ai"),
     }
-    return filtered, stats
-
-# ---------------------------------------------------------------------------
-# Crawl seeded (Markdown stage uses interaction + AUTO JS-only retry on retry/suppress)
-# ---------------------------------------------------------------------------
-
-async def crawl_seeded(
-    seeded_urls: Iterable[Dict[str, Any]],
-    *,
-    stage: str,
-    max_concurrency: int = 10,
-) -> List[Any]:
-    urls = [str(u.get("final_url") or u.get("url") or "").strip() for u in seeded_urls]
-    urls = [u for u in urls if u]
-    if not urls:
-        return []
-
-    # For LLM stage we can keep old batch behavior
-    if stage != "markdown":
-        run_cfg = _stage_run_config(stage)
-        dispatcher = _make_dispatcher(max_concurrency)
-        results: List[Any] = []
-        async with AsyncWebCrawler(config=browser_cfg) as crawler:
-            try:
-                res = await crawler.arun_many(urls=urls, config=run_cfg, dispatcher=dispatcher)
-                if hasattr(res, "__aiter__"):
-                    async for r in res:
-                        results.append(r)
-                else:
-                    if isinstance(res, list):
-                        results.extend(res)
-                    elif res is not None:
-                        results.append(res)
-            except Exception as e:
-                log.exception("[url_seeder] Crawler stream error: %s", e)
-        return results
-
-    # Markdown stage uses interactive plan + quality gate
-    policy = PageInteractionPolicy(
-        enable_cookie_playbook=True,
-        max_in_session_retries=1,
-        virtual_scroll=False,  # keep conservative by default; can be enabled by caller if desired
-    )
-    md_gen = build_default_md_generator()
-
-    sem = asyncio.Semaphore(max_concurrency)
-    out_results: List[Any] = []
-
-    async with AsyncWebCrawler(config=browser_cfg) as crawler:
-        async def _one(url: str):
-            async with sem:
-                try:
-                    init_cfg, retry_cfgs = make_interaction_plan(url, policy)
-                    # attach md generator
-                    init_cfg.markdown_generator = md_gen
-                    for rc in retry_cfgs:
-                        rc.markdown_generator = md_gen
-
-                    # initial
-                    r = await crawler.arun(url=url, config=init_cfg)
-                    if not getattr(r, "success", False):
-                        out_results.append(r)
-                        return
-
-                    md_obj = getattr(r, "markdown", None)
-                    text = (getattr(md_obj, "fit_markdown", None) or "").strip()
-                    action, reason, _stats = evaluate_markdown(
-                        text, url=url, allow_retry=True, generator_ignores_links=True
-                    )
-
-                    # If gate suggests a retry OR suppressed due to cookie-dominant content,
-                    # run a JS-only retry pass (if available) to try to remove cookie overlays.
-                    if action in ("retry", "suppress") and retry_cfgs:
-                        try:
-                            rr = await crawler.arun(url=url, config=retry_cfgs[0])
-                            out_results.append(rr)
-                            metrics.incr("seeder.interaction.retry_used", reason=reason)
-                            return
-                        except Exception as e:
-                            log.exception("[url_seeder] retry pass failed for %s: %s", url, e)
-                            # fall-through to append original result
-                    out_results.append(r)
-                except Exception as e:
-                    log.warning("[url_seeder] interaction error for %s: %s", url, e)
-
-        tasks = [asyncio.create_task(_one(u)) for u in urls]
-        await asyncio.gather(*tasks, return_exceptions=False)
-
-    return out_results
-
-# ---------------------------------------------------------------------------
-# Deep crawl fallback + discover_and_crawl
-# ---------------------------------------------------------------------------
-
-async def deep_crawl_fallback(
-    base_url: str,
-    *,
-    stage: str,
-    max_concurrency: int = 6,
-    keywords: Optional[List[str]] = None,
-    max_depth: int = 2,
-    max_pages: int = 200,
-    company_max_pages: int = -1,
-) -> List[Any]:
-    variants = _with_scheme_variants(base_url)
-    start_url = variants[0] if variants else base_url
-    if is_universal_external(start_url):
-        return []
-    effective_max_pages = min(max_pages, company_max_pages) if (company_max_pages and company_max_pages > 0) else max_pages
-    host = (urlparse(start_url).hostname or "").lower()
-    scorer = make_keyword_scorer(keywords or [], weight=0.7)
-    filter_chain = make_basic_filter_chain(
-        allowed_domains=_domain_variants(host),
-        patterns=None,
-        content_types=["text/html"],
-    )
-    run_cfg = _stage_run_config(stage)
-    run_cfg.deep_crawl_strategy = BestFirstCrawlingStrategy(  # type: ignore[attr-defined]
-        max_depth=max_depth,
-        include_external=False,
-        url_scorer=scorer,
-        filter_chain=filter_chain,
-        max_pages=effective_max_pages,
-    )
-    dispatcher = _make_dispatcher(max_concurrency)
-    results: List[Any] = []
-    async with AsyncWebCrawler(config=browser_cfg) as crawler:
-        res = await crawler.arun(start_url, config=run_cfg, dispatcher=dispatcher)
-        if hasattr(res, "__aiter__"):
-            async for r in res:
-                results.append(r)
-        else:
-            if isinstance(res, list):
-                results.extend(res)
-            elif res is not None:
-                results.append(res)
-    return results
-
-async def discover_and_crawl(
-    base_url: str,
-    *,
-    stage: str,
-    max_concurrency: int = 10,
-    seeding_source: str = "cc",
-    include: Optional[List[str]] = None,
-    exclude: Optional[List[str]] = None,
-    query: Optional[str] = None,
-    score_threshold: Optional[float] = None,
-    pattern: str = "*",
-    extract_head: bool = False,
-    live_check: bool = False,
-    max_urls: int = -1,
-    company_max_pages: int = -1,
-    concurrency: int = 10,
-    hits_per_sec: Optional[int] = 5,
-    force: bool = False,
-    verbose: bool = False,
-    drop_universal_externals: bool = True,
-    lang_primary: str = "en",
-    lang_accept_en_regions: Optional[set[str]] = None,
-    lang_strict_cctld: bool = False,
-    fallback_keywords: Optional[List[str]] = None,
-    discover_brands: bool = True,
-    auto_product_query: bool = True,
-    product_signal_threshold: Optional[float] = 0.3,
-    default_score_threshold_if_query: float = 0.25,
-    use_dual_bm25: bool = True,
-    dual_alpha: float = 0.65,
-) -> List[Any]:
-    filtered, _ = await seed_urls(
-        base_url,
-        source=seeding_source,
-        include=include,
-        exclude=exclude,
-        query=query,
-        score_threshold=score_threshold,
-        pattern=pattern,
-        extract_head=extract_head,
-        live_check=live_check,
-        max_urls=max_urls,
-        company_max_pages=company_max_pages,
-        concurrency=concurrency,
-        hits_per_sec=hits_per_sec,
-        force=force,
-        verbose=verbose,
-        drop_universal_externals=drop_universal_externals,
-        lang_primary=lang_primary,
-        lang_accept_en_regions=lang_accept_en_regions,
-        lang_strict_cctld=lang_strict_cctld,
-        discover_brands=discover_brands,
-        auto_product_query=auto_product_query,
-        product_signal_threshold=product_signal_threshold,
-        default_score_threshold_if_query=default_score_threshold_if_query,
-        use_dual_bm25=use_dual_bm25,
-        dual_alpha=dual_alpha,
-    )
-
-    if not filtered:
-        log.info("[url_seeder] No seeds → deep-crawl fallback")
-        return await deep_crawl_fallback(
-            base_url,
-            stage=stage,
-            max_concurrency=max_concurrency,
-            keywords=fallback_keywords or [],
-            company_max_pages=company_max_pages,
-        )
-
-    log.info("[url_seeder] Crawling %d seeded URLs", len(filtered))
-    return await crawl_seeded(filtered, stage=stage, max_concurrency=max_concurrency)
+    return kept, stats

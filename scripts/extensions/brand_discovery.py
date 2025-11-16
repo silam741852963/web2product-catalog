@@ -8,7 +8,7 @@ from urllib.parse import urlparse, urljoin
 
 import httpx
 
-from extensions.filtering import is_universal_external
+from extensions.filtering import is_universal_external, should_block_external_for_dataset
 
 logger = logging.getLogger("extensions.brand_discovery")
 
@@ -125,7 +125,7 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
      - Bucket by root (scheme://host), cap per-host, and score
      - Return list of candidate roots
 
-    This function intentionally avoids heavy browser tooling and uses minimal resources.
+    Dataset externals are blocked here via `should_block_external_for_dataset` to avoid cross-company contamination.
     """
     logger.info("[brand_discovery] start base_url=%s", base_url)
 
@@ -149,10 +149,7 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
                 logger.info("[brand_discovery] empty html for %s", base_url)
                 return []
 
-            # Extract hrefs (quick and dirty). We intentionally avoid full HTML parsing
-            # to keep CPU and memory minimal.
             hrefs = _HREF_RE.findall(html)
-            # hrefs is list of tuples (group1, group2) - pick whichever matched
             for a, b in hrefs[:BRAND_MAX_ANCHORS_SCAN]:
                 anchors_list.append(a or b)
 
@@ -160,7 +157,6 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
         logger.warning("[brand_discovery] httpx client error base_url=%s err=%s", base_url, e)
         return []
 
-    # Normalize final_url host
     base_host = _host(final_url) or _host(base_url)
     if BRAND_LOG_ANCHORS:
         for idx, h in enumerate(anchors_list[:BRAND_MAX_ANCHORS_SCAN]):
@@ -169,7 +165,7 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
     # 1) Resolve & de-duplicate anchors, and apply first-pass filters
     seen: set[str] = set()
     kept_urls: List[str] = []
-    drop_same_host = drop_neg = drop_social = drop_noisy = non_http = 0
+    drop_same_host = drop_neg = drop_social = drop_noisy = non_http = drop_dataset = 0
 
     for raw in anchors_list[:BRAND_MAX_ANCHORS_SCAN]:
         abs_url = _resolve_href(final_url, raw)
@@ -186,12 +182,19 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
             logger.debug("[brand_discovery.skip] href=%s reason=same_host", abs_url)
             continue
 
+        # Block dataset externals immediately
+        if should_block_external_for_dataset(final_url, abs_url):
+            drop_dataset += 1
+            logger.debug("[brand_discovery.skip] href=%s reason=dataset_external_block", abs_url)
+            continue
+
         neg_hit, neg_tok = _has_neg_path_token(abs_url)
         if neg_hit:
             drop_neg += 1
             logger.debug("[brand_discovery.skip] href=%s reason=neg_path token=%s", abs_url, neg_tok)
             continue
 
+        # Universal external (runtime-demoted set is honored inside is_universal_external)
         if is_universal_external(abs_url):
             drop_social += 1
             logger.debug("[brand_discovery.skip] href=%s reason=universal_external", abs_url)
@@ -206,15 +209,15 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
         kept_urls.append(abs_url)
 
     logger.debug(
-        "[brand_discovery] keep/drop summary: total=%d, non_http=%d, drop_same_host=%d, drop_neg=%d, drop_social=%d, drop_noisy_subdomain=%d, kept=%d",
-        len(anchors_list[:BRAND_MAX_ANCHORS_SCAN]), non_http, drop_same_host, drop_neg, drop_social, drop_noisy, len(kept_urls),
+        "[brand_discovery] keep/drop summary: total=%d, non_http=%d, drop_same_host=%d, drop_neg=%d, drop_social=%d, drop_noisy_subdomain=%d, drop_dataset=%d, kept=%d",
+        len(anchors_list[:BRAND_MAX_ANCHORS_SCAN]), non_http, drop_same_host, drop_neg, drop_social, drop_noisy, drop_dataset, len(kept_urls),
     )
 
     if not kept_urls:
         logger.info("[brand_discovery] discovered 0 candidate brand roots on %s", base_url)
         return []
 
-    # 2) Bucket by ROOT, cap per host (BRAND_MAX_PER_HOST), and score
+    # 2) Bucket by ROOT, cap per host, and score
     buckets: Dict[str, List[str]] = {}
     for u in kept_urls:
         root = _root(u)
@@ -227,14 +230,12 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
     candidates: List[Candidate] = []
     for root, urls in buckets.items():
         anchors_count = len(urls)
-        # Simple monotone scoring; weight by the number of distinct anchors pointing to the same root
         score = min(1.0, 0.2 + 0.1 * anchors_count)
         candidates.append(Candidate(root=root, score=score, examples=urls[:5], anchors_count=anchors_count))
 
-    # Sort by score, anchors_count
     candidates.sort(key=lambda c: (c.score, c.anchors_count), reverse=True)
 
-    for i, c in enumerate(candidates[:10]):  # debug few
+    for i, c in enumerate(candidates[:10]):
         logger.debug("[brand_discovery] candidate[%02d] root=%s score=%.3f anchors=%d examples=%d", i, c.root, c.score, c.anchors_count, len(c.examples))
         if BRAND_LOG_ANCHORS:
             for ex in c.examples:

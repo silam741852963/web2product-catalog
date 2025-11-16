@@ -31,6 +31,11 @@ __all__ = [
     "is_universal_external",
     "same_registrable_domain",
     "classify_external",
+    # NEW: dataset externals & runtime adjustments
+    "set_dataset_externals",
+    "is_in_dataset_externals",
+    "set_universal_external_runtime_exclusions",
+    "should_block_external_for_dataset",
     # language
     "is_non_english_url",
     "should_drop_for_language",
@@ -128,7 +133,7 @@ UNIVERSAL_EXTERNALS: set[str] = {
     "storage.googleapis.com", "ajax.googleapis.com", "s1.wp.com", "s2.wp.com",
     "kit.fontawesome.com", "cdn-cookieyes.com", "cdn.relay", "fonts.bunny.net",
     "dt-cdn.net", "dtcdn.net", "cdn.dynamicyield.com", "dynamicyield.com",
-    "maxcdn.bootstrapcdn.com",
+    "maxcdn.bootstrapcdn.com", "c0.wp.com", "gmpg.org", "stats.wp.com", "wp.me",
 
     # --- Ad/marketing/monitoring vendors (observed) ---
     "criteo.com", "gum.criteo.com", "static.criteo.net", "sslwidget.criteo.com",
@@ -167,81 +172,18 @@ FUNCTIONAL_SUBDOMAIN_PREFIXES: tuple[str, ...] = (
     "news", "press", "media",
 )
 
-# =============================================================================
-# Robust pattern matching (glob-to-regex + native regex)
-# =============================================================================
+# Multi-label public suffixes (for eTLD+1 registrable domain logic)
+_MULTI_LABEL_PUBLIC_SUFFIXES: set[str] = {
+    "co.uk", "org.uk", "ac.uk",
+    "com.au", "net.au", "org.au",
+    "co.jp", "ne.jp", "or.jp",
+    "com.cn", "com.sg", "com.br",
+}
 
-REGEX_PREFIX = ("re:", "regex:")
+# --- NEW: runtime overrides ---------------------------------------------------
+_DATASET_HOSTS_RD: Optional[set[str]] = None      # registrable domains from the externals list
+_UNIVERSAL_RUNTIME: Optional[set[str]] = None     # UNIVERSAL_EXTERNALS adjusted at runtime
 
-@lru_cache(maxsize=4096)
-def _compile_one(pattern: str) -> re.Pattern:
-    p = (pattern or "").strip()
-    if not p:
-        return re.compile(r"^$")  # never matches
-    lower = p.lower()
-    for prefix in REGEX_PREFIX:
-        if lower.startswith(prefix):
-            body = p[len(prefix):].strip()
-            try:
-                return re.compile(body, re.IGNORECASE)
-            except re.error as e:
-                logger.warning("Invalid regex pattern '%s': %s. Falling back to no-op.", p, e)
-                return re.compile(r"^$")
-    try:
-        return re.compile(fnmatch.translate(p), re.IGNORECASE)
-    except re.error as e:
-        logger.warning("Failed to compile glob '%s': %s. Falling back to literal-safe regex.", p, e)
-        return re.compile(re.escape(p), re.IGNORECASE)
-
-def _compile_many(patterns: List[str]) -> List[re.Pattern]:
-    return [_compile_one(p) for p in (patterns or []) if p and p.strip()]
-
-def _url_for_match(url: str) -> str:
-    return (url or "").strip()
-
-def _match_any(url: str, patterns: List[str]) -> bool:
-    if not patterns:
-        return False
-    s = _url_for_match(url)
-    for rx in _compile_many(patterns):
-        if rx.search(s):
-            return True
-    return False
-
-def _count_hits(url: str, patterns: List[str]) -> int:
-    if not patterns:
-        return 0
-    s = _url_for_match(url)
-    c = 0
-    for rx in _compile_many(patterns):
-        if rx.search(s):
-            c += 1
-    return c
-
-# --- SMART INCLUDE TOKENS ----------------------------------------------------
-SMART_INCLUDE_TOKENS: tuple[str, ...] = tuple(lang_cfg.get("SMART_INCLUDE_TOKENS"))
-SMART_TOKEN_RX_CACHE: Dict[str, re.Pattern] = {}
-
-def _token_rx(tok: str) -> re.Pattern:
-    rx = SMART_TOKEN_RX_CACHE.get(tok)
-    if rx is None:
-        rx = re.compile(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", re.IGNORECASE)
-        SMART_TOKEN_RX_CACHE[tok] = rx
-    return rx
-
-def _smart_include_hit(url: str) -> bool:
-    try:
-        p = urlparse(url).path or "/"
-    except Exception:
-        p = url or ""
-    for tok in SMART_INCLUDE_TOKENS:
-        if _token_rx(tok).search(p):
-            return True
-    return False
-
-# =============================================================================
-# Helpers
-# =============================================================================
 
 def _hostname(url_or_host: Any) -> str:
     try:
@@ -264,10 +206,201 @@ def _hostname(url_or_host: Any) -> str:
     except Exception:
         return ""
 
+
+def _host_labels(host: str) -> list[str]:
+    return (host or "").lower().strip(".").split(".") if host else []
+
+
+def _registrable_domain(host: str) -> str:
+    """
+    Lightweight eTLD+1: return the registrable apex (example.co.uk, example.com, etc.).
+    Handles common multi-label public suffixes.
+    """
+    h = (host or "").lower().strip(".")
+    if not h:
+        return ""
+    labels = _host_labels(h)
+    if len(labels) < 2:
+        return h
+    last2 = ".".join(labels[-2:])              # e.g. example.com OR co.uk
+    last3 = ".".join(labels[-3:]) if len(labels) >= 3 else ""  # e.g. example.co.uk
+    # If hostname ends with a 2-label public suffix (co.uk, co.jp, ...),
+    # registrable domain is the last 3 labels; otherwise last 2.
+    if last2 in _MULTI_LABEL_PUBLIC_SUFFIXES and last3:
+        return last3
+    return last2
+
+
+def set_dataset_externals(hosts_or_domains: Optional[Iterable[str]]) -> None:
+    """
+    Register the externals list (as registrable domains preferred).
+    Call with a set of domains (or hosts) from your full dataset.
+    """
+    global _DATASET_HOSTS_RD
+    rd: set[str] = set()
+    for s in (hosts_or_domains or []):
+        h = _hostname(s)
+        if not h:
+            continue
+        r = _registrable_domain(h)
+        if r:
+            rd.add(r)
+    _DATASET_HOSTS_RD = rd
+    if logger.isEnabledFor(logging.INFO):
+        logger.info("[filtering] dataset externals registered: %d registrable domains", len(_DATASET_HOSTS_RD))
+
+
+def is_in_dataset_externals(url_or_host: Any) -> bool:
+    rd = _DATASET_HOSTS_RD
+    if not rd:
+        return False
+    h = _hostname(url_or_host)
+    if not h:
+        return False
+    r = _registrable_domain(h)
+    if not r:
+        return False
+    return r in rd
+
+
+def set_universal_external_runtime_exclusions(hosts_or_domains: Optional[Iterable[str]]) -> None:
+    """
+    Demote/remove entries from UNIVERSAL_EXTERNALS that are also present
+    in the externals dataset (exact registrable-domain overlap only).
+    """
+    global _UNIVERSAL_RUNTIME
+    if not hosts_or_domains:
+        _UNIVERSAL_RUNTIME = None
+        return
+    rd: set[str] = set()
+    for s in hosts_or_domains:
+        h = _hostname(s)
+        if not h:
+            continue
+        r = _registrable_domain(h)
+        if r:
+            rd.add(r)
+    base = set(UNIVERSAL_EXTERNALS)
+    removed = {u for u in base if u in rd}
+    _UNIVERSAL_RUNTIME = base - removed
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "[filtering] UNIVERSAL externals demoted: removed=%d kept=%d",
+            len(removed), len(_UNIVERSAL_RUNTIME or base)
+        )
+
+
+def should_block_external_for_dataset(
+    base_url: str,
+    candidate_url: str,
+    allowed_brand_hosts: Optional[set[str]] = None,
+) -> bool:
+    """
+    Return True iff candidate_url is an EXTERNAL whose registrable domain is in the
+    dataset externals list, and is NOT explicitly whitelisted as a brand host.
+    Use this in brand discovery and url_index when following externals.
+    """
+    allowed = set(allowed_brand_hosts or ())
+    kind = classify_external(base_url, candidate_url, allowed_brand_hosts=allowed)
+    if kind != "external":
+        return False
+    if not _DATASET_HOSTS_RD:
+        return False
+    host = (urlparse(candidate_url).hostname or "").lower()
+    rd = _registrable_domain(host)
+    if not rd:
+        return False
+    return rd in _DATASET_HOSTS_RD
+
+# =============================================================================
+# Robust pattern matching (glob-to-regex + native regex)
+# =============================================================================
+
+REGEX_PREFIX = ("re:", "regex:")
+
+
+@lru_cache(maxsize=4096)
+def _compile_one(pattern: str) -> re.Pattern:
+    p = (pattern or "").strip()
+    if not p:
+        return re.compile(r"^$")  # never matches
+    lower = p.lower()
+    for prefix in REGEX_PREFIX:
+        if lower.startswith(prefix):
+            body = p[len(prefix):].strip()
+            try:
+                return re.compile(body, re.IGNORECASE)
+            except re.error as e:
+                logger.warning("Invalid regex pattern '%s': %s. Falling back to no-op.", p, e)
+                return re.compile(r"^$")
+    try:
+        return re.compile(fnmatch.translate(p), re.IGNORECASE)
+    except re.error as e:
+        logger.warning("Failed to compile glob '%s': %s. Falling back to literal-safe regex.", p, e)
+        return re.compile(re.escape(p), re.IGNORECASE)
+
+
+def _compile_many(patterns: List[str]) -> List[re.Pattern]:
+    return [_compile_one(p) for p in (patterns or []) if p and p.strip()]
+
+
+def _url_for_match(url: str) -> str:
+    return (url or "").strip()
+
+
+def _match_any(url: str, patterns: List[str]) -> bool:
+    if not patterns:
+        return False
+    s = _url_for_match(url)
+    for rx in _compile_many(patterns):
+        if rx.search(s):
+            return True
+    return False
+
+
+def _count_hits(url: str, patterns: List[str]) -> int:
+    if not patterns:
+        return 0
+    s = _url_for_match(url)
+    c = 0
+    for rx in _compile_many(patterns):
+        if rx.search(s):
+            c += 1
+    return c
+
+# --- SMART INCLUDE TOKENS ----------------------------------------------------
+SMART_INCLUDE_TOKENS: tuple[str, ...] = tuple(lang_cfg.get("SMART_INCLUDE_TOKENS"))
+SMART_TOKEN_RX_CACHE: Dict[str, re.Pattern] = {}
+
+
+def _token_rx(tok: str) -> re.Pattern:
+    rx = SMART_TOKEN_RX_CACHE.get(tok)
+    if rx is None:
+        rx = re.compile(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", re.IGNORECASE)
+        SMART_TOKEN_RX_CACHE[tok] = rx
+    return rx
+
+
+def _smart_include_hit(url: str) -> bool:
+    try:
+        p = urlparse(url).path or "/"
+    except Exception:
+        p = url or ""
+    for tok in SMART_INCLUDE_TOKENS:
+        if _token_rx(tok).search(p):
+            return True
+    return False
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
 def _label_boundary_match(host: str, suffix: str) -> bool:
     h = _hostname(host)
     s = suffix.lower()
     return h == s or h.endswith("." + s)
+
 
 def _has_functional_prefix(host: str) -> bool:
     h = _hostname(host)
@@ -278,13 +411,20 @@ def _has_functional_prefix(host: str) -> bool:
         return False
     return labels[0] in FUNCTIONAL_SUBDOMAIN_PREFIXES
 
+
 def is_universal_external(url_or_host: Any) -> bool:
+    """
+    Uses runtime-adjusted universal set (if provided) otherwise the base constant.
+    Functional subdomain prefixes are still treated as externals.
+    """
     host = _hostname(url_or_host)
-    hit = False
-    if host:
-        hit = any(_label_boundary_match(host, sfx) for sfx in UNIVERSAL_EXTERNALS)
-        if not hit and _has_functional_prefix(host):
-            hit = True
+    if not host:
+        return False
+    # use runtime override if present
+    base = _UNIVERSAL_RUNTIME if _UNIVERSAL_RUNTIME is not None else UNIVERSAL_EXTERNALS
+    hit = any(_label_boundary_match(host, sfx) for sfx in base)
+    if not hit and _has_functional_prefix(host):
+        hit = True
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("[filtering] is_universal_external(%s -> %s) -> %s", url_or_host, host, hit)
     return hit
@@ -300,6 +440,7 @@ DEFAULT_EXCLUDE_QUERY_KEYS: List[str] = list(lang_cfg.get("DEFAULT_EXCLUDE_QUERY
 # =============================================================================
 # Deep crawling filter helpers (optional)
 # =============================================================================
+
 
 def make_basic_filter_chain(
     *,
@@ -322,15 +463,18 @@ def make_basic_filter_chain(
         filters.append(ContentTypeFilter(allowed_types=content_types))  # type: ignore
     return FilterChain(filters)  # type: ignore
 
+
 def make_relevance_filter(query: str, threshold: float = 0.7) -> FilterChain:
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("[filtering] ContentRelevanceFilter query=%s threshold=%.2f", query, threshold)
     return FilterChain([ContentRelevanceFilter(query=query, threshold=threshold)])  # type: ignore
 
+
 def make_seo_filter(keywords: List[str], threshold: float = 0.5) -> FilterChain:
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("[filtering] SEOFilter keywords=%s threshold=%.2f", keywords, threshold)
     return FilterChain([SEOFilter(keywords=keywords, threshold=threshold)])  # type: ignore
+
 
 def make_keyword_scorer(keywords: List[str], weight: float = 0.7) -> KeywordRelevanceScorer:
     if logger.isEnabledFor(logging.DEBUG):
@@ -340,6 +484,7 @@ def make_keyword_scorer(keywords: List[str], weight: float = 0.7) -> KeywordRele
 # =============================================================================
 # URL seeding helpers (status/score filtering)
 # =============================================================================
+
 
 def filter_seeded_urls(
     urls: Iterable[Dict[str, Any]],
@@ -383,6 +528,9 @@ def filter_seeded_urls(
     return out
 
 # -----------------------------------------------------------------------------
+# Pattern-based keep/exclude helpers
+# -----------------------------------------------------------------------------
+
 
 def keep_patterns(urls: Iterable[Dict[str, Any]], patterns: List[str]) -> List[Dict[str, Any]]:
     out = []
@@ -393,6 +541,7 @@ def keep_patterns(urls: Iterable[Dict[str, Any]], patterns: List[str]) -> List[D
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("[filtering] keep_patterns -> kept=%d", len(out))
     return out
+
 
 def exclude_patterns(
     urls: Iterable[Dict[str, Any]],
@@ -412,6 +561,7 @@ def exclude_patterns(
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("[filtering] exclude_patterns -> kept=%d", len(out))
     return out
+
 
 def filter_by_patterns(
     urls: Iterable[Dict[str, Any]],
@@ -445,6 +595,7 @@ _REGIONAL_LANG_CODES = set(lang_cfg.get("REGIONAL_LANG_CODES"))
 _ENGLISH_REGIONS = set(lang_cfg.get("ENGLISH_REGIONS"))
 _CC_TO_LANG = dict(lang_cfg.get("CC_TO_LANG"))
 
+
 def _first_path_segment(path: str) -> str:
     if not path:
         return ""
@@ -453,34 +604,20 @@ def _first_path_segment(path: str) -> str:
             return part.lower()
     return ""
 
-def _host_labels(host: str) -> list[str]:
-    return (host or "").lower().strip(".").split(".") if host else []
-
-def _registrable_domain(host: str) -> str:
-    labels = _host_labels(host)
-    if len(labels) < 2:
-        return host or ""
-    last2 = ".".join(labels[-2:])
-    last3 = ".".join(labels[-3:]) if len(labels) >= 3 else ""
-    if last3 in {
-        "co.uk", "org.uk", "ac.uk",
-        "com.au", "net.au", "org.au",
-        "co.jp", "ne.jp", "or.jp",
-        "com.cn", "com.sg", "com.br",
-    } and len(labels) >= 3:
-        return ".".join(labels[-3:])
-    return last2
 
 def _normalize_token(tok: str) -> str:
     return (tok or "").strip().lower().replace("_", "-")
+
 
 def _is_lang_token(tok: str) -> bool:
     t = _normalize_token(tok)
     return (t in _LANG_CODES) or (t in _REGIONAL_LANG_CODES)
 
+
 def _cc_as_lang(tok: str) -> str | None:
     t = _normalize_token(tok)
     return _CC_TO_LANG.get(t)
+
 
 def _is_englishish_token(tok: str, accept_en_regions: set[str], primary_lang: str) -> bool:
     t = _normalize_token(tok)
@@ -491,6 +628,7 @@ def _is_englishish_token(tok: str, accept_en_regions: set[str], primary_lang: st
     if t in accept_en_regions or t in {f"{primary_lang}-{r}" for r in accept_en_regions}:
         return True
     return False
+
 
 def _token_is_non_english(tok: str, accept_en_regions: set[str], primary_lang: str) -> bool:
     t = _normalize_token(tok)
@@ -506,12 +644,6 @@ def _token_is_non_english(tok: str, accept_en_regions: set[str], primary_lang: s
         return mapped != "en"
     return False
 
-def same_registrable_domain(a: str, b: str) -> bool:
-    ha = (urlparse(a).hostname or "").lower()
-    hb = (urlparse(b).hostname or "").lower()
-    if not ha or not hb:
-        return False
-    return _registrable_domain(ha) == _registrable_domain(hb)
 
 def is_non_english_url(
     u: str,
@@ -564,11 +696,11 @@ def is_non_english_url(
         labels = _host_labels(host)
         cc = labels[-1] if labels else ""
         likely_non_en = {
-            "fr","de","es","it","pt","ru","jp","kr","cn","tw","hk","vn","th","id","my",
-            "tr","pl","cz","sk","ro","hu","bg","gr","ua","nl","be","dk","no","se","fi",
-            "il","ir","sa"
+            "fr", "de", "es", "it", "pt", "ru", "jp", "kr", "cn", "tw", "hk", "vn", "th", "id", "my",
+            "tr", "pl", "cz", "sk", "ro", "hu", "bg", "gr", "ua", "nl", "be", "dk", "no", "se", "fi",
+            "il", "ir", "sa",
         }
-        if cc and cc not in _ENGLISH_REGIONS and cc not in {"us","uk","gb"} and cc in likely_non_en:
+        if cc and cc not in _ENGLISH_REGIONS and cc not in {"us", "uk", "gb"} and cc in likely_non_en:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("[filtering.lang] strict ccTLD=%s non_en -> drop url=%s", cc, u)
             return True
@@ -576,6 +708,7 @@ def is_non_english_url(
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("[filtering.lang] default keep url=%s", u)
     return False
+
 
 def should_drop_for_language(
     u: str,
@@ -597,8 +730,10 @@ def should_drop_for_language(
 # Live-check language hardening (headers & <html lang>)
 # =============================================================================
 
+
 def _normalize_lang_code(code: str) -> str:
     return (code or "").strip().lower().replace("_", "-")
+
 
 def _is_non_english_lang_code(code: str, accept_en_regions: set[str]) -> bool:
     c = _normalize_lang_code(code)
@@ -610,6 +745,7 @@ def _is_non_english_lang_code(code: str, accept_en_regions: set[str]) -> bool:
         return False
     root = c.split("-")[0]
     return (root in _LANG_CODES) and (root != "en")
+
 
 def drop_by_response_language(
     url: str,
@@ -639,6 +775,7 @@ def drop_by_response_language(
 
     return False
 
+
 def apply_live_language_screen(
     items: List[Dict[str, Any]],
     headers_key: str = "headers",
@@ -655,8 +792,13 @@ def apply_live_language_screen(
             continue
         headers = u.get(headers_key)
         html_lang = u.get(html_lang_key)
-        if drop_by_response_language(url, headers=headers, html_lang=html_lang,
-                                     primary_lang=primary_lang, accept_en_regions=acc):
+        if drop_by_response_language(
+            url,
+            headers=headers,
+            html_lang=html_lang,
+            primary_lang=primary_lang,
+            accept_en_regions=acc,
+        ):
             dropped += 1
             continue
         kept.append(u)
@@ -667,6 +809,15 @@ def apply_live_language_screen(
 # =============================================================================
 # First-party brand / cross-domain helpers
 # =============================================================================
+
+
+def same_registrable_domain(a: str, b: str) -> bool:
+    ha = (urlparse(a).hostname or "").lower()
+    hb = (urlparse(b).hostname or "").lower()
+    if not ha or not hb:
+        return False
+    return _registrable_domain(ha) == _registrable_domain(hb)
+
 
 def classify_external(
     base_url: str,
@@ -696,8 +847,10 @@ def classify_external(
 # Priority scoring & composite filtering (with REASONS)
 # =============================================================================
 
+
 def _pattern_hits(url: str, patterns: List[str]) -> int:
     return _count_hits(url, patterns)
+
 
 def url_priority(
     url: str,
@@ -711,6 +864,7 @@ def url_priority(
     exc_hits = _count_hits(url, exclude)
     score = inc_hits * 10 - exc_hits * 5
     return score, inc_hits > 0, exc_hits > 0
+
 
 def url_should_keep(
     url: str,
@@ -741,7 +895,10 @@ def url_should_keep(
             strict_cctld=lang_strict_cctld,
         ):
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[filtering.keep] language drop -> %s (score=%d inc=%s exc=%s)", url, score, inc_hit, exc_hit)
+                logger.debug(
+                    "[filtering.keep] language drop -> %s (score=%d inc=%s exc=%s)",
+                    url, score, inc_hit, exc_hit
+                )
             return False
 
     if exc_hit and not inc_hit:
@@ -752,6 +909,7 @@ def url_should_keep(
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("[filtering.keep] keep: %s (score=%d inc=%s exc=%s)", url, score, inc_hit, exc_hit)
     return True
+
 
 def apply_url_filters(
     urls: Iterable[str] | Iterable[Dict[str, Any]],
@@ -820,7 +978,6 @@ def apply_url_filters(
         if keep_brand_domains:
             host = (urlparse(u).hostname or "").lower()
             if base_url:
-                # same site is implicitly allowed, but path excludes still apply later
                 _ = same_registrable_domain(base_url, u)
             if host in allowed_brand_hosts:
                 brand_allowed_host = True
@@ -846,12 +1003,10 @@ def apply_url_filters(
         )
 
     if return_reasons:
-        # Always return dict items for clarity in the tuple form
         if not is_dict_items:
             kept_items = [{"url": str(x)} for x in kept_items]  # type: ignore
         return kept_items, dropped
 
-    # Back-compat: preserve outbound type
     if is_dict_items:
         return kept_items  # type: ignore
     return [x["url"] for x in kept_items]  # type: ignore
@@ -859,6 +1014,7 @@ def apply_url_filters(
 # =============================================================================
 # Seeding convenience: universal BM25 query for product/service pages
 # =============================================================================
+
 
 def default_product_bm25_query() -> str:
     return lang_cfg.default_product_bm25_query()
