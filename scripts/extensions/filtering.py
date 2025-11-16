@@ -180,9 +180,13 @@ _MULTI_LABEL_PUBLIC_SUFFIXES: set[str] = {
     "com.cn", "com.sg", "com.br",
 }
 
-# --- NEW: runtime overrides ---------------------------------------------------
+# --- Runtime overrides ---------------------------------------------------
 _DATASET_HOSTS_RD: Optional[set[str]] = None      # registrable domains from the externals list
 _UNIVERSAL_RUNTIME: Optional[set[str]] = None     # UNIVERSAL_EXTERNALS adjusted at runtime
+
+# These guards ensure we only install the dataset externals / universal overrides once
+_DATASET_EXTERNALS_INSTALLED: bool = False
+_UNIVERSAL_RUNTIME_INSTALLED: bool = False
 
 
 def _hostname(url_or_host: Any) -> str:
@@ -235,8 +239,31 @@ def set_dataset_externals(hosts_or_domains: Optional[Iterable[str]]) -> None:
     """
     Register the externals list (as registrable domains preferred).
     Call with a set of domains (or hosts) from your full dataset.
+
+    This is intentionally idempotent: the first non-empty call installs the
+    dataset and logs at INFO; subsequent non-empty calls are treated as no-ops
+    to avoid re-initializing per company or per seeding pass.
     """
-    global _DATASET_HOSTS_RD
+    global _DATASET_HOSTS_RD, _DATASET_EXTERNALS_INSTALLED
+
+    # Allow an explicit "clear" if someone really passes an empty/None set.
+    if not hosts_or_domains:
+        _DATASET_HOSTS_RD = None
+        _DATASET_EXTERNALS_INSTALLED = False
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[filtering] dataset externals cleared (empty input)")
+        return
+
+    # If we've already installed a non-empty dataset once, just reuse it.
+    if _DATASET_EXTERNALS_INSTALLED and _DATASET_HOSTS_RD:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[filtering] dataset externals already installed; "
+                "skipping re-install (registrable=%d)",
+                len(_DATASET_HOSTS_RD),
+            )
+        return
+
     rd: set[str] = set()
     for s in (hosts_or_domains or []):
         h = _hostname(s)
@@ -245,10 +272,15 @@ def set_dataset_externals(hosts_or_domains: Optional[Iterable[str]]) -> None:
         r = _registrable_domain(h)
         if r:
             rd.add(r)
-    _DATASET_HOSTS_RD = rd
-    if logger.isEnabledFor(logging.INFO):
-        logger.info("[filtering] dataset externals registered: %d registrable domains", len(_DATASET_HOSTS_RD))
 
+    _DATASET_HOSTS_RD = rd
+    _DATASET_EXTERNALS_INSTALLED = True
+
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "[filtering] dataset externals registered: %d registrable domains",
+            len(_DATASET_HOSTS_RD),
+        )
 
 def is_in_dataset_externals(url_or_host: Any) -> bool:
     rd = _DATASET_HOSTS_RD
@@ -267,11 +299,31 @@ def set_universal_external_runtime_exclusions(hosts_or_domains: Optional[Iterabl
     """
     Demote/remove entries from UNIVERSAL_EXTERNALS that are also present
     in the externals dataset (exact registrable-domain overlap only).
+
+    This is also idempotent: the first non-empty call installs the runtime
+    override; later non-empty calls are no-ops to avoid repeated work and
+    repeated INFO logging. Passing an empty/None iterable resets the override.
     """
-    global _UNIVERSAL_RUNTIME
+    global _UNIVERSAL_RUNTIME, _UNIVERSAL_RUNTIME_INSTALLED
+
+    # Reset path: allow callers to clear overrides explicitly
     if not hosts_or_domains:
         _UNIVERSAL_RUNTIME = None
+        _UNIVERSAL_RUNTIME_INSTALLED = False
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[filtering] UNIVERSAL externals runtime overrides cleared")
         return
+
+    # Already installed once → don't recompute on every company
+    if _UNIVERSAL_RUNTIME_INSTALLED and _UNIVERSAL_RUNTIME is not None:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[filtering] UNIVERSAL externals runtime overrides already installed; "
+                "skipping re-install (kept=%d)",
+                len(_UNIVERSAL_RUNTIME),
+            )
+        return
+
     rd: set[str] = set()
     for s in hosts_or_domains:
         h = _hostname(s)
@@ -280,13 +332,17 @@ def set_universal_external_runtime_exclusions(hosts_or_domains: Optional[Iterabl
         r = _registrable_domain(h)
         if r:
             rd.add(r)
+
     base = set(UNIVERSAL_EXTERNALS)
     removed = {u for u in base if u in rd}
     _UNIVERSAL_RUNTIME = base - removed
+    _UNIVERSAL_RUNTIME_INSTALLED = True
+
     if logger.isEnabledFor(logging.INFO):
         logger.info(
             "[filtering] UNIVERSAL externals demoted: removed=%d kept=%d",
-            len(removed), len(_UNIVERSAL_RUNTIME or base)
+            len(removed),
+            len(_UNIVERSAL_RUNTIME or base),
         )
 
 

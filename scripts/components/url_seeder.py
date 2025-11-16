@@ -34,6 +34,7 @@ from extensions.run_utils import upsert_url_index
 
 log = logging.getLogger(__name__)
 
+_EXTERNALS_INSTALLED_ONCE = False
 
 # =====================================================================
 # ExternalsUniverse: central loader/registrar for dataset externals
@@ -77,16 +78,34 @@ class ExternalsUniverse:
         )
 
     def install(self) -> None:
-        """
-        Register dataset externals in filtering module and demote any overlaps
-        from UNIVERSAL_EXTERNALS at runtime so they aren't auto-dropped.
-        """
-        set_dataset_externals(self.registrable_domains or self.hosts)
-        set_universal_external_runtime_exclusions(self.registrable_domains or self.hosts)
-        log.info(
-            "[externals] Installed dataset externals: hosts=%d registrable=%d, allowed_brand_hosts=%d",
-            len(self.hosts), len(self.registrable_domains), len(self.allowed_brand_hosts),
-        )
+            """
+            Register dataset externals in filtering module and demote any overlaps
+            from UNIVERSAL_EXTERNALS at runtime so they aren't auto-dropped.
+            """
+            global _EXTERNALS_INSTALLED_ONCE
+            
+            if _EXTERNALS_INSTALLED_ONCE:
+                log.debug("[externals] Dataset externals already installed; skipping.")
+                return
+
+            # Keep the behavior the same: always (re)register the sets
+            set_dataset_externals(self.registrable_domains or self.hosts)
+            set_universal_external_runtime_exclusions(self.registrable_domains or self.hosts)
+
+            # But only log at INFO the first time
+            if not _EXTERNALS_INSTALLED_ONCE:
+                log.info(
+                    "[externals] Installed dataset externals: hosts=%d registrable=%d, allowed_brand_hosts=%d",
+                    len(self.hosts), len(self.registrable_domains), len(self.allowed_brand_hosts),
+                )
+                _EXTERNALS_INSTALLED_ONCE = True
+            else:
+                # Optional: keep a low-noise debug trace if you want
+                log.debug(
+                    "[externals] Dataset externals already installed; "
+                    "skipping repeated INFO log (hosts=%d registrable=%d)",
+                    len(self.hosts), len(self.registrable_domains),
+                )
 
 
 # -------------------------
