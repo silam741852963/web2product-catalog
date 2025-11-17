@@ -32,7 +32,6 @@ def make_default_crawler_run_config() -> CrawlerRunConfig:
         # ------------------------------------------------------------------ #
         # Page navigation / timing / JS
         # ------------------------------------------------------------------ #
-        wait_until= "networkidle",
         delay_before_return_html=2,  # seconds; can be raised for very dynamic pages
         page_timeout=60_000,         # ms – per-page timeout; override for tricky sites
 
