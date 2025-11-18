@@ -31,7 +31,7 @@ __all__ = [
     "is_universal_external",
     "same_registrable_domain",
     "classify_external",
-    # NEW: dataset externals & runtime adjustments
+    # Dataset externals & runtime adjustments
     "set_dataset_externals",
     "is_in_dataset_externals",
     "set_universal_external_runtime_exclusions",
@@ -48,6 +48,7 @@ __all__ = [
     "keep_patterns",
     "exclude_patterns",
     "filter_by_patterns",
+    "is_image_url",
     # deep-crawl helpers (optional)
     "make_basic_filter_chain",
     "make_relevance_filter",
@@ -116,6 +117,8 @@ UNIVERSAL_EXTERNALS: set[str] = {
     "webflow.io", "wordpress.com", "godaddy.com", "strikingly.com",
     "ecwid.com", "prestashop.com", "3dcart.com", "shopbase.com",
     "shift4shop.com", "lightspeedhq.com", "zohocommerce.com", "shop.app",
+    "framer.com", "definitions.sqspcdn.com", "fonts.gstatic.com",
+    "squarespace-cdn.com",
 
     # --- Marketing / CRM / analytics / ads ---
     "mailchimp.com", "campaignmonitor.com", "activecampaign.com", "hubspot.com",
@@ -172,6 +175,13 @@ FUNCTIONAL_SUBDOMAIN_PREFIXES: tuple[str, ...] = (
     "news", "press", "media",
 )
 
+# Additional heuristic host keywords that almost always mean "universal external"
+UNIVERSAL_HOST_KEYWORDS: tuple[str, ...] = (
+    "cdn", "analytics", "telemetry", "metrics", "tracking", "tracker",
+    "tagmanager", "tagsrv", "pixel", "adsrv", "adservice", "logx", "logs.",
+    "statcounter", "stats.", "short", "lnk", "click", "trk.", ".trk", "redirect",
+)
+
 # Multi-label public suffixes (for eTLD+1 registrable domain logic)
 _MULTI_LABEL_PUBLIC_SUFFIXES: set[str] = {
     "co.uk", "org.uk", "ac.uk",
@@ -179,6 +189,72 @@ _MULTI_LABEL_PUBLIC_SUFFIXES: set[str] = {
     "co.jp", "ne.jp", "or.jp",
     "com.cn", "com.sg", "com.br",
 }
+
+# Extensions we consider "pure assets" (we never want to crawl them as pages)
+ASSET_IMAGE_EXTENSIONS: tuple[str, ...] = (
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg", ".ico",
+)
+
+
+def _is_asset_image_path(path: str) -> bool:
+    p = (path or "").lower()
+    return any(p.endswith(ext) for ext in ASSET_IMAGE_EXTENSIONS)
+
+
+def is_image_url(url: str) -> bool:
+    """
+    Return True if the URL clearly points to an image file (hard drop),
+    regardless of positive tokens like 'buy', 'product', etc.
+    """
+    try:
+        pu = urlparse(url)
+        path = pu.path or ""
+    except Exception:
+        path = url or ""
+    return _is_asset_image_path(path)
+
+# Common government-style second-level labels (combined with ccTLDs)
+_GOV_SECOND_LEVELS: set[str] = {"gov", "gouv", "go", "govt"}
+
+
+def _is_government_domain(host: str) -> bool:
+    """
+    Heuristic: treat any registrable domain like:
+      - foo.gov
+      - foo.gov.<cc>
+      - foo.gouv.<cc>
+      - foo.go.<cc>
+      - foo.govt.<cc>
+    as a government site.
+
+    This is intentionally broad; the idea is that government domains are
+    never product-catalog pages for private companies.
+    """
+    if not host:
+        return False
+
+    rd = _registrable_domain(host)  # e.g. "example.gov", "meti.go.jp", "something.gouv.fr"
+    if not rd:
+        return False
+
+    labels = rd.split(".")
+    if len(labels) < 2:
+        return False
+
+    # ...gov  (e.g. "nasa.gov")
+    if labels[-1] == "gov":
+        return True
+
+    # ...<sec>.<cc>  (e.g. "meti.go.jp", "interieur.gouv.fr", "ato.gov.au")
+    if len(labels) >= 2:
+        sec = labels[-2]
+        tld = labels[-1]
+        # ccTLD is usually 2 chars, but we don't enforce that strictly
+        if sec in _GOV_SECOND_LEVELS:
+            return True
+
+    return False
+
 
 # --- Runtime overrides ---------------------------------------------------
 _DATASET_HOSTS_RD: Optional[set[str]] = None      # registrable domains from the externals list
@@ -282,6 +358,7 @@ def set_dataset_externals(hosts_or_domains: Optional[Iterable[str]]) -> None:
             len(_DATASET_HOSTS_RD),
         )
 
+
 def is_in_dataset_externals(url_or_host: Any) -> bool:
     rd = _DATASET_HOSTS_RD
     if not rd:
@@ -295,10 +372,59 @@ def is_in_dataset_externals(url_or_host: Any) -> bool:
     return r in rd
 
 
+@lru_cache(maxsize=8192)
+def _is_universal_host_cached(host: str) -> bool:
+    """
+    Fast path to decide if a *host* is a universal external.
+
+    Uses:
+      - runtime override set if present
+      - registrable-domain equality
+      - suffix label-boundary match
+      - functional subdomain prefixes
+      - heuristic host-keyword check (cdn, analytics, tracking, etc.)
+    """
+    if not host:
+        return False
+
+    h = host.lower().strip(".")
+
+    # Government domains ALWAYS universal externals
+    if _is_government_domain(h):
+        return True
+
+    # Use runtime override if present, otherwise base constant
+    base_suffixes = _UNIVERSAL_RUNTIME if _UNIVERSAL_RUNTIME is not None else UNIVERSAL_EXTERNALS
+
+    # Direct suffix / label-boundary match: foo.bar.facebook.com vs "facebook.com"
+    for sfx in base_suffixes:
+        if not sfx:
+            continue
+        if _label_boundary_match(h, sfx):
+            return True
+
+    # Registrable-domain equality: apps.apple.com => apple.com
+    rd = _registrable_domain(h)
+    if rd and rd in { _registrable_domain(s) for s in base_suffixes }:
+        return True
+
+    # Functional subdomain prefixes (status, docs, support, etc.)
+    if _has_functional_prefix(h):
+        return True
+
+    # Heuristic keywords strongly associated with universal/3P infrastructure
+    lowered = ".".join(_host_labels(h))
+    for kw in UNIVERSAL_HOST_KEYWORDS:
+        if kw in lowered:
+            return True
+
+    return False
+
+
 def set_universal_external_runtime_exclusions(hosts_or_domains: Optional[Iterable[str]]) -> None:
     """
     Demote/remove entries from UNIVERSAL_EXTERNALS that are also present
-    in the externals dataset (exact registrable-domain overlap only).
+    in the externals dataset (registrable-domain overlap).
 
     This is also idempotent: the first non-empty call installs the runtime
     override; later non-empty calls are no-ops to avoid repeated work and
@@ -310,6 +436,7 @@ def set_universal_external_runtime_exclusions(hosts_or_domains: Optional[Iterabl
     if not hosts_or_domains:
         _UNIVERSAL_RUNTIME = None
         _UNIVERSAL_RUNTIME_INSTALLED = False
+        _is_universal_host_cached.cache_clear()
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[filtering] UNIVERSAL externals runtime overrides cleared")
         return
@@ -324,19 +451,21 @@ def set_universal_external_runtime_exclusions(hosts_or_domains: Optional[Iterabl
             )
         return
 
-    rd: set[str] = set()
+    rd_dataset: set[str] = set()
     for s in hosts_or_domains:
         h = _hostname(s)
         if not h:
             continue
         r = _registrable_domain(h)
         if r:
-            rd.add(r)
+            rd_dataset.add(r)
 
     base = set(UNIVERSAL_EXTERNALS)
-    removed = {u for u in base if u in rd}
+    # Remove *all* universal entries whose registrable domain is in the dataset
+    removed = {u for u in base if _registrable_domain(u) in rd_dataset}
     _UNIVERSAL_RUNTIME = base - removed
     _UNIVERSAL_RUNTIME_INSTALLED = True
+    _is_universal_host_cached.cache_clear()
 
     if logger.isEnabledFor(logging.INFO):
         logger.info(
@@ -396,31 +525,40 @@ def _compile_one(pattern: str) -> re.Pattern:
         return re.compile(re.escape(p), re.IGNORECASE)
 
 
-def _compile_many(patterns: List[str]) -> List[re.Pattern]:
-    return [_compile_one(p) for p in (patterns or []) if p and p.strip()]
-
-
 def _url_for_match(url: str) -> str:
     return (url or "").strip()
 
 
 def _match_any(url: str, patterns: List[str]) -> bool:
+    """
+    Optimized matcher:
+      - no per-call list allocations
+      - relies on LRU-cached _compile_one(pattern)
+    """
     if not patterns:
         return False
     s = _url_for_match(url)
-    for rx in _compile_many(patterns):
-        if rx.search(s):
+    for p in patterns:
+        if not p:
+            continue
+        if _compile_one(p).search(s):
             return True
     return False
 
 
 def _count_hits(url: str, patterns: List[str]) -> int:
+    """
+    Efficiently count how many patterns match a URL.
+    Uses the same LRU-compilation as _match_any.
+    """
     if not patterns:
         return 0
     s = _url_for_match(url)
     c = 0
-    for rx in _compile_many(patterns):
-        if rx.search(s):
+    for p in patterns:
+        if not p:
+            continue
+        if _compile_one(p).search(s):
             c += 1
     return c
 
@@ -470,17 +608,20 @@ def _has_functional_prefix(host: str) -> bool:
 
 def is_universal_external(url_or_host: Any) -> bool:
     """
-    Uses runtime-adjusted universal set (if provided) otherwise the base constant.
-    Functional subdomain prefixes are still treated as externals.
+    Decide whether a URL/host is a universal external.
+
+    Behavior:
+      - consults runtime-adjusted universal set if provided
+      - matches:
+          * any subdomain of known universal suffixes
+          * registrable-domain equality with known universal entries
+          * common functional prefixes (status, docs, help, etc.)
+          * heuristic infra/analytics/shortener keywords in the host
     """
     host = _hostname(url_or_host)
     if not host:
         return False
-    # use runtime override if present
-    base = _UNIVERSAL_RUNTIME if _UNIVERSAL_RUNTIME is not None else UNIVERSAL_EXTERNALS
-    hit = any(_label_boundary_match(host, sfx) for sfx in base)
-    if not hit and _has_functional_prefix(host):
-        hit = True
+    hit = _is_universal_host_cached(host)
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("[filtering] is_universal_external(%s -> %s) -> %s", url_or_host, host, hit)
     return hit
@@ -630,6 +771,8 @@ def filter_by_patterns(
     out: List[Dict[str, Any]] = []
     for u in urls:
         url = str(u.get("final_url") or u.get("url") or "")
+        if is_image_url(url):
+            continue
         inc_hit = _match_any(url, include) or _smart_include_hit(url)
         exc_hit = _match_any(url, exclude)
         if exc_hit and not inc_hit:
@@ -936,6 +1079,11 @@ def url_should_keep(
     include = include or []
     exclude = exclude or []
 
+    if is_image_url(url):
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[filtering.keep] asset image -> drop: %s", url)
+        return False
+
     if drop_universal_externals and is_universal_external(url):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("[filtering.keep] universal external -> drop: %s", url)
@@ -991,7 +1139,8 @@ def apply_url_filters(
     where each dropped item is { "url": <str>, "reason": <str> } with reasons:
       - "universal_external"
       - "language"
-      - "exclude"  (matched exclude without include/override)
+      - "exclude"
+      - "asset_image"
     """
     include = include or []
     exclude = exclude or []
@@ -1005,6 +1154,15 @@ def apply_url_filters(
 
     for item in items:
         u = item["url"] if is_dict_items else str(item)
+
+        # HARD DROP: asset-like image URLs
+        if is_image_url(u):
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("[filtering.apply] DROP asset image: %s", u)
+            if return_reasons:
+                dropped.append({"url": u, "reason": "asset_image"})
+            continue
+
         score, inc_hit, exc_hit = url_priority(u, include=include, exclude=exclude)
 
         # 1) Universal externals

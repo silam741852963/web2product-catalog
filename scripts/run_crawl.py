@@ -30,12 +30,11 @@ from components.llm_extractor import parse_presence_result, _short_preview
 
 from components.url_seeder import ExternalsUniverse
 
-from extensions.artifact_scanner import ArtifactScanner
 from extensions.checkpoints import CheckpointManager
 from extensions.connectivity_guard import ConnectivityGuard
 from extensions.global_state import GlobalState, ResumePlan
 from extensions.logging import LoggingExtension
-from extensions.output_paths import save_stage_output, ensure_company_dirs
+from extensions.output_paths import save_stage_output, ensure_company_dirs, OUTPUT_ROOT
 
 from extensions.run_utils import (
     metrics,
@@ -68,7 +67,7 @@ from extensions.slot_allocator import SlotAllocator, SlotConfig, SessionSnapshot
 # Page interaction: use both first + retry configs
 from extensions.page_interaction import PageInteractionPolicy, first_pass_config, retry_pass_config
 
-# NEW externals-list support
+# Externals-list support
 from extensions.dataset_externals import DatasetExternals
 from extensions.filtering import (
     set_dataset_externals,
@@ -279,11 +278,13 @@ async def _crawl_company(
     state: GlobalState,
     net: ConnectivityGuard,
     slot_alloc: SlotAllocator,
-    externals_universe: Any | None = None,   # <-- NEW: pass down the externals universe for the seeder
+    externals_universe: Any | None = None,
 ) -> None:
     bvdid = company.bvdid
     logger = log_ext.get_company_logger(bvdid)
     ensure_company_dirs(bvdid)
+
+    retry_failed = bool(getattr(args, "retry_failed", False))
 
     await state.upsert_company(bvdid, company.name, company.url, stage=",".join(pipeline), status="pending")
     await state.mark_in_progress(bvdid, stage=",".join(pipeline))
@@ -359,6 +360,7 @@ async def _crawl_company(
         urls_from_index = [
             u for u, ent in (url_index or {}).items()
             if str(ent.get("status", "")).lower() in desired_statuses
+               and (retry_failed or not bool(ent.get("failed", False)))
         ]
         seeded_items = [{"url": u, "status": "valid"} for u in urls_from_index]
         # minimal resume summary (avoid clashing with seeding_metrics)
@@ -368,7 +370,13 @@ async def _crawl_company(
             "resume_mode": f"url_index[{','.join(sorted(desired_statuses))}]",
         }
         await state.set_resume_mode(bvdid, "url_index")
-        logger.info("[%s] Using url_index.json with %d URL(s) filtered by status in %s.", bvdid, len(seeded_items), sorted(desired_statuses))
+        logger.info(
+            "[%s] Using url_index.json with %d URL(s) filtered by status in %s | retry_failed=%s.",
+            bvdid,
+            len(seeded_items),
+            sorted(desired_statuses),
+            retry_failed,
+        )
 
     # --- Discovery path (seeder only)
     if not used_index_for_urls:
@@ -466,7 +474,7 @@ async def _crawl_company(
         await cp_mgr.mark_company_completed(bvdid)
         return
     
-    # If discovery used network, mirror to url_index
+    # If discovery used network, mirror to url_index and then load it
     if not used_index_for_urls:
         seeded_urls_for_index = [it.get("final_url") or it.get("url") for it in seeded_items if (it.get("final_url") or it.get("url"))]
         total_index = write_url_index_seed_only(bvdid, seeded_urls_for_index)
@@ -474,6 +482,11 @@ async def _crawl_company(
             await state.record_url_index(bvdid, count=total_index)
         except Exception:
             pass
+        # NEW: load url_index so we can see previous failure flags
+        try:
+            url_index = load_url_index(bvdid)
+        except Exception:
+            url_index = {}
 
     # Build URL list
     seeded = list(seeded_items)
@@ -488,9 +501,23 @@ async def _crawl_company(
     seeded_urls: List[str] = []
     for u in seeded:
         url = u.get("final_url") or u.get("url")
-        if url:
-            url_to_item[url] = u
-            seeded_urls.append(url)
+        if not url:
+            continue
+
+        # NEW: skip URLs that were previously marked failed in url_index.json,
+        # unless the user explicitly asked to retry them.
+        ent = url_index.get(url, {}) if url_index else {}
+        if ent.get("failed") and not retry_failed:
+            logger.info(
+                "[%s] Skipping previously failed URL (failed=%s) due to --retry-failed not set: %s",
+                bvdid,
+                ent.get("failed_reason", "unknown"),
+                url,
+            )
+            continue
+
+        url_to_item[url] = u
+        seeded_urls.append(url)
 
     # Presence gating
     if getattr(args, "require_presence", False) and used_index_for_urls and url_index:
@@ -527,7 +554,7 @@ async def _crawl_company(
             stage=",".join(pipeline),
             presence_only=bool(getattr(args, "presence_only", False))
         )
-        logger.info("[%s] No URLs after discovery/resume. DONE.", bvdid)
+        logger.info("[%s] No URLs after discovery/resume (respect_crawl_date=%s, retry_failed=%s). DONE.", bvdid, respect_crawl_date, retry_failed)
         metrics.incr("company.done", bvdid=bvdid, stage="none")
         await cp_mgr.mark_company_completed(bvdid)
         return
@@ -563,29 +590,6 @@ async def _crawl_company(
         return
 
     # ---------- Slot allocator helpers (dynamic tail boosting) ----------
-    async def _session_snapshot() -> SessionSnapshot:
-        try:
-            summary = await cp_mgr.summary()
-        except Exception:
-            summary = {}
-        total = max(1, len(summary))  # avoid zero division
-        finished = sum(1 for s in summary.values() if bool(s.get("finished")))
-        running = max(1, total - finished)
-        return SessionSnapshot(total_companies=total, finished_companies=finished, running_companies=running)
-
-    async def _company_snapshot() -> CompanySnapshot:
-        try:
-            cpi = await cp_mgr.get(bvdid, company_name=company.name)
-            urls_total = int(cpi.data.get("urls_total") or 0)
-            urls_done  = int(cpi.data.get("urls_done")  or 0)
-        except Exception:
-            urls_total = urls_done = 0
-        return CompanySnapshot(
-            urls_total=urls_total if urls_total > 0 else None,
-            urls_done=urls_done if urls_done > 0 else None,
-            timeout_rate=None,
-        )
-
     def _apply_max_permit(dispatcher, new_permit: int) -> None:
         try:
             if hasattr(dispatcher, "set_max_session_permit"):
@@ -593,6 +597,42 @@ async def _crawl_company(
             elif hasattr(dispatcher, "max_session_permit"):
                 setattr(dispatcher, "max_session_permit", int(new_permit))
         except Exception:
+            pass
+
+    async def _session_snapshot() -> SessionSnapshot:
+        try:
+            sp = await cp_mgr.get_session_progress()
+            return SessionSnapshot(
+                total_companies=int(sp.get("total_companies") or 0),
+                finished_companies=int(sp.get("completed_companies") or 0),
+                running_companies=max(0, int(sp.get("total_companies") or 0) - int(sp.get("completed_companies") or 0)),
+            )
+        except Exception:
+            return SessionSnapshot(total_companies=None, finished_companies=None, running_companies=None)
+
+    async def _maybe_resize_dispatcher(disp) -> None:
+        """
+        Ask SlotAllocator for a new per-company permit and apply it.
+        Called before each remote batch and JS-retry batch.
+        """
+        try:
+            ss = await _session_snapshot()
+            cpi = await cp_mgr.get(bvdid, company_name=company.name)
+            urls_total = int(cpi.data.get("urls_total") or 0)
+            urls_done = int(cpi.data.get("urls_done") or 0)
+            cs = CompanySnapshot(
+                urls_total=urls_total if urls_total > 0 else None,
+                urls_done=urls_done if urls_done > 0 else None,
+                timeout_rate=None,
+            )
+            new_slots = slot_alloc.recommend_for_company(bvdid, ss, cs)
+            _apply_max_permit(disp, new_slots)
+            logger.debug(
+                "[%s] SlotAllocator recommend: running=%d finished=%d/%d → per-company=%d",
+                bvdid, ss.running_companies, ss.finished_companies, ss.total_companies, new_slots
+            )
+        except Exception:
+            # best effort; we don't want resizing failures to break the crawl
             pass
 
     # ---------- Local HTML → MD -----------------------------------------
@@ -620,52 +660,92 @@ async def _crawl_company(
         async with AsyncWebCrawler(config=browser_cfg) as local_crawler:
             file_urls = [f"file://{p.resolve()}" for _, p in local_html_needed]
             md_cfg = _ensure_c4a_config_defaults(mk_md_config(args))
-            results = await local_crawler.arun_many(file_urls, config=md_cfg)
+
+            stream = await local_crawler.arun_many(file_urls, config=md_cfg)
             file2orig = {f"file://{p.resolve()}": u for (u, p) in local_html_needed}
-            for r in (results or []):
+
+            async for r in stream:
                 file_url = getattr(r, "url", None)
                 url = file2orig.get(file_url)
                 if not url:
                     continue
                 if getattr(r, "success", False):
                     s = _save_result_for_pipeline(
-                        bvdid, url, ["markdown"], r, logger, args.md_min_words, save_html_ref=False,
-                        md_gate_opts={"cookie_max_fraction": args.md_cookie_max_frac, "require_structure": args.md_require_structure},
-                        presence_only=bool(args.presence_only)
+                        bvdid,
+                        url,
+                        ["markdown"],
+                        r,
+                        logger,
+                        args.md_min_words,
+                        save_html_ref=False,
+                        md_gate_opts={
+                            "cookie_max_fraction": args.md_cookie_max_frac,
+                            "require_structure": args.md_require_structure,
+                        },
+                        presence_only=bool(args.presence_only),
                     )
                     saved_md_run += int(s["saved_md"])
                     md_suppressed_run += int(s["md_suppressed"])
                     md_retry_suggested_run += int(s["md_retry_suggested"])
                     if not llm_in_pipeline:
-                        if s.get("saved_md") or s.get("md_suppressed") or s.get("md_retry_suggested"):
+                        if (
+                            s.get("saved_md")
+                            or s.get("md_suppressed")
+                            or s.get("md_retry_suggested")
+                        ):
                             await mark_done_once(url)
                 else:
                     err = getattr(r, "error_message", "local-md-fail")
-                    logger.warning("[%s] Local HTML→MD failed: %s err=%s", bvdid, url, err)
+                    logger.warning(
+                        "[%s] Local HTML→MD failed: %s err=%s", bvdid, url, err
+                    )
                     await cp.mark_url_failed(url, f"local-md-error: {err}")
 
     # ---------- Remote fetch for Markdown (+ JS-only retry) --------------
     if need_remote_fetch:
         local_set = {u for (u, _) in local_html_needed}
-        all_remote = [(url_to_item.get(url) or {"url": url, "final_url": url}) for url in seeded_urls if url not in local_set]
+        all_remote = [
+            (url_to_item.get(url) or {"url": url, "final_url": url})
+            for url in seeded_urls
+            if url not in local_set
+        ]
 
         if getattr(args, "require_presence", False) and used_index_for_urls and url_index:
             filtered_remote = []
             for it in all_remote:
-                url = (it.get("final_url") or it.get("url"))
+                url = it.get("final_url") or it.get("url")
                 ent = url_index.get(url, {})
-                if int(ent.get("has_offering", 0) or 0) == 1 and bool(ent.get("presence_checked", False)):
+                has_off = int(ent.get("has_offering", 0) or 0)
+                pres = bool(ent.get("presence_checked", False))
+                if has_off == 1 and pres:
                     filtered_remote.append(it)
                 else:
-                    logger.debug("[%s] Skipping remote fetch %s due to require-presence gating", bvdid, url)
+                    logger.debug(
+                        "[%s]Skipping remote fetch %s due to require-presence gating",
+                        bvdid,
+                        url,
+                    )
             all_remote = filtered_remote
         elif getattr(args, "require_presence", False) and not used_index_for_urls:
+            # First-time runs with require_presence set intentionally skip processing
+            logger.info(
+                "[%s] --require-presence used but no url_index.json available; skipping remote fetch",
+                bvdid,
+            )
             all_remote = []
 
-        pending: set[str] = {(it.get("final_url") or it.get("url")) for it in all_remote if (it.get("final_url") or it.get("url"))}
+        pending: set[str] = {
+            (it.get("final_url") or it.get("url"))
+            for it in all_remote
+            if (it.get("final_url") or it.get("url"))
+        }
 
         if pending:
-            logger.info("[%s] Remote fetch for Markdown (and HTML reference): %d URL(s)", bvdid, len(pending))
+            logger.info(
+                "[%s] Remote fetch for Markdown (and HTML reference): %d URL(s)",
+                bvdid,
+                len(pending),
+            )
 
             md_cfg = _ensure_c4a_config_defaults(mk_md_config(args))
 
@@ -673,7 +753,9 @@ async def _crawl_company(
             ipol = PageInteractionPolicy(
                 enable_cookie_playbook=True,
                 max_in_session_retries=0,
-                wait_timeout_ms=max(60000, int(getattr(args, "page_timeout_ms", 120000))),
+                wait_timeout_ms=max(
+                    30000, int(getattr(args, "page_timeout_ms", 120000))
+                ),
                 delay_before_return_sec=1.5,
             )
             icfg = first_pass_config("about:blank", ipol)
@@ -682,7 +764,7 @@ async def _crawl_company(
             md_cfg.wait_for = icfg.wait_for
             md_cfg.delay_before_return_html = max(
                 getattr(md_cfg, "delay_before_return_html", 0) or 0.0,
-                icfg.delay_before_return_html
+                icfg.delay_before_return_html,
             )
             md_cfg.virtual_scroll_config = icfg.virtual_scroll_config
 
@@ -692,7 +774,7 @@ async def _crawl_company(
             js_retry_cfg.wait_for = rcfg2.wait_for
             js_retry_cfg.delay_before_return_html = max(
                 getattr(js_retry_cfg, "delay_before_return_html", 0) or 0.0,
-                rcfg2.delay_before_return_html
+                rcfg2.delay_before_return_html,
             )
             js_retry_cfg.virtual_scroll_config = rcfg2.virtual_scroll_config
             try:
@@ -704,218 +786,293 @@ async def _crawl_company(
             dispatcher = make_dispatcher(max_concurrency_for_company)
             html_saved_urls: Set[str] = set()
 
-            async def _session_snapshot() -> SessionSnapshot:
-                try:
-                    summary = await cp_mgr.summary()
-                except Exception:
-                    summary = {}
-                total = max(1, len(summary))  # avoid zero division
-                finished = sum(1 for s in summary.values() if bool(s.get("finished")))
-                running = max(1, total - finished)
-                return SessionSnapshot(total_companies=total, finished_companies=finished, running_companies=running)
-
-            async def _company_snapshot() -> CompanySnapshot:
-                try:
-                    cpi = await cp_mgr.get(bvdid, company_name=company.name)
-                    urls_total = int(cpi.data.get("urls_total") or 0)
-                    urls_done  = int(cpi.data.get("urls_done")  or 0)
-                except Exception:
-                    urls_total = urls_done = 0
-                return CompanySnapshot(
-                    urls_total=urls_total if urls_total > 0 else None,
-                    urls_done=urls_done if urls_done > 0 else None,
-                    timeout_rate=None,
-                )
-
-            def _apply_max_permit(dispatcher, new_permit: int) -> None:
-                try:
-                    if hasattr(dispatcher, "set_max_session_permit"):
-                        dispatcher.set_max_session_permit(int(new_permit))
-                    elif hasattr(dispatcher, "max_session_permit"):
-                        setattr(dispatcher, "max_session_permit", int(new_permit))
-                except Exception:
-                    pass
-
-            async def _maybe_resize_dispatcher(disp) -> None:
-                try:
-                    ss = await _session_snapshot()
-                    # recompute using this company's checkpoint
-                    cpi = await cp_mgr.get(bvdid, company_name=company.name)
-                    urls_total = int(cpi.data.get("urls_total") or 0)
-                    urls_done  = int(cpi.data.get("urls_done")  or 0)
-                    cs = CompanySnapshot(
-                        urls_total=urls_total if urls_total > 0 else None,
-                        urls_done=urls_done if urls_done > 0 else None,
-                        timeout_rate=None,
-                    )
-                    new_slots = slot_alloc.recommend_for_company(bvdid, ss, cs)
-                    _apply_max_permit(disp, new_slots)
-                    logger.debug("[%s] SlotAllocator recommend: running=%d finished=%d/%d → per-company=%d",
-                                 bvdid, ss.running_companies, ss.finished_companies, ss.total_companies, new_slots)
-                except Exception:
-                    pass
-
             attempts_by_url: Dict[str, int] = {}
             max_trans = int(args.retry_transport)
             max_soft = int(args.retry_soft_timeout)
 
-            # NEW: batched remote fetch
+            # NEW: batched remote fetch with streaming
             batch_size = max(8, int(getattr(args, "remote_batch_size", 64)))
-            logger.info("[%s] Remote fetch batching: batch_size=%d page_timeout_ms=%d",
-                        bvdid, batch_size, int(getattr(args, "page_timeout_ms", 120000)))
+            logger.info(
+                "[%s] Remote fetch batching: batch_size=%d page_timeout_ms=%d",
+                bvdid,
+                batch_size,
+                int(getattr(args, "page_timeout_ms", 120000)),
+            )
 
             def _pop_some(p: set[str], n: int) -> List[str]:
-                out = []
+                out: List[str] = []
                 for _ in range(min(n, len(p))):
                     out.append(p.pop())
                 return out
 
-            attempt = 0
-            while pending:
-                await net.wait_until_healthy()
-                attempt += 1
-                urls_this_round = _pop_some(pending, batch_size)
-                logger.info("[%s] Remote fetch pass #%d: processing %d of %d pending",
-                            bvdid, attempt, len(urls_this_round), len(pending) + len(urls_this_round))
-                to_retry: set[str] = set()
-                cookie_js_retry: set[str] = set()
+            async def _handle_result(r):
+                nonlocal saved_html_run, saved_md_run, md_suppressed_run, md_retry_suggested_run
 
-                # resize permits based on current tail state before each batch
-                await _maybe_resize_dispatcher(dispatcher)
+                url = getattr(r, "url", None)
+                if not url:
+                    return
 
-                async with AsyncWebCrawler(config=browser_cfg) as crawler:
-                    stream = await crawler.arun_many(urls=urls_this_round, config=md_cfg, dispatcher=dispatcher)
+                # Fast path: success
+                if getattr(r, "success", False):
+                    s = _save_result_for_pipeline(
+                        bvdid,
+                        url,
+                        ["markdown"],
+                        r,
+                        logger,
+                        args.md_min_words,
+                        save_html_ref=True,
+                        md_gate_opts={
+                            "cookie_max_fraction": args.md_cookie_max_frac,
+                            "require_structure": args.md_require_structure,
+                        },
+                        presence_only=bool(args.presence_only),
+                        html_saved_urls=html_saved_urls,
+                    )
+                    saved_html_run += int(s["saved_html"])
+                    saved_md_run += int(s["saved_md"])
+                    md_suppressed_run += int(s["md_suppressed"])
+                    md_retry_suggested_run += int(s["md_retry_suggested"])
+                    net.record_success()
 
-                    async def _handle_result(r):
-                        nonlocal saved_html_run, saved_md_run, md_suppressed_run, md_retry_suggested_run
-                        url = getattr(r, "url", None)
-                        if not url:
-                            return
-                        if getattr(r, "success", False):
-                            s = _save_result_for_pipeline(
-                                bvdid, url, ["markdown"], r, logger, args.md_min_words, save_html_ref=True,
-                                md_gate_opts={"cookie_max_fraction": args.md_cookie_max_frac, "require_structure": args.md_require_structure},
-                                presence_only=bool(args.presence_only),
-                                html_saved_urls=html_saved_urls,
-                            )
-                            saved_html_run += int(s["saved_html"])
-                            saved_md_run += int(s["saved_md"])
-                            md_suppressed_run += int(s["md_suppressed"])
-                            md_retry_suggested_run += int(s["md_retry_suggested"])
-                            net.record_success()
-
-                            cookie_case = (s.get("md_retry_suggested") or (s.get("md_suppressed") and ("cookie" in (s.get("md_reason") or "").lower())))
-                            if cookie_case:
-                                cookie_js_retry.add(url)
-                                metrics.incr("markdown.cookie_retry_scheduled", bvdid=bvdid, url=url)
-                            else:
-                                if not llm_in_pipeline and (s.get("saved_md") or s.get("md_suppressed")):
-                                    await mark_done_once(url)
-                            return
-
-                        # fallthrough for failure
-                        err = getattr(r, "error_message", "") or ""
-                        code = getattr(r, "status_code", None)
-                        kind = classify_failure(err, code, treat_timeouts_as_transport=bool(args.treat_timeouts_as_transport))
-
-                        if kind == "download":
-                            logger.info("[%s] Download navigation; skipping: %s", bvdid, url)
-                            await cp.add_note(f"download-skip: {url}")
-                            await mark_done_once(url)
-                            net.record_success()
-                            return
-
-                        if kind == "transport":
-                            attempts_by_url[url] = attempts_by_url.get(url, 0) + 1
-                            if attempts_by_url[url] <= max_trans:
-                                to_retry.add(url)
-                                net.record_transport_error()
-                                logger.warning("[%s] Transport-like failure; retry %d/%d: %s (code=%s err=%s)",
-                                               bvdid, attempts_by_url[url], max_trans, url, code, err)
-                            else:
-                                logger.warning("[%s] Transport failure exceeded retries: %s", bvdid, url)
-                                await cp.mark_url_failed(url, f"http-transport: {code} {err}")
-                            return
-
-                        if kind == "soft_timeout":
-                            attempts_by_url[url] = attempts_by_url.get(url, 0) + 1
-                            if attempts_by_url[url] <= max_soft:
-                                to_retry.add(url)
-                                logger.warning("[%s] Soft timeout; retry %d/%d; %s (err=%s)",
-                                               bvdid, attempts_by_url[url], max_soft, url, err)
-                            else:
-                                logger.warning("[%s] Soft timeout exceeded retries; marking failed: %s", bvdid, url)
-                                await cp.mark_url_failed(url, f"soft-timeout: {err}")
-                            return
-
-                        logger.warning("[%s] Failed (non-transport): %s status=%s err=%s", bvdid, url, code, err)
-                        await cp.mark_url_failed(url, f"http-error: {code} {err}")
-
-                    if hasattr(stream, "__aiter__"):
-                        async for r in stream:
-                            if not net.is_healthy():
-                                logger.warning("[%s] ConnectivityGuard OPEN — pausing stream...", bvdid)
-                                await state.mark_paused_net(bvdid)
-                                await net.wait_until_healthy()
-                                await state.mark_in_progress(bvdid, stage=",".join(pipeline))
-                                logger.info("[%s] Connectivity restored — resuming.", bvdid)
-                            await _handle_result(r)
+                    cookie_case = s.get("md_retry_suggested") or (
+                        s.get("md_suppressed")
+                        and "cookie" in (s.get("md_reason") or "").lower()
+                    )
+                    if cookie_case:
+                        cookie_js_retry.add(url)
+                        metrics.incr("markdown.cookie_retry_scheduled", bvdid=bvdid, url=url)
                     else:
-                        for r in (stream or []):
-                            if not net.is_healthy():
-                                logger.warning("[%s] ConnectivityGuard OPEN — pausing stream...", bvdid)
-                                await state.mark_paused_net(bvdid)
-                                await net.wait_until_healthy()
-                                await state.mark_in_progress(bvdid, stage=",".join(pipeline))
-                                logger.info("[%s] Connectivity restored — resuming.", bvdid)
-                            await _handle_result(r)
+                        if not llm_in_pipeline:
+                            if (
+                                s.get("saved_md")
+                                or s.get("md_suppressed")
+                                or s.get("md_retry_suggested")
+                            ):
+                                await mark_done_once(url)
+                    return
+
+                # ------------------------------------------------------------------
+                # Failure & soft-failure handling
+                # ------------------------------------------------------------------
+                err = getattr(r, "error_message", "") or ""
+                code = getattr(r, "status_code", None)
+
+                # 1) Graceful handling for HTTP 3xx (redirect-only pages)
+                #    These were previously showing up as "Failed (non-transport)".
+                if isinstance(code, int) and 300 <= code < 400:
+                    # Try to detect redirects to assets (images, etc.) for better labeling
+                    final_url = (
+                        getattr(r, "final_url", None)
+                        or getattr(r, "redirect_url", None)
+                        or getattr(r, "location", None)
+                    )
+
+                    def _is_asset(u: str) -> bool:
+                        if not u:
+                            return False
+                        path = u.split("?", 1)[0].lower()
+                        for ext in (
+                            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
+                            ".ico", ".mp4", ".webm", ".mov", ".avi", ".wmv", ".mkv",
+                            ".pdf", ".zip", ".rar", ".7z", ".gz", ".bz2", ".tar", ".tgz",
+                        ):
+                            if path.endswith(ext):
+                                return True
+                        return False
+
+                    if final_url and _is_asset(final_url):
+                        logger.info(
+                            "[%s] Redirect to asset, skipping: %s -> %s (status=%s)",
+                            bvdid,
+                            url,
+                            final_url,
+                            code,
+                        )
+                        if cp is not None:
+                            await cp.add_note(f"redirect-asset-skip: {url} -> {final_url} ({code})")
+                    else:
+                        logger.info(
+                            "[%s] Redirect-only page, skipping: %s (status=%s)",
+                            bvdid,
+                            url,
+                            code,
+                        )
+                        if cp is not None:
+                            await cp.add_note(f"redirect-skip: {url} ({code})")
+
+                    # Treat as handled (no retries, no transport error)
+                    await mark_done_once(url)
+                    net.record_success()
+                    return
+
+                # 2) Classify failure type (download / transport / other)
+                kind = classify_failure(
+                    err,
+                    code,
+                    treat_timeouts_as_transport=bool(args.treat_timeouts_as_transport),
+                )
+
+                # Download navigation: e.g. PDFs / binaries triggered as "pages"
+                if kind == "download":
+                    logger.info("[%s] Download navigation; skipping: %s", bvdid, url)
+                    if cp is not None:
+                        await cp.add_note(f"download-skip: {url}")
+                    await mark_done_once(url)
+                    net.record_success()
+                    return
+
+                # Transport-like failures: timeouts, DNS, connection reset, etc.
+                if kind == "transport":
+                    attempts_by_url[url] = attempts_by_url.get(url, 0) + 1
+                    if attempts_by_url[url] <= max_trans:
+                        to_retry.add(url)
+                        net.record_transport_error()
+                        logger.warning(
+                            "[%s] Transport-like failure; retry %d/%d: %s (code=%s err=%s)",
+                            bvdid,
+                            attempts_by_url[url],
+                            max_trans,
+                            url,
+                            code,
+                            err,
+                        )
+                    else:
+                        logger.warning(
+                            "[%s] Transport failure exceeded retries: %s (code=%s err=%s)",
+                            bvdid,
+                            url,
+                            code,
+                            err,
+                        )
+                        if cp is not None:
+                            await cp.mark_url_failed(url, f"http-transport: {code} {err}")
+                    return
+
+                # 3) Non-transport, non-download failures (4xx, weird cases, etc.)
+                #    Previously these likely surfaced as "Failed (non-transport)" spam.
+                logger.info(
+                    "[%s] Non-transport HTTP failure; giving up: %s (code=%s err=%s)",
+                    bvdid,
+                    url,
+                    code,
+                    err,
+                )
+                if cp is not None:
+                    await cp.mark_url_failed(url, f"http-non-transport: {code} {err}")
+                await mark_done_once(url)
+                # Do NOT count as transport error; just a handled terminal state.
+                net.record_success()
+
+            async def _handle_retry(rr):
+                nonlocal saved_html_run, saved_md_run, md_suppressed_run, md_retry_suggested_run
+                u = getattr(rr, "url", None)
+                if not u:
+                    return
+                if getattr(rr, "success", False):
+                    s2 = _save_result_for_pipeline(
+                        bvdid,
+                        u,
+                        ["markdown"],
+                        rr,
+                        logger,
+                        args.md_min_words,
+                        save_html_ref=True,
+                        md_gate_opts={
+                            "cookie_max_fraction": args.md_cookie_max_frac,
+                            "require_structure": args.md_require_structure,
+                        },
+                        presence_only=bool(args.presence_only),
+                        html_saved_urls=html_saved_urls,
+                    )
+                    saved_html_run += int(s2["saved_html"])
+                    saved_md_run += int(s2["saved_md"])
+                    md_suppressed_run += int(s2["md_suppressed"])
+                    md_retry_suggested_run += int(s2["md_retry_suggested"])
+                    net.record_success()
+                    if not llm_in_pipeline and (
+                        s2.get("saved_md")
+                        or s2.get("md_suppressed")
+                        or s2.get("md_retry_suggested")
+                    ):
+                        await mark_done_once(u)
+                    metrics.incr(
+                        "markdown.retry_performed", bvdid=bvdid, url=u
+                    )
+                else:
+                    err2 = getattr(rr, "error_message", "js-retry-fail")
+                    logger.warning(
+                        "[%s] JS-only retry failed: %s err=%s", bvdid, u, err2
+                    )
+                    await cp.mark_url_failed(
+                        u, f"js-only-retry-error: {err2}"
+                    )
+
+            attempt = 0
+            async with AsyncWebCrawler(config=browser_cfg) as crawler:
+                while pending:
+                    await net.wait_until_healthy()
+                    attempt += 1
+                    urls_this_round = _pop_some(pending, batch_size)
+                    logger.info(
+                        "[%s] Remote fetch pass #%d: processing %d of %d pending",
+                        bvdid,
+                        attempt,
+                        len(urls_this_round),
+                        len(pending) + len(urls_this_round),
+                    )
+                    to_retry: set[str] = set()
+                    cookie_js_retry: set[str] = set()
+
+                    # resize permits based on current tail state before each batch
+                    await _maybe_resize_dispatcher(dispatcher)
+
+                    stream = await crawler.arun_many(
+                        urls=urls_this_round, config=md_cfg, dispatcher=dispatcher
+                    )
+
+                    async for r in stream:
+                        if not net.is_healthy():
+                            logger.warning(
+                                "[%s] ConnectivityGuard OPEN — pausing stream...",
+                                bvdid,
+                            )
+                            await state.mark_paused_net(bvdid)
+                            await net.wait_until_healthy()
+                            await state.mark_in_progress(
+                                bvdid, stage=",".join(pipeline)
+                            )
+                            logger.info(
+                                "[%s] Connectivity restored — resuming.",
+                                bvdid,
+                            )
+                        await _handle_result(r)
 
                     # JS-only cookie/interstitial retry batch
                     if cookie_js_retry:
-                        logger.info("[%s] JS-only retry for %d URL(s) due to cookie/interstitial dominance",
-                                    bvdid, len(cookie_js_retry))
+                        logger.info(
+                            "[%s] JS-only retry for %d URL(s) due to cookie/interstitial dominance",
+                            bvdid,
+                            len(cookie_js_retry),
+                        )
                         # Resize again before retry; tail may have advanced
                         await _maybe_resize_dispatcher(dispatcher)
-                        retry_results = await crawler.arun_many(
-                            urls=list(cookie_js_retry), config=js_retry_cfg, dispatcher=dispatcher
+                        retry_stream = await crawler.arun_many(
+                            urls=list(cookie_js_retry),
+                            config=js_retry_cfg,
+                            dispatcher=dispatcher,
                         )
-
-                        async def _handle_retry(rr):
-                            nonlocal saved_html_run, saved_md_run, md_suppressed_run, md_retry_suggested_run
-                            u = getattr(rr, "url", None)
-                            if not u:
-                                return
-                            if getattr(rr, "success", False):
-                                s2 = _save_result_for_pipeline(
-                                    bvdid, u, ["markdown"], rr, logger, args.md_min_words, save_html_ref=True,
-                                    md_gate_opts={"cookie_max_fraction": args.md_cookie_max_frac, "require_structure": args.md_require_structure},
-                                    presence_only=bool(args.presence_only),
-                                    html_saved_urls=html_saved_urls,
-                                )
-                                saved_html_run += int(s2["saved_html"])
-                                saved_md_run += int(s2["saved_md"])
-                                md_suppressed_run += int(s2["md_suppressed"])
-                                md_retry_suggested_run += int(s2["md_retry_suggested"])
-                                net.record_success()
-                                if not llm_in_pipeline and (s2.get("saved_md") or s2.get("md_suppressed") or s2.get("md_retry_suggested")):
-                                    await mark_done_once(u)
-                                metrics.incr("markdown.retry_performed", bvdid=bvdid, url=u)
-                            else:
-                                err2 = getattr(rr, "error_message", "js-retry-fail")
-                                logger.warning("[%s] JS-only retry failed: %s err=%s", bvdid, u, err2)
-                                await cp.mark_url_failed(u, f"js-only-retry-error: {err2}")
-
-                        if hasattr(retry_results, "__aiter__"):
-                            async for rr in retry_results:
-                                await _handle_retry(rr)
-                        else:
-                            for rr in (retry_results or []):
-                                await _handle_retry(rr)
+                        async for rr in retry_stream:
+                            await _handle_retry(rr)
                         cookie_js_retry.clear()
 
-                if to_retry:
-                    logger.info("[%s] %d URL(s) scheduled for transport/soft-timeout retry (will be re-queued).", bvdid, len(to_retry))
-                    pending |= to_retry
+                    if to_retry:
+                        logger.info(
+                            "[%s] %d URL(s) scheduled for transport/soft-timeout retry (will be re-queued).",
+                            bvdid,
+                            len(to_retry),
+                        )
+                        pending |= to_retry
 
     # ---------- Local LLM over Markdown ---------------------------------
     if llm_in_pipeline and not plan.skip_llm:
@@ -1339,9 +1496,8 @@ async def main_async() -> None:
     await cp_mgr.mark_global_start()
     await cp_mgr.set_total_companies(n)
 
-    scanner = ArtifactScanner()
-    state = GlobalState()
-
+    state = GlobalState(db_path=OUTPUT_ROOT / "global_state.sqlite3")
+    
     # Connectivity guard
     net = ConnectivityGuard(
         probe_host="8.8.8.8",

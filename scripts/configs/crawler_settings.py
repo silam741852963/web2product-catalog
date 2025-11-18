@@ -33,20 +33,23 @@ def make_default_crawler_run_config() -> CrawlerRunConfig:
         # Page navigation / timing / JS
         # ------------------------------------------------------------------ #
         delay_before_return_html=2,  # seconds; can be raised for very dynamic pages
-        page_timeout=60_000,         # ms – per-page timeout; override for tricky sites
+        page_timeout=15_000,         # ms – per-page timeout; override for tricky sites
 
-        # ------------------------------------------------------------------ #
-        # Session & anti-bot
-        # ------------------------------------------------------------------ #
-        session_id=None,             # set per-company or per-domain if you need state
-        magic=True,                  # enable Crawl4AI's stealth features
-        simulate_user=True,          # mimic basic user interactions / delays
-        override_navigator=True,     # patch navigator.* to avoid trivial bot checks
+        # # ------------------------------------------------------------------ #
+        # # Session & anti-bot
+        # # ------------------------------------------------------------------ #
+        # session_id=None,             # set per-company or per-domain if you need state
+        # magic=True,                  # enable Crawl4AI's stealth features
+        # simulate_user=True,          # mimic basic user interactions / delays
+        # override_navigator=True,     # patch navigator.* to avoid trivial bot checks
 
-        # ------------------------------------------------------------------ #
-        # Filter
-        # ------------------------------------------------------------------ #
-        exclude_all_images=True
+        # # ------------------------------------------------------------------ #
+        # # Filter
+        # # ------------------------------------------------------------------ #
+        # exclude_all_images=True,
+        # word_count_threshold=15,
+        # remove_overlay_elements=True,
+
     )
 
 

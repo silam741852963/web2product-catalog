@@ -12,35 +12,19 @@ from extensions.filtering import is_universal_external, should_block_external_fo
 
 logger = logging.getLogger("extensions.brand_discovery")
 
-# Minimal, lightweight brand discovery: fetch homepage HTML (single HTTP GET),
-# extract external anchors with a tiny regex, then apply filtering heuristics.
-# This aims to use minimal CPU / RAM and no browser processes.
-
-# Cap anchors processed from the homepage to avoid pathological pages.
 BRAND_MAX_ANCHORS_SCAN: int = 1000
-
-# Cap how many distinct anchors per external HOST we keep before scoring.
 BRAND_MAX_PER_HOST: int = 1
-
-# Optional debug: log EACH anchor found (can be noisy)
 BRAND_LOG_ANCHORS: bool = False
-
-# Per-request timeout (seconds)
 BRAND_HTTP_TIMEOUT: float = 10.0
 
-# Limits for httpx client to keep resource usage low
 HTTPX_MAX_CONNECTIONS: int = 8
 HTTPX_MAX_KEEPALIVE: int = 4
 
-# -----------------------------
-# Heuristics
-# -----------------------------
 NOISY_SUBDOMAIN_PREFIXES: Tuple[str, ...] = (
     "news", "press", "media", "about", "careers",
     "jobs", "blog", "events", "support", "help", "status",
 )
 
-# Negative path tokens that are not brand homes
 NEG_PATH_TOKENS: Tuple[str, ...] = (
     "/privacy", "/terms", "/legal", "/account", "/signin", "/login",
 )
@@ -54,9 +38,6 @@ class Candidate:
     anchors_count: int
 
 
-# -----------------------------
-# Small helpers
-# -----------------------------
 def _host(u: str) -> str:
     try:
         return (urlparse(u).hostname or "").lower()
@@ -109,23 +90,16 @@ def _resolve_href(base_url: str, href: str) -> Optional[str]:
     return href
 
 
-# Very small regex to extract href values both double- and single-quoted.
 _HREF_RE = re.compile(r'href=(?:"([^"]+)"|\'([^\']+)\')', flags=re.I)
 
 
-# -----------------------------
-# Main entry
-# -----------------------------
 async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTTP_TIMEOUT) -> List[str]:
     """
     Lightweight brand discovery:
-     - GET homepage (single GET using httpx)
-     - Extract anchors via tiny regex (no HTML parser)
+     - GET homepage (single GET)
+     - Extract anchors via tiny regex
      - Resolve & filter external anchors
      - Bucket by root (scheme://host), cap per-host, and score
-     - Return list of candidate roots
-
-    Dataset externals are blocked here via `should_block_external_for_dataset` to avoid cross-company contamination.
     """
     logger.info("[brand_discovery] start base_url=%s", base_url)
 
@@ -150,8 +124,11 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
                 return []
 
             hrefs = _HREF_RE.findall(html)
-            for a, b in hrefs[:BRAND_MAX_ANCHORS_SCAN]:
+            # flatten and cap once
+            for a, b in hrefs:
                 anchors_list.append(a or b)
+                if len(anchors_list) >= BRAND_MAX_ANCHORS_SCAN:
+                    break
 
     except Exception as e:
         logger.warning("[brand_discovery] httpx client error base_url=%s err=%s", base_url, e)
@@ -159,15 +136,18 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
 
     base_host = _host(final_url) or _host(base_url)
     if BRAND_LOG_ANCHORS:
-        for idx, h in enumerate(anchors_list[:BRAND_MAX_ANCHORS_SCAN]):
+        for idx, h in enumerate(anchors_list):
             logger.debug("[brand_discovery] anchor[%04d] raw=%s", idx, h)
 
-    # 1) Resolve & de-duplicate anchors, and apply first-pass filters
+    if not anchors_list:
+        logger.info("[brand_discovery] no anchors discovered on %s", base_url)
+        return []
+
     seen: set[str] = set()
     kept_urls: List[str] = []
     drop_same_host = drop_neg = drop_social = drop_noisy = non_http = drop_dataset = 0
 
-    for raw in anchors_list[:BRAND_MAX_ANCHORS_SCAN]:
+    for raw in anchors_list:
         abs_url = _resolve_href(final_url, raw)
         if not abs_url:
             non_http += 1
@@ -182,7 +162,6 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
             logger.debug("[brand_discovery.skip] href=%s reason=same_host", abs_url)
             continue
 
-        # Block dataset externals immediately
         if should_block_external_for_dataset(final_url, abs_url):
             drop_dataset += 1
             logger.debug("[brand_discovery.skip] href=%s reason=dataset_external_block", abs_url)
@@ -194,7 +173,6 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
             logger.debug("[brand_discovery.skip] href=%s reason=neg_path token=%s", abs_url, neg_tok)
             continue
 
-        # Universal external (runtime-demoted set is honored inside is_universal_external)
         if is_universal_external(abs_url):
             drop_social += 1
             logger.debug("[brand_discovery.skip] href=%s reason=universal_external", abs_url)
@@ -210,14 +188,13 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
 
     logger.debug(
         "[brand_discovery] keep/drop summary: total=%d, non_http=%d, drop_same_host=%d, drop_neg=%d, drop_social=%d, drop_noisy_subdomain=%d, drop_dataset=%d, kept=%d",
-        len(anchors_list[:BRAND_MAX_ANCHORS_SCAN]), non_http, drop_same_host, drop_neg, drop_social, drop_noisy, drop_dataset, len(kept_urls),
+        len(anchors_list), non_http, drop_same_host, drop_neg, drop_social, drop_noisy, drop_dataset, len(kept_urls),
     )
 
     if not kept_urls:
         logger.info("[brand_discovery] discovered 0 candidate brand roots on %s", base_url)
         return []
 
-    # 2) Bucket by ROOT, cap per host, and score
     buckets: Dict[str, List[str]] = {}
     for u in kept_urls:
         root = _root(u)
@@ -225,7 +202,10 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
         if len(lst) < BRAND_MAX_PER_HOST:
             lst.append(u)
         else:
-            logger.debug("[brand_discovery.skip] href=%s reason=per_host_cap_exceeded host=%s cap=%d", u, root, BRAND_MAX_PER_HOST)
+            logger.debug(
+                "[brand_discovery.skip] href=%s reason=per_host_cap_exceeded host=%s cap=%d",
+                u, root, BRAND_MAX_PER_HOST
+            )
 
     candidates: List[Candidate] = []
     for root, urls in buckets.items():
@@ -236,11 +216,14 @@ async def discover_brand_sites(base_url: str, *, http_timeout: float = BRAND_HTT
     candidates.sort(key=lambda c: (c.score, c.anchors_count), reverse=True)
 
     for i, c in enumerate(candidates[:10]):
-        logger.debug("[brand_discovery] candidate[%02d] root=%s score=%.3f anchors=%d examples=%d", i, c.root, c.score, c.anchors_count, len(c.examples))
+        logger.debug(
+            "[brand_discovery] candidate[%02d] root=%s score=%.3f anchors=%d examples=%d",
+            i, c.root, c.score, c.anchors_count, len(c.examples),
+        )
         if BRAND_LOG_ANCHORS:
             for ex in c.examples:
                 logger.debug("  └─ ex: %s", ex)
 
-    results = sorted(set(c.root for c in candidates))
+    results = sorted({c.root for c in candidates})
     logger.info("[brand_discovery] discovered %d candidate brand roots on %s", len(results), base_url)
     return results

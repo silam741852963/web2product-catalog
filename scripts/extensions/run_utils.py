@@ -13,7 +13,6 @@ from collections import deque
 import re
 from urllib.parse import urlparse
 
-
 from crawl4ai import CacheMode, CrawlerRunConfig, RateLimiter
 from crawl4ai.async_dispatcher import MemoryAdaptiveDispatcher
 
@@ -45,23 +44,18 @@ class _NullMetrics:
 metrics = _NullMetrics()  # type: ignore
 
 __all__ = [
-    # language/pattern helpers
     "get_default_include_patterns",
     "get_default_exclude_patterns",
     "parse_patterns_csv",
     "parse_lang_accept_regions",
-    # cli & pipeline
     "build_parser",
     "parse_pipeline",
     "make_dispatcher",
-    # crawler stage configs
     "mk_md_config",
-    "mk_llm_config_for_markdown_input",  # kept for compatibility alias
+    "mk_llm_config_for_markdown_input",
     "mk_llm_config",
-    "mk_remote_config_for_pipeline",      # back-compat no-op alias
-    # url seeder kwarg builder
+    "mk_remote_config_for_pipeline",
     "build_seeder_kwargs",
-    # misc utilities used elsewhere
     "aggregate_seed_by_root",
     "classify_failure",
     "find_existing_artifact",
@@ -78,9 +72,6 @@ __all__ = [
     "is_llm_extracted_empty",
 ]
 
-# -----------------------
-# Error scan defaults
-# -----------------------
 _ERROR_DEFAULT_PATTERNS = (
     r"\b(traceback)\b",
     r"\b(exception|error)\b",
@@ -94,6 +85,47 @@ _ERROR_DEFAULT_PATTERNS = (
 
 META_PATH_NAME = "crawl_meta.json"
 URL_INDEX_NAME = "url_index.json"
+
+# ---------------------------------------------------------------------
+# Small JSON file cache (path -> (mtime, parsed_obj))
+# ---------------------------------------------------------------------
+_JSON_CACHE: Dict[Path, Tuple[float, Any]] = {}
+
+
+def _json_load_cached(path: Path) -> Any:
+    """
+    Load JSON from `path` with a simple mtime-based cache.
+    Used to avoid repeatedly re-reading and re-parsing url_index/meta
+    on every upsert.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {}
+
+    cached = _JSON_CACHE.get(path)
+    if cached is not None:
+        cached_mtime, obj = cached
+        if cached_mtime == mtime:
+            return obj
+
+    try:
+        raw = path.read_text(encoding="utf-8")
+        obj = json.loads(raw)
+    except Exception:
+        return {}
+
+    _JSON_CACHE[path] = (mtime, obj)
+    return obj
+
+
+def _json_update_cache(path: Path, obj: Any) -> None:
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return
+    _JSON_CACHE[path] = (mtime, obj)
+
 
 # -----------------------
 # Language-sensitive getters
@@ -117,10 +149,6 @@ def get_default_exclude_patterns() -> List[str]:
     return list(FALLBACK_EXCLUDE_PATTERNS)
 
 def parse_patterns_csv(raw: Optional[str]) -> List[str]:
-    """
-    Parse a comma/semicolon separated pattern list, ignore empties/whitespace.
-    Accepts '*' wildcards. Returns [] if nothing provided.
-    """
     if not raw:
         return []
     parts: List[str] = []
@@ -133,7 +161,7 @@ def parse_patterns_csv(raw: Optional[str]) -> List[str]:
 def parse_lang_accept_regions(raw: Optional[str]) -> set[str]:
     if not raw:
         return set()
-    return { t.strip().lower() for t in re.split(r"[,\s]+", raw) if t.strip() }
+    return {t.strip().lower() for t in re.split(r"[,\s]+", raw) if t.strip()}
 
 # -----------------------
 # CLI + utility functions
@@ -143,7 +171,6 @@ def build_parser() -> argparse.ArgumentParser:
         description="Seed → filter → fetch (Markdown + reference HTML) → local LLM over saved Markdown"
     )
 
-    # --- Input sources (multi-format via source_loader) ---
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument(
         "--source",
@@ -165,7 +192,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated glob(s) to scan inside --source-dir.",
     )
 
-    # --- Pipeline stages ---
     p.add_argument("--pipeline", type=str, default="markdown,llm",
                    help=("Comma-separated stages from {seed,markdown,llm}"))
 
@@ -182,7 +208,6 @@ def build_parser() -> argparse.ArgumentParser:
     grp.add_argument("--slot-tail-cap", type=int, default=0,
                      help="Optional higher cap applied only in the tail; 0 to reuse the per-company cap.")
 
-    # --- Seeding / filtering ---
     p.add_argument("--seeding-source", type=str, default="cc+sitemap",
                    choices=["sitemap", "cc", "sitemap+cc", "cc+sitemap"])
 
@@ -201,31 +226,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--require-presence", action="store_true",
                    help="Only process Markdown/LLM for URLs that have has_offering==1 and presence_checked in url_index.json")
 
-    # --- Brand / language / externals ---
     p.add_argument("--lang", type=str, default="en",
                    help="2-letter language code to use for language-sensitive constants (e.g. en, ja, vi)")
 
-
-    # Dataset externals list (full universe), distinct from the current --source batch
     egrp = p.add_mutually_exclusive_group()
     egrp.add_argument("--use-externals-list", dest="use_externals_list", action="store_true", default=True,
-                    help="If set, build an externals list of company hosts from a separate full dataset "
-                        "and use it to block cross-company externals only in brand discovery and url_index.")
+                      help="If set, build an externals list of company hosts from a separate full dataset "
+                           "and use it to block cross-company externals only in brand discovery and url_index.")
     egrp.add_argument("--no-use-externals-list", dest="use_externals_list", action="store_false")
     p.add_argument("--externals-list-source", type=Path,
-                help="Full dataset file (supported formats) whose company URLs form the externals list.")
+                   help="Full dataset file whose company URLs form the externals list.")
     p.add_argument("--externals-list-dir", type=Path,
-                help="Directory containing one or more supported data files for the externals list.")
+                   help="Directory containing data files for the externals list.")
     p.add_argument("--externals-list-pattern", type=str,
-                default="*.csv,*.tsv,*.xlsx,*.xls,*.json,*.jsonl,*.ndjson,*.parquet,*.feather,*.dta,*.sas7bdat,*.sav",
-                help="Comma-separated glob(s) to scan inside --externals-list-dir.")
+                   default="*.csv,*.tsv,*.xlsx,*.xls,*.json,*.jsonl,*.ndjson,*.parquet,*.feather,*.dta,*.sas7bdat,*.sav",
+                   help="Comma-separated glob(s) to scan inside --externals-list-dir.")
 
-    # Mutually exclusive toggles for brand discovery (default: True)
     dgrp = p.add_mutually_exclusive_group()
     dgrp.add_argument("--discover-brands", dest="discover_brands", action="store_true", default=True)
     dgrp.add_argument("--no-discover-brands", dest="discover_brands", action="store_false")
 
-    # Mutually exclusive toggles for dropping universal externals (default: True)
     ugr = p.add_mutually_exclusive_group()
     ugr.add_argument("--drop-universal-externals", dest="drop_universal_externals", action="store_true", default=True)
     ugr.add_argument("--no-drop-universal-externals", dest="drop_universal_externals", action="store_false")
@@ -238,12 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--company-max-pages", type=int, default=-1)
     p.add_argument("--hits-per-sec", type=int, default=50)
 
-    # --- Dual BM25 (for seeder) ---
     p.add_argument("--use-dual-bm25", dest="use_dual_bm25", action="store_true", default=True)
     p.add_argument("--no-use-dual-bm25", dest="use_dual_bm25", action="store_false")
     p.add_argument("--dual-alpha", type=float, default=0.5)
 
-    # --- Markdown generator knobs ---
     p.add_argument("--md-min-words", type=int, default=5)
     p.add_argument("--md-threshold", type=float, default=0.12)
     p.add_argument("--md-threshold-type", choices=["dynamic", "fixed"], default="fixed")
@@ -254,39 +272,44 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--md-body-width", type=int, default=0)
     p.add_argument("--md-cookie-max-frac", type=float, default=0.15)
 
-    # Mutually exclusive toggles for MD structure gating (default: True)
     mgrp = p.add_mutually_exclusive_group()
     mgrp.add_argument("--md-require-structure", dest="md_require_structure", action="store_true", default=True)
     mgrp.add_argument("--md-no-require-structure", dest="md_require_structure", action="store_false")
 
-    # --- Page timeouts + remote batch knobs ---
-    p.add_argument("--page-timeout-ms", type=int, default=120000,
+    p.add_argument("--page-timeout-ms", type=int, default=30000,
                    help="Per-page navigation/processing timeout in milliseconds (default: 120000).")
     p.add_argument("--remote-batch-size", type=int, default=64,
                    help="How many URLs to send in one remote fetch batch (default: 64).")
 
-    # --- LLM ---
     p.add_argument("--presence-only", action="store_true")
     p.add_argument("--llm-per-run-timeout", type=int, default=900,
-                help="Overall LLM run timeout in seconds (default 900).")
+                   help="Overall LLM run timeout in seconds (default 900).")
     p.add_argument("--llm-per-item-timeout", type=int, default=180,
-                help="Per-item streaming timeout in seconds when iterating the LLM stream (default 180).")
+                   help="Per-item streaming timeout in seconds (default 180).")
 
-    # --- Logging ---
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--max-open-company-logs", type=int, default=128)
     p.add_argument("--enable-session-log", action="store_true")
 
-    # --- Robustness ---
     p.add_argument("--company-timeout", type=int, default=1800)
     p.add_argument("--stall-interval", type=int, default=30)
     p.add_argument("--stall-timeout", type=int, default=1800)
 
-    # --- Failure classification knobs ---
     p.add_argument("--treat-timeouts-as-transport", action="store_true")
     p.add_argument("--retry-transport", type=int, default=2)
     p.add_argument("--retry-soft-timeout", type=int, default=1)
+
+    # Control whether to re-process URLs previously marked as failed
+    p.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help=(
+            "If set, re-process URLs previously marked as failed in url_index/checkpoints. "
+            "By default, failed URLs are treated as terminal and skipped."
+        ),
+    )
+
     return p
 
 def parse_pipeline(pipeline_arg: str) -> List[str]:
@@ -338,10 +361,10 @@ def load_url_index(bvdid: str) -> Dict[str, Any]:
     p = _url_index_path(bvdid)
     if not p.exists():
         return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    obj = _json_load_cached(p)
+    if isinstance(obj, dict):
+        return obj
+    return {}
 
 def _retry_emfile(fn: Callable[[], None], attempts: int = 6, delay: float = 0.15) -> None:
     for i in range(attempts):
@@ -357,7 +380,7 @@ def _retry_emfile(fn: Callable[[], None], attempts: int = 6, delay: float = 0.15
 def _atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    def _do():
+    def _do() -> None:
         tmp.write_text(data, encoding=encoding)
         tmp.replace(path)
     _retry_emfile(_do)
@@ -365,17 +388,15 @@ def _atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
 def _atomic_write_json(path: Path, obj: Any) -> None:
     content = json.dumps(obj, indent=2, ensure_ascii=False)
     _atomic_write_text(path, content, "utf-8")
+    _json_update_cache(path, obj)
 
 # ---------------------------------------------------------------------
-# URL index status precedence + writers (UPDATED)
+# URL index status precedence + writers
 # ---------------------------------------------------------------------
-
-# Higher number wins. Special handling for `filtered_*` and `presence_checked`.
 _STATUS_PRECEDENCE: Dict[str, int] = {
     "queued": 10,
-    # filtered_* gets 12 via _status_rank (below)
     "seeded": 20,
-    "presence_checked": 25,     # meta; shouldn't override html/markdown/llm
+    "presence_checked": 25,
     "html_saved": 30,
     "markdown_retry": 31,
     "markdown_suppressed": 32,
@@ -396,10 +417,8 @@ def _should_update_status(old: Optional[str], new: Optional[str]) -> bool:
     if not new:
         return False
     if new == "presence_checked":
-        # Only lift to presence_checked if we're at most seeded.
         return old in (None, "queued", "seeded")
     if isinstance(new, str) and new.startswith("filtered_"):
-        # filtered_* never overrides seeded or beyond
         return old in (None, "queued")
     return _status_rank(new) >= _status_rank(old)
 
@@ -419,33 +438,20 @@ def upsert_url_index(
     skip_status_update: bool = False,
     **extra: Any,
 ) -> None:
-    """
-    Upsert a single URL entry in outputs/{bvdid}/checkpoints/url_index.json
-
-    Status handling:
-      - If `skip_status_update=True`, status won’t change at all.
-      - Otherwise, we only upgrade status using precedence rules (never downgrade).
-      - Saving an artifact auto-lifts status to the corresponding stage if that’s an upgrade.
-    """
     idx = load_url_index(bvdid)
     ent: Dict[str, Any] = dict(idx.get(url, {}))
     now = datetime.now(timezone.utc).isoformat()
 
-    # Preserve earliest discovery timestamp
     ent.setdefault("discovered_at", ent.get("discovered_at", now))
 
-    # Score (rounded)
     if score is not None:
         try:
             ent["score"] = round(float(score), 6)
         except Exception:
             ent["score"] = score
 
-    # Current status snapshot for precedence checks
     current_status: Optional[str] = ent.get("status")
-
-    # --- Artifact paths (idempotent) with auto-lift proposals -----------
-    proposed_status: Optional[str] = status  # start with explicit status if provided
+    proposed_status: Optional[str] = status
 
     if html_path is not None:
         new_html = str(html_path)
@@ -476,7 +482,6 @@ def upsert_url_index(
         if not skip_status_update and proposed_status is None:
             proposed_status = "llm_extracted_empty" if llm_extracted_empty else "llm_extracted"
 
-    # --- Presence / LLM flags -------------------------------------------
     if has_offering is not None:
         try:
             ent["has_offering"] = int(has_offering)
@@ -496,19 +501,15 @@ def upsert_url_index(
         if not skip_status_update and proposed_status is None and llm_extracted_empty:
             proposed_status = "llm_extracted_empty"
 
-    # Optional reason
     if "reason" in extra and isinstance(extra["reason"], str):
         ent["reason"] = extra["reason"]
 
-    # --- Apply status with precedence (this is the key fix) -------------
     if not skip_status_update and proposed_status:
         if _should_update_status(current_status, proposed_status):
             ent["status"] = proposed_status
     elif "status" not in ent and proposed_status:
-        # If there is no prior status at all, set it.
         ent["status"] = proposed_status
 
-    # Update write timestamp
     ent["updated_at"] = now
 
     idx[url] = ent
@@ -516,10 +517,6 @@ def upsert_url_index(
     metrics.incr("url_index.upsert", bvdid=bvdid)
 
 def write_url_index_seed_only(bvdid: str, seeded_urls: List[str]) -> int:
-    """
-    Ensure all URLs are present with at least status=seeded, but never
-    downgrade an existing higher status.
-    """
     idx = load_url_index(bvdid)
     now = datetime.now(timezone.utc).isoformat()
     for u in seeded_urls:
@@ -528,7 +525,6 @@ def write_url_index_seed_only(bvdid: str, seeded_urls: List[str]) -> int:
         ent: Dict[str, Any] = dict(idx.get(u, {}))
         ent.setdefault("discovered_at", now)
         cur = ent.get("status")
-        # Lift to 'seeded' only if that's an upgrade by precedence
         if _should_update_status(cur, "seeded"):
             ent["status"] = "seeded"
         ent["updated_at"] = now
@@ -545,8 +541,10 @@ def read_last_crawl_date(bvdid: str) -> Optional[datetime]:
     if not p.exists():
         return None
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        v = data.get("last_crawled_at")
+        obj = _json_load_cached(p)
+        if not isinstance(obj, dict):
+            return None
+        v = obj.get("last_crawled_at")
         return datetime.fromisoformat(v) if v else None
     except Exception:
         return None
@@ -557,7 +555,7 @@ def write_last_crawl_date(bvdid: str, dt: Optional[datetime] = None) -> None:
     payload: Dict[str, Any] = {"last_crawled_at": new_ts}
     if meta_p.exists():
         try:
-            existing = json.loads(meta_p.read_text(encoding="utf-8"))
+            existing = _json_load_cached(meta_p)
             if isinstance(existing, dict):
                 existing["last_crawled_at"] = new_ts
                 payload = existing
@@ -607,11 +605,10 @@ def mk_md_config(args: argparse.Namespace) -> CrawlerRunConfig:
     return crawler_base_cfg.clone(
         markdown_generator=build_md_generator_from_args(args),
         cache_mode=CacheMode.BYPASS,
-        stream=False,
-        page_timeout=int(getattr(args, "page_timeout_ms", 120000))  # 120s default
+        stream=True,
+        page_timeout=int(getattr(args, "page_timeout_ms", 120000))
     )
 
-# Back-compat alias (kept so external calls don't break)
 def mk_llm_config_for_markdown_input(args: argparse.Namespace) -> CrawlerRunConfig:
     return mk_llm_config(args)
 
@@ -626,16 +623,15 @@ def mk_llm_config(args: argparse.Namespace) -> CrawlerRunConfig:
     return crawler_base_cfg.clone(
         extraction_strategy=extraction,
         cache_mode=CacheMode.BYPASS,
-        stream=True,
+        stream=False,
     )
 
-# No-op, kept for compatibility with older code paths
 def mk_remote_config_for_pipeline(*args, **kwargs) -> None:
     return None
 
 def make_dispatcher(max_concurrency: int) -> MemoryAdaptiveDispatcher:
     return MemoryAdaptiveDispatcher(
-        memory_threshold_percent=85.0,
+        memory_threshold_percent=50.0,
         check_interval=1.0,
         max_session_permit=max_concurrency,
         rate_limiter=RateLimiter(base_delay=(0.5, 1.2), max_delay=20.0, max_retries=2),
@@ -646,21 +642,9 @@ def make_dispatcher(max_concurrency: int) -> MemoryAdaptiveDispatcher:
 # Discovery helpers (seed stats)
 # -----------------------
 def _normalize_seed_root(url: str) -> str:
-    """
-    Normalize any seed_root URL to a canonical site root:
-
-        "https://www.example.com/foo/bar"  -> "https://example.com/"
-        "example.com/path"                 -> "https://example.com/"
-        "//example.com"                    -> "https://example.com/"
-
-    Used for seed aggregation so that all subpages under the same host
-    collapse into a single root entry.
-    """
     s = (url or "").strip()
     if not s:
         return ""
-
-    # Ensure we have a scheme so urlparse works consistently
     if s.startswith("//"):
         s = "https:" + s
     elif "://" not in s:
@@ -676,39 +660,9 @@ def _normalize_seed_root(url: str) -> str:
         host = host[4:]
     if not host:
         return ""
-
-    # We intentionally normalize scheme to https for aggregation
     return f"https://{host}/"
 
 def aggregate_seed_by_root(items: Iterable[Dict[str, Any]], base_root: str) -> Dict[str, Any]:
-    """
-    Aggregate seed statistics by canonical site root, not by individual page.
-
-    Example:
-        seed_root values:
-            https://marleycoffee.com/
-            https://marleycoffee.com/where-to-buy-usa/
-            https://www.marleycoffee.com/where-to-buy-canada/
-
-        -> all collapse to:
-            https://marleycoffee.com/
-
-    Returned structure:
-        {
-          "seed_counts_by_root": {
-              "https://mother-parkers.com/": 50,
-              "https://marleycoffee.com/": 3,
-          },
-          "seed_roots": [
-              "https://marleycoffee.com/",
-              "https://mother-parkers.com/"
-          ],
-          "seed_brand_roots": [
-              # everything except the normalized base_root
-          ],
-          "seed_brand_count": <len(seed_brand_roots)>
-        }
-    """
     counts: Dict[str, int] = {}
     roots: List[str] = []
 
@@ -746,9 +700,6 @@ def _resolve_lang_regions_from_args(args: argparse.Namespace) -> set[str]:
     return parse_lang_accept_regions(getattr(args, "lang_accept_en_regions", ""))
 
 def build_seeder_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
-    """
-    Build kwargs for url_seeder.seed_urls() / discover_and_crawl().
-    """
     include, exclude = _resolve_patterns_from_args(args)
     return {
         "source": getattr(args, "seeding_source", "cc"),
@@ -778,7 +729,7 @@ def build_seeder_kwargs(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
 # -----------------------
-# Failure classification
+# Failure classification / misc
 # -----------------------
 def classify_failure(err_msg: str | None, status_code: Optional[int], *, treat_timeouts_as_transport: bool) -> str:
     s = (err_msg or "").lower()
@@ -790,7 +741,6 @@ def classify_failure(err_msg: str | None, status_code: Optional[int], *, treat_t
         return "transport" if treat_timeouts_as_transport else "soft_timeout"
 
     if "net::" in s:
-        # IMPORTANT: HTTP response code failure (Playwright) – do NOT retry like transport
         if "err_http_response_code_failure" in s:
             return "other"
         if "timeout" in s or "err_connection_timed_out" in s or "err_timed_out" in s:
@@ -844,11 +794,7 @@ def classify_failure(err_msg: str | None, status_code: Optional[int], *, treat_t
 
     return "other"
 
-# -----------------------
-# Misc
-# -----------------------
 def per_company_slots(n_companies: int, max_slots: int) -> int:
-    # Backward-compat helper (no longer used by run_crawl.py)
     if n_companies <= 1:
         return max_slots
     return max(2, max_slots // min(n_companies, max_slots))

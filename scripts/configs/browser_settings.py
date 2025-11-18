@@ -268,6 +268,7 @@ def make_browser_config(
 browser_cfg = make_browser_config(
     lang="en-US",
     headless=True,
+    enable_stealth=True,
     viewport_width=1280,
     viewport_height=720,
     persistent=False,
