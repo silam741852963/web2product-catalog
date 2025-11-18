@@ -105,6 +105,7 @@ class GlobalState:
             """)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
             # Defensive migrations if table already existed
             self._migrate_columns({
                 "root_url": "TEXT",

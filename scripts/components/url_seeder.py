@@ -78,34 +78,24 @@ class ExternalsUniverse:
         )
 
     def install(self) -> None:
-            """
-            Register dataset externals in filtering module and demote any overlaps
-            from UNIVERSAL_EXTERNALS at runtime so they aren't auto-dropped.
-            """
-            global _EXTERNALS_INSTALLED_ONCE
-            
-            if _EXTERNALS_INSTALLED_ONCE:
-                log.debug("[externals] Dataset externals already installed; skipping.")
-                return
+        """
+        Register dataset externals in filtering module and demote any overlaps
+        from UNIVERSAL_EXTERNALS at runtime so they aren't auto-dropped.
+        """
+        global _EXTERNALS_INSTALLED_ONCE
 
-            # Keep the behavior the same: always (re)register the sets
-            set_dataset_externals(self.registrable_domains or self.hosts)
-            set_universal_external_runtime_exclusions(self.registrable_domains or self.hosts)
+        if _EXTERNALS_INSTALLED_ONCE:
+            log.debug("[externals] Dataset externals already installed; skipping.")
+            return
 
-            # But only log at INFO the first time
-            if not _EXTERNALS_INSTALLED_ONCE:
-                log.info(
-                    "[externals] Installed dataset externals: hosts=%d registrable=%d, allowed_brand_hosts=%d",
-                    len(self.hosts), len(self.registrable_domains), len(self.allowed_brand_hosts),
-                )
-                _EXTERNALS_INSTALLED_ONCE = True
-            else:
-                # Optional: keep a low-noise debug trace if you want
-                log.debug(
-                    "[externals] Dataset externals already installed; "
-                    "skipping repeated INFO log (hosts=%d registrable=%d)",
-                    len(self.hosts), len(self.registrable_domains),
-                )
+        set_dataset_externals(self.registrable_domains or self.hosts)
+        set_universal_external_runtime_exclusions(self.registrable_domains or self.hosts)
+
+        log.info(
+            "[externals] Installed dataset externals: hosts=%d registrable=%d, allowed_brand_hosts=%d",
+            len(self.hosts), len(self.registrable_domains), len(self.allowed_brand_hosts),
+        )
+        _EXTERNALS_INSTALLED_ONCE = True
 
 
 # -------------------------
@@ -162,10 +152,6 @@ def _normalized_root_key(root: str) -> str:
       - https scheme
       - apex host (no 'www.')
       - trailing slash
-    e.g.  https://mother-parkers.com,
-          https://mother-parkers.com/,
-          https://www.mother-parkers.com
-      -> https://mother-parkers.com/
     """
     return _apex_root(root)
 
@@ -267,7 +253,6 @@ async def _collect_roots_https(
             raw = await discover_brand_sites(preferred)
             for u in (raw or []):
                 for v in _with_https_only(str(u).strip()):
-                    # Guard: do not add dataset externals as brand roots unless explicitly allowed
                     if should_block_external_for_dataset(preferred, v, allowed_brand_hosts=allowed_brand_hosts or set()):
                         log.debug("[url_seeder] skip brand root due to dataset externals policy: %s", v)
                         continue
@@ -288,17 +273,32 @@ def _stage_run_config_for_discovery() -> CrawlerRunConfig:
     return crawler_base_cfg.clone(
         cache_mode=CacheMode.ENABLED,
         scraping_strategy=LXMLWebScrapingStrategy(),
-        stream=False,
+        stream=True,
     )
 
 
-async def _discover_with_crawl4ai(root: str) -> List[str]:
-    run_cfg = _stage_run_config_for_discovery()
+async def _discover_with_crawl4ai(
+    root: str,
+    *,
+    crawler: Optional[AsyncWebCrawler] = None,
+    run_cfg: Optional[CrawlerRunConfig] = None,
+) -> List[str]:
+    """
+    Fetch homepage links for `root` using Crawl4AI.
+
+    If a shared `crawler` and `run_cfg` are provided, they are reused to avoid
+    creating a browser session per root. Otherwise, a temporary crawler is used
+    (backwards-compatible behavior).
+    """
+    cfg = run_cfg or _stage_run_config_for_discovery()
     homepage = _ensure_https_root(root)
 
     try:
-        async with AsyncWebCrawler(config=browser_cfg) as crawler:
-            r = await crawler.arun(url=homepage, config=run_cfg)
+        if crawler is not None:
+            r = await crawler.arun(url=homepage, config=cfg)
+        else:
+            async with AsyncWebCrawler(config=browser_cfg) as c:
+                r = await c.arun(url=homepage, config=cfg)
     except Exception as e:
         log.debug("[url_seeder] Crawl4AI fetch failed for %s: %s", homepage, e)
         return []
@@ -334,14 +334,14 @@ async def _sitemap_fallback_all_variants(root: str, *, timeout_s: float = 45.0) 
     apex = _apex_root(root)
     www = _www_root(root)
 
-    variants = []
+    variants: List[str] = []
     for v in (canon, apex, www):
         if v not in variants:
             variants.append(v)
 
     log.info("[url_seeder] [sitemaps] start root=%s variants=%s", root, ", ".join(variants))
 
-    async def _one(v: str):
+    async def _one(v: str) -> List[str]:
         try:
             return await discover_from_sitemaps(v, timeout_s=timeout_s)
         except Exception as e:
@@ -349,7 +349,7 @@ async def _sitemap_fallback_all_variants(root: str, *, timeout_s: float = 45.0) 
             return []
 
     results = await asyncio.gather(*(_one(v) for v in variants))
-    merged = []
+    merged: List[str] = []
     for lst in results:
         merged.extend(lst or [])
 
@@ -379,22 +379,25 @@ async def _seed_brand_roots(
     *,
     preferred_root: str,
     allowed_brand_hosts: Optional[Set[str]],
+    shared_crawler: Optional[AsyncWebCrawler] = None,
+    run_cfg: Optional[CrawlerRunConfig] = None,
 ) -> Dict[str, List[str]]:
     """
     For each brand root, run homepage link discovery + sitemap variants;
     return dict[root] -> list[urls] (all in-domain, deduped).
     Dataset externals are blocked unless explicitly allowed via allowed_brand_hosts.
+
+    If `shared_crawler` is provided, it is reused for homepage fetches.
     """
     out: Dict[str, List[str]] = {}
 
     async def _seed_one(root: str) -> Tuple[str, List[str]]:
-        # Guard: drop if dataset-external relative to preferred
         if should_block_external_for_dataset(preferred_root, root, allowed_brand_hosts=allowed_brand_hosts or set()):
             log.debug("[url_seeder] block brand root (dataset externals): %s", root)
             return (root, [])
 
         try:
-            c4 = await _discover_with_crawl4ai(root)
+            c4 = await _discover_with_crawl4ai(root, crawler=shared_crawler, run_cfg=run_cfg)
             sm = await _sitemap_fallback_all_variants(root, timeout_s=45.0)
             merged = _dedupe(list(c4 or []) + list(sm or []))
             canon = _ensure_https_root(root)
@@ -437,7 +440,6 @@ async def _expand_with_brand_pages_simple(
 
         for root in (brand_roots or []):
             for v in _with_https_only(root):
-                # Guard: block dataset externals unless allowed
                 if should_block_external_for_dataset(preferred_root, v, allowed_brand_hosts=allowed_brand_hosts or set()):
                     log.debug("[url_seeder] skip fallback brand root (dataset externals): %s", v)
                     continue
@@ -490,7 +492,6 @@ async def seed_urls(
     **_ignore,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
 
-    # If an externals universe is provided, install its protections.
     if externals_universe:
         externals_universe.install()
     allowed_brand_hosts = (externals_universe.allowed_brand_hosts if externals_universe else set())
@@ -525,70 +526,75 @@ async def seed_urls(
     raw_pairs: List[Tuple[str, str]] = []
     used_fallback = False
 
-    # 1) Primary seeding on each root (homepage links, then sitemaps)
-    for r in roots:
-        c4_urls = await _discover_with_crawl4ai(r)
-        urls: List[str] = []
-        if c4_urls:
-            urls = _dedupe(c4_urls)
-        else:
-            log.info("[url_seeder] 0 URLs from Crawl4AI on %s → fallback to sitemap_hunter", r)
-            sm_urls = await _sitemap_fallback_all_variants(r, timeout_s=45.0)
-            used_fallback = used_fallback or bool(sm_urls)
-            urls = _dedupe(sm_urls or [])
+    # Shared discovery config & crawler to avoid spinning up multiple browser sessions
+    discovery_cfg = _stage_run_config_for_discovery()
 
-        if not urls:
-            continue
+    async with AsyncWebCrawler(config=browser_cfg) as crawler:
+        # 1) Primary seeding on each root (homepage links, then sitemaps)
+        for r in roots:
+            c4_urls = await _discover_with_crawl4ai(r, crawler=crawler, run_cfg=discovery_cfg)
+            urls: List[str] = []
+            if c4_urls:
+                urls = _dedupe(c4_urls)
+            else:
+                log.info("[url_seeder] 0 URLs from Crawl4AI on %s → fallback to sitemap_hunter", r)
+                sm_urls = await _sitemap_fallback_all_variants(r, timeout_s=45.0)
+                used_fallback = used_fallback or bool(sm_urls)
+                urls = _dedupe(sm_urls or [])
 
-        root_key = _normalized_root_key(r)
-        bucket = root_to_urls.setdefault(root_key, set())
-        for u in urls:
-            bucket.add(u)
-            raw_pairs.append((u, r))
+            if not urls:
+                continue
 
-    # 2) Brand-root discovery & seeding (PRE-FILTER)
-    if raw_pairs:
-        brand_page_urls: List[str] = []
-        for u, seed_root in raw_pairs:
-            if _looks_like_brand_page(u, seed_root):
-                brand_page_urls.append(u)
-        if brand_page_urls:
-            log.info("[url_seeder] brand pages detected=%d — discovering external brand roots", len(brand_page_urls))
-            brand_roots_set: Set[str] = set()
+            root_key = _normalized_root_key(r)
+            bucket = root_to_urls.setdefault(root_key, set())
+            for u in urls:
+                bucket.add(u)
+                raw_pairs.append((u, r))
 
-            async def _discover_from_page(bp: str) -> List[str]:
-                try:
-                    return await discover_brand_sites(bp)
-                except Exception as e:
-                    log.debug("[url_seeder] discover_brand_sites failed on %s: %s", bp, e)
-                    return []
+        # 2) Brand-root discovery & seeding (PRE-FILTER)
+        if raw_pairs:
+            brand_page_urls: List[str] = []
+            for u, seed_root in raw_pairs:
+                if _looks_like_brand_page(u, seed_root):
+                    brand_page_urls.append(u)
+            if brand_page_urls:
+                log.info("[url_seeder] brand pages detected=%d — discovering external brand roots", len(brand_page_urls))
+                brand_roots_set: Set[str] = set()
 
-            discovered_lists = await asyncio.gather(*(_discover_from_page(bp) for bp in _dedupe(brand_page_urls)))
-            for lst in discovered_lists:
-                for root in (lst or []):
-                    for v in _with_https_only(root):
-                        # Guard with dataset externals policy here too
-                        if should_block_external_for_dataset(preferred, v, allowed_brand_hosts=allowed_brand_hosts):
-                            log.debug("[url_seeder] skip discovered brand root (dataset externals): %s", v)
+                async def _discover_from_page(bp: str) -> List[str]:
+                    try:
+                        return await discover_brand_sites(bp)
+                    except Exception as e:
+                        log.debug("[url_seeder] discover_brand_sites failed on %s: %s", bp, e)
+                        return []
+
+                discovered_lists = await asyncio.gather(*(_discover_from_page(bp) for bp in _dedupe(brand_page_urls)))
+                for lst in discovered_lists:
+                    for root in (lst or []):
+                        for v in _with_https_only(root):
+                            if should_block_external_for_dataset(preferred, v, allowed_brand_hosts=allowed_brand_hosts):
+                                log.debug("[url_seeder] skip discovered brand root (dataset externals): %s", v)
+                                continue
+                            brand_roots_set.add(v)
+
+                if brand_roots_set:
+                    log.info("[url_seeder] unique brand roots discovered=%d — seeding them", len(brand_roots_set))
+                    seeded_map = await _seed_brand_roots(
+                        sorted(brand_roots_set),
+                        preferred_root=preferred,
+                        allowed_brand_hosts=allowed_brand_hosts,
+                        shared_crawler=crawler,
+                        run_cfg=discovery_cfg,
+                    )
+                    for root, urls in seeded_map.items():
+                        if not urls:
                             continue
-                        brand_roots_set.add(v)
-
-            if brand_roots_set:
-                log.info("[url_seeder] unique brand roots discovered=%d — seeding them", len(brand_roots_set))
-                seeded_map = await _seed_brand_roots(
-                    sorted(brand_roots_set),
-                    preferred_root=preferred,
-                    allowed_brand_hosts=allowed_brand_hosts,
-                )
-                for root, urls in seeded_map.items():
-                    if not urls:
-                        continue
-                    root_key = _normalized_root_key(root)
-                    bucket = root_to_urls.setdefault(root_key, set())
-                    for u in urls:
-                        bucket.add(u)
-                        raw_pairs.append((u, root))
-                log.info("[url_seeder] brand-root seeding appended urls=%d", sum(len(v) for v in seeded_map.values()))
+                        root_key = _normalized_root_key(root)
+                        bucket = root_to_urls.setdefault(root_key, set())
+                        for u in urls:
+                            bucket.add(u)
+                            raw_pairs.append((u, root))
+                    log.info("[url_seeder] brand-root seeding appended urls=%d", sum(len(v) for v in seeded_map.values()))
 
     # --- FINAL FALLBACK: url_index (dataset aware) ---
     total_discovered = sum(len(v) for v in root_to_urls.values())
@@ -617,7 +623,7 @@ async def seed_urls(
             )
             idx_urls: List[Dict[str, Any]] = idx_res.get("urls", []) or []
 
-            kept = []
+            kept: List[Dict[str, Any]] = []
             seen_k: Set[str] = set()
             for it in idx_urls:
                 u = str(it.get("url") or "").strip()
@@ -749,7 +755,6 @@ async def seed_urls(
                 except Exception:
                     pass
 
-    # Build per_root_counts from normalized root_to_urls
     per_root_counts: Dict[str, int] = {
         root_key: len(urls) for root_key, urls in sorted(root_to_urls.items(), key=lambda kv: kv[0])
     }

@@ -10,6 +10,9 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import contextlib
+from contextlib import contextmanager
+
 
 from extensions.output_paths import OUTPUT_ROOT as OUTPUTS_DIR, sanitize_bvdid
 
@@ -108,6 +111,28 @@ def _atomic_write_json(path: Path, obj: object):
 # Company checkpoint
 # ----------------------------
 
+def _update_url_index_failed(bvdid: str, url: str, reason: str) -> None:
+    """
+    Best-effort helper to mark a URL as failed in url_index.json.
+    We *do not* touch the main 'status' field used for pipeline stages;
+    instead we add dedicated failure fields so we can filter on them.
+    """
+    idx_path = url_index_path_for(bvdid)
+    existing: Dict[str, Any] = {}
+    if idx_path.exists():
+        try:
+            existing = json.loads(idx_path.read_text(encoding="utf-8"))
+        except Exception:
+            existing = {}
+
+    ent = existing.get(url) or {}
+    ent["failed"] = True
+    ent["failed_reason"] = reason
+    ent["failed_at"] = datetime.now(timezone.utc).isoformat()
+    existing[url] = ent
+
+    _atomic_write_json(idx_path, existing)
+
 @dataclass
 class CompanyProgress:
     bvdid: str
@@ -198,6 +223,28 @@ class CompanyCheckpoint:
             payload = json.dumps(payload_dict, indent=2, ensure_ascii=False)
             await asyncio.to_thread(_atomic_write_text, self.path, payload, "utf-8")
 
+    def _update_url_index_failed(bvdid: str, url: str, reason: str) -> None:
+        """
+        Best-effort helper to mark a URL as failed in url_index.json.
+        We *do not* touch the main 'status' field used for pipeline stages;
+        instead we add dedicated failure fields so we can filter on them.
+        """
+        idx_path = url_index_path_for(bvdid)
+        existing: Dict[str, Any] = {}
+        if idx_path.exists():
+            try:
+                existing = json.loads(idx_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+
+        ent = existing.get(url) or {}
+        ent["failed"] = True
+        ent["failed_reason"] = reason
+        ent["failed_at"] = datetime.now(timezone.utc).isoformat()
+        existing[url] = ent
+
+        _atomic_write_json(idx_path, existing)
+
     # ---- marks ----
 
     async def mark_start(self, stage: str, total_urls: int = 0) -> None:
@@ -226,10 +273,33 @@ class CompanyCheckpoint:
         await self.save()
 
     async def mark_url_failed(self, url: str, reason: str) -> None:
+        """
+        Increment failure counters, append a timestamped error entry, and
+        mirror the failure into url_index.json so future runs can decide
+        to skip or retry this URL based on the --retry-failed flag.
+        """
         self.data["urls_failed"] = int(self.data.get("urls_failed", 0)) + 1
         self.data["last_url"] = url
+
         errs = self.data.setdefault("errors", [])
-        errs.append({"url": url, "reason": reason})
+        errs.append({
+            "url": url,
+            "reason": reason,
+            "time": datetime.now(timezone.utc).isoformat(),
+        })
+
+        # Best-effort: reflect this failure into url_index.json
+        try:
+            await asyncio.to_thread(
+                _update_url_index_failed,
+                self.bvdid_original,
+                url,
+                reason,
+            )
+        except Exception:
+            # Don't let url_index issues break checkpoint updates
+            pass
+
         await self.save()
 
     async def add_note(self, text: str) -> None:
@@ -280,6 +350,66 @@ class CompanyCheckpoint:
 # Session-level (one JSON file)
 # ----------------------------
 
+@contextmanager
+def _session_file_lock(path: Path):
+    """
+    Cross-process advisory lock for session_checkpoint.json.
+
+    Uses a sidecar *.lock file and fcntl/msvcrt where available.
+    Best-effort: if locking fails, we still proceed – but when it works,
+    it serializes readers/writers across processes.
+    """
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Always open in text mode; we only care about the handle for locking.
+    f = open(lock_path, "a+", encoding="utf-8")
+    try:
+        try:
+            import fcntl  # type: ignore[attr-defined]
+        except Exception:
+            fcntl = None
+
+        if fcntl is not None:
+            # POSIX advisory lock
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                pass
+        else:
+            # Windows best-effort lock
+            try:
+                import msvcrt  # type: ignore
+                # Ensure file length > 0 or locking length 0 will fail
+                try:
+                    if lock_path.stat().st_size == 0:
+                        f.write("0")
+                        f.flush()
+                except Exception:
+                    pass
+                length = max(1, lock_path.stat().st_size)
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, length)
+            except Exception:
+                pass
+
+        yield
+    finally:
+        try:
+            if "fcntl" in locals() and fcntl is not None:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            else:
+                try:
+                    import msvcrt  # type: ignore
+                    length = max(1, lock_path.stat().st_size)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, length)
+                except Exception:
+                    pass
+        finally:
+            f.close()
+
 class CheckpointManager:
     """
     Maintains in-memory map of CompanyCheckpoint and a single
@@ -311,10 +441,11 @@ class CheckpointManager:
 
     # ---- internal helpers ----
 
-    def _load_session_locked(self) -> Dict[str, Any]:
+    def _load_session_unlocked(self) -> Dict[str, Any]:
         """
-        Load and normalize the session JSON.
-        Must be called with self._lock held.
+        Load and normalize the session JSON without taking the asyncio lock.
+        Callers are responsible for holding self._lock and (for multi-process
+        safety) _session_file_lock(self.session_path).
         """
         cur: Dict[str, Any] = {}
         if self.session_path.exists():
@@ -371,115 +502,192 @@ class CheckpointManager:
     async def append_company(self, bvdid: str, company_name: Optional[str] = None, **_ignored) -> None:
         """
         Append a company ID (and optionally its name) to session_checkpoint.json.
-        Accepts **_ignored to be tolerant to older call sites passing extra kwargs.
 
-        The session file now stores "companies" as a dict: { bvdid: company_name }.
-        This function will also migrate older list-based files into the new dict form.
-        """
-        async with self._lock:
-            cur = self._load_session_locked()
-
-            # ensure started_at exists (keep existing if present)
-            cur.setdefault("started_at", datetime.now(timezone.utc).isoformat())
-
-            # update/insert the current bvdid entry
-            if company_name is not None:
-                cur["companies"][bvdid] = company_name
-            else:
-                # if no name provided and entry missing, set empty string (so presence is recorded)
-                cur["companies"].setdefault(bvdid, "")
-
-            payload = json.dumps(cur, indent=2, ensure_ascii=False)
-            await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
-
-    async def mark_global_start(self) -> None:
-        """
-        Initialize / reset the session checkpoint for a new run.
-        This mirrors the old behavior (fresh structure) but now also zeros
-        global progress counters so completion_pct starts from 0.
+        Now uses a cross-process file lock and always merges with existing
+        content, so multi-instance runs don't clobber each other.
         """
         async with self._lock:
             now = datetime.now(timezone.utc).isoformat()
-            cur: Dict[str, Any] = {
-                "started_at": now,
-                "companies": {},
-                "total_companies": 0,
-                "completed_companies": 0,
-                "completion_pct": 0.0,
-                "last_company_bvdid": None,
-                "last_updated": now,
-            }
-            payload = json.dumps(cur, indent=2, ensure_ascii=False)
-            await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
+            with _session_file_lock(self.session_path):
+                cur = self._load_session_unlocked()
+
+                # ensure started_at exists (keep existing if present)
+                cur.setdefault("started_at", cur.get("started_at") or now)
+
+                if not isinstance(cur.get("companies"), dict):
+                    cur["companies"] = {}
+                companies: Dict[str, Any] = cur["companies"]
+
+                # update/insert the current bvdid entry
+                if company_name is not None:
+                    companies[bvdid] = company_name
+                else:
+                    companies.setdefault(bvdid, "")
+
+                # total_companies: number of distinct companies we've ever seen
+                existing_total = int(cur.get("total_companies") or 0)
+                cur["total_companies"] = max(existing_total, len(companies))
+
+                # last_updated + last_company
+                cur["last_company_bvdid"] = bvdid
+                cur["last_updated"] = now
+
+                completed = int(cur.get("completed_companies") or 0)
+                if cur["total_companies"] > 0:
+                    cur["completion_pct"] = (completed / cur["total_companies"]) * 100.0
+                else:
+                    cur["completion_pct"] = 0.0
+
+                payload = json.dumps(cur, indent=2, ensure_ascii=False)
+                await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
+
+    async def mark_global_start(self) -> None:
+        """
+        Initialize the session checkpoint in a non-destructive way.
+
+        If the file already exists, we *reuse* its companies and counters,
+        only normalizing the structure and updating last_updated. This prevents
+        later runs from wiping earlier progress while still keeping a single
+        shared session file.
+        """
+        async with self._lock:
+            now = datetime.now(timezone.utc).isoformat()
+            with _session_file_lock(self.session_path):
+                cur = self._load_session_unlocked()
+
+                if not cur:
+                    # First-time initialization
+                    cur = {
+                        "started_at": now,
+                        "companies": {},
+                        "total_companies": 0,
+                        "completed_companies": 0,
+                        "completion_pct": 0.0,
+                        "last_company_bvdid": None,
+                        "last_updated": now,
+                    }
+                else:
+                    cur.setdefault("started_at", cur.get("started_at") or now)
+                    if not isinstance(cur.get("companies"), dict):
+                        cur["companies"] = {}
+
+                    companies: Dict[str, Any] = cur["companies"]
+                    total_companies = max(int(cur.get("total_companies") or 0), len(companies))
+                    cur["total_companies"] = total_companies
+
+                    completed = int(cur.get("completed_companies") or 0)
+                    cur["completed_companies"] = completed
+
+                    if total_companies > 0:
+                        cur["completion_pct"] = (completed / total_companies) * 100.0
+                    else:
+                        cur["completion_pct"] = 0.0
+
+                    cur["last_updated"] = now
+
+                payload = json.dumps(cur, indent=2, ensure_ascii=False)
+                await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
 
     # ---- session: global progress (percentage) ----
 
     async def set_total_companies(self, total: int) -> None:
         """
-        Set the total number of companies in this run.
-        Safe to call multiple times; last value wins.
+        Set (or raise) the total number of companies in this session.
+
+        In multi-instance scenarios, we only ever move this value upward and
+        also respect the actual number of distinct company IDs recorded so far.
         """
         async with self._lock:
-            cur = self._load_session_locked()
             now = datetime.now(timezone.utc).isoformat()
+            with _session_file_lock(self.session_path):
+                cur = self._load_session_unlocked()
+                cur.setdefault("started_at", cur.get("started_at") or now)
 
-            cur.setdefault("started_at", now)
-            cur["total_companies"] = int(total)
-            completed = int(cur.get("completed_companies") or 0)
+                if not isinstance(cur.get("companies"), dict):
+                    cur["companies"] = {}
+                companies: Dict[str, Any] = cur["companies"]
 
-            if cur["total_companies"] > 0:
-                cur["completion_pct"] = (completed / cur["total_companies"]) * 100.0
-            else:
-                cur["completion_pct"] = 0.0
+                existing_total = max(int(cur.get("total_companies") or 0), len(companies))
+                new_total = max(existing_total, int(total))
+                cur["total_companies"] = new_total
 
-            cur["last_updated"] = now
+                completed = int(cur.get("completed_companies") or 0)
+                cur["completed_companies"] = completed
 
-            payload = json.dumps(cur, indent=2, ensure_ascii=False)
-            await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
+                if new_total > 0:
+                    cur["completion_pct"] = (completed / new_total) * 100.0
+                else:
+                    cur["completion_pct"] = 0.0
+
+                cur["last_updated"] = now
+
+                payload = json.dumps(cur, indent=2, ensure_ascii=False)
+                await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
 
     async def mark_company_completed(self, bvdid: str) -> None:
         """
         Increment the global completed_companies counter and recompute completion_pct.
-        Intended to be called once per company when its crawl pipeline finishes
-        (regardless of success/failure, as long as it's 'done').
+
+        Safe under multi-instance: we always re-read the current snapshot under a
+        cross-process lock and only bump the counter + last_company_bvdid.
         """
         async with self._lock:
-            cur = self._load_session_locked()
             now = datetime.now(timezone.utc).isoformat()
+            with _session_file_lock(self.session_path):
+                cur = self._load_session_unlocked()
+                cur.setdefault("started_at", cur.get("started_at") or now)
 
-            total = int(cur.get("total_companies") or 0)
-            completed = int(cur.get("completed_companies") or 0) + 1
+                if not isinstance(cur.get("companies"), dict):
+                    cur["companies"] = {}
+                companies: Dict[str, Any] = cur["companies"]
 
-            cur["completed_companies"] = completed
-            cur.setdefault("total_companies", total)
+                total = max(int(cur.get("total_companies") or 0), len(companies))
+                completed = int(cur.get("completed_companies") or 0) + 1
 
-            if cur["total_companies"] > 0:
-                cur["completion_pct"] = (completed / cur["total_companies"]) * 100.0
-            else:
-                # If total is unknown, leave pct as 0 or None; caller can still log (done, total)
-                cur["completion_pct"] = 0.0
+                cur["total_companies"] = total
+                cur["completed_companies"] = completed
+                cur["last_company_bvdid"] = bvdid
+                cur["last_updated"] = now
 
-            cur["last_company_bvdid"] = bvdid
-            cur["last_updated"] = now
+                if total > 0:
+                    cur["completion_pct"] = (completed / total) * 100.0
+                else:
+                    cur["completion_pct"] = 0.0
 
-            payload = json.dumps(cur, indent=2, ensure_ascii=False)
-            await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
+                payload = json.dumps(cur, indent=2, ensure_ascii=False)
+                await asyncio.to_thread(_atomic_write_text, self.session_path, payload, "utf-8")
 
     async def get_session_progress(self) -> Dict[str, Any]:
         """
         Convenience helper to read the latest global progress snapshot.
-        This reads directly from disk, without relying on in-memory state.
+
+        Reads from disk under a cross-process file lock and normalizes
+        total_companies based on the companies map (if present).
         """
         async with self._lock:
-            cur = self._load_session_locked()
-            return {
-                "total_companies": int(cur.get("total_companies") or 0),
-                "completed_companies": int(cur.get("completed_companies") or 0),
-                "completion_pct": float(cur.get("completion_pct") or 0.0),
-                "last_company_bvdid": cur.get("last_company_bvdid"),
-                "started_at": cur.get("started_at"),
-                "last_updated": cur.get("last_updated"),
-            }
+            with _session_file_lock(self.session_path):
+                cur = self._load_session_unlocked()
+
+        companies = cur.get("companies")
+        if not isinstance(companies, dict):
+            companies = {}
+
+        total_companies = max(int(cur.get("total_companies") or 0), len(companies))
+        completed = int(cur.get("completed_companies") or 0)
+
+        if total_companies > 0:
+            completion_pct = (completed / total_companies) * 100.0
+        else:
+            completion_pct = 0.0
+
+        return {
+            "total_companies": total_companies,
+            "completed_companies": completed,
+            "completion_pct": completion_pct,
+            "last_company_bvdid": cur.get("last_company_bvdid"),
+            "started_at": cur.get("started_at"),
+            "last_updated": cur.get("last_updated"),
+        }
 
     # ---- misc summary of in-memory company checkpoints ----
 
