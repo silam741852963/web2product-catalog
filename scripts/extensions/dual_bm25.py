@@ -1,200 +1,546 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
-import logging
 from dataclasses import dataclass
-from typing import Iterable, List, Set, Tuple, Callable, Optional
+from typing import Dict, List, Optional, Mapping
 
-from extensions.filtering import (
-    DEFAULT_EXCLUDE_PATTERNS,
-    DEFAULT_EXCLUDE_QUERY_KEYS,
-    UNIVERSAL_EXTERNALS,
-)
-from configs import language_settings as lang_cfg
+from crawl4ai.deep_crawling.filters import URLFilter
+from crawl4ai.deep_crawling.scorers import URLScorer
+from crawl4ai.utils import HeadPeekr
 
 __all__ = [
-    "build_default_negative_terms",
-    "build_default_negative_query",
     "DualBM25Config",
-    "DualBM25Combiner",
+    "DualBM25Filter",
+    "DualBM25Scorer",
 ]
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Tokenization helpers
-# ---------------------------------------------------------------------------
-_FILE_EXT_STOP = { "pdf","ps","rtf","doc","docx","ppt","pptx","pps","xls","xlsx",
-                  "csv","tsv","xml", "json","yml","yaml","md","rst","zip","rar",
-                  "7z","gz","bz2","xz","tar","tgz","dmg", "exe","msi","apk","jpg",
-                  "jpeg","png","gif","svg","webp","bmp","tif","tiff","ico", "mp3",
-                  "wav","m4a","ogg","flac","aac","mp4","m4v","webm","mov","avi",
-                  "wmv","mkv", "ics","eot","ttf","otf","woff","woff2","map", }
 
-_STOPWORDS: Set[str] = set(lang_cfg.get_stopwords())
+def _tokenize(text: str) -> List[str]:
+    """
+    Simple, fast, case-insensitive tokenization for BM25 scoring.
 
-_SPLIT_RX = re.compile(r"[^a-z0-9]+")
+    IMPORTANT FIX:
+      - Previously we used `text.lower().split()`, which treats an entire URL like:
+            "https://mother-parkers.com/coffee-excellence/private-label-formats"
+        as ONE token, so query terms never matched and BM25 scores stayed 0.
 
-def _basic_tokens(s: str) -> List[str]:
-    s = (s or "").lower().strip()
-    if not s:
+      - Now we split on non-alphanumeric boundaries, so the same URL becomes:
+            ["https", "mother", "parkers", "com",
+             "coffee", "excellence", "private", "label", "formats"]
+
+        This allows URL path segments to meaningfully interact with queries
+        like "product service solution coffee tea pricing catalog".
+    """
+    if not text:
         return []
-    parts = [p for p in _SPLIT_RX.split(s) if p]
-    return parts
+    return re.findall(r"[a-z0-9]+", text.lower())
 
-def _pattern_to_tokens(p: str) -> List[str]:
-    raw = (p or "").lower().strip()
-    if not raw:
-        return []
-
-    # strip glob / regex syntactic noise to expose textual tokens
-    raw = raw.replace("*", " ")
-    raw = raw.replace("?", " ")
-    raw = raw.replace("[", " ").replace("]", " ")
-    raw = raw.replace("{", " ").replace("}", " ")
-    raw = raw.replace("(", " ").replace(")", " ")
-    raw = raw.replace("|", " ")
-    raw = raw.replace("re:", " ").replace("regex:", " ")
-
-    toks = _basic_tokens(raw)
-
-    out: List[str] = []
-    for t in toks:
-        if not t or t in _STOPWORDS:
-            continue
-        if t.isdigit() or len(t) <= 2:
-            continue
-        if t in _FILE_EXT_STOP:
-            continue
-        out.append(t)
-    return out
-
-def _domain_to_token(host: str) -> str:
-    h = (host or "").lower().strip().strip(".")
-    if not h:
-        return ""
-    labels = [x for x in h.split(".") if x]
-    if not labels:
-        return ""
-    base = labels[-2] if len(labels) >= 2 else labels[-1]
-    base = base.strip("-_")
-    return base if base and base not in _STOPWORDS else ""
-
-# ---------------------------------------------------------------------------
-# Default negative terms derived from filtering policy
-# ---------------------------------------------------------------------------
-
-def build_default_negative_terms(
-    *,
-    extra_patterns: Optional[Iterable[str]] = None,
-    extra_query_keys: Optional[Iterable[str]] = None,
-    include_universal_external_hosts: bool = True,
-    min_len: int = 3,
-    limit: Optional[int] = 128,
-) -> List[str]:
-    seen: Set[str] = set()
-    collected: List[str] = []
-
-    pattern_sources: List[str] = list(DEFAULT_EXCLUDE_PATTERNS)
-    if extra_patterns:
-        pattern_sources.extend(list(extra_patterns))
-    for p in pattern_sources:
-        for tok in _pattern_to_tokens(p):
-            if len(tok) < min_len:
-                continue
-            if tok not in seen:
-                seen.add(tok)
-                collected.append(tok)
-
-    qkeys = list(DEFAULT_EXCLUDE_QUERY_KEYS)
-    if extra_query_keys:
-        qkeys.extend(list(extra_query_keys))
-    for k in qkeys:
-        k = (k or "").lower().strip()
-        if not k or k in _STOPWORDS:
-            continue
-        if len(k) < min_len:
-            continue
-        if k not in seen:
-            seen.add(k)
-            collected.append(k)
-
-    if include_universal_external_hosts:
-        for host in sorted(UNIVERSAL_EXTERNALS):
-            tok = _domain_to_token(host)
-            if tok and len(tok) >= min_len and tok not in seen:
-                seen.add(tok)
-                collected.append(tok)
-
-    if limit is not None and limit > 0 and len(collected) > limit:
-        collected = collected[:limit]
-
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug("[dual_bm25] built %d negative tokens; sample=%s",
-                  len(collected), collected[:12])
-    return collected
-
-def build_default_negative_query(**kwargs) -> str:
-    q = " ".join(build_default_negative_terms(**kwargs))
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug("[dual_bm25] negative_query terms=%d len=%d", len(q.split()), len(q))
-    return q
-
-# ---------------------------------------------------------------------------
-# Dual BM25 combiner (agnostic to underlying BM25 implementation)
-# ---------------------------------------------------------------------------
 
 @dataclass
 class DualBM25Config:
-    alpha: float = 0.5
-    score_norm: Callable[[float], float] = staticmethod(lambda s: 1.0 - math.exp(-max(0.0, float(s))))
-    clamp: bool = True
+    """
+    Configuration for DualBM25 scoring.
 
-class DualBM25Combiner:
+    - threshold: final combined score threshold in [0,1] to accept a URL
+                 (used by DualBM25Filter; ignored by DualBM25Scorer).
+    - alpha: weight for the positive query vs (1-alpha) for the negative.
+    - k1, b, avgdl: standard BM25 parameters, tuned for head-only content.
     """
-    Usage:
-        comb = DualBM25Combiner(bm25_fn)
-        score = comb.score(doc_text, pos_query="product service solutions", neg_query=None)
+    threshold: Optional[float] = 0.3
+    alpha: float = 0.5
+    k1: float = 1.2
+    b: float = 0.75
+    avgdl: int = 1000
+
+
+class _DualBM25Core:
     """
+    Shared BM25 core logic between filter and scorer.
+
+    Base combination for a single document:
+
+        score = alpha * pos_norm + (1 - alpha) * (1 - neg_norm)
+
+    with:
+        pos_norm = 1 - exp(-BM25(doc, pos_query))
+        neg_norm = 1 - exp(-BM25(doc, neg_query))
+
+    For HEAD+URL fusion, see score_head_and_url().
+    """
+
+    __slots__ = ("pos_terms", "neg_terms", "cfg")
+
     def __init__(
         self,
-        bm25_fn: Callable[[str, str], float],
+        positive_query: str,
+        negative_query: Optional[str] = None,
         cfg: Optional[DualBM25Config] = None,
     ) -> None:
-        self.bm25_fn = bm25_fn
-        self.cfg = cfg or DualBM25Config()
-        self._dbg_counter = 0  # limit per-call debug spam
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug("[dual_bm25] init alpha=%.2f clamp=%s", self.cfg.alpha, self.cfg.clamp)
+        self.pos_terms: List[str] = _tokenize(positive_query)
+        self.neg_terms: List[str] = _tokenize(negative_query) if negative_query else []
+        self.cfg: DualBM25Config = cfg or DualBM25Config()
 
-    def score(
-        self,
-        text: str,
-        *,
-        pos_query: Optional[str],
-        neg_query: Optional[str] = None,
-    ) -> float:
-        if not text:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[DualBM25Core.__init__] pos_terms=%d neg_terms=%d alpha=%.3f "
+                "k1=%.2f b=%.2f avgdl=%d",
+                len(self.pos_terms),
+                len(self.neg_terms),
+                self.cfg.alpha,
+                self.cfg.k1,
+                self.cfg.b,
+                self.cfg.avgdl,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Core BM25 helpers
+    # ------------------------------------------------------------------ #
+
+    def _bm25(self, document: str, query_terms: List[str]) -> float:
+        """
+        Standard BM25 scoring over a single document and tokenized query.
+        IDF is approximated per-document for simplicity.
+        """
+        if not document or not query_terms:
             return 0.0
 
-        raw_pos = self.bm25_fn(text, pos_query) if pos_query else 0.0
-        pos = self.cfg.score_norm(raw_pos)
+        doc_terms = _tokenize(document)
+        doc_len = len(doc_terms)
+        if doc_len == 0:
+            return 0.0
 
-        neg_q = neg_query if (neg_query is not None and neg_query.strip()) else build_default_negative_query()
-        raw_neg = self.bm25_fn(text, neg_q) if neg_q else 0.0
-        neg = self.cfg.score_norm(raw_neg)
+        tf: Dict[str, int] = {}
+        for t in doc_terms:
+            tf[t] = tf.get(t, 0) + 1
+
+        k1 = self.cfg.k1
+        b = self.cfg.b
+        avgdl = float(self.cfg.avgdl) if self.cfg.avgdl > 0 else float(doc_len)
+
+        score = 0.0
+        unique_query_terms = set(query_terms)
+        matched_terms = 0
+
+        for term in unique_query_terms:
+            freq = tf.get(term, 0)
+            if freq == 0:
+                continue
+
+            matched_terms += 1
+
+            # Simple IDF surrogate using within-doc stats.
+            idf = math.log((1.0 + 1.0) / (freq + 0.5) + 1.0)
+
+            numerator = freq * (k1 + 1.0)
+            denominator = freq + k1 * (1.0 - b + b * (doc_len / avgdl))
+            contribution = idf * (numerator / max(denominator, 1e-9))
+            score += contribution
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[DualBM25Core._bm25] doc_len=%d matched_terms=%d raw_score=%.6f",
+                doc_len,
+                matched_terms,
+                score,
+            )
+
+        return score
+
+    @staticmethod
+    def _normalize_score(raw: float) -> float:
+        """
+        Map unbounded BM25 score to [0, 1) via 1 - exp(-max(0, raw)).
+        """
+        return 1.0 - math.exp(-max(0.0, float(raw)))
+
+    def score_document(self, document: str) -> Dict[str, float]:
+        """
+        Compute dual BM25 scores from a single pre-built document.
+
+        Returns dict with:
+            - combined: final combined score in [0,1]
+            - raw_pos, pos_norm, raw_neg, neg_norm
+        """
+        # Positive
+        raw_pos = self._bm25(document, self.pos_terms)
+        pos_norm = self._normalize_score(raw_pos)
+
+        # Negative
+        if self.neg_terms:
+            raw_neg = self._bm25(document, self.neg_terms)
+            neg_norm = self._normalize_score(raw_neg)
+        else:
+            raw_neg = 0.0
+            neg_norm = 0.0
 
         alpha = float(self.cfg.alpha)
-        combined = alpha * pos + (1.0 - alpha) * (1.0 - neg)
-        if self.cfg.clamp:
-            combined = max(0.0, min(1.0, combined))
+        combined = alpha * pos_norm + (1.0 - alpha) * (1.0 - neg_norm)
 
-        # Log first N calls at DEBUG to avoid flooding
-        if log.isEnabledFor(logging.DEBUG) and self._dbg_counter < 50:
-            self._dbg_counter += 1
-            log.debug(
-                "[dual_bm25] #%d pos_raw=%.4f pos=%.4f neg_raw=%.4f neg=%.4f alpha=%.2f => combined=%.4f",
-                self._dbg_counter, raw_pos, pos, raw_neg, neg, alpha, combined
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[DualBM25Core.score_document] raw_pos=%.6f pos_norm=%.6f "
+                "raw_neg=%.6f neg_norm=%.6f alpha=%.3f combined=%.6f",
+                raw_pos,
+                pos_norm,
+                raw_neg,
+                neg_norm,
+                alpha,
+                combined,
             )
-        return combined
+
+        return {
+            "combined": combined,
+            "raw_pos": raw_pos,
+            "pos_norm": pos_norm,
+            "raw_neg": raw_neg,
+            "neg_norm": neg_norm,
+        }
+
+    # ------------------------------------------------------------------ #
+    # HEAD + URL fusion helper (shared by filter & scorer)
+    # ------------------------------------------------------------------ #
+
+    def score_head_and_url(
+        self,
+        *,
+        url: str,
+        head_doc: Optional[str],
+    ) -> Dict[str, float]:
+        # Head: allow None/empty ⇒ treated as no signal
+        if head_doc and head_doc.strip():
+            head_scores = self.score_document(head_doc)
+        else:
+            head_scores = {
+                "combined": 0.0,
+                "raw_pos": 0.0,
+                "pos_norm": 0.0,
+                "raw_neg": 0.0,
+                "neg_norm": 0.0,
+            }
+
+        # URL: always scored
+        url_scores = self.score_document(url)
+
+        head_combined = head_scores["combined"]
+        url_combined = url_scores["combined"]
+
+        head_empty = not head_doc or not head_doc.strip()
+        url_neg_raw = url_scores["raw_neg"]
+
+        # NEW: track whether head has any actual positive/negative matches
+        head_has_pos = head_scores["raw_pos"] > 0.0
+        head_has_neg = head_scores["raw_neg"] > 0.0
+        head_neutral = not head_has_pos and not head_has_neg
+
+        if head_empty and url_neg_raw > 0.0:
+            fused_combined = 0.0
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[DualBM25Core.score_head_and_url] url=%s head_empty=True "
+                    "url_raw_neg=%.6f -> fused_combined=0.000000 (forced drop)",
+                    url,
+                    url_neg_raw,
+                )
+
+        elif head_neutral and url_neg_raw > 0.0:
+            fused_combined = 0.0
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[DualBM25Core.score_head_and_url] url=%s head_neutral=True "
+                    "url_raw_neg=%.6f -> fused_combined=0.000000 (forced drop)",
+                    url,
+                    url_neg_raw,
+                )
+
+        else:
+            fused_combined = max(head_combined, url_combined)
+
+        return {
+            "head_combined": head_combined,
+            "head_raw_pos": head_scores["raw_pos"],
+            "head_pos_norm": head_scores["pos_norm"],
+            "head_raw_neg": head_scores["raw_neg"],
+            "head_neg_norm": head_scores["neg_norm"],
+            "url_combined": url_combined,
+            "url_raw_pos": url_scores["raw_pos"],
+            "url_pos_norm": url_scores["pos_norm"],
+            "url_raw_neg": url_scores["raw_neg"],
+            "url_neg_norm": url_scores["neg_norm"],
+            "fused_combined": fused_combined,
+        }
+
+class DualBM25Filter(URLFilter):
+    """
+    Asynchronous URL filter using a "dual" BM25 scheme over HEAD HTML + URL:
+
+        doc_score     = alpha * pos_norm + (1 - alpha) * (1 - neg_norm)
+        head_score    = doc_score(head_doc)
+        url_score     = doc_score(url_string)
+        fused_score   = max(head_score, url_score)
+
+    Special rule (Option B):
+        - If HEAD is effectively empty AND the URL has any negative hits
+          (e.g. /terms-of-use, /contact-us) → fused_score is forced to 0.
+
+    Decision:
+        - If fused_score >= threshold  -> KEEP
+        - Else                         -> DROP
+
+    The filter fetches only the head HTML via HeadPeekr.peek_html(url), then
+    builds a compact document from:
+        - <title> (weight 3)
+        - meta description (weight 2)
+        - meta keywords + all meta content (weight 1)
+    """
+
+    __slots__ = ("_core",)
+
+    def __init__(
+        self,
+        positive_query: str,
+        negative_query: Optional[str] = None,
+        *,
+        cfg: Optional[DualBM25Config] = None,
+        name: Optional[str] = None,
+    ) -> None:
+        super().__init__(name=name or "DualBM25Filter")
+        self._core = _DualBM25Core(positive_query, negative_query, cfg=cfg)
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[DualBM25Filter.__init__] name=%s pos_terms=%d neg_terms=%d "
+                "threshold=%s alpha=%.3f k1=%.2f b=%.2f avgdl=%d",
+                self.name,
+                len(self._core.pos_terms),
+                len(self._core.neg_terms),
+                (
+                    f"{self._core.cfg.threshold:.3f}"
+                    if self._core.cfg.threshold is not None
+                    else "None"
+                ),
+                self._core.cfg.alpha,
+                self._core.cfg.k1,
+                self._core.cfg.b,
+                self._core.cfg.avgdl,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Core doc builder for HEAD HTML
+    # ------------------------------------------------------------------ #
+
+    def _build_document(self, html: str) -> str:
+        """
+        Build a light-weight text representation from head HTML.
+        """
+        title = HeadPeekr.get_title(html) or ""
+        meta: Dict[str, str] = HeadPeekr.extract_meta_tags(html)
+
+        parts: List[str] = []
+        if title:
+            parts.append((title + " ") * 3)
+        desc = meta.get("description", "")
+        if desc:
+            parts.append((desc + " ") * 2)
+        kw = meta.get("keywords", "")
+        if kw:
+            parts.append(kw)
+        if meta:
+            parts.append(" ".join(meta.values()))
+
+        doc = " ".join(parts)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[DualBM25Filter._build_document] built doc_len_chars=%d "
+                "title_len=%d meta_keys=%d",
+                len(doc),
+                len(title),
+                len(meta),
+            )
+        return doc
+
+    # ------------------------------------------------------------------ #
+    # URLFilter API
+    # ------------------------------------------------------------------ #
+
+    async def apply(self, url: str) -> bool:
+        """
+        Asynchronously decide whether to KEEP the URL using dual BM25
+        over both HEAD HTML and the URL string itself.
+
+        Strategy:
+          - Try to fetch HEAD HTML and build a head-document.
+          - Call _DualBM25Core.score_head_and_url(url, head_doc).
+          - fused_score = scores["fused_combined"].
+          - If fused_score >= threshold -> KEEP, else DROP.
+
+        If head HTML cannot be fetched or parsed, we pass head_doc=None and rely
+        on URL-only scoring with the same fusion rules (including the negative-URL
+        + empty-head drop behavior).
+        """
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("[DualBM25Filter.apply] url=%s START", url)
+
+        head_html: Optional[str] = None
+        try:
+            head_html = await HeadPeekr.peek_html(url)
+        except Exception as exc:
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[DualBM25Filter.apply] url=%s head fetch error: %r "
+                    "-> falling back to URL-only scoring",
+                    url,
+                    exc,
+                )
+            head_html = None
+
+        head_doc: Optional[str] = None
+        if head_html:
+            head_doc = self._build_document(head_html)
+
+        # Unified scoring: HEAD+URL fusion with Option B rule inside
+        scores = self._core.score_head_and_url(url=url, head_doc=head_doc)
+        fused_combined = scores["fused_combined"]
+
+        # If threshold is None, treat as "always keep" (acts as pure scorer)
+        if self._core.cfg.threshold is not None:
+            decision = fused_combined >= self._core.cfg.threshold
+        else:
+            decision = True
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                (
+                    "[DualBM25Filter.apply] url=%s "
+                    "head_raw_pos=%.6f head_raw_neg=%.6f head_combined=%.6f "
+                    "url_raw_pos=%.6f url_raw_neg=%.6f url_combined=%.6f "
+                    "fused_combined=%.6f threshold=%s -> decision=%s"
+                ),
+                url,
+                scores["head_raw_pos"],
+                scores["head_raw_neg"],
+                scores["head_combined"],
+                scores["url_raw_pos"],
+                scores["url_raw_neg"],
+                scores["url_combined"],
+                fused_combined,
+                (
+                    f"{self._core.cfg.threshold:.3f}"
+                    if self._core.cfg.threshold is not None
+                    else "None"
+                ),
+                decision,
+            )
+
+        self._update_stats(decision)
+        return decision
+
+
+class DualBM25Scorer(URLScorer):
+    """
+    URLScorer variant of Dual BM25.
+
+    This scorer **does not** perform network I/O. Instead, it scores using a
+    pre-built document for each URL (treated as the HEAD-like document), plus
+    the URL string itself, with the exact same fusion logic as the filter.
+
+    Usage patterns:
+
+        # 1) Using a prebuilt doc index (recommended)
+        doc_index = {url: "title description meta ...", ...}
+        scorer = DualBM25Scorer(
+            positive_query="product service solution platform",
+            negative_query="blog news careers",
+            doc_index=doc_index,
+            cfg=DualBM25Config(threshold=None, alpha=0.7),
+            weight=1.0,
+        )
+
+        score = scorer.score(url)  # returns fused_combined in [0,1] * weight
+
+        # 2) Fallback: let it score based on the URL text only
+        scorer = DualBM25Scorer(
+            positive_query="product service solution platform",
+            negative_query="blog news careers",
+        )
+        score = scorer.score(url)
+
+    Note:
+        - `cfg.threshold` is ignored here; this class only returns scores.
+        - Output is the fused normalized dual-BM25 score in [0,1], multiplied by `weight`.
+    """
+
+    __slots__ = ("_core", "_doc_index")
+
+    def __init__(
+        self,
+        positive_query: str,
+        negative_query: Optional[str] = None,
+        *,
+        cfg: Optional[DualBM25Config] = None,
+        doc_index: Optional[Mapping[str, str]] = None,
+        weight: float = 1.0,
+    ) -> None:
+        super().__init__(weight=weight)
+        self._core = _DualBM25Core(positive_query, negative_query, cfg=cfg)
+        self._doc_index = doc_index
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[DualBM25Scorer.__init__] pos_terms=%d neg_terms=%d weight=%.3f "
+                "avgdl=%d alpha=%.3f",
+                len(self._core.pos_terms),
+                len(self._core.neg_terms),
+                self.weight,
+                self._core.cfg.avgdl,
+                self._core.cfg.alpha,
+            )
+
+    # ------------------------------------------------------------------ #
+    # URLScorer core
+    # ------------------------------------------------------------------ #
+
+    def _get_document_for_url(self, url: str) -> Optional[str]:
+        """
+        Resolve a text document for a given URL.
+
+        - If doc_index is provided, use doc_index[url] when available.
+        - Otherwise, return None to indicate 'no head doc', and rely on URL-only.
+        """
+        if self._doc_index is not None:
+            doc = self._doc_index.get(url)
+            if doc:
+                return doc
+        return None
+
+    def _calculate_score(self, url: str) -> float:
+        """
+        Calculate dual BM25 fused score for URL, using the same HEAD+URL
+        fusion logic as DualBM25Filter.
+
+        - head_doc = doc_index[url] if available, else None.
+        - scores = core.score_head_and_url(url=url, head_doc=head_doc)
+        - return scores["fused_combined"] * weight
+        """
+        head_doc = self._get_document_for_url(url)
+
+        # Unified scoring; same Option B rule as filter
+        scores = self._core.score_head_and_url(url=url, head_doc=head_doc)
+        fused = scores["fused_combined"]
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[DualBM25Scorer._calculate_score] url=%s fused_combined=%.6f "
+                "head_raw_pos=%.6f head_raw_neg=%.6f url_raw_pos=%.6f url_raw_neg=%.6f",
+                url,
+                fused,
+                scores["head_raw_pos"],
+                scores["head_raw_neg"],
+                scores["url_raw_pos"],
+                scores["url_raw_neg"],
+            )
+
+        return fused

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+from hashlib import sha1
 from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
-from hashlib import sha1
 
 # Base directory
 OUTPUT_ROOT = Path("outputs")
@@ -60,21 +60,44 @@ def _safe_slug_from_path(path: str, *, max_len: int = 80) -> str:
 def ensure_company_dirs(bvdid: str) -> dict[str, Path]:
     """
     Ensure output folders exist for a given company ID.
-    Returns a mapping for html, markdown, json, logs, and checkpoints subfolders.
-    Uses a Windows-safe sanitized id for the path, but you should continue
-    to pass the original `bvdid` everywhere else in code.
+
+    New canonical layout:
+      outputs/{safe_bvdid}/
+        html/        -> raw / cleaned HTML artifacts
+        markdown/    -> generated Markdown
+        product/     -> structured LLM output (product info, JSON)
+        log/         -> per-company logs
+        metadata/    -> crawl_meta.json, url_index.json, presence flags, etc.
+
+    For backward compatibility, the returned mapping also exposes:
+      - "json"        -> product/    (old name for LLM output)
+      - "logs"        -> log/
+      - "checkpoints" -> metadata/
     """
     safe = sanitize_bvdid(bvdid)
     base = OUTPUT_ROOT / safe
-    dirs = {
-        "html": base / "html",
-        "markdown": base / "markdown",
-        "json": base / "json",
-        "logs": base / "logs",
-        "checkpoints": base / "checkpoints",
+
+    html_dir = base / "html"
+    md_dir = base / "markdown"
+    product_dir = base / "product"
+    log_dir = base / "log"
+    metadata_dir = base / "metadata"
+
+    dirs: dict[str, Path] = {
+        "html": html_dir,
+        "markdown": md_dir,
+        "product": product_dir,
+        "json": product_dir,        # legacy alias
+        "log": log_dir,
+        "logs": log_dir,            # legacy alias
+        "metadata": metadata_dir,
+        "checkpoints": metadata_dir,  # legacy alias
     }
-    for d in dirs.values():
+
+    # Create each unique directory once
+    for d in set(dirs.values()):
         d.mkdir(parents=True, exist_ok=True)
+
     return dirs
 
 
@@ -88,31 +111,51 @@ def save_stage_output(
     encoding: str = "utf-8",
 ) -> Path:
     """
-    Save output into outputs/{safe_bvdid}/{stage}/ with sanitized filename.
-    stage ∈ {"html","markdown","json"}.
+    Save pipeline output into the appropriate stage directory.
+
+    Canonical stages:
+      - "html"     -> outputs/{safe}/html/*.html
+      - "markdown" -> outputs/{safe}/markdown/*.md
+      - "product"  -> outputs/{safe}/product/*.json
+
+    For backward compatibility, "json" is treated as "product".
+
+    Filenames are based on a sanitized combination of netloc + path and an
+    8-char hash of the URL to avoid collisions.
     """
     dirs = ensure_company_dirs(bvdid)
-    subdir = dirs.get(stage)
-    if not subdir:
-        raise ValueError(f"Invalid stage '{stage}' (expected html|markdown|json)")
+
+    # Legacy alias
+    if stage == "json":
+        stage = "product"
+
+    if stage not in ("html", "markdown", "product"):
+        raise ValueError(f"Invalid stage '{stage}' (expected html|markdown|product)")
+
+    subdir = dirs[stage if stage != "product" else "product"]
 
     parsed = urlparse(url)
-    # Include netloc in slug for nicer grouping across identical paths on different hosts
-    base_slug = f"{parsed.netloc}_{_safe_slug_from_path(parsed.path or '/')}" if parsed.netloc else _safe_slug_from_path(parsed.path or "/")
+    if parsed.netloc:
+        base_slug = f"{parsed.netloc}_{_safe_slug_from_path(parsed.path or '/')}"
+    else:
+        base_slug = _safe_slug_from_path(parsed.path or "/")
+
     h = sha1(url.encode()).hexdigest()[:8]
     fname = filename_hint or f"{base_slug}-{h}"
 
-    if stage == "json":
+    if stage == "product":
         out_path = subdir / f"{fname}.json"
         with open(out_path, "w", encoding=encoding) as f:
             if isinstance(data, (dict, list)):
                 json.dump(data, f, ensure_ascii=False, indent=2)
             else:
                 f.write(str(data))
-    else:
-        ext = ".html" if stage == "html" else ".md"
-        out_path = subdir / f"{fname}{ext}"
-        with open(out_path, "w", encoding=encoding) as f:
-            f.write(str(data))
+        return out_path
+
+    # html / markdown
+    ext = ".html" if stage == "html" else ".md"
+    out_path = subdir / f"{fname}{ext}"
+    with open(out_path, "w", encoding=encoding) as f:
+        f.write(str(data))
 
     return out_path

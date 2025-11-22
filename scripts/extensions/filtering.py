@@ -1,220 +1,84 @@
 from __future__ import annotations
 
-import fnmatch
 import logging
-import re
+from fnmatch import fnmatch
 from functools import lru_cache
-from typing import Optional, List, Iterable, Dict, Any, Tuple, Union
-from urllib.parse import urlparse, parse_qsl
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
-from crawl4ai.deep_crawling.filters import (
-    FilterChain,
-    URLPatternFilter,
-    DomainFilter,
-    ContentTypeFilter,
-    SEOFilter,
-    ContentRelevanceFilter,
-)
-from crawl4ai.deep_crawling.scorers import KeywordRelevanceScorer
+from crawl4ai.deep_crawling.filters import URLFilter
 
-from configs import language_settings as lang_cfg
+from configs import language as lang_cfg
+
+__all__ = [
+    "UniversalExternalFilter",
+    "HTMLContentFilter",
+    "LanguageAwareURLFilter",
+]
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    # policies
-    "UNIVERSAL_EXTERNALS",
-    "DEFAULT_INCLUDE_PATTERNS",
-    "DEFAULT_EXCLUDE_PATTERNS",
-    "DEFAULT_EXCLUDE_QUERY_KEYS",
-    # externals / brand
-    "is_universal_external",
-    "same_registrable_domain",
-    "classify_external",
-    # Dataset externals & runtime adjustments
-    "set_dataset_externals",
-    "is_in_dataset_externals",
-    "set_universal_external_runtime_exclusions",
-    "should_block_external_for_dataset",
-    # language
-    "is_non_english_url",
-    "should_drop_for_language",
-    "drop_by_response_language",
-    "apply_live_language_screen",
-    # keep/drop + scoring
-    "url_priority",
-    "url_should_keep",
-    "apply_url_filters",
-    "keep_patterns",
-    "exclude_patterns",
-    "filter_by_patterns",
-    "is_image_url",
-    # deep-crawl helpers (optional)
-    "make_basic_filter_chain",
-    "make_relevance_filter",
-    "make_seo_filter",
-    "make_keyword_scorer",
-    # seeding convenience
-    "default_product_bm25_query",
-]
+# --------------------------------------------------------------------------- #
+# Host / domain helpers
+# --------------------------------------------------------------------------- #
 
-# =============================================================================
-# Centralized "universal external" policy (single source of truth)
-# =============================================================================
 
-UNIVERSAL_EXTERNALS: set[str] = {
-    # --- Social / community / media mega-platforms ---
-    "facebook.com", "instagram.com", "twitter.com", "x.com", "youtube.com",
-    "linkedin.com", "tiktok.com", "pinterest.com", "reddit.com", "slack.com",
-    "medium.com", "substack.com", "discord.com", "quora.com", "trustpilot.com",
-    "glassdoor.com", "crunchbase.com",
+def _normalize_host(value: str) -> str:
+    """Best-effort host normalizer (module-level helper)."""
+    try:
+        if not value:
+            return ""
+        value = value.strip()
+        if "://" in value:
+            return (urlparse(value).hostname or "").lower()
+        return value.lower()
+    except Exception:
+        return ""
 
-    # --- Link shorteners / trackers ---
-    "t.co", "goo.gl", "bit.ly", "bitly.com", "tinyurl.com", "ow.ly", "buff.ly",
-    "rebrand.ly", "lnkd.in", "mailchi.mp", "hubspotlinks.com", "adobe.ly",
-    "shorturl.at", "urlr.me", "clickfunnels.com",
 
-    # --- App stores ---
-    "apps.apple.com", "itunes.apple.com", "play.google.com",
-    "appgallery.huawei.com", "galaxy.store", "microsoft.com/store",
-    "apps.microsoft.com",
+def _host_labels(host: str) -> List[str]:
+    host = (host or "").strip().strip(".").lower()
+    return [p for p in host.split(".") if p]
 
-    # --- SSO / identity providers ---
-    "accounts.google.com", "login.microsoftonline.com", "auth0.com", "okta.com",
-    "onelogin.com", "pingidentity.com", "appleid.apple.com", "login.salesforce.com",
-
-    # --- Docs / KB SaaS & hosted help centers ---
-    "intercom.help", "zendesk.com", "freshdesk.com", "helpscoutdocs.com",
-    "readme.io", "gitbook.io", "document360.io", "service-now.com",
-    "notion.site", "confluence.com", "knowledgeowl.com", "zoho.com",
-    "helpjuice.com", "deskera.com",
-
-    # --- Atlassian cloud ---
-    "atlassian.net", "statuspage.io", "jira.com", "confluence.net",
-
-    # --- Dev hosting / code forges ---
-    "github.com", "gitlab.com", "bitbucket.org", "sourceforge.net",
-    "stackblitz.com", "codesandbox.io", "replit.com",
-
-    # --- Google properties (not product sites) ---
-    "developers.google.com", "support.google.com", "docs.google.com",
-    "drive.google.com", "forms.gle", "maps.google.com", "maps.app.goo.gl",
-    "calendar.google.com", "photos.google.com", "accounts.google.com",
-    "fonts.googleapis.com", "maps.googleapis.com",
-
-    # --- General news / media ---
-    "newsweek.com", "cnn.com", "bbc.co.uk", "reuters.com", "bloomberg.com",
-    "nytimes.com", "washingtonpost.com", "theguardian.com", "forbes.com",
-    "yahoo.com", "nbcnews.com", "cnbc.com", "businessinsider.com", "techcrunch.com",
-
-    # --- Status / uptime / monitoring ---
-    "status.io", "statuspal.io", "statuspage.io", "uptime.com", "pingdom.com",
-    "betteruptime.com", "freshstatus.io",
-
-    # --- E-commerce / hosting / site builders ---
-    "shopify.com", "myshopify.com", "bigcommerce.com", "magento.com",
-    "woocommerce.com", "wix.com", "squarespace.com", "weebly.com",
-    "webflow.io", "wordpress.com", "godaddy.com", "strikingly.com",
-    "ecwid.com", "prestashop.com", "3dcart.com", "shopbase.com",
-    "shift4shop.com", "lightspeedhq.com", "zohocommerce.com", "shop.app",
-    "framer.com", "definitions.sqspcdn.com", "fonts.gstatic.com",
-    "squarespace-cdn.com",
-
-    # --- Marketing / CRM / analytics / ads ---
-    "mailchimp.com", "campaignmonitor.com", "activecampaign.com", "hubspot.com",
-    "salesforce.com", "pardot.com", "marketo.com", "keap.com", "sendgrid.com",
-    "constantcontact.com", "convertkit.com", "drip.com", "klaviyo.com",
-    "adobe.com", "doubleclick.net", "googletagmanager.com", "google-analytics.com",
-    "analytics.google.com", "tagmanager.google.com", "mixpanel.com",
-    "segment.com", "hotjar.com", "fullstory.com", "crazyegg.com",
-    "facebook.net", "fbcdn.net", "twitteranalytics.com", "yuvedtech.com",
-
-    # --- CDN / asset / security / storage / fonts / icons ---
-    "cloudflare.com", "cdn.cloudflare.net", "akamaihd.net", "akamaized.net",
-    "fastly.net", "vercel.app", "netlify.app", "edgekey.net", "edgesuite.net",
-    "stackpathcdn.com", "azureedge.net", "firebaseapp.com", "cloudfront.net",
-    "storage.googleapis.com", "ajax.googleapis.com", "s1.wp.com", "s2.wp.com",
-    "kit.fontawesome.com", "cdn-cookieyes.com", "cdn.relay", "fonts.bunny.net",
-    "dt-cdn.net", "dtcdn.net", "cdn.dynamicyield.com", "dynamicyield.com",
-    "maxcdn.bootstrapcdn.com", "c0.wp.com", "gmpg.org", "stats.wp.com", "wp.me",
-
-    # --- Ad/marketing/monitoring vendors (observed) ---
-    "criteo.com", "gum.criteo.com", "static.criteo.net", "sslwidget.criteo.com",
-    "crwdcntrl.net", "match.adsrvr.org", "adsrvr.org",
-    "appsflyer.com", "useinsider.com", "segment.api.useinsider.com",
-    "newrelic.com", "js-agent.newrelic.com", "dynatrace.com",
-
-    # --- Plugin / SaaS widget hosts ---
-    "pages.dev", "pages.github.com", "lp.constantcontactpages.com",
-    "list-manage.com", "statcounter.com", "s.gravatar.com",
-    "assets.website-files.com", "googleadservices.com", "cdn2.hubspot.net",
-    "cdn2.hubspot.com", "s.w.org",
-
-    # --- Payment / checkout platforms ---
-    "stripe.com", "paypal.com", "braintreepayments.com", "squareup.com",
-    "adyen.com", "authorize.net", "klarna.com", "afterpay.com", "affirm.com",
-
-    # --- Booking / ticketing / delivery SaaS ---
-    "eventbrite.com", "ticketmaster.com", "opentable.com", "resy.com",
-    "doordash.com", "ubereats.com", "postmates.com", "grubhub.com",
-
-    # --- Survey / forms / scheduling ---
-    "surveymonkey.com", "typeform.com", "jotform.com", "googleforms.com",
-    "calendly.com", "doodle.com", "wufoo.com",
-
-    # --- Corporate catch-alls / standards ---
-    "microsoft.com", "google.com", "apple.com", "amazon.com", "aws.amazon.com", "adobe.io",
-    "creativecommons.org", "ietf.org", "w3.org", "archive.org", "who.int",
-    "un.org", "europa.eu", "g2.com", "capterra.com", "producthunt.com",
-}
-
-# Functional subdomain prefixes (indicate 3P/docs/status etc.)
-FUNCTIONAL_SUBDOMAIN_PREFIXES: tuple[str, ...] = (
-    "community", "status", "learning", "learn", "docs", "developer", "developers",
-    "help", "support", "kb", "academy", "login", "signin", "auth", "accounts",
-    "news", "press", "media",
-)
-
-# Additional heuristic host keywords that almost always mean "universal external"
-UNIVERSAL_HOST_KEYWORDS: tuple[str, ...] = (
-    "cdn", "analytics", "telemetry", "metrics", "tracking", "tracker",
-    "tagmanager", "tagsrv", "pixel", "adsrv", "adservice", "logx", "logs.",
-    "statcounter", "stats.", "short", "lnk", "click", "trk.", ".trk", "redirect",
-)
 
 # Multi-label public suffixes (for eTLD+1 registrable domain logic)
-_MULTI_LABEL_PUBLIC_SUFFIXES: set[str] = {
-    "co.uk", "org.uk", "ac.uk",
-    "com.au", "net.au", "org.au",
-    "co.jp", "ne.jp", "or.jp",
-    "com.cn", "com.sg", "com.br",
+_MULTI_LABEL_PUBLIC_SUFFIXES: Set[str] = {
+    "co.uk",
+    "org.uk",
+    "ac.uk",
+    "com.au",
+    "net.au",
+    "org.au",
+    "co.jp",
+    "ne.jp",
+    "or.jp",
+    "com.cn",
+    "com.sg",
+    "com.br",
 }
 
-# Extensions we consider "pure assets" (we never want to crawl them as pages)
-ASSET_IMAGE_EXTENSIONS: tuple[str, ...] = (
-    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg", ".ico",
-)
 
-
-def _is_asset_image_path(path: str) -> bool:
-    p = (path or "").lower()
-    return any(p.endswith(ext) for ext in ASSET_IMAGE_EXTENSIONS)
-
-
-def is_image_url(url: str) -> bool:
+def _registrable_domain(host: str) -> str:
     """
-    Return True if the URL clearly points to an image file (hard drop),
-    regardless of positive tokens like 'buy', 'product', etc.
+    Lightweight eTLD+1-ish: return registrable apex (example.co.uk, example.com, etc.).
+    Handles common multi-label public suffixes.
     """
-    try:
-        pu = urlparse(url)
-        path = pu.path or ""
-    except Exception:
-        path = url or ""
-    return _is_asset_image_path(path)
+    labels = _host_labels(host)
+    if not labels:
+        return ""
+    if len(labels) == 1:
+        return labels[0]
+
+    last2 = ".".join(labels[-2:])
+    last3 = ".".join(labels[-3:]) if len(labels) >= 3 else ""
+
+    if last2 in _MULTI_LABEL_PUBLIC_SUFFIXES and last3:
+        return last3
+    return last2
+
 
 # Common government-style second-level labels (combined with ccTLDs)
-_GOV_SECOND_LEVELS: set[str] = {"gov", "gouv", "go", "govt"}
+_GOV_SECOND_LEVELS: Set[str] = {"gov", "gouv", "go", "govt"}
 
 
 def _is_government_domain(host: str) -> bool:
@@ -225,15 +89,9 @@ def _is_government_domain(host: str) -> bool:
       - foo.gouv.<cc>
       - foo.go.<cc>
       - foo.govt.<cc>
-    as a government site.
-
-    This is intentionally broad; the idea is that government domains are
-    never product-catalog pages for private companies.
+    as "government".
     """
-    if not host:
-        return False
-
-    rd = _registrable_domain(host)  # e.g. "example.gov", "meti.go.jp", "something.gouv.fr"
+    rd = _registrable_domain(host)
     if not rd:
         return False
 
@@ -241,994 +99,1045 @@ def _is_government_domain(host: str) -> bool:
     if len(labels) < 2:
         return False
 
-    # ...gov  (e.g. "nasa.gov")
     if labels[-1] == "gov":
         return True
 
-    # ...<sec>.<cc>  (e.g. "meti.go.jp", "interieur.gouv.fr", "ato.gov.au")
     if len(labels) >= 2:
         sec = labels[-2]
-        tld = labels[-1]
-        # ccTLD is usually 2 chars, but we don't enforce that strictly
         if sec in _GOV_SECOND_LEVELS:
             return True
 
     return False
 
 
-# --- Runtime overrides ---------------------------------------------------
-_DATASET_HOSTS_RD: Optional[set[str]] = None      # registrable domains from the externals list
-_UNIVERSAL_RUNTIME: Optional[set[str]] = None     # UNIVERSAL_EXTERNALS adjusted at runtime
-
-# These guards ensure we only install the dataset externals / universal overrides once
-_DATASET_EXTERNALS_INSTALLED: bool = False
-_UNIVERSAL_RUNTIME_INSTALLED: bool = False
-
-
-def _hostname(url_or_host: Any) -> str:
-    try:
-        if isinstance(url_or_host, str):
-            s = url_or_host.strip()
-            if not s:
-                return ""
-            if "://" in s or s.startswith(("file://", "raw:")):
-                return (urlparse(s).hostname or "").lower()
-            return s.lower()
-        if isinstance(url_or_host, dict):
-            for k in ("final_url", "url", "href", "link"):
-                v = url_or_host.get(k)
-                if isinstance(v, str):
-                    return _hostname(v)
-        s = str(url_or_host)
-        if "://" in s:
-            return (urlparse(s).hostname or "").lower()
-        return s.lower()
-    except Exception:
-        return ""
-
-
-def _host_labels(host: str) -> list[str]:
-    return (host or "").lower().strip(".").split(".") if host else []
-
-
-def _registrable_domain(host: str) -> str:
-    """
-    Lightweight eTLD+1: return the registrable apex (example.co.uk, example.com, etc.).
-    Handles common multi-label public suffixes.
-    """
-    h = (host or "").lower().strip(".")
-    if not h:
-        return ""
-    labels = _host_labels(h)
-    if len(labels) < 2:
-        return h
-    last2 = ".".join(labels[-2:])              # e.g. example.com OR co.uk
-    last3 = ".".join(labels[-3:]) if len(labels) >= 3 else ""  # e.g. example.co.uk
-    # If hostname ends with a 2-label public suffix (co.uk, co.jp, ...),
-    # registrable domain is the last 3 labels; otherwise last 2.
-    if last2 in _MULTI_LABEL_PUBLIC_SUFFIXES and last3:
-        return last3
-    return last2
-
-
-def set_dataset_externals(hosts_or_domains: Optional[Iterable[str]]) -> None:
-    """
-    Register the externals list (as registrable domains preferred).
-    Call with a set of domains (or hosts) from your full dataset.
-
-    This is intentionally idempotent: the first non-empty call installs the
-    dataset and logs at INFO; subsequent non-empty calls are treated as no-ops
-    to avoid re-initializing per company or per seeding pass.
-    """
-    global _DATASET_HOSTS_RD, _DATASET_EXTERNALS_INSTALLED
-
-    # Allow an explicit "clear" if someone really passes an empty/None set.
-    if not hosts_or_domains:
-        _DATASET_HOSTS_RD = None
-        _DATASET_EXTERNALS_INSTALLED = False
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[filtering] dataset externals cleared (empty input)")
-        return
-
-    # If we've already installed a non-empty dataset once, just reuse it.
-    if _DATASET_EXTERNALS_INSTALLED and _DATASET_HOSTS_RD:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "[filtering] dataset externals already installed; "
-                "skipping re-install (registrable=%d)",
-                len(_DATASET_HOSTS_RD),
-            )
-        return
-
-    rd: set[str] = set()
-    for s in (hosts_or_domains or []):
-        h = _hostname(s)
-        if not h:
-            continue
-        r = _registrable_domain(h)
-        if r:
-            rd.add(r)
-
-    _DATASET_HOSTS_RD = rd
-    _DATASET_EXTERNALS_INSTALLED = True
-
-    if logger.isEnabledFor(logging.INFO):
-        logger.info(
-            "[filtering] dataset externals registered: %d registrable domains",
-            len(_DATASET_HOSTS_RD),
-        )
-
-
-def is_in_dataset_externals(url_or_host: Any) -> bool:
-    rd = _DATASET_HOSTS_RD
-    if not rd:
-        return False
-    h = _hostname(url_or_host)
-    if not h:
-        return False
-    r = _registrable_domain(h)
-    if not r:
-        return False
-    return r in rd
-
-
-@lru_cache(maxsize=8192)
-def _is_universal_host_cached(host: str) -> bool:
-    """
-    Fast path to decide if a *host* is a universal external.
-
-    Uses:
-      - runtime override set if present
-      - registrable-domain equality
-      - suffix label-boundary match
-      - functional subdomain prefixes
-      - heuristic host-keyword check (cdn, analytics, tracking, etc.)
-    """
-    if not host:
-        return False
-
-    h = host.lower().strip(".")
-
-    # Government domains ALWAYS universal externals
-    if _is_government_domain(h):
-        return True
-
-    # Use runtime override if present, otherwise base constant
-    base_suffixes = _UNIVERSAL_RUNTIME if _UNIVERSAL_RUNTIME is not None else UNIVERSAL_EXTERNALS
-
-    # Direct suffix / label-boundary match: foo.bar.facebook.com vs "facebook.com"
-    for sfx in base_suffixes:
-        if not sfx:
-            continue
-        if _label_boundary_match(h, sfx):
-            return True
-
-    # Registrable-domain equality: apps.apple.com => apple.com
-    rd = _registrable_domain(h)
-    if rd and rd in { _registrable_domain(s) for s in base_suffixes }:
-        return True
-
-    # Functional subdomain prefixes (status, docs, support, etc.)
-    if _has_functional_prefix(h):
-        return True
-
-    # Heuristic keywords strongly associated with universal/3P infrastructure
-    lowered = ".".join(_host_labels(h))
-    for kw in UNIVERSAL_HOST_KEYWORDS:
-        if kw in lowered:
-            return True
-
-    return False
-
-
-def set_universal_external_runtime_exclusions(hosts_or_domains: Optional[Iterable[str]]) -> None:
-    """
-    Demote/remove entries from UNIVERSAL_EXTERNALS that are also present
-    in the externals dataset (registrable-domain overlap).
-
-    This is also idempotent: the first non-empty call installs the runtime
-    override; later non-empty calls are no-ops to avoid repeated work and
-    repeated INFO logging. Passing an empty/None iterable resets the override.
-    """
-    global _UNIVERSAL_RUNTIME, _UNIVERSAL_RUNTIME_INSTALLED
-
-    # Reset path: allow callers to clear overrides explicitly
-    if not hosts_or_domains:
-        _UNIVERSAL_RUNTIME = None
-        _UNIVERSAL_RUNTIME_INSTALLED = False
-        _is_universal_host_cached.cache_clear()
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[filtering] UNIVERSAL externals runtime overrides cleared")
-        return
-
-    # Already installed once → don't recompute on every company
-    if _UNIVERSAL_RUNTIME_INSTALLED and _UNIVERSAL_RUNTIME is not None:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "[filtering] UNIVERSAL externals runtime overrides already installed; "
-                "skipping re-install (kept=%d)",
-                len(_UNIVERSAL_RUNTIME),
-            )
-        return
-
-    rd_dataset: set[str] = set()
-    for s in hosts_or_domains:
-        h = _hostname(s)
-        if not h:
-            continue
-        r = _registrable_domain(h)
-        if r:
-            rd_dataset.add(r)
-
-    base = set(UNIVERSAL_EXTERNALS)
-    # Remove *all* universal entries whose registrable domain is in the dataset
-    removed = {u for u in base if _registrable_domain(u) in rd_dataset}
-    _UNIVERSAL_RUNTIME = base - removed
-    _UNIVERSAL_RUNTIME_INSTALLED = True
-    _is_universal_host_cached.cache_clear()
-
-    if logger.isEnabledFor(logging.INFO):
-        logger.info(
-            "[filtering] UNIVERSAL externals demoted: removed=%d kept=%d",
-            len(removed),
-            len(_UNIVERSAL_RUNTIME or base),
-        )
-
-
-def should_block_external_for_dataset(
-    base_url: str,
-    candidate_url: str,
-    allowed_brand_hosts: Optional[set[str]] = None,
-) -> bool:
-    """
-    Return True iff candidate_url is an EXTERNAL whose registrable domain is in the
-    dataset externals list, and is NOT explicitly whitelisted as a brand host.
-    Use this in brand discovery and url_index when following externals.
-    """
-    allowed = set(allowed_brand_hosts or ())
-    kind = classify_external(base_url, candidate_url, allowed_brand_hosts=allowed)
-    if kind != "external":
-        return False
-    if not _DATASET_HOSTS_RD:
-        return False
-    host = (urlparse(candidate_url).hostname or "").lower()
-    rd = _registrable_domain(host)
-    if not rd:
-        return False
-    return rd in _DATASET_HOSTS_RD
-
-# =============================================================================
-# Robust pattern matching (glob-to-regex + native regex)
-# =============================================================================
-
-REGEX_PREFIX = ("re:", "regex:")
-
-
-@lru_cache(maxsize=4096)
-def _compile_one(pattern: str) -> re.Pattern:
-    p = (pattern or "").strip()
-    if not p:
-        return re.compile(r"^$")  # never matches
-    lower = p.lower()
-    for prefix in REGEX_PREFIX:
-        if lower.startswith(prefix):
-            body = p[len(prefix):].strip()
-            try:
-                return re.compile(body, re.IGNORECASE)
-            except re.error as e:
-                logger.warning("Invalid regex pattern '%s': %s. Falling back to no-op.", p, e)
-                return re.compile(r"^$")
-    try:
-        return re.compile(fnmatch.translate(p), re.IGNORECASE)
-    except re.error as e:
-        logger.warning("Failed to compile glob '%s': %s. Falling back to literal-safe regex.", p, e)
-        return re.compile(re.escape(p), re.IGNORECASE)
-
-
-def _url_for_match(url: str) -> str:
-    return (url or "").strip()
-
-
-def _match_any(url: str, patterns: List[str]) -> bool:
-    """
-    Optimized matcher:
-      - no per-call list allocations
-      - relies on LRU-cached _compile_one(pattern)
-    """
-    if not patterns:
-        return False
-    s = _url_for_match(url)
-    for p in patterns:
-        if not p:
-            continue
-        if _compile_one(p).search(s):
-            return True
-    return False
-
-
-def _count_hits(url: str, patterns: List[str]) -> int:
-    """
-    Efficiently count how many patterns match a URL.
-    Uses the same LRU-compilation as _match_any.
-    """
-    if not patterns:
-        return 0
-    s = _url_for_match(url)
-    c = 0
-    for p in patterns:
-        if not p:
-            continue
-        if _compile_one(p).search(s):
-            c += 1
-    return c
-
-# --- SMART INCLUDE TOKENS ----------------------------------------------------
-SMART_INCLUDE_TOKENS: tuple[str, ...] = tuple(lang_cfg.get("SMART_INCLUDE_TOKENS"))
-SMART_TOKEN_RX_CACHE: Dict[str, re.Pattern] = {}
-
-
-def _token_rx(tok: str) -> re.Pattern:
-    rx = SMART_TOKEN_RX_CACHE.get(tok)
-    if rx is None:
-        rx = re.compile(rf"(?<![a-z0-9]){re.escape(tok)}(?![a-z0-9])", re.IGNORECASE)
-        SMART_TOKEN_RX_CACHE[tok] = rx
-    return rx
-
-
-def _smart_include_hit(url: str) -> bool:
-    try:
-        p = urlparse(url).path or "/"
-    except Exception:
-        p = url or ""
-    for tok in SMART_INCLUDE_TOKENS:
-        if _token_rx(tok).search(p):
-            return True
-    return False
-
-# =============================================================================
-# Helpers
-# =============================================================================
-
-
 def _label_boundary_match(host: str, suffix: str) -> bool:
-    h = _hostname(host)
-    s = suffix.lower()
+    """
+    Host-level suffix match with label boundary protection.
+    """
+    h = _normalize_host(host)
+    s = (suffix or "").strip().strip(".").lower()
+    if not h or not s:
+        return False
     return h == s or h.endswith("." + s)
 
 
+def _top_level_label(host: str) -> str:
+    """
+    Simple TLD extractor: last label of the host.
+    """
+    labels = _host_labels(host)
+    return labels[-1] if labels else ""
+
+
+# Functional subdomain prefixes (status, docs, support, etc.)
+FUNCTIONAL_SUBDOMAIN_PREFIXES: tuple[str, ...] = (
+    "community",
+    "status",
+    "learning",
+    "learn",
+    "docs",
+    "developer",
+    "developers",
+    "help",
+    "support",
+    "kb",
+    "academy",
+    "login",
+    "signin",
+    "auth",
+    "accounts",
+    "news",
+    "press",
+    "media",
+)
+
+
 def _has_functional_prefix(host: str) -> bool:
-    h = _hostname(host)
+    """
+    Return True if the host clearly looks like a docs/status/help/infra subdomain.
+    """
+    h = _normalize_host(host)
     if not h:
         return False
-    labels = h.split(".")
+    labels = _host_labels(h)
     if len(labels) < 3:
         return False
     return labels[0] in FUNCTIONAL_SUBDOMAIN_PREFIXES
 
 
-def is_universal_external(url_or_host: Any) -> bool:
+# Additional heuristic host keywords that almost always mean "universal external"
+UNIVERSAL_HOST_KEYWORDS: tuple[str, ...] = (
+    "cdn",
+    "analytics",
+    "telemetry",
+    "metrics",
+    "tracking",
+    "tracker",
+    "tagmanager",
+    "tagsrv",
+    "pixel",
+    "adsrv",
+    "adservice",
+    "logx",
+    "logs.",
+    "statcounter",
+    "stats.",
+    "short",
+    "lnk",
+    "click",
+    "trk.",
+    ".trk",
+    "redirect",
+)
+
+
+# --------------------------------------------------------------------------- #
+# UniversalExternalFilter
+# --------------------------------------------------------------------------- #
+
+
+class UniversalExternalFilter(URLFilter):
     """
-    Decide whether a URL/host is a universal external.
+    Drop "universal external" URLs (social, CDNs, analytics, docs SaaS, etc.)
+    and enforce dataset-level isolation between companies.
+
+    Semantics:
+
+      - We maintain two disjoint notions of "externals":
+        * universal externals: infra/social/tracking/etc. (hard-coded suffixes,
+          govt domains, functional prefixes, infra keywords).
+        * dataset externals: registrable domains that *belong* to the dataset
+          of company URLs (from DatasetExternals).
+
+      - For a given company, identified by its registrable domain:
+
+        * That company's own domain       -> ALWAYS kept.
+        * Other dataset company domains   -> ALWAYS dropped (prevent cross-company bleed).
+        * Universal external domains      -> ALWAYS dropped.
+        * Everything else (non-dataset, non-universal) -> kept, so that a
+          separate policy can decide how to handle arbitrary externals.
+    """
+
+    __slots__ = (
+        "_universal_domains",
+        "_dataset_domains",
+        "_company_domain",
+    )
+
+    _DEFAULT_UNIVERSAL_SUFFIXES: Set[str] = {
+        # Social / community / media
+        "facebook.com",
+        "instagram.com",
+        "twitter.com",
+        "x.com",
+        "youtube.com",
+        "linkedin.com",
+        "tiktok.com",
+        "pinterest.com",
+        "reddit.com",
+        "slack.com",
+        "medium.com",
+        "substack.com",
+        "discord.com",
+        "quora.com",
+        "trustpilot.com",
+        "glassdoor.com",
+        "crunchbase.com",
+        # Shorteners / trackers
+        "t.co",
+        "goo.gl",
+        "bit.ly",
+        "bitly.com",
+        "tinyurl.com",
+        "ow.ly",
+        "buff.ly",
+        "rebrand.ly",
+        "lnkd.in",
+        "mailchi.mp",
+        "hubspotlinks.com",
+        "adobe.ly",
+        "shorturl.at",
+        "urlr.me",
+        "clickfunnels.com",
+        # App stores
+        "apple.com",
+        "play.google.com",
+        "appgallery.huawei.com",
+        "galaxy.store",
+        "microsoft.com",
+        "apps.microsoft.com",
+        # Identity providers
+        "accounts.google.com",
+        "login.microsoftonline.com",
+        "auth0.com",
+        "okta.com",
+        "onelogin.com",
+        "pingidentity.com",
+        "appleid.apple.com",
+        "login.salesforce.com",
+        # Docs / KB SaaS
+        "intercom.help",
+        "zendesk.com",
+        "freshdesk.com",
+        "helpscoutdocs.com",
+        "readme.io",
+        "gitbook.io",
+        "document360.io",
+        "service-now.com",
+        "notion.site",
+        "confluence.com",
+        "knowledgeowl.com",
+        "zoho.com",
+        "helpjuice.com",
+        "deskera.com",
+        # Atlassian cloud
+        "atlassian.net",
+        "statuspage.io",
+        "jira.com",
+        "confluence.net",
+        # Dev hosting / code forges
+        "github.com",
+        "gitlab.com",
+        "bitbucket.org",
+        "sourceforge.net",
+        "stackblitz.com",
+        "codesandbox.io",
+        "replit.com",
+        # Google properties (non-product)
+        "developers.google.com",
+        "support.google.com",
+        "docs.google.com",
+        "drive.google.com",
+        "forms.gle",
+        "maps.google.com",
+        "maps.app.goo.gl",
+        "calendar.google.com",
+        "photos.google.com",
+        "fonts.googleapis.com",
+        "maps.googleapis.com",
+        # General news / media
+        "newsweek.com",
+        "cnn.com",
+        "bbc.co.uk",
+        "reuters.com",
+        "bloomberg.com",
+        "nytimes.com",
+        "washingtonpost.com",
+        "theguardian.com",
+        "forbes.com",
+        "yahoo.com",
+        "nbcnews.com",
+        "cnbc.com",
+        "businessinsider.com",
+        "techcrunch.com",
+        # Status / uptime / monitoring
+        "status.io",
+        "statuspal.io",
+        "uptime.com",
+        "pingdom.com",
+        "betteruptime.com",
+        "freshstatus.io",
+        # E-commerce / hosting / site builders
+        "shopify.com",
+        "myshopify.com",
+        "bigcommerce.com",
+        "magento.com",
+        "woocommerce.com",
+        "wix.com",
+        "squarespace.com",
+        "weebly.com",
+        "webflow.io",
+        "wordpress.com",
+        "godaddy.com",
+        "strikingly.com",
+        "ecwid.com",
+        "prestashop.com",
+        "3dcart.com",
+        "shopbase.com",
+        "shift4shop.com",
+        "lightspeedhq.com",
+        "zohocommerce.com",
+        "shop.app",
+        "framer.com",
+        "squarespace-cdn.com",
+        # Marketing / CRM / analytics / ads
+        "mailchimp.com",
+        "campaignmonitor.com",
+        "activecampaign.com",
+        "hubspot.com",
+        "salesforce.com",
+        "pardot.com",
+        "marketo.com",
+        "keap.com",
+        "sendgrid.com",
+        "constantcontact.com",
+        "convertkit.com",
+        "drip.com",
+        "klaviyo.com",
+        "adobe.com",
+        "doubleclick.net",
+        "google-analytics.com",
+        "analytics.google.com",
+        "tagmanager.google.com",
+        "mixpanel.com",
+        "segment.com",
+        "hotjar.com",
+        "fullstory.com",
+        "crazyegg.com",
+        "facebook.net",
+        "fbcdn.net",
+        "twitteranalytics.com",
+        # CDN / asset / security / storage / fonts / icons
+        "cloudflare.com",
+        "cdn.cloudflare.net",
+        "akamaihd.net",
+        "akamaized.net",
+        "fastly.net",
+        "vercel.app",
+        "netlify.app",
+        "edgekey.net",
+        "edgesuite.net",
+        "stackpathcdn.com",
+        "azureedge.net",
+        "firebaseapp.com",
+        "cloudfront.net",
+        "storage.googleapis.com",
+        "ajax.googleapis.com",
+        "s1.wp.com",
+        "s2.wp.com",
+        "gmpg.org",
+        "kit.fontawesome.com",
+        "fonts.gstatic.com",
+        "fonts.bunny.net",
+        "stats.wp.com",
+        "wp.me",
+        # Monitoring / Ads
+        "criteo.com",
+        "crwdcntrl.net",
+        "adsrvr.org",
+        "appsflyer.com",
+        "useinsider.com",
+        "newrelic.com",
+        "dynatrace.com",
+        # Plugin / SaaS widget hosts
+        "pages.dev",
+        "list-manage.com",
+        "statcounter.com",
+        "s.gravatar.com",
+        "googleadservices.com",
+        "hubspot.net",
+        "hubspot.com",
+        # Payment / checkout
+        "stripe.com",
+        "paypal.com",
+        "braintreepayments.com",
+        "squareup.com",
+        "adyen.com",
+        "authorize.net",
+        "klarna.com",
+        "afterpay.com",
+        "affirm.com",
+        # Booking / ticketing / delivery
+        "eventbrite.com",
+        "ticketmaster.com",
+        "opentable.com",
+        "resy.com",
+        "doordash.com",
+        "ubereats.com",
+        "postmates.com",
+        "grubhub.com",
+        # Survey / forms / scheduling
+        "surveymonkey.com",
+        "typeform.com",
+        "jotform.com",
+        "googleforms.com",
+        "calendly.com",
+        "doodle.com",
+        "wufoo.com",
+        # Corporate/standards/directories
+        "google.com",
+        "amazon.com",
+        "aws.amazon.com",
+        "adobe.io",
+        "creativecommons.org",
+        "ietf.org",
+        "w3.org",
+        "archive.org",
+        "who.int",
+        "un.org",
+        "europa.eu",
+        "g2.com",
+        "capterra.com",
+        "producthunt.com",
+        # Government
+        "canada.ca",
+        "priv.gc.ca",
+    }
+
+    def __init__(
+        self,
+        *,
+        universal_suffixes: Optional[Iterable[str]] = None,
+        dataset_externals: Optional[Iterable[str]] = None,
+        company_url: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> None:
+        super().__init__(name=name or "UniversalExternalFilter")
+
+        self._universal_domains: Set[str] = set()
+        self._dataset_domains: Set[str] = set()
+        self._company_domain: str = ""
+
+        if universal_suffixes is None:
+            universal_suffixes = self._DEFAULT_UNIVERSAL_SUFFIXES
+
+        self.update_universal_suffixes(universal_suffixes, replace=True)
+
+        if dataset_externals:
+            self.update_dataset_externals(dataset_externals, replace=True)
+
+        if company_url:
+            self.set_company_url(company_url)
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[UniversalExternalFilter.__init__] universal=%d dataset=%d company_domain=%s",
+                len(self._universal_domains),
+                len(self._dataset_domains),
+                self._company_domain,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Configuration helpers
+    # ------------------------------------------------------------------ #
+
+    def set_company_url(self, company_url: str) -> None:
+        """
+        Set the current company's canonical URL (or host) so we can distinguish:
+
+          - that company's own registrable domain (keep),
+          - other dataset company domains (drop),
+          - pure universal externals (drop).
+        """
+        h = _normalize_host(company_url)
+        if not h:
+            self._company_domain = ""
+        else:
+            rd = _registrable_domain(h)
+            self._company_domain = rd or h
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[UniversalExternalFilter.set_company_url] company_url=%s company_domain=%s",
+                company_url,
+                self._company_domain,
+            )
+
+        # Changing company domain affects classification cache
+        self._classify_host.cache_clear()
+
+    def update_universal_suffixes(
+        self,
+        suffixes: Iterable[str],
+        *,
+        replace: bool = False,
+    ) -> None:
+        normalized: Set[str] = set()
+        for s in suffixes or []:
+            h = _normalize_host(s)
+            if not h:
+                continue
+            rd = _registrable_domain(h)
+            if rd:
+                normalized.add(rd)
+
+        if replace:
+            self._universal_domains = normalized
+        else:
+            self._universal_domains.update(normalized)
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[UniversalExternalFilter.update_universal_suffixes] replace=%s now=%d",
+                replace,
+                len(self._universal_domains),
+            )
+
+        self._classify_host.cache_clear()
+
+    def update_dataset_externals(
+        self,
+        hosts_or_domains: Iterable[str],
+        *,
+        replace: bool = False,
+    ) -> None:
+        """
+        Update the set of registrable domains that *belong* to the dataset
+        of company URLs. These represent other companies whose URLs we want
+        to treat as cross-company externals.
+        """
+        normalized: Set[str] = set()
+        for s in hosts_or_domains or []:
+            h = _normalize_host(s)
+            if not h:
+                continue
+            rd = _registrable_domain(h)
+            if rd:
+                normalized.add(rd)
+
+        if replace:
+            self._dataset_domains = normalized
+        else:
+            self._dataset_domains.update(normalized)
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[UniversalExternalFilter.update_dataset_externals] replace=%s now=%d",
+                replace,
+                len(self._dataset_domains),
+            )
+
+        self._classify_host.cache_clear()
+
+    # ------------------------------------------------------------------ #
+    # Core logic
+    # ------------------------------------------------------------------ #
+
+    @lru_cache(maxsize=8192)
+    def _classify_host(self, host: str) -> str:
+        """
+        Return one of:
+          - "company"   : host belongs to the current company domain
+          - "dataset"   : host belongs to another dataset company domain
+          - "universal" : social/infra/analytics/etc., or government
+          - "other"     : anything else (non-dataset, non-universal)
+        """
+        h = _normalize_host(host)
+        if not h:
+            return "other"
+
+        rd = _registrable_domain(h)
+
+        # 1) Current company's own registrable domain
+        if rd and self._company_domain and rd == self._company_domain:
+            return "company"
+
+        # 2) Known dataset company domains (belong to dataset but NOT this company)
+        if rd and rd in self._dataset_domains:
+            return "dataset"
+
+        # 3) Government domains are always treated as universal externals
+        if _is_government_domain(h):
+            return "universal"
+
+        # 4) Hard universal suffixes
+        for sfx in self._universal_domains:
+            if not sfx:
+                continue
+            if rd == sfx or _label_boundary_match(h, sfx):
+                return "universal"
+
+        # 5) Functional subdomain prefixes (status/docs/support/etc.)
+        if _has_functional_prefix(h):
+            return "universal"
+
+        # 6) Strong infra/analytics/CDN keywords
+        lowered = ".".join(_host_labels(h))
+        for kw in UNIVERSAL_HOST_KEYWORDS:
+            if kw in lowered:
+                return "universal"
+
+        return "other"
+
+    def apply(self, url: str) -> bool:
+        """
+        Decide whether to KEEP (True) or DROP (False) a URL.
+
+        Policy:
+
+          - "company"   -> keep
+          - "dataset"   -> drop  (other dataset companies)
+          - "universal" -> drop  (social/CDN/analytics/etc.)
+          - "other"     -> keep  (non-dataset externals; handled elsewhere)
+        """
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname or ""
+        except Exception:
+            host = ""
+            result = False
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[UniversalExternalFilter.apply] url=%s host_parse_error -> DROP",
+                    url,
+                )
+            self._update_stats(result)
+            return result
+
+        classification = self._classify_host(host)
+
+        if classification == "company":
+            result = True
+            reason = "company_domain"
+        elif classification in ("dataset", "universal"):
+            result = False
+            reason = classification
+        else:
+            # "other" -> non-dataset externals; allowed so a higher-level policy
+            # can decide what to do with them.
+            result = True
+            reason = "other_external"
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[UniversalExternalFilter.apply] url=%s host=%s classification=%s reason=%s -> %s",
+                url,
+                host,
+                classification,
+                reason,
+                "KEEP" if result else "DROP",
+            )
+
+        self._update_stats(result)
+        return result
+
+
+# --------------------------------------------------------------------------- #
+# HTMLContentFilter
+# --------------------------------------------------------------------------- #
+
+class HTMLContentFilter(URLFilter):
+    """
+    Only keep URLs likely to be HTML over HTTP(S).
+
+    Strategy:
+      - If scheme is non-HTTP(S) (mailto, tel, javascript, etc.) → DROP.
+      - If no extension → assume HTML → KEEP.
+      - If extension in known non-HTML list → DROP.
+      - Otherwise → KEEP (php/asp/jsp/etc).
+    """
+
+    __slots__ = ("_reject_exts",)
+
+    _DEFAULT_REJECT_EXTS: Set[str] = {
+        # Docs / office
+        "pdf",
+        "ps",
+        "rtf",
+        "doc",
+        "docx",
+        "ppt",
+        "pptx",
+        "pps",
+        "xls",
+        "xlsx",
+        "csv",
+        "tsv",
+        "xml",
+        "json",
+        "yml",
+        "yaml",
+        "md",
+        "rst",
+        # Archives / binaries
+        "zip",
+        "rar",
+        "7z",
+        "gz",
+        "bz2",
+        "xz",
+        "tar",
+        "tgz",
+        "dmg",
+        "exe",
+        "msi",
+        "apk",
+        "iso",
+        # Images
+        "jpg",
+        "jpeg",
+        "png",
+        "gif",
+        "svg",
+        "webp",
+        "bmp",
+        "tif",
+        "tiff",
+        "ico",
+        # Audio / video
+        "mp3",
+        "wav",
+        "m4a",
+        "ogg",
+        "flac",
+        "aac",
+        "mp4",
+        "m4v",
+        "webm",
+        "mov",
+        "avi",
+        "wmv",
+        "mkv",
+        # Fonts / maps
+        "eot",
+        "ttf",
+        "otf",
+        "woff",
+        "woff2",
+        "map",
+    }
+
+    def __init__(
+        self,
+        *,
+        reject_exts: Optional[Iterable[str]] = None,
+        name: Optional[str] = None,
+    ) -> None:
+        super().__init__(name=name or "HTMLContentFilter")
+        reject_exts = reject_exts or self._DEFAULT_REJECT_EXTS
+        self._reject_exts = {e.lower().lstrip(".") for e in reject_exts}
+
+    @staticmethod
+    def _extract_extension(url: str) -> str:
+        try:
+            parsed = urlparse(url)
+            path = parsed.path or ""
+        except Exception:
+            path = url or ""
+
+        segment = path.rsplit("/", 1)[-1]
+        if "." not in segment:
+            return ""
+        ext = segment.rsplit(".", 1)[-1].lower()
+        return ext
+
+    def apply(self, url: str) -> bool:
+        # First, drop non-HTTP(S) schemes like mailto:, tel:, javascript:, data:, etc.
+        try:
+            parsed = urlparse(url)
+            scheme = (parsed.scheme or "").lower()
+        except Exception:
+            scheme = ""
+
+        if scheme and scheme not in ("http", "https"):
+            # Explicitly DROP mailto:/tel:/javascript:/data:/...
+            result = False
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[HTMLContentFilter.apply] url=%s scheme=%s -> DROP (non-http scheme)",
+                    url,
+                    scheme,
+                )
+            self._update_stats(result)
+            return result
+
+        ext = self._extract_extension(url)
+
+        if not ext:
+            result = True
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[HTMLContentFilter.apply] url=%s ext='' -> KEEP (no extension)",
+                    url,
+                )
+            self._update_stats(result)
+            return result
+
+        if ext in self._reject_exts:
+            result = False
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[HTMLContentFilter.apply] url=%s ext=%s -> DROP (non-HTML)",
+                    url,
+                    ext,
+                )
+            self._update_stats(result)
+            return result
+
+        result = True
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[HTMLContentFilter.apply] url=%s ext=%s -> KEEP",
+                url,
+                ext,
+            )
+        self._update_stats(result)
+        return result
+
+
+# --------------------------------------------------------------------------- #
+# LanguageAwareURLFilter (language-driven include/exclude + TLD logic)
+# --------------------------------------------------------------------------- #
+
+
+class LanguageAwareURLFilter(URLFilter):
+    """
+    Filter URLs using language-specific rules from configs.language.
 
     Behavior:
-      - consults runtime-adjusted universal set if provided
-      - matches:
-          * any subdomain of known universal suffixes
-          * registrable-domain equality with known universal entries
-          * common functional prefixes (status, docs, help, etc.)
-          * heuristic infra/analytics/shortener keywords in the host
+      - Uses DEFAULT_INCLUDE_PATTERNS / DEFAULT_EXCLUDE_PATTERNS for the
+        selected language (or explicit overrides).
+      - Optionally applies TLD allow/deny per language:
+            LANG_TLD_ALLOW[lang] -> allowed TLDs (e.g., {"com","jp"})
+            LANG_TLD_DENY[lang]  -> blocked TLDs
+      - Optionally applies host suffix allow/deny:
+            LANG_HOST_ALLOW_SUFFIXES[lang] -> host suffixes to KEEP
+            LANG_HOST_BLOCK_SUFFIXES[lang] -> host suffixes to DROP
+
+    Matching:
+      - Path/URL pattern match uses glob-style fnmatch against:
+            path ("/foo/bar")
+        and
+            host + path ("example.com/foo/bar").
+
+    IMPORTANT CHANGE:
+      - Exclude patterns are still hard drops.
+      - Include patterns are now *soft*: if they don't match, the URL is still
+        allowed (subject to host/TLD), instead of being dropped outright.
+        This avoids killing all internal links during deep crawling just
+        because they don't look like product pages yet.
     """
-    host = _hostname(url_or_host)
-    if not host:
-        return False
-    hit = _is_universal_host_cached(host)
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[filtering] is_universal_external(%s -> %s) -> %s", url_or_host, host, hit)
-    return hit
 
-# =============================================================================
-# Default URL pattern heuristics (KEEP / DROP)
-# =============================================================================
-
-DEFAULT_INCLUDE_PATTERNS: List[str] = list(lang_cfg.get("DEFAULT_INCLUDE_PATTERNS"))
-DEFAULT_EXCLUDE_PATTERNS: List[str] = list(lang_cfg.get("DEFAULT_EXCLUDE_PATTERNS"))
-DEFAULT_EXCLUDE_QUERY_KEYS: List[str] = list(lang_cfg.get("DEFAULT_EXCLUDE_QUERY_KEYS"))
-
-# =============================================================================
-# Deep crawling filter helpers (optional)
-# =============================================================================
-
-
-def make_basic_filter_chain(
-    *,
-    allowed_domains: Optional[List[str]] = None,
-    patterns: Optional[List[str]] = None,
-    content_types: Optional[List[str]] = None,
-) -> FilterChain:
-    filters = []
-    if allowed_domains:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[filtering] DomainFilter allowed=%s", allowed_domains)
-        filters.append(DomainFilter(allowed_domains=allowed_domains))  # type: ignore
-    if patterns:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[filtering] URLPatternFilter patterns=%s", patterns)
-        filters.append(URLPatternFilter(patterns=patterns))  # type: ignore
-    if content_types:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[filtering] ContentTypeFilter allowed_types=%s", content_types)
-        filters.append(ContentTypeFilter(allowed_types=content_types))  # type: ignore
-    return FilterChain(filters)  # type: ignore
-
-
-def make_relevance_filter(query: str, threshold: float = 0.7) -> FilterChain:
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[filtering] ContentRelevanceFilter query=%s threshold=%.2f", query, threshold)
-    return FilterChain([ContentRelevanceFilter(query=query, threshold=threshold)])  # type: ignore
-
-
-def make_seo_filter(keywords: List[str], threshold: float = 0.5) -> FilterChain:
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[filtering] SEOFilter keywords=%s threshold=%.2f", keywords, threshold)
-    return FilterChain([SEOFilter(keywords=keywords, threshold=threshold)])  # type: ignore
-
-
-def make_keyword_scorer(keywords: List[str], weight: float = 0.7) -> KeywordRelevanceScorer:
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[filtering] KeywordRelevanceScorer keywords=%s weight=%.2f", keywords, weight)
-    return KeywordRelevanceScorer(keywords=keywords, weight=weight)  # type: ignore
-
-# =============================================================================
-# URL seeding helpers (status/score filtering)
-# =============================================================================
-
-
-def filter_seeded_urls(
-    urls: Iterable[Dict[str, Any]],
-    *,
-    require_status: Optional[str] = "valid",
-    min_score: Optional[float] = None,
-    drop_universal_externals: bool = True,
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for u in urls:
-        u_url = str(u.get("final_url") or u.get("url") or "")
-        if not u_url:
-            continue
-
-        if drop_universal_externals and is_universal_external(u_url):
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[filtering] drop universal external: %s", u_url)
-            continue
-
-        if require_status and u.get("status") != require_status:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "[filtering] drop status!=%s: %s (status=%s)",
-                    require_status, u_url, u.get("status")
-                )
-            continue
-
-        if min_score is not None:
-            score = u.get("relevance_score")
-            if score is None or float(score) < float(min_score):
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "[filtering] drop score<%.2f: %s (score=%s)",
-                        float(min_score), u_url, score
-                    )
-                continue
-
-        out.append(u)
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[filtering] filter_seeded_urls -> kept=%d", len(out))
-    return out
-
-# -----------------------------------------------------------------------------
-# Pattern-based keep/exclude helpers
-# -----------------------------------------------------------------------------
-
-
-def keep_patterns(urls: Iterable[Dict[str, Any]], patterns: List[str]) -> List[Dict[str, Any]]:
-    out = []
-    for u in urls:
-        url = str(u.get("final_url") or u.get("url") or "")
-        if _match_any(url, patterns) or _smart_include_hit(url):
-            out.append(u)
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[filtering] keep_patterns -> kept=%d", len(out))
-    return out
-
-
-def exclude_patterns(
-    urls: Iterable[Dict[str, Any]],
-    patterns: List[str],
-    *,
-    include_override: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    include_override = include_override or []
-    out = []
-    for u in urls:
-        url = str(u.get("final_url") or u.get("url") or "")
-        inc_hit = _match_any(url, include_override) or _smart_include_hit(url)
-        exc_hit = _match_any(url, patterns)
-        if exc_hit and not inc_hit:
-            continue
-        out.append(u)
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[filtering] exclude_patterns -> kept=%d", len(out))
-    return out
-
-
-def filter_by_patterns(
-    urls: Iterable[Dict[str, Any]],
-    *,
-    include: Optional[List[str]] = None,
-    exclude: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    include = include or []
-    exclude = exclude or []
-    out: List[Dict[str, Any]] = []
-    for u in urls:
-        url = str(u.get("final_url") or u.get("url") or "")
-        if is_image_url(url):
-            continue
-        inc_hit = _match_any(url, include) or _smart_include_hit(url)
-        exc_hit = _match_any(url, exclude)
-        if exc_hit and not inc_hit:
-            continue
-        out.append(u)
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "[filtering] filter_by_patterns(include=%d, exclude=%d) -> kept=%d",
-            len(include), len(exclude), len(out)
-        )
-    return out
-
-# =============================================================================
-# Language filtering (URL-level heuristics)
-# =============================================================================
-
-_LANG_CODES = set(lang_cfg.get("LANG_CODES"))
-_REGIONAL_LANG_CODES = set(lang_cfg.get("REGIONAL_LANG_CODES"))
-_ENGLISH_REGIONS = set(lang_cfg.get("ENGLISH_REGIONS"))
-_CC_TO_LANG = dict(lang_cfg.get("CC_TO_LANG"))
-
-
-def _first_path_segment(path: str) -> str:
-    if not path:
-        return ""
-    for part in path.split("/"):
-        if part:
-            return part.lower()
-    return ""
-
-
-def _normalize_token(tok: str) -> str:
-    return (tok or "").strip().lower().replace("_", "-")
-
-
-def _is_lang_token(tok: str) -> bool:
-    t = _normalize_token(tok)
-    return (t in _LANG_CODES) or (t in _REGIONAL_LANG_CODES)
-
-
-def _cc_as_lang(tok: str) -> str | None:
-    t = _normalize_token(tok)
-    return _CC_TO_LANG.get(t)
-
-
-def _is_englishish_token(tok: str, accept_en_regions: set[str], primary_lang: str) -> bool:
-    t = _normalize_token(tok)
-    if t == "www":
-        return True
-    if t == primary_lang or t.startswith(f"{primary_lang}-"):
-        return True
-    if t in accept_en_regions or t in {f"{primary_lang}-{r}" for r in accept_en_regions}:
-        return True
-    return False
-
-
-def _token_is_non_english(tok: str, accept_en_regions: set[str], primary_lang: str) -> bool:
-    t = _normalize_token(tok)
-    if not t:
-        return False
-    if _is_lang_token(t):
-        if _is_englishish_token(t, accept_en_regions, primary_lang):
-            return False
-        root = t.split("-")[0]
-        return (root in _LANG_CODES) and (root != "en")
-    mapped = _cc_as_lang(t)
-    if mapped:
-        return mapped != "en"
-    return False
-
-
-def is_non_english_url(
-    u: str,
-    primary_lang: str = "en",
-    accept_en_regions: set[str] | None = None,
-    strict_cctld: bool = False,
-) -> bool:
-    acc = set(accept_en_regions or _ENGLISH_REGIONS)
-    try:
-        pu = urlparse(u)
-    except Exception:
-        return False
-
-    host = (pu.hostname or "").lower()
-    path = (pu.path or "/").lower()
-    q = {k.lower(): _normalize_token(v) for k, v in parse_qsl(pu.query or "", keep_blank_values=True)}
-
-    # 1) Subdomain markers
-    labels = _host_labels(host)
-    if len(labels) >= 3:
-        sub = labels[0]
-        if _token_is_non_english(sub, acc, primary_lang):
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[filtering.lang] sub=%s -> non_en=True url=%s", sub, u)
-            return True
-
-    # 2) First path segment
-    first_seg = _first_path_segment(path)
-    if first_seg and _token_is_non_english(first_seg, acc, primary_lang):
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[filtering.lang] path-seg=%s -> non_en=True url=%s", first_seg, u)
-        return True
-
-    # 3) Query param language hints
-    for k in {"lang", "hl", "locale", "lc", "lr", "region"}:
-        v = q.get(k, "")
-        if not v:
-            continue
-        if _token_is_non_english(v, acc, primary_lang):
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[filtering.lang] query %s=%s -> non_en=True url=%s", k, v, u)
-            return True
-        if len(v) == 2 and v in _LANG_CODES and v != primary_lang:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[filtering.lang] query %s=%s (2-letter) non_en -> drop url=%s", k, v, u)
-            return True
-
-    # 4) ccTLD fallback (optional; conservative)
-    if strict_cctld:
-        labels = _host_labels(host)
-        cc = labels[-1] if labels else ""
-        likely_non_en = {
-            "fr", "de", "es", "it", "pt", "ru", "jp", "kr", "cn", "tw", "hk", "vn", "th", "id", "my",
-            "tr", "pl", "cz", "sk", "ro", "hu", "bg", "gr", "ua", "nl", "be", "dk", "no", "se", "fi",
-            "il", "ir", "sa",
-        }
-        if cc and cc not in _ENGLISH_REGIONS and cc not in {"us", "uk", "gb"} and cc in likely_non_en:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[filtering.lang] strict ccTLD=%s non_en -> drop url=%s", cc, u)
-            return True
-
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[filtering.lang] default keep url=%s", u)
-    return False
-
-
-def should_drop_for_language(
-    u: str,
-    primary_lang: str = "en",
-    accept_en_regions: set[str] | None = None,
-    strict_cctld: bool = False,
-) -> bool:
-    drop = is_non_english_url(
-        u,
-        primary_lang=primary_lang,
-        accept_en_regions=accept_en_regions,
-        strict_cctld=strict_cctld,
+    __slots__ = (
+        "_lang_code",
+        "_include_patterns",
+        "_exclude_patterns",
+        "_allowed_tlds",
+        "_blocked_tlds",
+        "_allowed_host_suffixes",
+        "_blocked_host_suffixes",
     )
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[filtering.lang] should_drop_for_language(%s) -> %s", u, drop)
-    return drop
 
-# =============================================================================
-# Live-check language hardening (headers & <html lang>)
-# =============================================================================
+    def __init__(
+        self,
+        *,
+        lang_code: str = "en",
+        include_patterns: Optional[Iterable[str]] = None,
+        exclude_patterns: Optional[Iterable[str]] = None,
+        allowed_tlds: Optional[Iterable[str]] = None,
+        blocked_tlds: Optional[Iterable[str]] = None,
+        allowed_host_suffixes: Optional[Iterable[str]] = None,
+        blocked_host_suffixes: Optional[Iterable[str]] = None,
+        name: Optional[str] = None,
+    ) -> None:
+        super().__init__(name=name or f"LanguageAwareURLFilter[{lang_code}]")
 
+        self._lang_code = (lang_code or "en").lower()
+        # Load the full language spec (base + lang_<code>.py overlay)
+        spec: Dict[str, any] = lang_cfg.get_lang_spec(self._lang_code)
 
-def _normalize_lang_code(code: str) -> str:
-    return (code or "").strip().lower().replace("_", "-")
+        # Patterns (glob-style)
+        inc = include_patterns or spec.get("DEFAULT_INCLUDE_PATTERNS", [])
+        exc = exclude_patterns or spec.get("DEFAULT_EXCLUDE_PATTERNS", [])
 
+        self._include_patterns: List[str] = [p.lower() for p in inc]
+        self._exclude_patterns: List[str] = [p.lower() for p in exc]
 
-def _is_non_english_lang_code(code: str, accept_en_regions: set[str]) -> bool:
-    c = _normalize_lang_code(code)
-    if not c:
-        return False
-    if c == "en" or c in {"en-us", "en-gb"}:
-        return False
-    if c in accept_en_regions or c.startswith("en-"):
-        return False
-    root = c.split("-")[0]
-    return (root in _LANG_CODES) and (root != "en")
+        # TLD rules are stored as language → {tlds}
+        spec_allow_tld: Dict[str, Iterable[str]] = spec.get("LANG_TLD_ALLOW", {}) or {}
+        spec_deny_tld: Dict[str, Iterable[str]] = spec.get("LANG_TLD_DENY", {}) or {}
 
+        allow_src = (
+            allowed_tlds
+            if allowed_tlds is not None
+            else spec_allow_tld.get(self._lang_code, [])
+        )
+        deny_src = (
+            blocked_tlds
+            if blocked_tlds is not None
+            else spec_deny_tld.get(self._lang_code, [])
+        )
 
-def drop_by_response_language(
-    url: str,
-    *,
-    headers: Optional[Dict[str, str]] = None,
-    html_lang: Optional[str] = None,
-    primary_lang: str = "en",
-    accept_en_regions: Optional[set[str]] = None,
-) -> bool:
-    acc = set(accept_en_regions or _ENGLISH_REGIONS)
+        self._allowed_tlds: Set[str] = {t.lower().lstrip(".") for t in (allow_src or [])}
+        self._blocked_tlds: Set[str] = {t.lower().lstrip(".") for t in (deny_src or [])}
 
-    if headers:
-        lowered = {str(k).lower(): str(v) for k, v in headers.items()}
-        h = lowered.get("content-language") or lowered.get("content_language")
-        if h:
-            tokens = [t.strip() for t in h.replace(";", ",").split(",") if t.strip()]
-            for tok in tokens:
-                if _is_non_english_lang_code(tok, acc):
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug("[filtering.live-lang] drop by Content-Language=%s url=%s", tok, url)
-                    return True
+        # Host suffix rules are likewise language → {suffixes}
+        spec_allow_host: Dict[str, Iterable[str]] = spec.get(
+            "LANG_HOST_ALLOW_SUFFIXES", {}
+        ) or {}
+        spec_block_host: Dict[str, Iterable[str]] = spec.get(
+            "LANG_HOST_BLOCK_SUFFIXES", {}
+        ) or {}
 
-    if html_lang and _is_non_english_lang_code(html_lang, acc):
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[filtering.live-lang] drop by <html lang=%s> url=%s", html_lang, url)
+        allow_host_src = (
+            allowed_host_suffixes
+            if allowed_host_suffixes is not None
+            else spec_allow_host.get(self._lang_code, [])
+        )
+        block_host_src = (
+            blocked_host_suffixes
+            if blocked_host_suffixes is not None
+            else spec_block_host.get(self._lang_code, [])
+        )
+
+        self._allowed_host_suffixes: Set[str] = {
+            h.lower().strip(".") for h in (allow_host_src or [])
+        }
+        self._blocked_host_suffixes: Set[str] = {
+            h.lower().strip(".") for h in (block_host_src or [])
+        }
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[LanguageAwareURLFilter.__init__] lang=%s inc=%d exc=%d "
+                "allowed_tlds=%s blocked_tlds=%s allowed_host_suffixes=%s "
+                "blocked_host_suffixes=%s",
+                self._lang_code,
+                len(self._include_patterns),
+                len(self._exclude_patterns),
+                sorted(list(self._allowed_tlds))[:10],
+                sorted(list(self._blocked_tlds))[:10],
+                sorted(list(self._allowed_host_suffixes))[:10],
+                sorted(list(self._blocked_host_suffixes))[:10],
+            )
+
+    # ------------------------------------------------------------------ #
+    # Core logic
+    # ------------------------------------------------------------------ #
+
+    def _match_patterns(
+        self,
+        host: str,
+        path: str,
+        patterns: List[str],
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Try to match any pattern against path or host+path.
+
+        Returns:
+            (matched: bool, pattern: Optional[str])
+        """
+        if not patterns:
+            return False, None
+        host = host.lower()
+        path = path.lower()
+        target = host + path
+        for pat in patterns:
+            p = pat.lower()
+            if fnmatch(path, p) or fnmatch(target, p):
+                return True, pat
+        return False, None
+
+    def _host_allowed_by_suffix(self, host: str) -> bool:
+        h = _normalize_host(host)
+        if not self._allowed_host_suffixes:
+            return True  # no restriction
+        return any(_label_boundary_match(h, sfx) for sfx in self._allowed_host_suffixes)
+
+    def _host_blocked_by_suffix(self, host: str) -> bool:
+        if not self._blocked_host_suffixes:
+            return False
+        h = _normalize_host(host)
+        return any(_label_boundary_match(h, sfx) for sfx in self._blocked_host_suffixes)
+
+    def _tld_allowed(self, host: str) -> bool:
+        tld = _top_level_label(host).lstrip(".").lower()
+        if self._allowed_tlds and tld not in self._allowed_tlds:
+            return False
+        if self._blocked_tlds and tld in self._blocked_tlds:
+            return False
         return True
 
-    return False
+    def apply(self, url: str) -> bool:
+        """
+        Decide whether to KEEP the URL based on language-aware rules.
 
-
-def apply_live_language_screen(
-    items: List[Dict[str, Any]],
-    headers_key: str = "headers",
-    html_lang_key: str = "html_lang",
-    primary_lang: str = "en",
-    accept_en_regions: Optional[set[str]] = None,
-) -> List[Dict[str, Any]]:
-    acc = set(accept_en_regions or _ENGLISH_REGIONS)
-    kept: List[Dict[str, Any]] = []
-    dropped = 0
-    for u in items:
-        url = u.get("final_url") or u.get("url") or ""
-        if not url:
-            continue
-        headers = u.get(headers_key)
-        html_lang = u.get(html_lang_key)
-        if drop_by_response_language(
-            url,
-            headers=headers,
-            html_lang=html_lang,
-            primary_lang=primary_lang,
-            accept_en_regions=acc,
-        ):
-            dropped += 1
-            continue
-        kept.append(u)
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[filtering.live-lang] kept=%d dropped=%d (by response metadata)", len(kept), dropped)
-    return kept
-
-# =============================================================================
-# First-party brand / cross-domain helpers
-# =============================================================================
-
-
-def same_registrable_domain(a: str, b: str) -> bool:
-    ha = (urlparse(a).hostname or "").lower()
-    hb = (urlparse(b).hostname or "").lower()
-    if not ha or not hb:
-        return False
-    return _registrable_domain(ha) == _registrable_domain(hb)
-
-
-def classify_external(
-    base_url: str,
-    candidate_url: str,
-    allowed_brand_hosts: Optional[set[str]] = None,
-) -> str:
-    """
-    Classify a cross-domain candidate relative to base_url:
-      - 'brand'     : host explicitly whitelisted
-      - 'same_site' : same registrable domain
-      - 'external'  : everything else
-    """
-    allowed = set(allowed_brand_hosts or ())
-    base_host = (urlparse(base_url).hostname or "").lower()
-    cand_host = (urlparse(candidate_url).hostname or "").lower()
-
-    if not base_host or not cand_host:
-        return "external"
-
-    if cand_host in allowed:
-        return "brand"
-    if _registrable_domain(base_host) == _registrable_domain(cand_host):
-        return "same_site"
-    return "external"
-
-# =============================================================================
-# Priority scoring & composite filtering (with REASONS)
-# =============================================================================
-
-
-def _pattern_hits(url: str, patterns: List[str]) -> int:
-    return _count_hits(url, patterns)
-
-
-def url_priority(
-    url: str,
-    *,
-    include: Optional[List[str]] = None,
-    exclude: Optional[List[str]] = None,
-) -> Tuple[int, bool, bool]:
-    include = include or []
-    exclude = exclude or []
-    inc_hits = _count_hits(url, include) + (1 if _smart_include_hit(url) else 0)
-    exc_hits = _count_hits(url, exclude)
-    score = inc_hits * 10 - exc_hits * 5
-    return score, inc_hits > 0, exc_hits > 0
-
-
-def url_should_keep(
-    url: str,
-    *,
-    include: Optional[List[str]] = None,
-    exclude: Optional[List[str]] = None,
-    drop_universal_externals: bool = True,
-    lang_primary: str = "en",
-    lang_accept_en_regions: Optional[set[str]] = None,
-    lang_strict_cctld: bool = False,
-    include_overrides_language: bool = False,
-) -> bool:
-    include = include or []
-    exclude = exclude or []
-
-    if is_image_url(url):
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[filtering.keep] asset image -> drop: %s", url)
-        return False
-
-    if drop_universal_externals and is_universal_external(url):
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[filtering.keep] universal external -> drop: %s", url)
-        return False
-
-    score, inc_hit, exc_hit = url_priority(url, include=include, exclude=exclude)
-
-    if not (include_overrides_language and inc_hit):
-        if should_drop_for_language(
-            url,
-            primary_lang=lang_primary,
-            accept_en_regions=lang_accept_en_regions,
-            strict_cctld=lang_strict_cctld,
-        ):
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "[filtering.keep] language drop -> %s (score=%d inc=%s exc=%s)",
-                    url, score, inc_hit, exc_hit
+        Returns:
+            True  -> keep / follow
+            False -> drop
+        """
+        try:
+            parsed = urlparse(url)
+            host = parsed.hostname or ""
+            path = parsed.path or "/"
+        except Exception:
+            host = ""
+            path = "/"
+            result = False
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[LanguageAwareURLFilter.apply] url=%s parse_error -> DROP",
+                    url,
                 )
-            return False
+            self._update_stats(result)
+            return result
 
-    if exc_hit and not inc_hit:
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[filtering.keep] exclude hit without include -> drop: %s (score=%d)", url, score)
-        return False
+        # Host-level rules (suffix + TLD)
+        if self._host_blocked_by_suffix(host):
+            result = False
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[LanguageAwareURLFilter.apply] url=%s host=%s -> DROP (blocked_host_suffix)",
+                    url,
+                    host,
+                )
+            self._update_stats(result)
+            return result
 
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[filtering.keep] keep: %s (score=%d inc=%s exc=%s)", url, score, inc_hit, exc_hit)
-    return True
+        if not self._host_allowed_by_suffix(host):
+            result = False
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[LanguageAwareURLFilter.apply] url=%s host=%s -> DROP (not_allowed_by_suffix)",
+                    url,
+                    host,
+                )
+            self._update_stats(result)
+            return result
 
+        if not self._tld_allowed(host):
+            result = False
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[LanguageAwareURLFilter.apply] url=%s host=%s -> DROP (tld_not_allowed)",
+                    url,
+                    host,
+                )
+            self._update_stats(result)
+            return result
 
-def apply_url_filters(
-    urls: Iterable[str] | Iterable[Dict[str, Any]],
-    *,
-    include: Optional[List[str]] = None,
-    exclude: Optional[List[str]] = None,
-    drop_universal_externals: bool = True,
-    lang_primary: str = "en",
-    lang_accept_en_regions: Optional[set[str]] = None,
-    lang_strict_cctld: bool = False,
-    include_overrides_language: bool = False,
-    sort_by_priority: bool = True,
-    base_url: Optional[str] = None,
-    keep_brand_domains: bool = False,
-    allowed_brand_hosts: Optional[set[str]] = None,
-    return_reasons: bool = False,
-) -> Union[List[str], List[Dict[str, Any]], Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
-    """
-    Apply language policy (first), then include/exclude, then optional brand allowance.
+        # Path / pattern rules
+        # 1) Exclude patterns first (hard drop)
+        exc_matched, exc_pat = self._match_patterns(host, path, self._exclude_patterns)
+        if exc_matched:
+            result = False
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[LanguageAwareURLFilter.apply] url=%s host=%s path=%s -> DROP (exclude_pattern='%s')",
+                    url,
+                    host,
+                    path,
+                    exc_pat,
+                )
+            self._update_stats(result)
+            return result
 
-    If `return_reasons=True`, returns a tuple:
-      (kept_items, dropped_with_reasons)
-    where each dropped item is { "url": <str>, "reason": <str> } with reasons:
-      - "universal_external"
-      - "language"
-      - "exclude"
-      - "asset_image"
-    """
-    include = include or []
-    exclude = exclude or []
-    allowed_brand_hosts = set(allowed_brand_hosts or ())
+        # 2) Include patterns (soft)
+        inc_matched, inc_pat = self._match_patterns(host, path, self._include_patterns)
 
-    items = list(urls)
-    is_dict_items = bool(items and isinstance(items[0], dict))
+        if inc_matched:
+            result = True
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[LanguageAwareURLFilter.apply] url=%s host=%s path=%s -> KEEP (include_pattern='%s')",
+                    url,
+                    host,
+                    path,
+                    inc_pat,
+                )
+            self._update_stats(result)
+            return result
 
-    kept: List[Tuple[int, bool, bool, Any]] = []
-    dropped: List[Dict[str, Any]] = []
-
-    for item in items:
-        u = item["url"] if is_dict_items else str(item)
-
-        # HARD DROP: asset-like image URLs
-        if is_image_url(u):
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[filtering.apply] DROP asset image: %s", u)
-            if return_reasons:
-                dropped.append({"url": u, "reason": "asset_image"})
-            continue
-
-        score, inc_hit, exc_hit = url_priority(u, include=include, exclude=exclude)
-
-        # 1) Universal externals
-        if drop_universal_externals and is_universal_external(u):
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[filtering.apply] DROP universal external: %s", u)
-            if return_reasons:
-                dropped.append({"url": u, "reason": "universal_external"})
-            continue
-
-        # 2) Language
-        lang_drop = not (include_overrides_language and inc_hit) and should_drop_for_language(
-            u,
-            primary_lang=lang_primary,
-            accept_en_regions=lang_accept_en_regions,
-            strict_cctld=lang_strict_cctld,
-        )
-        if lang_drop:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[filtering.apply] DROP by language: %s", u)
-            if return_reasons:
-                dropped.append({"url": u, "reason": "language"})
-            continue
-
-        # 3) Brand classification
-        brand_allowed_host = False
-        if keep_brand_domains:
-            host = (urlparse(u).hostname or "").lower()
-            if base_url:
-                _ = same_registrable_domain(base_url, u)
-            if host in allowed_brand_hosts:
-                brand_allowed_host = True
-
-        # 4) Exclude-only (unless brand-allowed host)
-        if exc_hit and not inc_hit and not brand_allowed_host:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[filtering.apply] DROP by exclude: %s", u)
-            if return_reasons:
-                dropped.append({"url": u, "reason": "exclude"})
-            continue
-
-        kept.append((score, inc_hit, exc_hit, item))
-
-    if sort_by_priority and kept:
-        kept.sort(key=lambda t: (not t[1], -t[0]))  # include-hit first, then by score desc
-
-    kept_items = [t[3] for t in kept]
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "[filtering.apply] kept=%d / total=%d (sorted=%s, keep_brand=%s)",
-            len(kept_items), len(items), bool(sort_by_priority), bool(keep_brand_domains),
-        )
-
-    if return_reasons:
-        if not is_dict_items:
-            kept_items = [{"url": str(x)} for x in kept_items]  # type: ignore
-        return kept_items, dropped
-
-    if is_dict_items:
-        return kept_items  # type: ignore
-    return [x["url"] for x in kept_items]  # type: ignore
-
-# =============================================================================
-# Seeding convenience: universal BM25 query for product/service pages
-# =============================================================================
-
-
-def default_product_bm25_query() -> str:
-    return lang_cfg.default_product_bm25_query()
+        # 3) No include match: previously this was a DROP; this was too aggressive
+        # for deep crawling (most internal links are not yet product pages).
+        # Now we KEEP by default, but log that it's a "soft allow".
+        result = True
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "[LanguageAwareURLFilter.apply] url=%s host=%s path=%s -> KEEP (no_include_match, soft_allow)",
+                url,
+                host,
+                path,
+            )
+        self._update_stats(result)
+        return result

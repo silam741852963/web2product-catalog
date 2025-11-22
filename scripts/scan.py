@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import csv
 import gzip
@@ -11,7 +12,9 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 from extensions.output_paths import sanitize_bvdid
 
-# -------- Models --------
+# =====================================================================================
+# Models
+# =====================================================================================
 
 @dataclass
 class LogHit:
@@ -27,7 +30,10 @@ class LogHit:
     def to_dict(self) -> Dict:
         return asdict(self)
 
-# -------- Defaults & Regex --------
+
+# =====================================================================================
+# Defaults & Regex
+# =====================================================================================
 
 DEFAULT_ERROR_PATTERNS: List[re.Pattern] = [
     re.compile(r"\[(ERROR)\]", re.IGNORECASE),
@@ -51,13 +57,23 @@ DEFAULT_PREFILTER_TOKENS = {
     "net::err_", "timeout",
 }
 
-# -------- Helpers --------
+
+# =====================================================================================
+# Helpers
+# =====================================================================================
 
 def _iter_company_log_files(outputs_root: Path, glob_pattern: str) -> List[Path]:
+    """
+    Iterate company log files under:
+        outputs_root/**/log/<glob_pattern>
+
+    Note: previously it was "logs/"; now logs are under companyid/log/.
+    """
     root = outputs_root
     if not root.exists():
         return []
-    return list(root.rglob(f"logs/{glob_pattern}"))
+    return list(root.rglob(f"log/{glob_pattern}"))
+
 
 def _compile_user_patterns(patterns: Iterable[str]) -> List[re.Pattern]:
     out: List[re.Pattern] = []
@@ -68,6 +84,7 @@ def _compile_user_patterns(patterns: Iterable[str]) -> List[re.Pattern]:
             out.append(re.compile(re.escape(p), re.IGNORECASE))
     return out
 
+
 def _pick_matchers(level: str, extra_patterns: Optional[List[re.Pattern]] = None) -> Tuple[List[re.Pattern], str]:
     extra_patterns = extra_patterns or []
     if level == "error":
@@ -75,6 +92,7 @@ def _pick_matchers(level: str, extra_patterns: Optional[List[re.Pattern]] = None
     if level == "warning":
         return (DEFAULT_WARNING_PATTERNS + extra_patterns, "WARNING")
     return (DEFAULT_ERROR_PATTERNS + DEFAULT_WARNING_PATTERNS + extra_patterns, "ALL")
+
 
 def _infer_level_from_line(line: str, default_level: str) -> str:
     if re.search(r"\[(ERROR)\]", line, re.IGNORECASE) or re.search(r"\bError:\b", line, re.IGNORECASE):
@@ -86,9 +104,14 @@ def _infer_level_from_line(line: str, default_level: str) -> str:
         return "ERROR"
     if default_level == "warning":
         return "WARNING"
-    return "ERROR"
+    return "INFO"
+
 
 def _extract_sanitized_id_from_path(path: Path) -> str:
+    """
+    Try to extract the sanitized company id from a full path like:
+      /.../outputs/<sanitized_bvdid>/log/...
+    """
     try:
         parts = list(path.resolve().parts)
     except Exception:
@@ -101,6 +124,7 @@ def _extract_sanitized_id_from_path(path: Path) -> str:
         return parts[idx + 1]
     return ""
 
+
 def _derive_prefilter_tokens(user_patterns: List[str]) -> List[str]:
     tokens = set(DEFAULT_PREFILTER_TOKENS)
     for p in user_patterns:
@@ -110,13 +134,17 @@ def _derive_prefilter_tokens(user_patterns: List[str]) -> List[str]:
                 tokens.add(t)
     return sorted(tokens)
 
+
 def _open_possibly_compressed(path: Path, encoding: str):
-    """Return a file-like object for normal or .gz files"""
+    """Return a file-like object for normal or .gz files."""
     if path.suffix.lower().endswith(".gz"):
         return gzip.open(path, mode="rt", encoding=encoding, errors="ignore")
     return path.open("r", encoding=encoding, errors="ignore")
 
-# -------- Single-file scan (sync, used inside thread pool) --------
+
+# =====================================================================================
+# Single-file scan (sync, used inside thread pool)
+# =====================================================================================
 
 def _scan_one_file_sync(
     log_path: Path,
@@ -191,7 +219,10 @@ def _scan_one_file_sync(
 
     return hits
 
-# -------- Async scanner (public API) --------
+
+# =====================================================================================
+# Async scanner (public API)
+# =====================================================================================
 
 async def ascan_logs(
     *,
@@ -206,7 +237,8 @@ async def ascan_logs(
     use_prefilter: bool = True,
 ) -> Tuple[Dict[str, List[LogHit]], List[LogHit]]:
     """
-    Async scan logs under outputs/{sanitized_bvdid}/logs/*.log (and .log.gz).
+    Async scan logs under outputs/{sanitized_bvdid}/log/*.log (and .log.gz).
+
     Returns (hits_by_company, all_hits).
     """
     log_files = _iter_company_log_files(outputs_root, logs_glob)
@@ -250,7 +282,10 @@ async def ascan_logs(
 
     return hits_by_company, all_hits
 
-# -------- Synchronous wrapper (compatibility) --------
+
+# =====================================================================================
+# Synchronous wrapper (compatibility)
+# =====================================================================================
 
 def scan_logs(
     *,
@@ -290,7 +325,10 @@ def scan_logs(
     else:
         return asyncio.run(coro)
 
-# -------- CSV enrichment helpers (unchanged, but robustified) --------
+
+# =====================================================================================
+# CSV enrichment helpers
+# =====================================================================================
 
 def _read_source_map_with_sanitized(source_csv: Optional[Path]) -> Tuple[Dict[str, Dict[str, str]], Dict[str, str]]:
     """
@@ -331,6 +369,7 @@ def _read_source_map_with_sanitized(source_csv: Optional[Path]) -> Tuple[Dict[st
 
     return src_map, rev_map
 
+
 def create_test_csv(
     out_csv: Path,
     companies: Iterable[str],
@@ -356,7 +395,13 @@ def create_test_csv(
             original = rev_map[key]
 
         if original in src_map:
-            rows.append({"bvdid": original, "name": src_map[original].get("name", ""), "url": src_map[original].get("url", "")})
+            rows.append(
+                {
+                    "bvdid": original,
+                    "name": src_map[original].get("name", ""),
+                    "url": src_map[original].get("url", ""),
+                }
+            )
         else:
             rows.append({"bvdid": original, "name": "", "url": ""})
 
@@ -371,13 +416,17 @@ def create_test_csv(
 
     return len(rows)
 
-# -------- Optional export to JSON / CSV (for CLI convenience) --------
+
+# =====================================================================================
+# Optional export to JSON / CSV (for CLI convenience)
+# =====================================================================================
 
 def dump_hits_json(hits: List[LogHit], out_json: Path) -> None:
     out_json = Path(out_json)
     out_json.parent.mkdir(parents=True, exist_ok=True)
     payload = [h.to_dict() for h in hits]
     out_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
 
 def dump_hits_csv(hits: List[LogHit], out_csv: Path) -> None:
     out_csv = Path(out_csv)
@@ -387,11 +436,264 @@ def dump_hits_csv(hits: List[LogHit], out_csv: Path) -> None:
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         for h in hits:
-            writer.writerow({
-                "bvdid": h.bvdid,
-                "sanitized_bvdid": h.sanitized_bvdid,
-                "level": h.level,
-                "log_path": h.log_path,
-                "line_no": h.line_no,
-                "message": h.message,
-            })
+            writer.writerow(
+                {
+                    "bvdid": h.bvdid,
+                    "sanitized_bvdid": h.sanitized_bvdid,
+                    "level": h.level,
+                    "log_path": h.log_path,
+                    "line_no": h.line_no,
+                    "message": h.message,
+                }
+            )
+
+
+# =====================================================================================
+# CLI (merged from scan_logs.py) + extraction feature
+# =====================================================================================
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "Async log scanner: scan outputs/{companyid}/log/*.log for ERROR/WARNING blocks; "
+            "print and optionally export / extract pattern-matching lines."
+        )
+    )
+    p.add_argument(
+        "--outputs-root",
+        type=Path,
+        default=Path("outputs"),
+        help="Root directory containing per-company folders (default: ./outputs).",
+    )
+    p.add_argument(
+        "--logs-glob",
+        type=str,
+        default="*.log",
+        help="Glob pattern for log files relative to each log/ dir (default: *.log). Use *.log* to include .log.gz.",
+    )
+    p.add_argument(
+        "--encoding",
+        type=str,
+        default="utf-8",
+        help="File encoding for reading log files (default utf-8).",
+    )
+    p.add_argument(
+        "--no-prefilter",
+        dest="use_prefilter",
+        action="store_false",
+        help="Disable prefilter token scan (slower, but may find more).",
+    )
+
+    p.add_argument(
+        "--level",
+        choices=["error", "warning", "all"],
+        default="error",
+        help="Which severity to match (default: error).",
+    )
+    p.add_argument(
+        "--pattern",
+        action="append",
+        default=[],
+        help="Extra regex pattern(s) to match (can be repeated).",
+    )
+
+    p.add_argument(
+        "--context-before",
+        type=int,
+        default=0,
+        help="Lines before a hit to include (default: 0).",
+    )
+    p.add_argument(
+        "--context-after",
+        type=int,
+        default=20,
+        help="Lines after a hit to include (default: 20).",
+    )
+
+    p.add_argument(
+        "--print",
+        dest="do_print",
+        action="store_true",
+        help="Print hits to stdout.",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Limit number of printed hits (0 = no limit).",
+    )
+
+    p.add_argument(
+        "--json-out",
+        type=Path,
+        default=None,
+        help="Write all hits as a JSON file (optional).",
+    )
+    p.add_argument(
+        "--csv-out",
+        type=Path,
+        default=None,
+        help="Write all hits as a CSV file (optional).",
+    )
+
+    p.add_argument(
+        "--write-test-csv",
+        type=Path,
+        default=None,
+        help="Write a CSV of matched companies (BVDIDs) to this path.",
+    )
+    p.add_argument(
+        "--source-csv",
+        type=Path,
+        default=None,
+        help="Original company CSV to enrich/normalize BVDIDs in the test CSV.",
+    )
+
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=64,
+        help="Max concurrent file scans (default: 64).",
+    )
+
+    p.add_argument(
+        "--extract-dir",
+        type=Path,
+        default=None,
+        help=(
+            "If set, for each company, write all hit lines whose message matches --pattern "
+            "into a separate text file in this directory (one file per company)."
+        ),
+    )
+
+    return p.parse_args()
+
+
+def _print_hits(all_hits: List[LogHit], limit: int = 0) -> None:
+    count = 0
+    for h in all_hits:
+        if limit and count >= limit:
+            break
+        print("=" * 80)
+        label = h.bvdid if h.bvdid != "UNKNOWN" else h.sanitized_bvdid
+        print(f"{h.level} | {label} | {h.log_path}:{h.line_no}")
+        print(h.message)
+        if h.context_before:
+            print("-- before --")
+            for ln in h.context_before:
+                print(ln)
+        if h.context_after:
+            print("-- after --")
+            for ln in h.context_after:
+                print(ln)
+        count += 1
+    if limit and len(all_hits) > limit:
+        print(f"... ({len(all_hits) - limit} more not shown)")
+
+
+def _extract_lines_to_files(
+    all_hits: List[LogHit],
+    *,
+    patterns: List[str],
+    extract_dir: Path,
+) -> None:
+    """
+    Take all hits and, for lines whose `message` matches any of `patterns`,
+    write them to per-company text files in `extract_dir`.
+
+    Company key = original BVDID if known, otherwise sanitized_bvdid.
+    Each line format:
+        <LEVEL> <log_path>:<line_no> <message>
+    """
+    if not patterns:
+        return
+
+    extract_dir = Path(extract_dir)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    regexes = _compile_user_patterns(patterns)
+
+    by_company: Dict[str, List[str]] = {}
+
+    for h in all_hits:
+        msg = h.message or ""
+        if not msg:
+            continue
+        if not any(rx.search(msg) for rx in regexes):
+            continue
+
+        key = h.bvdid if h.bvdid != "UNKNOWN" else (h.sanitized_bvdid or "UNKNOWN")
+        line = f"{h.level} {h.log_path}:{h.line_no} {msg}"
+        by_company.setdefault(key, []).append(line)
+
+    if not by_company:
+        return
+
+    for key, lines in by_company.items():
+        fname = f"{key}.logextract.txt"
+        out_path = extract_dir / fname
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+async def _run_async(args: argparse.Namespace) -> None:
+    hits_by_company, all_hits = await ascan_logs(
+        outputs_root=args.outputs_root,
+        logs_glob=args.logs_glob,
+        level=args.level,
+        patterns=args.pattern,
+        context_before=args.context_before,
+        context_after=args.context_after,
+        encoding=args.encoding,
+        workers=args.workers,
+        use_prefilter=args.use_prefilter,
+    )
+
+    # Build company list, prefer original id if known
+    companies: List[str] = []
+    seen = set()
+    for lst in hits_by_company.values():
+        for h in lst:
+            key = h.bvdid if h.bvdid != "UNKNOWN" else h.sanitized_bvdid
+            if key and key not in seen:
+                companies.append(key)
+                seen.add(key)
+
+    print(f"Found {len(all_hits)} hit(s) across {len(companies)} compan(ies).")
+
+    if args.do_print:
+        _print_hits(all_hits, limit=args.limit)
+
+    if args.json_out:
+        dump_hits_json(all_hits, args.json_out)
+        print(f"Wrote JSON: {args.json_out}")
+
+    if args.csv_out:
+        dump_hits_csv(all_hits, args.csv_out)
+        print(f"Wrote CSV: {args.csv_out}")
+
+    if args.write_test_csv:
+        n = create_test_csv(
+            out_csv=args.write_test_csv,
+            companies=companies,
+            source_csv=args.source_csv,
+        )
+        print(f"Wrote test CSV with {n} compan(ies): {args.write_test_csv}")
+
+    # New: extraction of pattern-matching lines into files
+    if args.extract_dir is not None and args.pattern:
+        _extract_lines_to_files(
+            all_hits,
+            patterns=args.pattern,
+            extract_dir=args.extract_dir,
+        )
+        print(f"Wrote extracted lines to: {args.extract_dir}")
+
+
+def main() -> None:
+    args = _parse_args()
+    asyncio.run(_run_async(args))
+
+
+if __name__ == "__main__":
+    main()

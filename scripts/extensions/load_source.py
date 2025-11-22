@@ -6,14 +6,29 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from typing import (
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Set,
+    Tuple,
+)
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    logger.addHandler(logging.NullHandler())
 
-# -----------------------------
+# =========================================================================== #
 # Model
-# -----------------------------
+# =========================================================================== #
+
+
 @dataclass
 class CompanyInput:
     bvdid: str
@@ -31,23 +46,43 @@ class CompanyInput:
         return self.name
 
 
-# -----------------------------
+# =========================================================================== #
 # URL normalization helpers
-# -----------------------------
+# =========================================================================== #
+
 # Two-label public suffixes that require one extra label to form the registrable domain.
 # e.g. foo.example.co.uk -> example.co.uk
 _TWO_LEVEL_SUFFIXES: Set[str] = {
-    "co.uk", "org.uk", "ac.uk",
-    "com.au", "net.au", "org.au",
-    "co.jp", "ne.jp", "or.jp",
-    "com.cn", "com.sg", "com.br",
+    "co.uk",
+    "org.uk",
+    "ac.uk",
+    "com.au",
+    "net.au",
+    "org.au",
+    "co.jp",
+    "ne.jp",
+    "or.jp",
+    "com.cn",
+    "com.sg",
+    "com.br",
 }
 
 # Tracking params to drop outright; any key that matches these
 _DROP_PARAMS: Set[str] = {
-    "gclid", "fbclid", "igshid", "mc_cid", "mc_eid", "msclkid",
-    "smid", "oly_anon_id", "oly_enc_id", "vero_conv", "vero_id",
-    "ref", "referrer", "utm_id",
+    "gclid",
+    "fbclid",
+    "igshid",
+    "mc_cid",
+    "mc_eid",
+    "msclkid",
+    "smid",
+    "oly_anon_id",
+    "oly_enc_id",
+    "vero_conv",
+    "vero_id",
+    "ref",
+    "referrer",
+    "utm_id",
 }
 # Prefix-based (e.g., utm_source, utm_medium, utm_campaign, utm_term, utm_content)
 _DROP_PARAM_PREFIXES: Tuple[str, ...] = ("utm_", "mtm_", "pk_")
@@ -69,11 +104,11 @@ def _registrable_domain(host: str) -> str:
     if len(labels) < 2:
         return h
 
-    last2 = ".".join(labels[-2:])           # e.g. "example.com" or "co.uk"
+    last2 = ".".join(labels[-2:])
     if last2 in _TWO_LEVEL_SUFFIXES and len(labels) >= 3:
         # If hostname ends with a known 2-label public suffix, registrable domain is last 3 labels.
-        return ".".join(labels[-3:])        # e.g. "example.co.uk"
-    return last2                             # e.g. "example.com"
+        return ".".join(labels[-3:])
+    return last2
 
 
 def _canonical_host(raw_host: str, *, collapse_www: bool = True) -> str:
@@ -159,9 +194,10 @@ def canonical_url(u: str, *, default_scheme: str = "https", collapse_www: bool =
     return urlunparse(parts)
 
 
-# -----------------------------
+# =========================================================================== #
 # Key resolution / normalization
-# -----------------------------
+# =========================================================================== #
+
 _PRIMARY_ID_KEYS = ("bvdid", "hojin_id", "id")
 _PRIMARY_NAME_KEYS = ("name", "company_name", "company")
 _PRIMARY_URL_KEYS = ("url", "website", "homepage", "home_page")
@@ -187,7 +223,12 @@ def _resolve_keys(fieldnames: Optional[Sequence[str]]) -> Tuple[str, str, str]:
     )
 
 
-def _row_to_company(row: Dict[str, str], id_key: str, name_key: str, url_key: str) -> Optional[CompanyInput]:
+def _row_to_company(
+    row: Mapping[str, str],
+    id_key: str,
+    name_key: str,
+    url_key: str,
+) -> Optional[CompanyInput]:
     # Canonical, original-cased view
     id_val = (row.get(id_key, "") or "").strip() if id_key else ""
     nm_val = (row.get(name_key, "") or "").strip() if name_key else ""
@@ -216,92 +257,23 @@ def _row_to_company(row: Dict[str, str], id_key: str, name_key: str, url_key: st
         return None
 
     exclude = {(id_key or "").lower(), (name_key or "").lower(), (url_key or "").lower()}
-    metadata: Dict[str, str] = {k: (v or "") for k, v in row.items() if (k or "").lower() not in exclude}
+    metadata: Dict[str, str] = {
+        str(k): (v or "")
+        for k, v in row.items()
+        if (k or "").lower() not in exclude
+    }
     return CompanyInput(bvdid=id_val, name=nm_val, url=url_val, metadata=metadata)
 
 
-# -----------------------------
-# CSV / TSV (no pandas needed)
-# -----------------------------
-def _iter_csv(path: Path, *, encoding: str, delimiter: str, limit: Optional[int]) -> Iterator[CompanyInput]:
-    count = 0
-    with path.open("r", encoding=encoding, newline="") as f:
-        reader = csv.DictReader(f, delimiter=delimiter)
-        id_key, name_key, url_key = _resolve_keys(reader.fieldnames)
-        for row in reader:
-            if limit is not None and count >= limit:
-                break
-            ci = _row_to_company(row, id_key, name_key, url_key)
-            if ci:
-                yield ci
-                count += 1
+# =========================================================================== #
+# Pandas helper (lazy import)
+# =========================================================================== #
 
 
-# -----------------------------
-# JSON / NDJSON (no pandas)
-# -----------------------------
-def _iter_json_like(path: Path, *, encoding: str, limit: Optional[int]) -> Iterator[CompanyInput]:
-    text = path.read_text(encoding=encoding, errors="ignore").strip()
-    rows: List[Dict] = []
-
-    def as_dicts(obj) -> List[Dict]:
-        if isinstance(obj, list):
-            return [x for x in obj if isinstance(x, dict)]
-        if isinstance(obj, dict):
-            # common wrappers: {"data":[...]} / {"records":[...]}
-            for k in ("data", "records", "items", "rows"):
-                v = obj.get(k)
-                if isinstance(v, list):
-                    return [x for x in v if isinstance(x, dict)]
-            return [obj]
-        return []
-
-    # Try JSON first
-    try:
-        rows = as_dicts(json.loads(text))
-    except Exception:
-        # Try NDJSON / JSONL
-        rows = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, dict):
-                    rows.append(obj)
-            except Exception:
-                continue
-
-    # Stream
-    if not rows:
-        return iter(())  # type: ignore
-    # Determine keys once from the first row
-    id_key, name_key, url_key = _resolve_keys(list(rows[0].keys()))
-    count = 0
-    for row in rows:
-        if limit is not None and count >= limit:
-            break
-        if not isinstance(row, dict):
-            continue
-        ci = _row_to_company(
-            {str(k): str(v) if v is not None else "" for k, v in row.items()},
-            id_key,
-            name_key,
-            url_key,
-        )
-        if ci:
-            yield ci
-            count += 1
-
-
-# -----------------------------
-# Pandas-backed formats (optional)
-# -----------------------------
 def _require_pandas():
     try:
         import pandas as pd  # type: ignore
-    except Exception as e:
+    except Exception as e:  # pragma: no cover - import guard
         raise RuntimeError(
             "This file type requires pandas (and possibly pyarrow/fastparquet/openpyxl). "
             "Install extras, e.g.: pip install pandas pyarrow openpyxl"
@@ -310,80 +282,389 @@ def _require_pandas():
 
 
 def _iter_pandas_df(df, *, limit: Optional[int]) -> Iterator[CompanyInput]:
+    """
+    Efficient DataFrame -> CompanyInput iterator.
+
+    Speed-optimized vs. the naive .to_dict(orient='records') approach:
+      - Resolve (id, name, url) keys once using df.columns.
+      - Iterate with itertuples() to avoid per-row dict creation overhead.
+    """
     if df is None or df.empty:
         return iter(())  # type: ignore
-    # Normalize to dict rows
-    for i, row in enumerate(df.to_dict(orient="records")):
+
+    cols: List[str] = [str(c) for c in df.columns]
+    id_key, name_key, url_key = _resolve_keys(cols)
+
+    for i, row in enumerate(df.itertuples(index=False, name=None)):
         if limit is not None and i >= limit:
             break
-        # Resolve keys per row using all columns
-        id_key, name_key, url_key = _resolve_keys(list(row.keys()))
-        ci = _row_to_company(
-            {str(k): ("" if row[k] is None else str(row[k])) for k in row.keys()},
-            id_key,
-            name_key,
-            url_key,
-        )
+        values = list(row)
+        row_dict: Dict[str, str] = {}
+        for col, val in zip(cols, values):
+            row_dict[col] = "" if val is None else str(val)
+        ci = _row_to_company(row_dict, id_key, name_key, url_key)
         if ci:
             yield ci
 
 
-def _iter_excel(path: Path, *, limit: Optional[int]) -> Iterator[CompanyInput]:
-    pd = _require_pandas()
-    # Read first sheet only (multi-sheet: user can split or extend here)
-    df = pd.read_excel(path, dtype=str)  # requires openpyxl/xlrd depending on file
-    yield from _iter_pandas_df(df, limit=limit)
+# =========================================================================== #
+# Plugin interface
+# =========================================================================== #
 
 
-def _iter_stata(path: Path, *, limit: Optional[int]) -> Iterator[CompanyInput]:
-    pd = _require_pandas()
-    df = pd.read_stata(path)  # dtype inference; coercion to str in iterator
-    yield from _iter_pandas_df(df, limit=limit)
+class SourceFormatPlugin(Protocol):
+    """
+    Plugin interface for loading CompanyInput rows from a file.
+
+    Each plugin:
+      - declares the file extensions it supports
+      - implements iter_companies(path, encoding, limit)
+    """
+
+    @property
+    def name(self) -> str:  # pragma: no cover - interface
+        ...
+
+    @property
+    def extensions(self) -> Tuple[str, ...]:  # pragma: no cover - interface
+        ...
+
+    def iter_companies(
+        self,
+        path: Path,
+        *,
+        encoding: str,
+        limit: Optional[int],
+    ) -> Iterator[CompanyInput]:  # pragma: no cover - interface
+        ...
 
 
-def _iter_parquet(path: Path, *, limit: Optional[int]) -> Iterator[CompanyInput]:
-    pd = _require_pandas()
-    df = pd.read_parquet(path)  # needs pyarrow/fastparquet
-    yield from _iter_pandas_df(df, limit=limit)
+# =========================================================================== #
+# Concrete plugins
+# =========================================================================== #
+
+@dataclass(frozen=True)
+class CsvLikePlugin(SourceFormatPlugin):
+    """
+    CSV / TSV / TXT plugin (no pandas).
+
+    Uses csv.DictReader and resolves (id, name, url) once per file.
+    """
+
+    _name: str
+    _extensions: Tuple[str, ...]
+    _delimiter_map: Mapping[str, str]
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def extensions(self) -> Tuple[str, ...]:
+        return self._extensions
+
+    def iter_companies(
+        self,
+        path: Path,
+        *,
+        encoding: str,
+        limit: Optional[int],
+    ) -> Iterator[CompanyInput]:
+        count = 0
+        with path.open("r", encoding=encoding, newline="") as f:
+            # Pick delimiter from map; default to comma.
+            delim = self._delimiter_map.get(path.suffix.lower(), ",")
+            reader = csv.DictReader(f, delimiter=delim)
+            id_key, name_key, url_key = _resolve_keys(reader.fieldnames)
+            for row in reader:
+                if limit is not None and count >= limit:
+                    break
+                ci = _row_to_company(row, id_key, name_key, url_key)
+                if ci:
+                    yield ci
+                    count += 1
 
 
-def _iter_feather(path: Path, *, limit: Optional[int]) -> Iterator[CompanyInput]:
-    pd = _require_pandas()
-    df = pd.read_feather(path)  # needs pyarrow
-    yield from _iter_pandas_df(df, limit=limit)
+@dataclass(frozen=True)
+class JsonLikePlugin(SourceFormatPlugin):
+    """
+    JSON / NDJSON / JSONL plugin (no pandas).
+
+    Speed considerations:
+      - Attempt to parse as a single JSON blob first.
+      - If that fails (or isn't list/dict-ish), fall back to line-by-line NDJSON.
+      - Resolve keys once from the first row.
+    """
+
+    _name: str
+    _extensions: Tuple[str, ...]
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def extensions(self) -> Tuple[str, ...]:
+        return self._extensions
+
+    def iter_companies(
+        self,
+        path: Path,
+        *,
+        encoding: str,
+        limit: Optional[int],
+    ) -> Iterator[CompanyInput]:
+        text = path.read_text(encoding=encoding, errors="ignore").strip()
+        rows: List[Dict] = []
+
+        def as_dicts(obj) -> List[Dict]:
+            if isinstance(obj, list):
+                return [x for x in obj if isinstance(x, dict)]
+            if isinstance(obj, dict):
+                # common wrappers: {"data":[...]} / {"records":[...]}
+                for k in ("data", "records", "items", "rows"):
+                    v = obj.get(k)
+                    if isinstance(v, list):
+                        return [x for x in v if isinstance(x, dict)]
+                return [obj]
+            return []
+
+        # Try JSON first
+        try:
+            rows = as_dicts(json.loads(text))
+        except Exception:
+            rows = []
+
+        # Fallback: NDJSON / JSONL
+        if not rows:
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        rows.append(obj)
+                except Exception:
+                    continue
+
+        if not rows:
+            return iter(())  # type: ignore
+
+        # Determine keys once from the first row
+        id_key, name_key, url_key = _resolve_keys(list(rows[0].keys()))
+        count = 0
+        for row in rows:
+            if limit is not None and count >= limit:
+                break
+            if not isinstance(row, dict):
+                continue
+            ci = _row_to_company(
+                {str(k): "" if v is None else str(v) for k, v in row.items()},
+                id_key,
+                name_key,
+                url_key,
+            )
+            if ci:
+                yield ci
+                count += 1
 
 
-def _iter_sas7bdat(path: Path, *, limit: Optional[int]) -> Iterator[CompanyInput]:
-    pd = _require_pandas()
-    df = pd.read_sas(path, format="sas7bdat")  # needs sas7bdat library via pandas
-    yield from _iter_pandas_df(df, limit=limit)
+@dataclass(frozen=True)
+class ExcelPlugin(SourceFormatPlugin):
+    """
+    Excel plugin (.xls, .xlsx) backed by pandas.
+    """
+
+    _name: str = "excel"
+    _extensions: Tuple[str, ...] = (".xls", ".xlsx")
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def extensions(self) -> Tuple[str, ...]:
+        return self._extensions
+
+    def iter_companies(
+        self,
+        path: Path,
+        *,
+        encoding: str,  # unused, kept for interface compat
+        limit: Optional[int],
+    ) -> Iterator[CompanyInput]:
+        pd = _require_pandas()
+        df = pd.read_excel(path, dtype=str)
+        yield from _iter_pandas_df(df, limit=limit)
 
 
-def _iter_spss(path: Path, *, limit: Optional[int]) -> Iterator[CompanyInput]:
-    pd = _require_pandas()
-    df = pd.read_spss(path)  # requires pyreadstat
-    yield from _iter_pandas_df(df, limit=limit)
+@dataclass(frozen=True)
+class StataPlugin(SourceFormatPlugin):
+    _name: str = "stata"
+    _extensions: Tuple[str, ...] = (".dta",)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def extensions(self) -> Tuple[str, ...]:
+        return self._extensions
+
+    def iter_companies(
+        self,
+        path: Path,
+        *,
+        encoding: str,  # unused
+        limit: Optional[int],
+    ) -> Iterator[CompanyInput]:
+        pd = _require_pandas()
+        df = pd.read_stata(path)
+        yield from _iter_pandas_df(df, limit=limit)
 
 
-# -----------------------------
+@dataclass(frozen=True)
+class ParquetPlugin(SourceFormatPlugin):
+    _name: str = "parquet"
+    _extensions: Tuple[str, ...] = (".parquet", ".feather")
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def extensions(self) -> Tuple[str, ...]:
+        return self._extensions
+
+    def iter_companies(
+        self,
+        path: Path,
+        *,
+        encoding: str,  # unused
+        limit: Optional[int],
+    ) -> Iterator[CompanyInput]:
+        pd = _require_pandas()
+        if path.suffix.lower() == ".feather":
+            df = pd.read_feather(path)
+        else:
+            df = pd.read_parquet(path)
+        yield from _iter_pandas_df(df, limit=limit)
+
+
+@dataclass(frozen=True)
+class SasPlugin(SourceFormatPlugin):
+    _name: str = "sas"
+    _extensions: Tuple[str, ...] = (".sas7bdat",)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def extensions(self) -> Tuple[str, ...]:
+        return self._extensions
+
+    def iter_companies(
+        self,
+        path: Path,
+        *,
+        encoding: str,  # unused
+        limit: Optional[int],
+    ) -> Iterator[CompanyInput]:
+        pd = _require_pandas()
+        df = pd.read_sas(path, format="sas7bdat")
+        yield from _iter_pandas_df(df, limit=limit)
+
+
+@dataclass(frozen=True)
+class SpssPlugin(SourceFormatPlugin):
+    _name: str = "spss"
+    _extensions: Tuple[str, ...] = (".sav",)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def extensions(self) -> Tuple[str, ...]:
+        return self._extensions
+
+    def iter_companies(
+        self,
+        path: Path,
+        *,
+        encoding: str,  # unused
+        limit: Optional[int],
+    ) -> Iterator[CompanyInput]:
+        pd = _require_pandas()
+        df = pd.read_spss(path)
+        yield from _iter_pandas_df(df, limit=limit)
+
+
+# =========================================================================== #
+# Plugin registry
+# =========================================================================== #
+
+def _build_plugin_registry() -> Dict[str, SourceFormatPlugin]:
+    """
+    Build extension -> plugin map.
+
+    This is the main "plugin hub" for this module. To support a new format:
+      1) Implement a SourceFormatPlugin.
+      2) Add it here with its supported extensions.
+    """
+    csv_like = CsvLikePlugin(
+        _name="csv_like",
+        _extensions=(".csv", ".tsv", ".txt"),
+        _delimiter_map={
+            ".csv": ",",
+            ".tsv": "\t",
+            ".txt": ",",
+        },
+    )
+    json_like = JsonLikePlugin(
+        _name="json_like",
+        _extensions=(".json", ".jsonl", ".ndjson"),
+    )
+    excel = ExcelPlugin()
+    stata = StataPlugin()
+    parquet = ParquetPlugin()
+    sas = SasPlugin()
+    spss = SpssPlugin()
+
+    plugins: List[SourceFormatPlugin] = [
+        csv_like,
+        json_like,
+        excel,
+        stata,
+        parquet,
+        sas,
+        spss,
+    ]
+
+    registry: Dict[str, SourceFormatPlugin] = {}
+    for plugin in plugins:
+        for ext in plugin.extensions:
+            e = ext.lower()
+            if e in registry:
+                logger.warning(
+                    "[load_source] extension %s already registered to %s; "
+                    "overriding with %s",
+                    e,
+                    registry[e].name,
+                    plugin.name,
+                )
+            registry[e] = plugin
+    return registry
+
+
+_PLUGIN_BY_EXT: Dict[str, SourceFormatPlugin] = _build_plugin_registry()
+
+
+# =========================================================================== #
 # File discovery & basic dedupe
-# -----------------------------
-_SUPPORTED_EXT_HANDLERS = {
-    ".csv": lambda p, enc, lim: _iter_csv(p, encoding=enc, delimiter=",", limit=lim),
-    ".tsv": lambda p, enc, lim: _iter_csv(p, encoding=enc, delimiter="\t", limit=lim),
-    ".txt": lambda p, enc, lim: _iter_csv(p, encoding=enc, delimiter=",", limit=lim),  # permissive
-    ".json": lambda p, enc, lim: _iter_json_like(p, encoding=enc, limit=lim),
-    ".jsonl": lambda p, enc, lim: _iter_json_like(p, encoding=enc, limit=lim),
-    ".ndjson": lambda p, enc, lim: _iter_json_like(p, encoding=enc, limit=lim),
-    ".xlsx": lambda p, enc, lim: _iter_excel(p, limit=lim),
-    ".xls": lambda p, enc, lim: _iter_excel(p, limit=lim),
-    ".dta": lambda p, enc, lim: _iter_stata(p, limit=lim),
-    ".parquet": lambda p, enc, lim: _iter_parquet(p, limit=lim),
-    ".feather": lambda p, enc, lim: _iter_feather(p, limit=lim),
-    ".sas7bdat": lambda p, enc, lim: _iter_sas7bdat(p, limit=lim),
-    ".sav": lambda p, enc, lim: _iter_spss(p, limit=lim),
-}
-
+# =========================================================================== #
 
 def _ext(path: Path) -> str:
     return path.suffix.lower()
@@ -402,7 +683,11 @@ def _gather_files(root: Path, patterns: Sequence[str], recursive: bool = True) -
     return sorted(set(files))
 
 
-def _dedupe_records(records: Iterable[CompanyInput], *, keys: Tuple[str, str] = ("bvdid", "url")) -> List[CompanyInput]:
+def _dedupe_records(
+    records: Iterable[CompanyInput],
+    *,
+    keys: Tuple[str, str] = ("bvdid", "url"),
+) -> List[CompanyInput]:
     seen: Set[Tuple[str, str]] = set()
     out: List[CompanyInput] = []
     for r in records:
@@ -416,9 +701,10 @@ def _dedupe_records(records: Iterable[CompanyInput], *, keys: Tuple[str, str] = 
     return out
 
 
-# -----------------------------
+# =========================================================================== #
 # Preprocess: aggregate & schedule-aware ordering
-# -----------------------------
+# =========================================================================== #
+
 def _aggregate_by_canonical_url(records: Iterable[CompanyInput]) -> List[CompanyInput]:
     """
     Aggregate rows that resolve to the same canonical URL.
@@ -441,9 +727,14 @@ def _aggregate_by_canonical_url(records: Iterable[CompanyInput]) -> List[Company
             # Skip obviously broken URLs
             continue
         # rewrite in-place canonical URL for downstream
-        r = CompanyInput(bvdid=r.bvdid, name=r.name, url=cu, metadata=dict(r.metadata))
-        r.metadata.setdefault("normalized_url", cu)
-        buckets.setdefault(cu, []).append(r)
+        rr = CompanyInput(
+            bvdid=r.bvdid,
+            name=r.name,
+            url=cu,
+            metadata=dict(r.metadata),
+        )
+        rr.metadata.setdefault("normalized_url", cu)
+        buckets.setdefault(cu, []).append(rr)
 
     merged: List[CompanyInput] = []
     for cu, items in buckets.items():
@@ -484,7 +775,7 @@ def _aggregate_by_canonical_url(records: Iterable[CompanyInput]) -> List[Company
         if len(items) > 1:
             # Explicitly log merges so you can audit them.
             logger.info(
-                "[source_loader] merged %d rows into canonical URL %s -> bvdid=%s name=%s",
+                "[load_source] merged %d rows into canonical URL %s -> bvdid=%s name=%s",
                 len(items),
                 cu,
                 new_bvdid,
@@ -528,9 +819,10 @@ def _interleave_by_domain(records: List[CompanyInput]) -> List[CompanyInput]:
     return out
 
 
-# -----------------------------
+# =========================================================================== #
 # Public API
-# -----------------------------
+# =========================================================================== #
+
 DEFAULT_SOURCE_PATTERNS = (
     "*.csv,*.tsv,*.xlsx,*.xls,*.json,*.jsonl,*.ndjson,*.parquet,*.feather,*.dta,*.sas7bdat,*.sav"
 )
@@ -542,12 +834,19 @@ def load_companies_from_source_file(
     encoding: str = "utf-8",
     limit: Optional[int] = None,
 ) -> List[CompanyInput]:
+    """
+    Load companies from a single file using the registered format plugins.
+
+    This is the plugin-aware replacement for the old extension table:
+      - Detects the plugin based on file suffix.
+      - Streams CompanyInput instances from the plugin.
+    """
     path = Path(path)
     ext = _ext(path)
-    handler = _SUPPORTED_EXT_HANDLERS.get(ext)
-    if not handler:
+    plugin = _PLUGIN_BY_EXT.get(ext)
+    if not plugin:
         raise ValueError(f"Unsupported source file extension: {ext} ({path.name})")
-    return list(handler(path, encoding, limit))
+    return list(plugin.iter_companies(path, encoding=encoding, limit=limit))
 
 
 def _postprocess_companies(
@@ -583,15 +882,29 @@ def load_companies_from_dir(
     aggregate_same_url: bool = True,
     interleave_domains: bool = True,
 ) -> List[CompanyInput]:
+    """
+    Load companies from all matching files under a directory, using plugins.
+
+    - patterns: glob patterns for filenames (comma-separated DEFAULT_SOURCE_PATTERNS by default).
+    - recursive: whether to search recursively.
+    - limit_per_file: cap number of rows per file for large sources.
+    """
     pats = patterns or [p.strip() for p in DEFAULT_SOURCE_PATTERNS.split(",")]
     files = _gather_files(root, pats, recursive=recursive)
     recs: List[CompanyInput] = []
     for f in files:
         try:
-            recs.extend(load_companies_from_source_file(f, encoding=encoding, limit=limit_per_file))
+            recs.extend(
+                load_companies_from_source_file(
+                    f,
+                    encoding=encoding,
+                    limit=limit_per_file,
+                )
+            )
         except ValueError:
             # Unsupported file type that matched the glob; skip
             continue
+
     # Backward compat path (dedupe kept as alias for basic (id,url) dedupe)
     return _postprocess_companies(
         recs,
@@ -630,6 +943,7 @@ def load_companies_from_source(
             interleave_domains=interleave_domains,
         )
         return recs
+
     recs = load_companies_from_source_file(p, encoding=encoding, limit=limit)
     return _postprocess_companies(
         recs,
