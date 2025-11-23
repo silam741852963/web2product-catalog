@@ -217,7 +217,7 @@ class TextFirstBrowserConfigStrategy:
     default_region_country: str = "US"
     default_region_currency: str = "USD"
     enable_stealth: bool = True
-    ignore_https_errors: bool = True  # used if your Crawl4AI version supports it
+    ignore_https_errors: bool = True
     text_mode: bool = True
     light_mode: bool = True
 

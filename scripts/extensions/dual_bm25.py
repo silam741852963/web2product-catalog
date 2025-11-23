@@ -231,7 +231,6 @@ class _DualBM25Core:
         head_empty = not head_doc or not head_doc.strip()
         url_neg_raw = url_scores["raw_neg"]
 
-        # NEW: track whether head has any actual positive/negative matches
         head_has_pos = head_scores["raw_pos"] > 0.0
         head_has_neg = head_scores["raw_neg"] > 0.0
         head_neutral = not head_has_pos and not head_has_neg

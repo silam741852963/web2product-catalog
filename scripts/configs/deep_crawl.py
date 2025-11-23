@@ -62,7 +62,7 @@ class BFSDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
     Defaults are overridable on .build().
     """
 
-    default_max_depth: int = 4
+    default_max_depth: int = 3
     default_include_external: bool = False
     default_max_pages: Optional[int] = None
     default_score_threshold: Optional[float] = None
@@ -122,7 +122,7 @@ class DFSDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
       - When you want to reach far from a starting point before spreading.
     """
 
-    default_max_depth: int = 4
+    default_max_depth: int = 3
     default_include_external: bool = False
     default_max_pages: Optional[int] = None
     default_score_threshold: Optional[float] = None
@@ -186,7 +186,7 @@ class BestFirstDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
         but is accepted for convenience; pass-through if provided.
     """
 
-    default_max_depth: int = 4
+    default_max_depth: int = 3
     default_include_external: bool = False
     default_max_pages: Optional[int] = None
     default_filter_chain: Optional[FilterChain] = None
@@ -304,7 +304,7 @@ class DeepCrawlStrategyFactory:
 #: - Conservative depth
 #: - max_pages can be set at call site; here we keep it None (unbounded).
 default_bfs_internal_provider = BFSDeepCrawlStrategyProvider(
-    default_max_depth=4,
+    default_max_depth=3,
     default_include_external=False,
     default_max_pages=None,
     default_score_threshold=None,
@@ -314,7 +314,7 @@ default_bfs_internal_provider = BFSDeepCrawlStrategyProvider(
 #: - Caller must inject a url_scorer (e.g., KeywordRelevanceScorer)
 #:   when calling the factory, or set default_url_scorer on the provider.
 default_bestfirst_provider = BestFirstDeepCrawlStrategyProvider(
-    default_max_depth=4,
+    default_max_depth=3,
     default_include_external=True,
     default_max_pages=None,
     default_filter_chain=None,

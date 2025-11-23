@@ -565,7 +565,7 @@ async def run_full_pass_for_company(
 
 
 # ---------------------------------------------------------------------------
-# Company-level crawl (with JS injection, no dispatcher)
+# Company-level crawl
 # ---------------------------------------------------------------------------
 
 
@@ -580,6 +580,7 @@ async def crawl_company(
     crawler_base_cfg: Any = None,
     page_policy: Optional[PageInteractionPolicy] = None,
     page_interaction_factory: Optional[PageInteractionFactory] = None,
+    max_pages: Optional[int] = None,
 ) -> None:
     logger.info(
         "Starting crawl for company_id=%s url=%s",
@@ -591,7 +592,20 @@ async def crawl_company(
 
     start_urls: List[str] = list(root_urls) if root_urls else [company.domain_url]
 
+    # Per-company page counter
+    pages_processed = 0
+
     for start_url in start_urls:
+        # If we already hit the limit earlier (e.g. on another root URL), stop.
+        if max_pages is not None and pages_processed >= max_pages:
+            logger.info(
+                "Per-company max_pages limit (%d) already reached for company_id=%s, "
+                "skipping remaining roots",
+                max_pages,
+                company.company_id,
+            )
+            break
+
         logger.info(
             "Deep crawl: company_id=%s root=%s pending_roots=%d",
             company.company_id,
@@ -625,8 +639,6 @@ async def crawl_company(
                     js_code=js_code,
                     js_only=interaction_cfg.js_only,
                     wait_for=interaction_cfg.wait_for,
-                    # If your CrawlerRunConfig exposes delay_before_return_html,
-                    # you can also add:
                     # "delay_before_return_html": interaction_cfg.delay_before_return_sec,
                 )
 
@@ -648,25 +660,64 @@ async def crawl_company(
             config=config,
         )
 
+        # ------------------------------------------------------------------ #
+        # Streaming mode: manually drive async generator to honour max_pages
+        # without triggering unhandled async-generator close exceptions.
+        # ------------------------------------------------------------------ #
         if not isinstance(results_or_gen, list):
-            async for page_result in results_or_gen:
-                try:
-                    await process_page_result(
-                        page_result=page_result,
-                        company=company,
-                        guard=guard,
-                        gating_cfg=gating_cfg,
+            agen = results_or_gen
+
+            # Normalise to the underlying async iterator
+            if hasattr(agen, "__aiter__"):
+                agen = agen.__aiter__()
+
+            while True:
+                # Check limit *before* pulling the next page
+                if max_pages is not None and pages_processed >= max_pages:
+                    logger.info(
+                        "Per-company max_pages limit (%d) reached for company_id=%s, "
+                        "stopping crawl for this company",
+                        max_pages,
+                        company.company_id,
                     )
+                    # Explicitly close the async generator to avoid the
+                    # "Task exception was never retrieved" caused by the
+                    # ContextVar reset in Crawl4AI's result_wrapper.
+                    aclose = getattr(agen, "aclose", None)
+                    if aclose is not None:
+                        try:
+                            await aclose()
+                        except Exception as e:
+                            # Swallow errors from aclose to keep logs clean;
+                            # the crawl is already logically complete.
+                            logger.debug(
+                                "Error while closing deep crawl generator for company=%s: %s",
+                                company.company_id,
+                                e,
+                            )
+                    break
+
+                try:
+                    page_result = await agen.__anext__()
+                except StopAsyncIteration:
+                    # Normal end of stream
+                    break
                 except Exception as e:
-                    url = getattr(page_result, "url", None)
                     logger.exception(
-                        "Error processing page %s (company=%s): %s",
-                        url,
+                        "Error fetching next deep crawl result (company=%s): %s",
                         company.company_id,
                         e,
                     )
-        else:
-            for page_result in results_or_gen:
+                    # Try to close the generator and then bail out
+                    aclose = getattr(agen, "aclose", None)
+                    if aclose is not None:
+                        try:
+                            await aclose()
+                        except Exception:
+                            pass
+                    break
+
+                # Process page
                 try:
                     await process_page_result(
                         page_result=page_result,
@@ -674,6 +725,7 @@ async def crawl_company(
                         guard=guard,
                         gating_cfg=gating_cfg,
                     )
+                    pages_processed += 1
                 except Exception as e:
                     url = getattr(page_result, "url", None)
                     logger.exception(
@@ -683,6 +735,36 @@ async def crawl_company(
                         e,
                     )
 
+        # ------------------------------------------------------------------ #
+        # Non-stream mode: same as before, just respect max_pages.
+        # ------------------------------------------------------------------ #
+        else:
+            for page_result in results_or_gen:
+                try:
+                    await process_page_result(
+                        page_result=page_result,
+                        company=company,
+                        guard=guard,
+                        gating_cfg=gating_cfg,
+                    )
+                    pages_processed += 1
+                except Exception as e:
+                    url = getattr(page_result, "url", None)
+                    logger.exception(
+                        "Error processing page %s (company=%s): %s",
+                        url,
+                        company.company_id,
+                        e,
+                    )
+
+                if max_pages is not None and pages_processed >= max_pages:
+                    logger.info(
+                        "Per-company max_pages limit (%d) reached for company_id=%s, "
+                        "stopping crawl for this company",
+                        max_pages,
+                        company.company_id,
+                    )
+                    break
 
 # ---------------------------------------------------------------------------
 # BM25 helpers
@@ -857,6 +939,10 @@ async def run_company_pipeline(
 
         filter_chain = FilterChain(filters)
 
+        max_pages_per_company: Optional[int] = None
+        if getattr(args, "max_pages", None) and args.max_pages > 0:
+            max_pages_per_company = args.max_pages
+
         # Use deep crawl strategies from configs.deep_crawl
         if args.strategy == "bestfirst":
             deep_strategy = default_bestfirst_factory.create(
@@ -873,7 +959,6 @@ async def run_company_pipeline(
                 provider=DFSDeepCrawlStrategyProvider(
                     default_max_depth=3,
                     default_include_external=False,
-                    default_max_pages=None,
                     default_score_threshold=None,
                 )
             )
@@ -895,6 +980,7 @@ async def run_company_pipeline(
                     crawler_base_cfg=crawler_base_cfg,
                     page_policy=page_policy,
                     page_interaction_factory=page_interaction_factory,
+                    max_pages=max_pages_per_company,
                 )
 
                 await state.recompute_company_from_index(
@@ -1048,8 +1134,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         type=int,
         default=500,
         help=(
-            "Maximum number of pages to crawl per company (currently unused; "
-            "configs.deep_crawl may have its own limits)."
+            "Maximum number of pages to crawl per company. "
+            "Enforced in run.py as a per-company limit."
         ),
     )
     parser.add_argument(

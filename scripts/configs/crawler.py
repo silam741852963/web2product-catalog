@@ -60,7 +60,7 @@ class DefaultCrawlerRunStrategy:
 
     # Baseline defaults – tuned for generic product-site crawling
     base_word_count_threshold: int = 200
-    base_page_timeout: int = 120_000  # ms
+    base_page_timeout: int = 60_000  # ms
     base_delay_before_return_html: float = 2.0  # seconds
 
     # Resource / telemetry defaults

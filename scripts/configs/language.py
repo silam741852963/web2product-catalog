@@ -345,6 +345,36 @@ DEFAULT_LANG_SPEC: Dict[str, Any] = {
         "be": "nl",
     },
 
+    "PATH_LANG_TOKENS": {
+        "en": {
+            "en", "en-us", "en-gb", "en-au", "en-ca", "en-nz",
+        },
+        "ja": {
+            "ja", "jp", "ja-jp",
+        },
+        "de": {
+            "de", "de-de",
+        },
+        "fr": {
+            "fr", "fr-fr",
+        },
+        "es": {
+            "es", "es-es", "es-mx",
+        },
+        "pt": {
+            "pt", "pt-br", "pt-pt",
+        },
+        "zh": {
+            "zh", "zh-cn", "zh-tw", "zh-hk",
+        },
+        "ko": {
+            "ko", "ko-kr",
+        },
+        "vi": {
+            "vi", "vn",
+        },
+    },
+
     # ------------------------------------------------------------------ #
     # File-extension stop list & lexical stopwords
     # ------------------------------------------------------------------ #
@@ -694,10 +724,22 @@ def get_product_tokens_re() -> Pattern:
 def default_product_bm25_query() -> str:
     return default_language_factory.default_product_bm25_query()
 
-
 def get_stopwords() -> Set[str]:
     return default_language_factory.stopwords()
 
+def get_path_lang_tokens() -> Dict[str, Set[str]]:
+    """
+    Return the PATH_LANG_TOKENS mapping from the active language spec.
+
+    Keys: canonical language codes (e.g., "en", "ja")
+    Values: sets of strings that can appear as path segments indicating that language.
+    """
+    tokens = default_language_factory.get("PATH_LANG_TOKENS", {}) or {}
+    # Ensure all values are sets of lowercase strings
+    out: Dict[str, Set[str]] = {}
+    for code, vals in tokens.items():
+        out[code.lower()] = {str(v).lower() for v in vals}
+    return out
 
 __all__ = [
     "DEFAULT_LANG_SPEC",
@@ -714,4 +756,5 @@ __all__ = [
     "get_product_tokens_re",
     "default_product_bm25_query",
     "get_stopwords",
+    "get_path_lang_tokens",
 ]

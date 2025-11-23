@@ -866,54 +866,46 @@ class HTMLContentFilter(URLFilter):
 
 
 # --------------------------------------------------------------------------- #
-# LanguageAwareURLFilter (language-driven include/exclude + TLD logic)
+# LanguageAwareURLFilter
 # --------------------------------------------------------------------------- #
 
 
 class LanguageAwareURLFilter(URLFilter):
     """
-    Filter URLs using language-specific rules from configs.language.
+    Filter URLs using ONLY language-related rules from configs.language.
 
     Behavior:
-      - Uses DEFAULT_INCLUDE_PATTERNS / DEFAULT_EXCLUDE_PATTERNS for the
-        selected language (or explicit overrides).
-      - Optionally applies TLD allow/deny per language:
+      - Applies TLD allow/deny per language:
             LANG_TLD_ALLOW[lang] -> allowed TLDs (e.g., {"com","jp"})
             LANG_TLD_DENY[lang]  -> blocked TLDs
-      - Optionally applies host suffix allow/deny:
+      - Applies host suffix allow/deny:
             LANG_HOST_ALLOW_SUFFIXES[lang] -> host suffixes to KEEP
             LANG_HOST_BLOCK_SUFFIXES[lang] -> host suffixes to DROP
+      - Uses PATH_LANG_TOKENS to detect explicit language codes in URL paths
+        (e.g. /ja/, /en-us/) and drops URLs whose path-language conflicts
+        with the active lang_code.
 
-    Matching:
-      - Path/URL pattern match uses glob-style fnmatch against:
-            path ("/foo/bar")
-        and
-            host + path ("example.com/foo/bar").
-
-    IMPORTANT CHANGE:
-      - Exclude patterns are still hard drops.
-      - Include patterns are now *soft*: if they don't match, the URL is still
-        allowed (subject to host/TLD), instead of being dropped outright.
-        This avoids killing all internal links during deep crawling just
-        because they don't look like product pages yet.
+    NOTE:
+      - DEFAULT_INCLUDE_PATTERNS / DEFAULT_EXCLUDE_PATTERNS are NO LONGER USED.
+      - include_patterns / exclude_patterns constructor arguments are accepted
+        for backward compatibility but are completely ignored.
     """
 
     __slots__ = (
         "_lang_code",
-        "_include_patterns",
-        "_exclude_patterns",
         "_allowed_tlds",
         "_blocked_tlds",
         "_allowed_host_suffixes",
         "_blocked_host_suffixes",
+        "_path_lang_tokens",  # global mapping of path language tokens
     )
 
     def __init__(
         self,
         *,
         lang_code: str = "en",
-        include_patterns: Optional[Iterable[str]] = None,
-        exclude_patterns: Optional[Iterable[str]] = None,
+        include_patterns: Optional[Iterable[str]] = None,   # deprecated, ignored
+        exclude_patterns: Optional[Iterable[str]] = None,   # deprecated, ignored
         allowed_tlds: Optional[Iterable[str]] = None,
         blocked_tlds: Optional[Iterable[str]] = None,
         allowed_host_suffixes: Optional[Iterable[str]] = None,
@@ -925,13 +917,6 @@ class LanguageAwareURLFilter(URLFilter):
         self._lang_code = (lang_code or "en").lower()
         # Load the full language spec (base + lang_<code>.py overlay)
         spec: Dict[str, any] = lang_cfg.get_lang_spec(self._lang_code)
-
-        # Patterns (glob-style)
-        inc = include_patterns or spec.get("DEFAULT_INCLUDE_PATTERNS", [])
-        exc = exclude_patterns or spec.get("DEFAULT_EXCLUDE_PATTERNS", [])
-
-        self._include_patterns: List[str] = [p.lower() for p in inc]
-        self._exclude_patterns: List[str] = [p.lower() for p in exc]
 
         # TLD rules are stored as language → {tlds}
         spec_allow_tld: Dict[str, Iterable[str]] = spec.get("LANG_TLD_ALLOW", {}) or {}
@@ -977,46 +962,29 @@ class LanguageAwareURLFilter(URLFilter):
             h.lower().strip(".") for h in (block_host_src or [])
         }
 
+        # Path language tokens from language config (global mapping)
+        raw_path_tokens: Dict[str, Set[str]] = lang_cfg.get_path_lang_tokens()
+        self._path_lang_tokens: Dict[str, Set[str]] = {
+            code.lower(): {v.lower() for v in vals}
+            for code, vals in raw_path_tokens.items()
+        }
+
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(
-                "[LanguageAwareURLFilter.__init__] lang=%s inc=%d exc=%d "
+                "[LanguageAwareURLFilter.__init__] lang=%s "
                 "allowed_tlds=%s blocked_tlds=%s allowed_host_suffixes=%s "
-                "blocked_host_suffixes=%s",
+                "blocked_host_suffixes=%s path_lang_tokens_keys=%s",
                 self._lang_code,
-                len(self._include_patterns),
-                len(self._exclude_patterns),
                 sorted(list(self._allowed_tlds))[:10],
                 sorted(list(self._blocked_tlds))[:10],
                 sorted(list(self._allowed_host_suffixes))[:10],
                 sorted(list(self._blocked_host_suffixes))[:10],
+                sorted(list(self._path_lang_tokens.keys()))[:10],
             )
 
     # ------------------------------------------------------------------ #
-    # Core logic
+    # Core helpers (language-only)
     # ------------------------------------------------------------------ #
-
-    def _match_patterns(
-        self,
-        host: str,
-        path: str,
-        patterns: List[str],
-    ) -> Tuple[bool, Optional[str]]:
-        """
-        Try to match any pattern against path or host+path.
-
-        Returns:
-            (matched: bool, pattern: Optional[str])
-        """
-        if not patterns:
-            return False, None
-        host = host.lower()
-        path = path.lower()
-        target = host + path
-        for pat in patterns:
-            p = pat.lower()
-            if fnmatch(path, p) or fnmatch(target, p):
-                return True, pat
-        return False, None
 
     def _host_allowed_by_suffix(self, host: str) -> bool:
         h = _normalize_host(host)
@@ -1038,9 +1006,35 @@ class LanguageAwareURLFilter(URLFilter):
             return False
         return True
 
+    def _detect_path_language(self, path: str) -> Optional[str]:
+        """
+        Inspect URL path segments and try to infer an explicit language tag,
+        using PATH_LANG_TOKENS from configs.language.
+
+        Returns:
+            canonical language code if found (e.g. "ja", "en"), else None.
+        """
+        if not self._path_lang_tokens:
+            return None
+
+        segments = [seg.lower() for seg in (path or "").split("/") if seg]
+        if not segments:
+            return None
+
+        for code, tokens in self._path_lang_tokens.items():
+            # Exact segment match (e.g., "ja", "ja-jp", "en-us")
+            if any(seg in tokens for seg in segments):
+                return code
+
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Core logic
+    # ------------------------------------------------------------------ #
+
     def apply(self, url: str) -> bool:
         """
-        Decide whether to KEEP the URL based on language-aware rules.
+        Decide whether to KEEP the URL based purely on language-aware rules.
 
         Returns:
             True  -> keep / follow
@@ -1096,45 +1090,30 @@ class LanguageAwareURLFilter(URLFilter):
             self._update_stats(result)
             return result
 
-        # Path / pattern rules
-        # 1) Exclude patterns first (hard drop)
-        exc_matched, exc_pat = self._match_patterns(host, path, self._exclude_patterns)
-        if exc_matched:
+        # Path language mismatch (e.g. /ja/... on an "en" crawl)
+        detected_lang = self._detect_path_language(path)
+        if detected_lang is not None and detected_lang != self._lang_code:
+            # Hard drop URLs whose path is clearly in a different language,
+            # e.g. lang_code="en" but path looks Japanese (/ja/...).
             result = False
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(
-                    "[LanguageAwareURLFilter.apply] url=%s host=%s path=%s -> DROP (exclude_pattern='%s')",
+                    "[LanguageAwareURLFilter.apply] url=%s host=%s path=%s "
+                    "-> DROP (path_lang_mismatch detected=%s active=%s)",
                     url,
                     host,
                     path,
-                    exc_pat,
+                    detected_lang,
+                    self._lang_code,
                 )
             self._update_stats(result)
             return result
 
-        # 2) Include patterns (soft)
-        inc_matched, inc_pat = self._match_patterns(host, path, self._include_patterns)
-
-        if inc_matched:
-            result = True
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(
-                    "[LanguageAwareURLFilter.apply] url=%s host=%s path=%s -> KEEP (include_pattern='%s')",
-                    url,
-                    host,
-                    path,
-                    inc_pat,
-                )
-            self._update_stats(result)
-            return result
-
-        # 3) No include match: previously this was a DROP; this was too aggressive
-        # for deep crawling (most internal links are not yet product pages).
-        # Now we KEEP by default, but log that it's a "soft allow".
+        # Passed all language checks → KEEP
         result = True
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(
-                "[LanguageAwareURLFilter.apply] url=%s host=%s path=%s -> KEEP (no_include_match, soft_allow)",
+                "[LanguageAwareURLFilter.apply] url=%s host=%s path=%s -> KEEP (language_ok)",
                 url,
                 host,
                 path,
