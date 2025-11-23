@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from fnmatch import fnmatch
 from functools import lru_cache
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse
@@ -110,15 +109,24 @@ def _is_government_domain(host: str) -> bool:
     return False
 
 
-def _label_boundary_match(host: str, suffix: str) -> bool:
+def _label_boundary_match_normalized(host_norm: str, suffix: str) -> bool:
     """
     Host-level suffix match with label boundary protection.
+    Assumes `host_norm` is already normalized and stripped.
     """
-    h = _normalize_host(host)
+    h = (host_norm or "").strip().strip(".").lower()
     s = (suffix or "").strip().strip(".").lower()
     if not h or not s:
         return False
     return h == s or h.endswith("." + s)
+
+
+def _label_boundary_match(host: str, suffix: str) -> bool:
+    """
+    Host-level suffix match with label boundary protection.
+    This variant accepts arbitrary host strings and normalizes internally.
+    """
+    return _label_boundary_match_normalized(_normalize_host(host), suffix)
 
 
 def _top_level_label(host: str) -> str:
@@ -189,6 +197,49 @@ UNIVERSAL_HOST_KEYWORDS: tuple[str, ...] = (
     ".trk",
     "redirect",
 )
+
+
+# --------------------------------------------------------------------------- #
+# Normalization caches for heavy, shared sets
+# --------------------------------------------------------------------------- #
+
+
+@lru_cache(maxsize=32)
+def _normalized_universal_domains_cache(suffixes: Tuple[str, ...]) -> frozenset[str]:
+    """
+    Normalize a collection of universal suffixes to registrable domains.
+
+    Cached so that repeated UniversalExternalFilter instances sharing the same
+    suffix set don't recompute normalization.
+    """
+    normalized: Set[str] = set()
+    for s in suffixes:
+        h = _normalize_host(s)
+        if not h:
+            continue
+        rd = _registrable_domain(h)
+        if rd:
+            normalized.add(rd)
+    return frozenset(normalized)
+
+
+@lru_cache(maxsize=64)
+def _normalized_dataset_domains_cache(hosts: Tuple[str, ...]) -> frozenset[str]:
+    """
+    Normalize a collection of dataset external hosts to registrable domains.
+
+    Cached so that repeated UniversalExternalFilter instances sharing the same
+    dataset list don't recompute normalization.
+    """
+    normalized: Set[str] = set()
+    for s in hosts:
+        h = _normalize_host(s)
+        if not h:
+            continue
+        rd = _registrable_domain(h)
+        if rd:
+            normalized.add(rd)
+    return frozenset(normalized)
 
 
 # --------------------------------------------------------------------------- #
@@ -542,19 +593,22 @@ class UniversalExternalFilter(URLFilter):
         *,
         replace: bool = False,
     ) -> None:
-        normalized: Set[str] = set()
-        for s in suffixes or []:
-            h = _normalize_host(s)
-            if not h:
-                continue
-            rd = _registrable_domain(h)
-            if rd:
-                normalized.add(rd)
+        """
+        Update universal external suffixes.
+
+        The expensive normalization step is cached across instances when the
+        same suffix collection is provided (e.g., default set).
+        """
+        seq = tuple(suffixes or ())
+        if not seq:
+            normalized_set: Set[str] = set()
+        else:
+            normalized_set = set(_normalized_universal_domains_cache(seq))
 
         if replace:
-            self._universal_domains = normalized
+            self._universal_domains = normalized_set
         else:
-            self._universal_domains.update(normalized)
+            self._universal_domains.update(normalized_set)
 
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(
@@ -575,20 +629,20 @@ class UniversalExternalFilter(URLFilter):
         Update the set of registrable domains that *belong* to the dataset
         of company URLs. These represent other companies whose URLs we want
         to treat as cross-company externals.
+
+        Heavy normalization work is cached across instances when the same
+        dataset_externals collection is reused.
         """
-        normalized: Set[str] = set()
-        for s in hosts_or_domains or []:
-            h = _normalize_host(s)
-            if not h:
-                continue
-            rd = _registrable_domain(h)
-            if rd:
-                normalized.add(rd)
+        seq = tuple(hosts_or_domains or ())
+        if not seq:
+            normalized_set: Set[str] = set()
+        else:
+            normalized_set = set(_normalized_dataset_domains_cache(seq))
 
         if replace:
-            self._dataset_domains = normalized
+            self._dataset_domains = normalized_set
         else:
-            self._dataset_domains.update(normalized)
+            self._dataset_domains.update(normalized_set)
 
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(
@@ -634,7 +688,7 @@ class UniversalExternalFilter(URLFilter):
         for sfx in self._universal_domains:
             if not sfx:
                 continue
-            if rd == sfx or _label_boundary_match(h, sfx):
+            if rd == sfx or _label_boundary_match_normalized(h, sfx):
                 return "universal"
 
         # 5) Functional subdomain prefixes (status/docs/support/etc.)
@@ -705,6 +759,7 @@ class UniversalExternalFilter(URLFilter):
 # --------------------------------------------------------------------------- #
 # HTMLContentFilter
 # --------------------------------------------------------------------------- #
+
 
 class HTMLContentFilter(URLFilter):
     """
@@ -798,14 +853,8 @@ class HTMLContentFilter(URLFilter):
         self._reject_exts = {e.lower().lstrip(".") for e in reject_exts}
 
     @staticmethod
-    def _extract_extension(url: str) -> str:
-        try:
-            parsed = urlparse(url)
-            path = parsed.path or ""
-        except Exception:
-            path = url or ""
-
-        segment = path.rsplit("/", 1)[-1]
+    def _extract_extension_from_path(path: str) -> str:
+        segment = (path or "").rsplit("/", 1)[-1]
         if "." not in segment:
             return ""
         ext = segment.rsplit(".", 1)[-1].lower()
@@ -816,8 +865,10 @@ class HTMLContentFilter(URLFilter):
         try:
             parsed = urlparse(url)
             scheme = (parsed.scheme or "").lower()
+            path = parsed.path or ""
         except Exception:
             scheme = ""
+            path = url or ""
 
         if scheme and scheme not in ("http", "https"):
             # Explicitly DROP mailto:/tel:/javascript:/data:/...
@@ -831,7 +882,7 @@ class HTMLContentFilter(URLFilter):
             self._update_stats(result)
             return result
 
-        ext = self._extract_extension(url)
+        ext = self._extract_extension_from_path(path)
 
         if not ext:
             result = True
@@ -904,8 +955,6 @@ class LanguageAwareURLFilter(URLFilter):
         self,
         *,
         lang_code: str = "en",
-        include_patterns: Optional[Iterable[str]] = None,   # deprecated, ignored
-        exclude_patterns: Optional[Iterable[str]] = None,   # deprecated, ignored
         allowed_tlds: Optional[Iterable[str]] = None,
         blocked_tlds: Optional[Iterable[str]] = None,
         allowed_host_suffixes: Optional[Iterable[str]] = None,
@@ -963,9 +1012,9 @@ class LanguageAwareURLFilter(URLFilter):
         }
 
         # Path language tokens from language config (global mapping)
-        raw_path_tokens: Dict[str, Set[str]] = lang_cfg.get_path_lang_tokens()
+        raw_path_tokens: Dict[str, Iterable[str]] = spec.get("PATH_LANG_TOKENS", {}) or {}
         self._path_lang_tokens: Dict[str, Set[str]] = {
-            code.lower(): {v.lower() for v in vals}
+            code.lower(): {str(v).lower() for v in vals}
             for code, vals in raw_path_tokens.items()
         }
 
@@ -987,16 +1036,22 @@ class LanguageAwareURLFilter(URLFilter):
     # ------------------------------------------------------------------ #
 
     def _host_allowed_by_suffix(self, host: str) -> bool:
-        h = _normalize_host(host)
         if not self._allowed_host_suffixes:
             return True  # no restriction
-        return any(_label_boundary_match(h, sfx) for sfx in self._allowed_host_suffixes)
+        h = _normalize_host(host)
+        return any(
+            _label_boundary_match_normalized(h, sfx)
+            for sfx in self._allowed_host_suffixes
+        )
 
     def _host_blocked_by_suffix(self, host: str) -> bool:
         if not self._blocked_host_suffixes:
             return False
         h = _normalize_host(host)
-        return any(_label_boundary_match(h, sfx) for sfx in self._blocked_host_suffixes)
+        return any(
+            _label_boundary_match_normalized(h, sfx)
+            for sfx in self._blocked_host_suffixes
+        )
 
     def _tld_allowed(self, host: str) -> bool:
         tld = _top_level_label(host).lstrip(".").lower()

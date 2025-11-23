@@ -542,7 +542,30 @@ Be conservative: if uncertain, return {"r": 0}.
     # These are *hints*; override/extend per language in lang_<code>.py.
     # ------------------------------------------------------------------ #
     "LANG_TLD_ALLOW": {
-        "en": {"com", "net", "org", "io", "ai", "co"},
+        "en": {
+            # Classic generic TLDs
+            "com", "net", "org", "biz", "info",
+
+            # Startup / tech / SaaS
+            "io", "ai", "app", "dev", "tech", "cloud", "software",
+
+            # Business / corporate
+            "co", "company", "inc", "ltd", "plc", "llc", "corp",
+            "enterprises", "enterprise", "holdings", "group",
+            "partners", "ventures", "capital", "industries", "industry",
+            "business",
+
+            # Services / agencies
+            "services", "solutions", "systems", "consulting",
+            "agency", "studio", "digital", "health",
+
+            # Commerce
+            "shop", "store", "market",
+
+            # Global / international presence
+            "global", "international", "world",
+        },
+
         "ja": {"jp", "co.jp", "ne.jp", "or.jp", "go.jp", "ac.jp"},
     },
     "LANG_TLD_DENY": {

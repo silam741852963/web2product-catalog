@@ -17,7 +17,14 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.addHandler(logging.NullHandler())
 
-import psutil
+# psutil is optional; degrade gracefully if missing
+try:
+    import psutil  # type: ignore
+    PSUTIL_AVAILABLE = True
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore
+    PSUTIL_AVAILABLE = False
+
 
 @dataclass
 class ResourceMonitorConfig:
@@ -39,7 +46,6 @@ class ResourceMonitor:
     - Tracks global network I/O deltas.
     - Tracks process disk I/O deltas.
     - Writes a single JSON summary at the end.
-
     """
 
     def __init__(
@@ -112,36 +118,50 @@ class ResourceMonitor:
         self._start_ts_iso = now.isoformat()
         self._start_monotonic = time.monotonic()
 
-        try:
-            self._process = psutil.Process(os.getpid())  # type: ignore[name-defined]
-            # Warm up CPU percent metrics to avoid weird initial 0.0
-            self._process.cpu_percent(interval=None)  # type: ignore[union-attr]
-            psutil.cpu_percent(interval=None, percpu=True)  # type: ignore[name-defined]
-        except Exception as e:  # pragma: no cover
+        # Initialize psutil process handle and warm up CPU metrics
+        if PSUTIL_AVAILABLE:
+            try:
+                self._process = psutil.Process(os.getpid())  # type: ignore[union-attr]
+                # Warm up CPU percent metrics to avoid weird initial 0.0
+                self._process.cpu_percent(interval=None)  # type: ignore[union-attr]
+                psutil.cpu_percent(interval=None, percpu=True)  # type: ignore[union-attr]
+            except Exception as e:  # pragma: no cover
+                logger.warning(
+                    "[ResourceMonitor] Failed to initialize psutil Process: %s", e
+                )
+                self._process = None
+        else:
+            # psutil is not available; we will still write basic host/process info
             logger.warning(
-                "[ResourceMonitor] Failed to initialize psutil Process: %s", e
+                "[ResourceMonitor] psutil not available; resource sampling disabled."
             )
             self._process = None
 
-        # Initial network + IO baselines
-        try:
-            net = psutil.net_io_counters()  # type: ignore[name-defined]
-            self._net_start = (net.bytes_sent, net.bytes_recv)
-            self._net_last = self._net_start
-        except Exception:
+        # Initial network + IO baselines (best-effort)
+        if PSUTIL_AVAILABLE:
+            try:
+                net = psutil.net_io_counters()  # type: ignore[union-attr]
+                self._net_start = (net.bytes_sent, net.bytes_recv)
+                self._net_last = self._net_start
+            except Exception:
+                self._net_start = None
+                self._net_last = None
+
+            try:
+                if self._process is not None:
+                    io = self._process.io_counters()  # type: ignore[union-attr]
+                    self._io_start = (io.read_bytes, io.write_bytes)
+                    self._io_last = self._io_start
+            except Exception:
+                self._io_start = None
+                self._io_last = None
+        else:
             self._net_start = None
             self._net_last = None
-
-        try:
-            if self._process is not None:
-                io = self._process.io_counters()  # type: ignore[union-attr]
-                self._io_start = (io.read_bytes, io.write_bytes)
-                self._io_last = self._io_start
-        except Exception:
             self._io_start = None
             self._io_last = None
 
-        # Even if psutil is missing, we still write host/process metadata later
+        # Background thread (runs even if psutil is missing; samples will be no-ops)
         self._thread = threading.Thread(
             target=self._run_loop,
             name="ResourceMonitorThread",
@@ -151,6 +171,7 @@ class ResourceMonitor:
         logger.info(
             "[ResourceMonitor] started (interval=%.2fs, psutil_available=%s)",
             self.interval_sec,
+            PSUTIL_AVAILABLE,
         )
 
     def stop(self) -> None:
@@ -210,6 +231,7 @@ class ResourceMonitor:
                 )
 
     def _take_sample(self) -> None:
+        # If we have no psutil process, sampling is effectively disabled
         if self._process is None:
             return
 
@@ -219,7 +241,7 @@ class ResourceMonitor:
 
             # CPU (system & per-CPU)
             try:
-                per_cpu = psutil.cpu_percent(  # type: ignore[name-defined]
+                per_cpu = psutil.cpu_percent(  # type: ignore[union-attr]
                     interval=None,
                     percpu=True,
                 )
@@ -257,7 +279,7 @@ class ResourceMonitor:
 
             # Memory (system)
             try:
-                vm = psutil.virtual_memory()  # type: ignore[name-defined]
+                vm = psutil.virtual_memory()  # type: ignore[union-attr]
                 used_pct = float(vm.percent)
                 self._mem_system_used_percent_avg += (
                     used_pct - self._mem_system_used_percent_avg
@@ -291,11 +313,12 @@ class ResourceMonitor:
                 pass
 
             # Network (system-wide)
-            try:
-                net = psutil.net_io_counters()  # type: ignore[name-defined]
-                self._net_last = (net.bytes_sent, net.bytes_recv)
-            except Exception:
-                pass
+            if PSUTIL_AVAILABLE:
+                try:
+                    net = psutil.net_io_counters()  # type: ignore[union-attr]
+                    self._net_last = (net.bytes_sent, net.bytes_recv)
+                except Exception:
+                    pass
 
             # Process IO
             try:
@@ -323,39 +346,40 @@ class ResourceMonitor:
             },
         }
 
-        try:
-            info["cpu"] = {
-                "logical_cores": psutil.cpu_count(logical=True),  # type: ignore[name-defined]
-                "physical_cores": psutil.cpu_count(logical=False),  # type: ignore[name-defined]
-            }
+        if PSUTIL_AVAILABLE:
             try:
-                freq = psutil.cpu_freq()  # type: ignore[name-defined]
+                info["cpu"] = {
+                    "logical_cores": psutil.cpu_count(logical=True),  # type: ignore[union-attr]
+                    "physical_cores": psutil.cpu_count(logical=False),  # type: ignore[union-attr]
+                }
+                try:
+                    freq = psutil.cpu_freq()  # type: ignore[union-attr]
+                except Exception:
+                    freq = None
+                if freq:
+                    info["cpu"]["max_freq_mhz"] = freq.max
+                    info["cpu"]["min_freq_mhz"] = freq.min
             except Exception:
-                freq = None
-            if freq:
-                info["cpu"]["max_freq_mhz"] = freq.max
-                info["cpu"]["min_freq_mhz"] = freq.min
-        except Exception:
-            pass
+                pass
 
-        try:
-            vm = psutil.virtual_memory()  # type: ignore[name-defined]
-            info["memory"] = {
-                "total_gb": round(vm.total / (1024**3), 2),
-            }
-        except Exception:
-            pass
+            try:
+                vm = psutil.virtual_memory()  # type: ignore[union-attr]
+                info["memory"] = {
+                    "total_gb": round(vm.total / (1024**3), 2),
+                }
+            except Exception:
+                pass
 
-        # Load average (if available)
-        try:
-            load1, load5, load15 = psutil.getloadavg()  # type: ignore[attr-defined]
-            info["load_average"] = {
-                "1m": load1,
-                "5m": load5,
-                "15m": load15,
-            }
-        except Exception:
-            pass
+            # Load average (if available)
+            try:
+                load1, load5, load15 = psutil.getloadavg()  # type: ignore[attr-defined]
+                info["load_average"] = {
+                    "1m": load1,
+                    "5m": load5,
+                    "15m": load15,
+                }
+            except Exception:
+                pass
 
         return info
 
@@ -471,6 +495,7 @@ class ResourceMonitor:
             "sampling_interval_sec": self.interval_sec,
             "samples": samples,
             "sample_errors": self._sample_errors,
+            "psutil_available": PSUTIL_AVAILABLE,
             "host": self._build_host_info(),
             "process": self._build_process_info(),
             "cpu": cpu,

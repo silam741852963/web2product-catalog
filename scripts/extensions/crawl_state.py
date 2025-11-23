@@ -66,6 +66,7 @@ def _atomic_write_json(path: Path, obj: Any) -> None:
     _atomic_write_text(path, payload, "utf-8")
     _json_update_cache(path, obj)
 
+
 def _atomic_write_json_nocache(path: Path, obj: Any) -> None:
     """
     Atomic JSON write that does NOT update _JSON_CACHE.
@@ -74,6 +75,7 @@ def _atomic_write_json_nocache(path: Path, obj: Any) -> None:
     payload = json.dumps(obj, ensure_ascii=False, indent=2)
     _atomic_write_text(path, payload, "utf-8")
     # intentionally do NOT call _json_update_cache
+
 
 def _json_load_cached(path: Path) -> Any:
     try:
@@ -96,18 +98,22 @@ def _json_load_cached(path: Path) -> Any:
     _JSON_CACHE[path] = (mtime, obj)
     return obj
 
+
 def _json_load_nocache(path: Path) -> Any:
     """
     Load JSON from disk without touching the global _JSON_CACHE.
     Intended for large per-company manifests like url_index.json.
     """
+
     def _read() -> Any:
         try:
             raw = path.read_text(encoding="utf-8")
             return json.loads(raw)
         except Exception:
             return {}
+
     return _retry_emfile(_read)
+
 
 def _json_update_cache(path: Path, obj: Any) -> None:
     try:
@@ -142,7 +148,11 @@ COMPANY_STATUS_LLM_DONE: CompanyStatus = "llm_done"
 
 # Per-URL status semantics derived from run_utils.upsert_url_index
 _MARKDOWN_COMPLETE_STATUSES = {"markdown_saved", "markdown_suppressed"}
-_LLM_COMPLETE_STATUSES = {"llm_extracted", "llm_extracted_empty"}
+_LLM_COMPLETE_STATUSES = {
+    "llm_extracted",
+    "llm_extracted_empty",
+    "llm_full_extracted",  # treat full extraction as LLM-complete as well
+}
 
 
 def _company_metadata_dir(bvdid: str) -> Path:
@@ -174,6 +184,7 @@ def _global_state_path() -> Path:
 # ---------------------------------------------------------------------------
 # Dataclasses: snapshots for callers (plugin-style, immutable views)
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class CompanySnapshot:
@@ -211,6 +222,7 @@ class _Stmt:
 # URL-index helpers
 # ---------------------------------------------------------------------------
 
+
 def load_url_index(bvdid: str) -> Dict[str, Any]:
     """
     Public helper to read url_index.json from outputs/{safe}/metadata/url_index.json.
@@ -221,6 +233,7 @@ def load_url_index(bvdid: str) -> Dict[str, Any]:
         return {}
     obj = _json_load_nocache(p)
     return obj if isinstance(obj, dict) else {}
+
 
 def upsert_url_index_entry(bvdid: str, url: str, patch: Dict[str, Any]) -> None:
     """
@@ -256,6 +269,7 @@ def upsert_url_index_entry(bvdid: str, url: str, patch: Dict[str, Any]) -> None:
 
     _update()
 
+
 def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
     """
     For a single url_index entry, decide:
@@ -266,16 +280,19 @@ def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
     """
     status = (ent.get("status") or "").lower()
     has_md_path = bool(ent.get("markdown_path"))
-    has_json_path = bool(ent.get("json_path"))
+    # Support both legacy 'json_path' and current 'product_path' key
+    has_llm_artifact = bool(ent.get("json_path") or ent.get("product_path"))
     presence_checked = bool(ent.get("presence_checked"))
 
     markdown_done = has_md_path or status in _MARKDOWN_COMPLETE_STATUSES
     # We treat either full LLM extraction or presence-only as LLM stage completion.
-    llm_done = has_json_path or status in _LLM_COMPLETE_STATUSES or presence_checked
+    llm_done = has_llm_artifact or status in _LLM_COMPLETE_STATUSES or presence_checked
     return markdown_done, llm_done
 
 
-def _compute_company_stage_from_index(index: Dict[str, Any]) -> Tuple[CompanyStatus, int, int, int]:
+def _compute_company_stage_from_index(
+    index: Dict[str, Any]
+) -> Tuple[CompanyStatus, int, int, int]:
     """
     Given the full url_index dict for a company, compute:
       - company-level status in the limited enum
@@ -325,7 +342,9 @@ def _compute_company_stage_from_index(index: Dict[str, Any]) -> Tuple[CompanySta
     return status, urls_total, md_done, llm_done
 
 
-def _pending_urls_for_stage(index: Dict[str, Any], stage: Literal["markdown", "llm"]) -> List[str]:
+def _pending_urls_for_stage(
+    index: Dict[str, Any], stage: Literal["markdown", "llm"]
+) -> List[str]:
     """
     Compute URLs that are *not done* for the given stage, using url_index only.
 
@@ -351,6 +370,7 @@ def _pending_urls_for_stage(index: Dict[str, Any], stage: Literal["markdown", "l
 # SQLite-backed global state (runs + per-company high level)
 # ---------------------------------------------------------------------------
 
+
 class CrawlState:
     """
     Unified state backend (plugin-style):
@@ -366,7 +386,9 @@ class CrawlState:
     def __init__(self, db_path: Path = DEFAULT_DB) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False, isolation_level=None)
+        self._conn = sqlite3.connect(
+            self.db_path, check_same_thread=False, isolation_level=None
+        )
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._init_schema()
@@ -419,7 +441,9 @@ class CrawlState:
 
         await asyncio.to_thread(_run)
 
-    async def _query_one(self, sql: str, args: Tuple[Any, ...]) -> Optional[sqlite3.Row]:
+    async def _query_one(
+        self, sql: str, args: Tuple[Any, ...]
+    ) -> Optional[sqlite3.Row]:
         def _run():
             with self._lock:
                 cur = self._conn.execute(sql, args)
@@ -513,10 +537,14 @@ class CrawlState:
                     UPDATE runs
                        SET completed_companies=?,
                            last_company_bvdid=?,
-                           last_updated=?
+                           last_updated=?,
+                           total_companies = CASE
+                               WHEN total_companies < ? THEN ?
+                               ELSE total_companies
+                           END
                      WHERE run_id=?
                     """,
-                    (completed, bvdid, now, run_id),
+                    (completed, bvdid, now, completed, completed, run_id),
                 )
 
         await asyncio.to_thread(_run)
@@ -760,6 +788,10 @@ class CrawlState:
           - per-status counts
           - lists of pending / in-progress / done bvdid
           - latest run summary (from runs table, if any)
+
+        NOTE: This is always a snapshot of the *current* DB state.
+        It overwrites the JSON file each time, but does NOT reset any DB state,
+        so progress from previous runs is preserved.
         """
 
         path = _global_state_path()
@@ -867,6 +899,7 @@ class CrawlState:
         Does *not* modify the main status field; it only adds dedicated failure
         metadata so you can inspect or filter later.
         """
+
         def _update() -> None:
             patch: Dict[str, Any] = {
                 "failed": True,

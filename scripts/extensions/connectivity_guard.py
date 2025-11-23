@@ -44,6 +44,10 @@ class ConnectivityGuardConfig:
     err_ratio_trip: float = 0.85        # require high transport error ratio to OPEN
     err_ratio_floor_samples: float = 10 # min effective sample count before ratio considered
 
+    # Logging control for low-level probe failures
+    # If False (default), we will NOT log each individual probe failure.
+    log_probe_failures: bool = False
+
 
 def _parse_probe_endpoints(
     probe_endpoints: Iterable[str] | None,
@@ -151,6 +155,7 @@ class ConnectivityGuard:
         ewma_half_life_s: float = 30.0,
         err_ratio_trip: float = 0.85,
         err_ratio_floor_samples: float = 10.0,
+        log_probe_failures: bool | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         # Config object (plugin-style)
@@ -167,6 +172,9 @@ class ConnectivityGuard:
             ewma_half_life_s=float(ewma_half_life_s),
             err_ratio_trip=float(err_ratio_trip),
             err_ratio_floor_samples=float(err_ratio_floor_samples),
+            log_probe_failures=bool(log_probe_failures)
+            if log_probe_failures is not None
+            else False,
         )
 
         targets = _parse_probe_endpoints(probe_endpoints, probe_host, probe_port)
@@ -314,7 +322,12 @@ class ConnectivityGuard:
                 await w.wait_closed()
             return True
         except Exception as e:
-            self._logger.debug("ConnectivityGuard probe failed: %s:%d err=%r", host, port, e)
+            # These failures are expected in many environments (firewalls, transient
+            # outages, etc). They are now *opt-in* to keep logs clean.
+            if self.cfg.log_probe_failures:
+                self._logger.debug(
+                    "ConnectivityGuard probe failed: %s:%d err=%r", host, port, e
+                )
             return False
 
     async def _probe_round(self) -> Tuple[int, int]:

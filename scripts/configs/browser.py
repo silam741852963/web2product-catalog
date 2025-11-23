@@ -208,7 +208,7 @@ class TextFirstBrowserConfigStrategy:
     default_lang: str = "en-US"
     default_headless: bool = True
     viewport_width: int = 1280
-    viewport_height: int = 720
+    viewport_height: int = 600
     default_user_agent: str = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "Chrome/122.0.0.0 Safari/537.36"

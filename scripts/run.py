@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,7 +73,17 @@ from extensions.crawl_state import (
 # Resource monitoring
 from extensions.resource_monitor import ResourceMonitor, ResourceMonitorConfig
 
+# Stall management
+from extensions.stall_guard import StallGuard, StallGuardConfig
+
 logger = logging.getLogger("deep_crawl_runner")
+
+_HTTP_LANG_MAP: Dict[str, str] = {
+    "en": "en-US",
+    "ja": "ja-JP",
+    "de": "de-DE",
+    "fr": "fr-FR",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +91,7 @@ logger = logging.getLogger("deep_crawl_runner")
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True)
 class Company:
     company_id: str
     domain_url: str
@@ -93,10 +104,9 @@ class Company:
 
 def _companies_from_source(path: Path) -> List[Company]:
     inputs: List[CompanyInput] = load_companies_from_source(path)
-    companies: List[Company] = []
-
-    for ci in inputs:
-        companies.append(Company(company_id=ci.bvdid, domain_url=ci.url))
+    companies: List[Company] = [
+        Company(company_id=ci.bvdid, domain_url=ci.url) for ci in inputs
+    ]
 
     logger.info("Loaded %d companies from source %s", len(companies), path)
     return companies
@@ -137,7 +147,8 @@ def _write_crawl_meta(company: Company, snapshot: Any) -> None:
 
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        # no pretty-printing → smaller, faster to write
+        json.dump(payload, f, ensure_ascii=False)
         try:
             f.flush()
         except Exception:
@@ -156,6 +167,7 @@ async def process_page_result(
     company: Company,
     guard: Optional[ConnectivityGuard],
     gating_cfg: md_gating.MarkdownGatingConfig,
+    stall_guard: Optional[StallGuard] = None,
 ) -> None:
     """
     Process a single page_result coming from deep crawl.
@@ -165,8 +177,11 @@ async def process_page_result(
     if guard is not None:
         await guard.wait_until_healthy()
 
-    requested_url = getattr(page_result, "url", None)
-    final_url = getattr(page_result, "final_url", None) or requested_url
+    # Cache getattr locally to reduce attribute lookup overhead in tight loops
+    _getattr = getattr
+
+    requested_url = _getattr(page_result, "url", None)
+    final_url = _getattr(page_result, "final_url", None) or requested_url
 
     if not final_url:
         logger.warning("Page result missing URL; skipping entry")
@@ -174,15 +189,15 @@ async def process_page_result(
 
     url = final_url
 
-    markdown = getattr(page_result, "markdown", None)
-    status_code = getattr(page_result, "status_code", None)
-    error = getattr(page_result, "error", None) or getattr(
+    markdown = _getattr(page_result, "markdown", None)
+    status_code = _getattr(page_result, "status_code", None)
+    error = _getattr(page_result, "error", None) or _getattr(
         page_result, "error_message", None
     )
 
-    html = getattr(page_result, "html", None)
+    html = _getattr(page_result, "html", None)
     if html is None:
-        html = getattr(page_result, "final_html", None)
+        html = _getattr(page_result, "final_html", None)
 
     # --- Gating decision (save / suppress only) ----------------------------
     action, reason, stats = md_gating.evaluate_markdown(
@@ -229,12 +244,12 @@ async def process_page_result(
     md_path: Optional[str] = None
     md_status: Optional[str] = None
 
-    if gating_accept:
+    if gating_accept and markdown:
         try:
             p = save_stage_output(
                 bvdid=company.company_id,
                 url=url,
-                data=markdown or "",
+                data=markdown,
                 stage="markdown",
             )
             if p is not None:
@@ -255,7 +270,7 @@ async def process_page_result(
         "requested_url": requested_url,
         "status_code": status_code,
         "error": error,
-        "depth": getattr(page_result, "depth", None),
+        "depth": _getattr(page_result, "depth", None),
         "presence": 0,
         "extracted": 0,
         "gating_accept": gating_accept,
@@ -273,6 +288,10 @@ async def process_page_result(
 
     upsert_url_index_entry(company.company_id, url, entry)
 
+    # Stall guard progress heartbeat per successfully processed page
+    if stall_guard is not None:
+        stall_guard.record_page(company.company_id, url)
+
 
 # ---------------------------------------------------------------------------
 # LLM presence second pass
@@ -283,6 +302,7 @@ async def run_presence_pass_for_company(
     company: Company,
     *,
     presence_strategy: Any,
+    stall_guard: Optional[StallGuard] = None,
 ) -> None:
     state = get_crawl_state()
     pending_urls = await state.get_pending_urls_for_llm(company.company_id)
@@ -325,6 +345,8 @@ async def run_presence_pass_for_company(
                 },
             )
             updated += 1
+            if stall_guard is not None:
+                stall_guard.record_heartbeat("llm_presence")
             continue
 
         try:
@@ -347,6 +369,8 @@ async def run_presence_pass_for_company(
                 },
             )
             updated += 1
+            if stall_guard is not None:
+                stall_guard.record_heartbeat("llm_presence")
             continue
 
         if not text.strip():
@@ -361,6 +385,8 @@ async def run_presence_pass_for_company(
                 },
             )
             updated += 1
+            if stall_guard is not None:
+                stall_guard.record_heartbeat("llm_presence")
             continue
 
         try:
@@ -392,6 +418,8 @@ async def run_presence_pass_for_company(
                 },
             )
             updated += 1
+            if stall_guard is not None:
+                stall_guard.record_heartbeat("llm_presence")
             continue
 
         has_offering, confidence, preview = parse_presence_result(
@@ -410,6 +438,9 @@ async def run_presence_pass_for_company(
 
         upsert_url_index_entry(company.company_id, url, patch)
         updated += 1
+
+        if stall_guard is not None:
+            stall_guard.record_heartbeat("llm_presence")
 
     logger.info(
         "LLM presence: updated %d URLs for company_id=%s",
@@ -433,6 +464,7 @@ async def run_full_pass_for_company(
     company: Company,
     *,
     full_strategy: Any,
+    stall_guard: Optional[StallGuard] = None,
 ) -> None:
     index = load_url_index(company.company_id)
     if not isinstance(index, dict) or not index:
@@ -448,10 +480,8 @@ async def run_full_pass_for_company(
             continue
 
         md_path = ent.get("markdown_path")
-        if not md_path:
-            continue
-
-        if ent.get("extracted"):
+        if not md_path or ent.get("extracted"):
+            # Already processed or no markdown; skip without heartbeat
             continue
 
         try:
@@ -471,6 +501,8 @@ async def run_full_pass_for_company(
                     "status": "llm_full_markdown_read_error",
                 },
             )
+            if stall_guard is not None:
+                stall_guard.record_heartbeat("llm_full")
             continue
 
         if not text.strip():
@@ -484,6 +516,8 @@ async def run_full_pass_for_company(
                     "status": "llm_full_empty_markdown",
                 },
             )
+            if stall_guard is not None:
+                stall_guard.record_heartbeat("llm_full")
             continue
 
         try:
@@ -507,6 +541,8 @@ async def run_full_pass_for_company(
                     "status": f"llm_full_error:{type(e).__name__}",
                 },
             )
+            if stall_guard is not None:
+                stall_guard.record_heartbeat("llm_full")
             continue
 
         payload = parse_extracted_payload(raw_result)
@@ -516,7 +552,7 @@ async def run_full_pass_for_company(
             product_path = save_stage_output(
                 bvdid=company.company_id,
                 url=url,
-                data=json.dumps(payload_dict, ensure_ascii=False, indent=2),
+                data=json.dumps(payload_dict, ensure_ascii=False),
                 stage="product",
             )
         except Exception as e:
@@ -534,6 +570,8 @@ async def run_full_pass_for_company(
                     "status": "llm_full_write_error",
                 },
             )
+            if stall_guard is not None:
+                stall_guard.record_heartbeat("llm_full")
             continue
 
         presence_flag = 1 if payload.offerings else 0
@@ -549,6 +587,9 @@ async def run_full_pass_for_company(
 
         upsert_url_index_entry(company.company_id, url, patch)
         updated += 1
+
+        if stall_guard is not None:
+            stall_guard.record_heartbeat("llm_full")
 
     logger.info(
         "LLM full: wrote product JSON for %d URLs (company_id=%s)",
@@ -576,6 +617,7 @@ async def crawl_company(
     deep_strategy: Any,
     guard: Optional[ConnectivityGuard],
     gating_cfg: md_gating.MarkdownGatingConfig,
+    stall_guard: Optional[StallGuard] = None,
     root_urls: Optional[List[str]] = None,
     crawler_base_cfg: Any = None,
     page_policy: Optional[PageInteractionPolicy] = None,
@@ -724,6 +766,7 @@ async def crawl_company(
                         company=company,
                         guard=guard,
                         gating_cfg=gating_cfg,
+                        stall_guard=stall_guard,
                     )
                     pages_processed += 1
                 except Exception as e:
@@ -746,6 +789,7 @@ async def crawl_company(
                         company=company,
                         guard=guard,
                         gating_cfg=gating_cfg,
+                        stall_guard=stall_guard,
                     )
                     pages_processed += 1
                 except Exception as e:
@@ -766,6 +810,7 @@ async def crawl_company(
                     )
                     break
 
+
 # ---------------------------------------------------------------------------
 # BM25 helpers
 # ---------------------------------------------------------------------------
@@ -775,8 +820,12 @@ def build_dual_bm25_components() -> Dict[str, Any]:
     """
     Use language-specific BM25 tokens from configs.language.
     """
-    product_tokens: List[str] = default_language_factory.get("PRODUCT_TOKENS", []) or []
-    exclude_tokens: List[str] = default_language_factory.get("EXCLUDE_TOKENS", []) or []
+    product_tokens: List[str] = (
+        default_language_factory.get("PRODUCT_TOKENS", []) or []
+    )
+    exclude_tokens: List[str] = (
+        default_language_factory.get("EXCLUDE_TOKENS", []) or []
+    )
 
     positive_terms = set(product_tokens)
     negative_terms = set(exclude_tokens)
@@ -826,6 +875,44 @@ def build_dual_bm25_components() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Dataset externals helper
+# ---------------------------------------------------------------------------
+
+
+def _build_dataset_externals(
+    companies: List[Company],
+    dataset_file: Optional[str],
+) -> List[str]:
+    dataset_hosts: set[str] = set()
+
+    def _add_host(raw_url: str) -> None:
+        try:
+            host = urlparse(raw_url).hostname or ""
+        except Exception:
+            host = ""
+        if not host:
+            return
+        dataset_hosts.add(host)
+        if host.startswith("www."):
+            dataset_hosts.add(host[4:])
+        else:
+            dataset_hosts.add(f"www.{host}")
+
+    for c in companies:
+        _add_host(c.domain_url)
+
+    if dataset_file:
+        try:
+            ds_inputs: List[CompanyInput] = load_companies_from_source(Path(dataset_file))
+            for ci in ds_inputs:
+                _add_host(ci.url)
+        except Exception as e:
+            logger.exception("Failed to load dataset-file %s: %s", dataset_file, e)
+
+    return sorted(dataset_hosts)
+
+
+# ---------------------------------------------------------------------------
 # Company pipeline runner (per-company, concurrent)
 # ---------------------------------------------------------------------------
 
@@ -848,6 +935,7 @@ async def run_company_pipeline(
     run_id: Optional[str],
     presence_llm: Any,
     full_llm: Any,
+    stall_guard: Optional[StallGuard],
     crawler_base_cfg: Any = None,
     page_policy: Optional[PageInteractionPolicy] = None,
     page_interaction_factory: Optional[PageInteractionFactory] = None,
@@ -862,6 +950,12 @@ async def run_company_pipeline(
             company.company_id,
             company.domain_url,
         )
+
+        if stall_guard is not None:
+            stall_guard.record_heartbeat("company_start")
+
+        # Only mark as completed if the pipeline runs to the end of the try-block.
+        completed_ok = False
 
         snap = await state.get_company_snapshot(company.company_id)
         status = snap.status or COMPANY_STATUS_PENDING
@@ -976,6 +1070,7 @@ async def run_company_pipeline(
                     deep_strategy=deep_strategy,
                     guard=guard,
                     gating_cfg=gating_cfg,
+                    stall_guard=stall_guard,
                     root_urls=resume_roots,
                     crawler_base_cfg=crawler_base_cfg,
                     page_policy=page_policy,
@@ -994,12 +1089,25 @@ async def run_company_pipeline(
                 await run_presence_pass_for_company(
                     company,
                     presence_strategy=presence_llm,
+                    stall_guard=stall_guard,
                 )
             elif args.llm_mode == "full" and full_llm is not None:
                 await run_full_pass_for_company(
                     company,
                     full_strategy=full_llm,
+                    stall_guard=stall_guard,
                 )
+
+            # If we reached here without cancellation, treat this company as completed
+            completed_ok = True
+
+        except asyncio.CancelledError:
+            company_logger.warning(
+                "Company pipeline cancelled for company_id=%s",
+                company.company_id,
+            )
+            # Do NOT mark as completed; propagate cancellation so the run can stop.
+            raise
 
         except Exception as e:
             logger.exception(
@@ -1007,6 +1115,7 @@ async def run_company_pipeline(
                 company.company_id,
                 e,
             )
+
         finally:
             try:
                 snap_meta = await state.get_company_snapshot(company.company_id)
@@ -1018,7 +1127,8 @@ async def run_company_pipeline(
                 )
 
             try:
-                if run_id is not None:
+                # Only increment run-level completed count when the pipeline truly finished.
+                if run_id is not None and completed_ok:
                     await state.mark_company_completed(run_id, company.company_id)
                     await state.recompute_global_state()
             except Exception:
@@ -1026,6 +1136,10 @@ async def run_company_pipeline(
                     "Failed to update run/global state for company_id=%s",
                     company.company_id,
                 )
+
+            if stall_guard is not None and completed_ok:
+                # Only treat as "completed" for stall detection when the pipeline finished
+                stall_guard.record_company_completed(company.company_id)
 
             logging_ext.reset_company_context(token)
             logging_ext.close_company(company.company_id)
@@ -1262,6 +1376,61 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     page_interaction_factory = default_page_interaction_factory
 
+    # Stall guard: detect global stalls relative to per-page timeout
+    stall_cfg = StallGuardConfig(
+        page_timeout_sec=page_policy.wait_timeout_ms / 1000.0,
+        soft_timeout_factor=2.0,   # soft stall ≥ 2 × page timeout
+        hard_timeout_factor=4.0,   # hard stall ≥ 4 × page timeout
+        check_interval_sec=15.0,
+        min_pages_before_detection=20,
+        min_companies_before_detection=0,
+        min_consecutive_stall_checks=2,
+        # Internal auto-kill is disabled; we will decide in a callback
+        # based on ConnectivityGuard state.
+        auto_kill_process=False,
+        auto_kill_exit_code=3,
+        dump_state_path=out_dir / "stall_state.json",
+    )
+    stall_guard = StallGuard(config=stall_cfg)
+
+    # If StallGuard supports an on_stall hook, gate killing on connectivity state.
+    async def _handle_stall(snapshot: Any) -> None:
+        # When connectivity is healthy, treat stall as a real stall and exit.
+        if guard.is_healthy():
+            logger.error(
+                "StallGuard detected a hard stall with healthy connectivity; "
+                "terminating process with exit code %d",
+                stall_cfg.auto_kill_exit_code,
+            )
+            # Best-effort flush of root logger handlers so logs aren't lost.
+            root_logger = logging.getLogger()
+            for h in list(root_logger.handlers):
+                try:
+                    h.flush()
+                except Exception:
+                    pass
+            os._exit(stall_cfg.auto_kill_exit_code)
+        else:
+            # ConnectivityGuard says we're in outage / not healthy → do NOT kill.
+            logger.warning(
+                "StallGuard detected a stall but ConnectivityGuard is %s; "
+                "suppressing auto-kill.",
+                guard.state(),
+            )
+
+    # Only attach if StallGuard exposes this attribute (for safety with older versions).
+    if hasattr(stall_guard, "on_stall"):
+        # type: ignore[attr-defined] to satisfy type checkers if you use them
+        stall_guard.on_stall = _handle_stall  # type: ignore[attr-defined]
+    else:
+        logger.warning(
+            "StallGuard has no 'on_stall' hook; auto_kill_process is disabled "
+            "to avoid killing the run during connectivity outages."
+        )
+
+    await stall_guard.start()
+
+
     state = get_crawl_state()
 
     try:
@@ -1281,7 +1450,10 @@ async def main_async(args: argparse.Namespace) -> None:
 
         total = len(companies)
 
-        # Initialize run row and seed companies in DB
+        # Initialize run row; DO NOT reset per-company status here.
+        # This allows resume/skip logic to work across multiple runs:
+        # - Companies that reached max_pages and were marked markdown_done
+        #   will stay done and be skipped on the next run.
         run_id = await state.start_run(
             pipeline="deep_crawl",
             version=None,
@@ -1293,11 +1465,13 @@ async def main_async(args: argparse.Namespace) -> None:
         )
 
         for c in companies:
+            # Ensure the company exists in the DB and its root_url is set.
+            # We intentionally do NOT touch the status, so previous completion
+            # state derived from url_index.json is preserved.
             await state.upsert_company(
                 c.company_id,
                 name=None,
                 root_url=c.domain_url,
-                status=COMPANY_STATUS_PENDING,
             )
 
         try:
@@ -1306,43 +1480,10 @@ async def main_async(args: argparse.Namespace) -> None:
             logger.exception("Failed to recompute global crawl state at startup")
 
         # Build dataset_externals host whitelist
-        dataset_hosts: set[str] = set()
-
-        for c in companies:
-            try:
-                host = urlparse(c.domain_url).hostname or ""
-            except Exception:
-                host = ""
-            if host:
-                dataset_hosts.add(host)
-                if host.startswith("www."):
-                    dataset_hosts.add(host[4:])
-                else:
-                    dataset_hosts.add(f"www.{host}")
-
-        if args.dataset_file:
-            try:
-                ds_inputs: List[CompanyInput] = load_companies_from_source(
-                    Path(args.dataset_file)
-                )
-                for ci in ds_inputs:
-                    try:
-                        h = urlparse(ci.url).hostname or ""
-                    except Exception:
-                        h = ""
-                    if not h:
-                        continue
-                    dataset_hosts.add(h)
-                    if h.startswith("www."):
-                        dataset_hosts.add(h[4:])
-                    else:
-                        dataset_hosts.add(f"www.{h}")
-            except Exception as e:
-                logger.exception(
-                    "Failed to load dataset-file %s: %s", args.dataset_file, e
-                )
-
-        dataset_externals: List[str] = sorted(dataset_hosts)
+        dataset_externals: List[str] = _build_dataset_externals(
+            companies=companies,
+            dataset_file=args.dataset_file,
+        )
 
         # BM25 scorer + filter
         bm25_components = build_dual_bm25_components()
@@ -1352,12 +1493,7 @@ async def main_async(args: argparse.Namespace) -> None:
         max_companies = max(1, int(args.company_concurrency))
 
         # Browser config (no dispatcher)
-        http_lang = {
-            "en": "en-US",
-            "ja": "ja-JP",
-            "de": "de-DE",
-            "fr": "fr-FR",
-        }.get(args.lang, f"{args.lang}-US")
+        http_lang = _HTTP_LANG_MAP.get(args.lang, f"{args.lang}-US")
 
         browser_cfg = default_browser_factory.create(
             lang=http_lang,
@@ -1398,6 +1534,7 @@ async def main_async(args: argparse.Namespace) -> None:
                             run_id=run_id,
                             presence_llm=presence_llm,
                             full_llm=full_llm,
+                            stall_guard=stall_guard,
                             crawler_base_cfg=crawler_base_cfg,
                             page_policy=page_policy,
                             page_interaction_factory=page_interaction_factory,
@@ -1413,6 +1550,11 @@ async def main_async(args: argparse.Namespace) -> None:
             await guard.stop()
         except Exception:
             logger.exception("Error while stopping ConnectivityGuard")
+
+        try:
+            await stall_guard.stop()
+        except Exception:
+            logger.exception("Error while stopping StallGuard")
 
         try:
             logging_ext.close()

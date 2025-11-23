@@ -18,26 +18,23 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+# Precompiled tokenization regex (lowercase alphanumerics)
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
 
 def _tokenize(text: str) -> List[str]:
     """
     Simple, fast, case-insensitive tokenization for BM25 scoring.
 
-    IMPORTANT FIX:
-      - Previously we used `text.lower().split()`, which treats an entire URL like:
-            "https://mother-parkers.com/coffee-excellence/private-label-formats"
-        as ONE token, so query terms never matched and BM25 scores stayed 0.
-
-      - Now we split on non-alphanumeric boundaries, so the same URL becomes:
-            ["https", "mother", "parkers", "com",
-             "coffee", "excellence", "private", "label", "formats"]
-
-        This allows URL path segments to meaningfully interact with queries
-        like "product service solution coffee tea pricing catalog".
+    Split on non-alphanumeric boundaries so that a URL like:
+        "https://mother-parkers.com/coffee-excellence/private-label-formats"
+    becomes:
+        ["https", "mother", "parkers", "com",
+         "coffee", "excellence", "private", "label", "formats"]
     """
     if not text:
         return []
-    return re.findall(r"[a-z0-9]+", text.lower())
+    return _TOKEN_RE.findall(text.lower())
 
 
 @dataclass
@@ -72,7 +69,13 @@ class _DualBM25Core:
     For HEAD+URL fusion, see score_head_and_url().
     """
 
-    __slots__ = ("pos_terms", "neg_terms", "cfg")
+    __slots__ = (
+        "pos_terms",
+        "neg_terms",
+        "pos_term_set",
+        "neg_term_set",
+        "cfg",
+    )
 
     def __init__(
         self,
@@ -80,8 +83,17 @@ class _DualBM25Core:
         negative_query: Optional[str] = None,
         cfg: Optional[DualBM25Config] = None,
     ) -> None:
+        # Tokenize once and keep both list + set:
+        # - list preserved for debugging/inspection if needed
+        # - set used for scoring to avoid per-call set() allocations
         self.pos_terms: List[str] = _tokenize(positive_query)
-        self.neg_terms: List[str] = _tokenize(negative_query) if negative_query else []
+        self.neg_terms: List[str] = (
+            _tokenize(negative_query) if negative_query else []
+        )
+
+        self.pos_term_set = set(self.pos_terms)
+        self.neg_term_set = set(self.neg_terms)
+
         self.cfg: DualBM25Config = cfg or DualBM25Config()
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -97,40 +109,53 @@ class _DualBM25Core:
             )
 
     # ------------------------------------------------------------------ #
-    # Core BM25 helpers
+    # Core BM25 helpers (single TF build shared for pos & neg)
     # ------------------------------------------------------------------ #
 
-    def _bm25(self, document: str, query_terms: List[str]) -> float:
+    def _build_tf(self, document: str) -> tuple[Dict[str, int], int]:
         """
-        Standard BM25 scoring over a single document and tokenized query.
-        IDF is approximated per-document for simplicity.
-        """
-        if not document or not query_terms:
-            return 0.0
+        Tokenize document and build term-frequency map.
 
+        Returns:
+            (tf_dict, doc_len_tokens)
+        """
         doc_terms = _tokenize(document)
         doc_len = len(doc_terms)
         if doc_len == 0:
-            return 0.0
+            return {}, 0
 
         tf: Dict[str, int] = {}
         for t in doc_terms:
             tf[t] = tf.get(t, 0) + 1
+        return tf, doc_len
+
+    def _bm25_from_tf(
+        self,
+        tf: Dict[str, int],
+        doc_len: int,
+        term_set: set[str],
+    ) -> float:
+        """
+        BM25 scoring using a pre-built term-frequency map and a set of query terms.
+        """
+        if not tf or not term_set or doc_len <= 0:
+            return 0.0
 
         k1 = self.cfg.k1
         b = self.cfg.b
         avgdl = float(self.cfg.avgdl) if self.cfg.avgdl > 0 else float(doc_len)
 
         score = 0.0
-        unique_query_terms = set(query_terms)
+        debug_enabled = logger.isEnabledFor(logging.DEBUG)
         matched_terms = 0
 
-        for term in unique_query_terms:
+        for term in term_set:
             freq = tf.get(term, 0)
             if freq == 0:
                 continue
 
-            matched_terms += 1
+            if debug_enabled:
+                matched_terms += 1
 
             # Simple IDF surrogate using within-doc stats.
             idf = math.log((1.0 + 1.0) / (freq + 0.5) + 1.0)
@@ -140,7 +165,7 @@ class _DualBM25Core:
             contribution = idf * (numerator / max(denominator, 1e-9))
             score += contribution
 
-        if logger.isEnabledFor(logging.DEBUG):
+        if debug_enabled:
             logger.debug(
                 "[DualBM25Core._bm25] doc_len=%d matched_terms=%d raw_score=%.6f",
                 doc_len,
@@ -165,17 +190,20 @@ class _DualBM25Core:
             - combined: final combined score in [0,1]
             - raw_pos, pos_norm, raw_neg, neg_norm
         """
+        # Single tokenization + TF map reused for both queries
+        tf, doc_len = self._build_tf(document)
+
         # Positive
-        raw_pos = self._bm25(document, self.pos_terms)
-        pos_norm = self._normalize_score(raw_pos)
+        raw_pos = self._bm25_from_tf(tf, doc_len, self.pos_term_set)
 
         # Negative
-        if self.neg_terms:
-            raw_neg = self._bm25(document, self.neg_terms)
-            neg_norm = self._normalize_score(raw_neg)
+        if self.neg_term_set:
+            raw_neg = self._bm25_from_tf(tf, doc_len, self.neg_term_set)
         else:
             raw_neg = 0.0
-            neg_norm = 0.0
+
+        pos_norm = self._normalize_score(raw_pos)
+        neg_norm = self._normalize_score(raw_neg)
 
         alpha = float(self.cfg.alpha)
         combined = alpha * pos_norm + (1.0 - alpha) * (1.0 - neg_norm)
@@ -235,6 +263,7 @@ class _DualBM25Core:
         head_has_neg = head_scores["raw_neg"] > 0.0
         head_neutral = not head_has_pos and not head_has_neg
 
+        # Option B: strong negative URL signal + no/neutral HEAD ⇒ force drop
         if head_empty and url_neg_raw > 0.0:
             fused_combined = 0.0
             if logger.isEnabledFor(logging.DEBUG):
@@ -271,6 +300,7 @@ class _DualBM25Core:
             "url_neg_norm": url_scores["neg_norm"],
             "fused_combined": fused_combined,
         }
+
 
 class DualBM25Filter(URLFilter):
     """
@@ -522,7 +552,7 @@ class DualBM25Scorer(URLScorer):
 
         - head_doc = doc_index[url] if available, else None.
         - scores = core.score_head_and_url(url=url, head_doc=head_doc)
-        - return scores["fused_combined"] * weight
+        - return scores["fused_combined"]
         """
         head_doc = self._get_document_for_url(url)
 
