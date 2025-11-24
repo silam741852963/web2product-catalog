@@ -773,6 +773,39 @@ class CrawlState:
                 )
             )
         return out
+    
+    async def get_companies_by_ids(self, bvdids: List[str]) -> List[CompanySnapshot]:
+        """
+        Convenience helper: return snapshots for a specific subset of companies.
+        Useful for retry wrappers that want to inspect the state of previously
+        stalled / timeout companies after a new run.
+        """
+        if not bvdids:
+            return []
+
+        placeholders = ",".join("?" for _ in bvdids)
+        rows = await self._query_all(
+            f"SELECT * FROM companies WHERE bvdid IN ({placeholders})",
+            tuple(bvdids),
+        )
+
+        out: List[CompanySnapshot] = []
+        for row in rows:
+            out.append(
+                CompanySnapshot(
+                    bvdid=row["bvdid"],
+                    name=row["name"],
+                    root_url=row["root_url"],
+                    status=(row["status"] or COMPANY_STATUS_PENDING),
+                    urls_total=int(row["urls_total"] or 0),
+                    urls_markdown_done=int(row["urls_markdown_done"] or 0),
+                    urls_llm_done=int(row["urls_llm_done"] or 0),
+                    last_error=row["last_error"],
+                    created_at=row["created_at"],
+                    updated_at=row["updated_at"],
+                )
+            )
+        return out
 
     async def recompute_global_state(self) -> Dict[str, Any]:
         """
