@@ -14,7 +14,7 @@ while :; do
   echo "[retry-wrapper] iteration ${ITER}: running crawler..."
 
   # Run the crawler; we *expect* non-zero (RETRY_EXIT_CODE) sometimes.
-  python scripts/run.py "$@"
+  python3 scripts/run.py "$@"
   EXIT_CODE=$?
 
   if [[ "$EXIT_CODE" -eq 0 ]]; then
@@ -35,7 +35,7 @@ while :; do
 
   # --- Read current retry count from JSON (as argv[1]) ---
   CURRENT_RETRY_COUNT=$(
-    python - "$RETRY_FILE" << 'EOF'
+    python3 - "$RETRY_FILE" << 'EOF'
 import json, sys, pathlib
 p = pathlib.Path(sys.argv[1])
 data = json.loads(p.read_text(encoding="utf-8"))
@@ -47,7 +47,7 @@ EOF
 
   if (( PREV_RETRY_COUNT > 0 )); then
     # --- Check progress between previous and current retry sets ---
-    python - "$PREV_RETRY_COUNT" "$CURRENT_RETRY_COUNT" "$MIN_RETRY_SUCCESS_RATE" << 'EOF'
+    python3 - "$PREV_RETRY_COUNT" "$CURRENT_RETRY_COUNT" "$MIN_RETRY_SUCCESS_RATE" << 'EOF'
 import sys
 prev = int(sys.argv[1])
 cur = int(sys.argv[2])
