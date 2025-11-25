@@ -115,7 +115,8 @@ def _maybe_flush_retry_file(*, force: bool = False) -> None:
     retry_ids = sorted(set(stalled_ids) | set(timeout_ids))
 
     payload: Dict[str, Any] = {
-        "generated_at": datetime.now(timezone=timezone.utc).isoformat(),
+        # FIX: use positional arg or tz= instead of invalid keyword "timezone="
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "stalled_companies": stalled_ids,
         "timeout_companies": timeout_ids,
         "retry_companies": retry_ids,

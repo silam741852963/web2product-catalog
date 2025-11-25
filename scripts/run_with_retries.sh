@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail   # no -e because we handle non-zero exits manually
 
 # Configurable via env vars
 RETRY_EXIT_CODE="${RETRY_EXIT_CODE:-17}"
-MAX_RETRY_ITER="${MAX_RETRY_ITER:-10}"           # max number of runs
-MIN_RETRY_SUCCESS_RATE="${MIN_RETRY_SUCCESS_RATE:-0.3}"  # 30%
-OUT_DIR="${OUT_DIR:-outputs}"                   # must match --out-dir in run.py
+MAX_RETRY_ITER="${MAX_RETRY_ITER:-10}"                    # max number of runs
+MIN_RETRY_SUCCESS_RATE="${MIN_RETRY_SUCCESS_RATE:-0.3}"   # 30%
+OUT_DIR="${OUT_DIR:-outputs}"                             # must match --out-dir in run.py
 
 PREV_RETRY_COUNT=0
 ITER=1
 
 while :; do
   echo "[retry-wrapper] iteration ${ITER}: running crawler..."
+
+  # Run the crawler; we *expect* non-zero (RETRY_EXIT_CODE) sometimes.
   python scripts/run.py "$@"
   EXIT_CODE=$?
 
@@ -31,18 +33,21 @@ while :; do
     exit 1
   fi
 
-  CURRENT_RETRY_COUNT=$(python - <<EOF
+  # --- Read current retry count from JSON (as argv[1]) ---
+  CURRENT_RETRY_COUNT=$(
+    python - "$RETRY_FILE" << 'EOF'
 import json, sys, pathlib
 p = pathlib.Path(sys.argv[1])
 data = json.loads(p.read_text(encoding="utf-8"))
 print(len(data.get("retry_companies", [])))
 EOF
-"$RETRY_FILE")
+  )
 
   echo "[retry-wrapper] ${CURRENT_RETRY_COUNT} companies need retry."
 
   if (( PREV_RETRY_COUNT > 0 )); then
-    python - <<EOF "$PREV_RETRY_COUNT" "$CURRENT_RETRY_COUNT" "$MIN_RETRY_SUCCESS_RATE"
+    # --- Check progress between previous and current retry sets ---
+    python - "$PREV_RETRY_COUNT" "$CURRENT_RETRY_COUNT" "$MIN_RETRY_SUCCESS_RATE" << 'EOF'
 import sys
 prev = int(sys.argv[1])
 cur = int(sys.argv[2])
