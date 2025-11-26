@@ -94,9 +94,13 @@ _COMPANIES_WITH_MEMORY_PRESSURE: set[str] = set()
 # Retry file management (written progressively during the run).
 _RETRY_FILE_PATH: Optional[Path] = None
 _RETRY_DIRTY_COUNT = 0
-# Default = 1 → write out on every new retry company.
+# Default = 1 -> write out on every new retry company.
 # Increase via env RETRY_FLUSH_THRESHOLD to batch writes if you want.
 _RETRY_FLUSH_THRESHOLD = int(os.environ.get("RETRY_FLUSH_THRESHOLD", "1"))
+
+# Stats used by the retry wrapper, emitted into retry_companies.json
+_TOTAL_COMPANIES_FOR_RETRY: int = 0
+_ATTEMPTED_COMPANIES: set[str] = set()
 
 
 def _maybe_flush_retry_file(*, force: bool = False) -> None:
@@ -119,12 +123,19 @@ def _maybe_flush_retry_file(*, force: bool = False) -> None:
     memory_ids = sorted(_COMPANIES_WITH_MEMORY_PRESSURE)
     retry_ids = sorted(set(stalled_ids) | set(timeout_ids) | set(memory_ids))
 
+    total_companies = _TOTAL_COMPANIES_FOR_RETRY
+    attempted_total = len(_ATTEMPTED_COMPANIES)
+    all_attempted = bool(total_companies and attempted_total >= total_companies)
+
     payload: Dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "stalled_companies": stalled_ids,
         "timeout_companies": timeout_ids,
         "memory_companies": memory_ids,
         "retry_companies": retry_ids,
+        "total_companies": total_companies or 0,
+        "attempted_total": attempted_total,
+        "all_attempted": all_attempted,
     }
 
     tmp = _RETRY_FILE_PATH.with_suffix(_RETRY_FILE_PATH.suffix + ".tmp")
@@ -366,7 +377,7 @@ async def process_page_result(
         md_status = "markdown_suppressed"
 
     # For explicit page-level timeouts we override the status so that the
-    # url_index entry is *not* considered markdown-complete and will be
+    # url_index entry is not considered markdown-complete and will be
     # picked up by the resume logic in the next run.
     if timeout_exceeded:
         md_status = "timeout_page_exceeded"
@@ -984,6 +995,9 @@ async def run_company_pipeline(
     page_timeout_ms: Optional[int] = None,
 ) -> None:
     async with sem:
+        global _ATTEMPTED_COMPANIES
+        _ATTEMPTED_COMPANIES.add(company.company_id)
+
         token = logging_ext.set_company_context(company.company_id)
         company_logger = logging_ext.get_company_logger(company.company_id)
         company_logger.info(
@@ -1004,7 +1018,7 @@ async def run_company_pipeline(
 
         if status == COMPANY_STATUS_PENDING:
             company_logger.info(
-                "State=PENDING → fresh crawl for %s", company.company_id
+                "State=PENDING -> fresh crawl for %s", company.company_id
             )
             do_crawl = True
         elif status == COMPANY_STATUS_MD_NOT_DONE:
@@ -1013,7 +1027,7 @@ async def run_company_pipeline(
             )
             if pending_md:
                 company_logger.info(
-                    "State=MARKDOWN_NOT_DONE → resuming crawl for %s from %d pending URLs",
+                    "State=MARKDOWN_NOT_DONE -> resuming crawl for %s from %d pending URLs",
                     company.company_id,
                     len(pending_md),
                 )
@@ -1030,13 +1044,13 @@ async def run_company_pipeline(
             COMPANY_STATUS_LLM_NOT_DONE,
         ):
             company_logger.info(
-                "State=%s → skipping crawl for %s",
+                "State=%s -> skipping crawl for %s",
                 status,
                 company.company_id,
             )
         else:
             company_logger.info(
-                "State=%s (unknown) → treating as PENDING for %s",
+                "State=%s (unknown) -> treating as PENDING for %s",
                 status,
                 company.company_id,
             )
@@ -1044,7 +1058,7 @@ async def run_company_pipeline(
 
         if not do_crawl and args.llm_mode == "none":
             company_logger.info(
-                "No crawl and llm_mode=none → skipping company %s",
+                "No crawl and llm_mode=none -> skipping company %s",
                 company.company_id,
             )
             logging_ext.reset_company_context(token)
@@ -1447,7 +1461,7 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     stall_guard = StallGuard(config=stall_cfg)
 
-    # Memory guard – used to detect Crawl4AI "Requeued due to critical memory pressure"
+    # Memory guard used to detect Crawl4AI "Requeued due to critical memory pressure"
     memory_guard = MemoryGuard()
 
     company_tasks: Dict[str, asyncio.Task] = {}
@@ -1580,6 +1594,10 @@ async def main_async(args: argparse.Namespace) -> None:
         companies = companies_to_run
         total = len(companies)
         await state.update_run_totals(run_id, total_companies=total)
+
+        global _TOTAL_COMPANIES_FOR_RETRY, _ATTEMPTED_COMPANIES
+        _TOTAL_COMPANIES_FOR_RETRY = total
+        _ATTEMPTED_COMPANIES = set()
 
         if not companies:
             logger.info(

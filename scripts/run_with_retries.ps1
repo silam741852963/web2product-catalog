@@ -3,17 +3,19 @@ param(
     [string[]]$RunArgs
 )
 
+# Basic config
 $retryExitCode = $env:RETRY_EXIT_CODE
 if (-not $retryExitCode) { $retryExitCode = 17 }
 
-$maxRetryIter = $env:MAX_RETRY_ITER
-if (-not $maxRetryIter) { $maxRetryIter = 10 }
-
-$minSuccessRate = $env:MIN_RETRY_SUCCESS_RATE
-if (-not $minSuccessRate) { $minSuccessRate = 0.3 }
-
 $outDir = $env:OUT_DIR
 if (-not $outDir) { $outDir = "outputs" }
+
+# Strict mode config: only applied once all companies have been attempted at least once
+$strictMinSuccessRate = $env:STRICT_MIN_RETRY_SUCCESS_RATE
+if (-not $strictMinSuccessRate) { $strictMinSuccessRate = 0.1 }
+
+$strictMaxRetryIter = $env:STRICT_MAX_RETRY_ITER
+if (-not $strictMaxRetryIter) { $strictMaxRetryIter = 10 }
 
 # Persistent retry history file (JSONL)
 $retryHistoryFile = if ($env:RETRY_HISTORY_FILE) {
@@ -52,6 +54,10 @@ function Write-RetryHistory {
 $prevRetryCount = 0
 $iter = 1
 
+# Strict mode state
+$strictMode = $false
+$strictRetryCount = 0
+
 while ($true) {
     Write-Host "[retry-wrapper] iteration ${iter}: running crawler..."
     & python scripts/run.py @RunArgs
@@ -77,12 +83,31 @@ while ($true) {
     }
 
     $json = Get-Content $retryFile -Raw | ConvertFrom-Json
-    $currentRetryCount = ($json.retry_companies | Measure-Object).Count
+
+    $currentRetryCount = 0
+    if ($json.retry_companies) {
+        $currentRetryCount = ($json.retry_companies | Measure-Object).Count
+    }
+
+    $allAttemptedFlag = $false
+    if ($null -ne $json.all_attempted -and $json.all_attempted) {
+        $allAttemptedFlag = $true
+    }
+
     Write-Host "[retry-wrapper] $currentRetryCount companies need retry."
+    Write-Host "[retry-wrapper] all_attempted=$allAttemptedFlag"
 
     $reason = "retry_exit_continue"
 
-    if ($prevRetryCount -gt 0) {
+    # Enable strict mode once all companies have been attempted at least once
+    if (-not $strictMode -and $allAttemptedFlag) {
+        $strictMode = $true
+        $strictRetryCount = 0
+        Write-Host "[retry-wrapper] all companies have been attempted at least once; enabling strict retry policy (min success rate=$strictMinSuccessRate, max strict retries=$strictMaxRetryIter)."
+    }
+
+    # In strict mode, once we have a previous retry count, require improvement
+    if ($strictMode -and $prevRetryCount -gt 0) {
         $succeeded = $prevRetryCount - $currentRetryCount
         $rate = 0.0
         if ($prevRetryCount -gt 0) {
@@ -95,16 +120,24 @@ while ($true) {
             Write-Host "[retry-wrapper] no companies left to retry; stopping."
             $reason = "retry_exit_stop_empty"
         }
-        elseif ($rate -lt [double]$minSuccessRate) {
-            Write-Host "[retry-wrapper] progress below MIN_RETRY_SUCCESS_RATE=$minSuccessRate; stop auto retries."
+        elseif ($rate -lt [double]$strictMinSuccessRate) {
+            Write-Host "[retry-wrapper] progress below STRICT_MIN_RETRY_SUCCESS_RATE=$strictMinSuccessRate; stopping."
             $reason = "retry_exit_stop_progress"
         }
     }
 
-    if ($reason -eq "retry_exit_continue" -and $iter -ge [int]$maxRetryIter) {
-        Write-Host "[retry-wrapper] reached MAX_RETRY_ITER=$maxRetryIter; stopping."
-        $reason = "retry_exit_stop_max_iter"
+    # In strict mode, also enforce a hard cap on number of strict retries
+    if ($strictMode -and $reason -eq "retry_exit_continue") {
+        if ($strictRetryCount -ge [int]$strictMaxRetryIter) {
+            Write-Host "[retry-wrapper] reached STRICT_MAX_RETRY_ITER=$strictMaxRetryIter; stopping."
+            $reason = "retry_exit_stop_max_iter"
+        }
     }
+
+    # Default behavior when not in strict mode:
+    # - No improvement required
+    # - No retry limit
+    # So we just loop while reason stays "retry_exit_continue".
 
     # Log this iteration's outcome
     Write-RetryHistory -Iteration $iter -ExitCode $exitCode -CurrentRetryCount $currentRetryCount -PrevRetryCount $prevRetryCount -Reason $reason
@@ -114,5 +147,8 @@ while ($true) {
     }
 
     $prevRetryCount = $currentRetryCount
+    if ($strictMode) {
+        $strictRetryCount += 1
+    }
     $iter += 1
 }
