@@ -67,6 +67,7 @@ from extensions.crawl_state import (
 )
 from extensions.resource_monitor import ResourceMonitor, ResourceMonitorConfig
 from extensions.stall_guard import StallGuard, StallGuardConfig
+from extensions.memory_guard import MemoryGuard, CriticalMemoryPressure
 
 logger = logging.getLogger("deep_crawl_runner")
 
@@ -87,6 +88,9 @@ _COMPANIES_WITH_TIMEOUT_ERRORS: set[str] = set()
 # Companies whose pipeline was explicitly stalled by StallGuard.
 _STALLED_COMPANIES: set[str] = set()
 
+# Companies whose crawl reported critical memory pressure.
+_COMPANIES_WITH_MEMORY_PRESSURE: set[str] = set()
+
 # Retry file management (written progressively during the run).
 _RETRY_FILE_PATH: Optional[Path] = None
 _RETRY_DIRTY_COUNT = 0
@@ -99,7 +103,7 @@ def _maybe_flush_retry_file(*, force: bool = False) -> None:
     """
     Write retry_companies.json atomically from in-memory sets.
 
-    Called progressively (on new stalls / timeouts) and once at the end
+    Called progressively (on new stalls / timeouts / memory-pressure) and once at the end
     with force=True to guarantee latest state is on disk.
     """
     global _RETRY_DIRTY_COUNT
@@ -112,13 +116,14 @@ def _maybe_flush_retry_file(*, force: bool = False) -> None:
 
     stalled_ids = sorted(_STALLED_COMPANIES)
     timeout_ids = sorted(_COMPANIES_WITH_TIMEOUT_ERRORS)
-    retry_ids = sorted(set(stalled_ids) | set(timeout_ids))
+    memory_ids = sorted(_COMPANIES_WITH_MEMORY_PRESSURE)
+    retry_ids = sorted(set(stalled_ids) | set(timeout_ids) | set(memory_ids))
 
     payload: Dict[str, Any] = {
-        # FIX: use positional arg or tz= instead of invalid keyword "timezone="
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "stalled_companies": stalled_ids,
         "timeout_companies": timeout_ids,
+        "memory_companies": memory_ids,
         "retry_companies": retry_ids,
     }
 
@@ -153,6 +158,20 @@ def mark_company_stalled(company_id: str) -> None:
         return
 
     _STALLED_COMPANIES.add(company_id)
+    _RETRY_DIRTY_COUNT += 1
+    _maybe_flush_retry_file()
+
+
+def mark_company_memory_pressure(company_id: str) -> None:
+    """
+    Mark a company as having hit Crawl4AI critical memory pressure.
+    """
+    global _RETRY_DIRTY_COUNT
+
+    if company_id in _COMPANIES_WITH_MEMORY_PRESSURE:
+        return
+
+    _COMPANIES_WITH_MEMORY_PRESSURE.add(company_id)
     _RETRY_DIRTY_COUNT += 1
     _maybe_flush_retry_file()
 
@@ -238,6 +257,7 @@ async def process_page_result(
     gating_cfg: md_gating.MarkdownGatingConfig,
     timeout_error_marker: str,
     stall_guard: Optional[StallGuard] = None,  # kept for future signalling if needed
+    memory_guard: Optional[MemoryGuard] = None,
 ) -> None:
     """Process a single page_result coming from deep crawl."""
     if guard is not None:
@@ -257,6 +277,16 @@ async def process_page_result(
     error = _getattr(page_result, "error", None) or _getattr(
         page_result, "error_message", None
     )
+
+    # Critical memory-pressure handling: if Crawl4AI signals this, mark the
+    # company for retry and trigger a controlled abort of this run.
+    if memory_guard is not None:
+        memory_guard.check_page_error(
+            error=error,
+            company_id=company.company_id,
+            url=url,
+            mark_company_memory=mark_company_memory_pressure,
+        )
 
     # Track per-page timeout errors so we can schedule company-level retries.
     timeout_exceeded = False
@@ -645,6 +675,7 @@ async def crawl_company(
     page_interaction_factory: Optional[PageInteractionFactory] = None,
     max_pages: Optional[int] = None,
     page_timeout_ms: Optional[int] = None,
+    memory_guard: Optional[MemoryGuard] = None,
 ) -> None:
     logger.info(
         "Starting crawl for company_id=%s url=%s",
@@ -772,8 +803,12 @@ async def crawl_company(
                         gating_cfg=gating_cfg,
                         timeout_error_marker=timeout_error_marker,
                         stall_guard=stall_guard,
+                        memory_guard=memory_guard,
                     )
                     pages_processed += 1
+                except CriticalMemoryPressure:
+                    # Bubble up so the company pipeline / main run know to abort
+                    raise
                 except Exception as e:
                     url = getattr(page_result, "url", None)
                     logger.exception(
@@ -794,8 +829,12 @@ async def crawl_company(
                         gating_cfg=gating_cfg,
                         timeout_error_marker=timeout_error_marker,
                         stall_guard=stall_guard,
+                        memory_guard=memory_guard,
                     )
                     pages_processed += 1
+                except CriticalMemoryPressure:
+                    # Bubble up so the company pipeline / main run know to abort
+                    raise
                 except Exception as e:
                     url = getattr(page_result, "url", None)
                     logger.exception(
@@ -938,6 +977,7 @@ async def run_company_pipeline(
     presence_llm: Any,
     full_llm: Any,
     stall_guard: Optional[StallGuard],
+    memory_guard: Optional[MemoryGuard],
     crawler_base_cfg: Any = None,
     page_policy: Optional[PageInteractionPolicy] = None,
     page_interaction_factory: Optional[PageInteractionFactory] = None,
@@ -1077,6 +1117,7 @@ async def run_company_pipeline(
                     page_interaction_factory=page_interaction_factory,
                     max_pages=max_pages_per_company,
                     page_timeout_ms=page_timeout_ms,
+                    memory_guard=memory_guard,
                 )
 
                 await state.recompute_company_from_index(
@@ -1103,6 +1144,14 @@ async def run_company_pipeline(
         except asyncio.CancelledError:
             company_logger.warning(
                 "Company pipeline cancelled for company_id=%s",
+                company.company_id,
+            )
+            raise
+
+        except CriticalMemoryPressure:
+            company_logger.error(
+                "Critical memory pressure while processing company_id=%s; "
+                "propagating to top-level for restart.",
                 company.company_id,
             )
             raise
@@ -1393,10 +1442,13 @@ async def main_async(args: argparse.Namespace) -> None:
     stall_cfg = StallGuardConfig(
         page_timeout_sec=page_timeout_ms / 1000.0,
         soft_timeout_factor=3.0,
-        hard_timeout_factor=10.0,
+        hard_timeout_factor=6.0,
         check_interval_sec=30.0,
     )
     stall_guard = StallGuard(config=stall_cfg)
+
+    # Memory guard – used to detect Crawl4AI "Requeued due to critical memory pressure"
+    memory_guard = MemoryGuard()
 
     company_tasks: Dict[str, asyncio.Task] = {}
 
@@ -1557,13 +1609,17 @@ async def main_async(args: argparse.Namespace) -> None:
         async with AsyncWebCrawler(config=browser_cfg) as crawler:
             sem = asyncio.Semaphore(max_companies)
 
-            batch_size = max_companies * 4
+            batch_size = max_companies * 2
             if batch_size < max_companies:
                 batch_size = max_companies
 
             total = len(companies)
+            abort_run = False
 
             for batch_start in range(0, total, batch_size):
+                if abort_run:
+                    break  # stop scheduling new batches after memory pressure
+
                 batch = companies[batch_start : batch_start + batch_size]
 
                 tasks: List[asyncio.Task] = []
@@ -1588,6 +1644,7 @@ async def main_async(args: argparse.Namespace) -> None:
                             presence_llm=presence_llm,
                             full_llm=full_llm,
                             stall_guard=stall_guard,
+                            memory_guard=memory_guard,
                             crawler_base_cfg=crawler_base_cfg,
                             page_policy=page_policy,
                             page_interaction_factory=page_interaction_factory,
@@ -1599,9 +1656,21 @@ async def main_async(args: argparse.Namespace) -> None:
                     tasks.append(task)
 
                 if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    # Clean up per-company task map
                     for company in batch:
                         company_tasks.pop(company.company_id, None)
+
+                    # If any company hit critical memory pressure, abort remaining batches.
+                    for r in results:
+                        if isinstance(r, CriticalMemoryPressure):
+                            logger.error(
+                                "Critical memory pressure reported by at least one company; "
+                                "aborting remaining batches so the wrapper can restart the run."
+                            )
+                            abort_run = True
+                            break
 
     finally:
         try:
@@ -1628,24 +1697,27 @@ async def main_async(args: argparse.Namespace) -> None:
     # ---------------- Post-run retry summary ----------------
     stalled_ids = set(_STALLED_COMPANIES)
     timeout_ids = set(_COMPANIES_WITH_TIMEOUT_ERRORS)
-    retry_ids = sorted(stalled_ids | timeout_ids)
+    memory_ids = set(_COMPANIES_WITH_MEMORY_PRESSURE)
+    retry_ids = sorted(stalled_ids | timeout_ids | memory_ids)
 
     if retry_ids:
         # Ensure latest state is flushed to disk.
         _maybe_flush_retry_file(force=True)
         logger.error(
-            "Detected %d companies requiring retry (stall=%d, timeout=%d). "
+            "Detected %d companies requiring retry (stall=%d, timeout=%d, memory=%d). "
             "See %s. Exiting with code %d.",
             len(retry_ids),
             len(stalled_ids),
             len(timeout_ids),
+            len(memory_ids),
             _RETRY_FILE_PATH,
             RETRY_EXIT_CODE,
         )
         raise SystemExit(RETRY_EXIT_CODE)
     else:
         logger.info(
-            "No stalled companies or page timeouts detected; exiting with code 0."
+            "No stalled companies, page timeouts, or memory-pressure companies detected; "
+            "exiting with code 0."
         )
 
 
