@@ -1719,6 +1719,38 @@ async def main_async(args: argparse.Namespace) -> None:
 
         abort_run = False
 
+        # Configure host-level limits for MemoryGuard and provide a global
+        # callback to cancel all running company tasks if we hit the hard limit.
+        memory_guard.config.host_soft_limit = float(
+            os.environ.get("HOST_MEM_SOFT_LIMIT", "0.88")
+        )
+        memory_guard.config.host_hard_limit = float(
+            os.environ.get("HOST_MEM_HARD_LIMIT", "0.94")
+        )
+        memory_guard.config.check_interval_sec = float(
+            os.environ.get("HOST_MEM_CHECK_INTERVAL", "1.0")
+        )
+
+        def _on_critical_memory(company_id: str) -> None:
+            nonlocal abort_run
+            abort_run = True
+            logger.error(
+                "Host memory hard limit reached; cancelling all running company "
+                "tasks (triggered by company_id=%s).",
+                company_id,
+            )
+            for cid, task in list(company_tasks.items()):
+                if not task.done():
+                    logger.error(
+                        "MemoryGuard: cancelling company task company_id=%s",
+                        cid,
+                    )
+                    # Mark every in-flight company as needing a memory retry
+                    mark_company_memory_pressure(cid)
+                    task.cancel()
+
+        memory_guard.config.on_critical = _on_critical_memory
+
         async def _global_stall_watchdog() -> None:
             nonlocal abort_run
             try:
