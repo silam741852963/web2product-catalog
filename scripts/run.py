@@ -1518,8 +1518,8 @@ async def main_async(args: argparse.Namespace) -> None:
     # Stall guard
     stall_cfg = StallGuardConfig(
         page_timeout_sec=page_timeout_ms / 1000.0,
-        soft_timeout_factor=3.0,
-        hard_timeout_factor=6.0,
+        soft_timeout_factor=1.5,
+        hard_timeout_factor=3.0,
         check_interval_sec=30.0,
     )
     stall_guard = StallGuard(config=stall_cfg)
@@ -1757,7 +1757,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 idle = await wait_for_global_hard_stall(
                     stall_guard,
                     page_timeout_sec=page_timeout_ms / 1000.0,
-                    factor=float(os.environ.get("GLOBAL_STALL_FACTOR", "9")),
+                    factor=float(os.environ.get("GLOBAL_STALL_FACTOR", "4.5")),
                     check_interval_sec=stall_cfg.check_interval_sec,
                 )
             except asyncio.CancelledError:

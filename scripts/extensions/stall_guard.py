@@ -27,9 +27,9 @@ class StallGuardConfig:
     """
 
     page_timeout_sec: float = 60.0
-    soft_timeout_factor: float = 2.0
-    hard_timeout_factor: float = 5.0
-    check_interval_sec: float = 15.0
+    soft_timeout_factor: float = 1.5
+    hard_timeout_factor: float = 3.0
+    check_interval_sec: float = 30.0
 
     @property
     def soft_timeout_sec(self) -> float:
@@ -429,7 +429,7 @@ async def wait_for_global_hard_stall(
     stall_guard: StallGuard,
     *,
     page_timeout_sec: float,
-    factor: float = 9.0,
+    factor: float = 4.5,
     check_interval_sec: float = 30.0,
 ) -> float:
     """
@@ -445,7 +445,7 @@ async def wait_for_global_hard_stall(
     """
 
     if factor <= 0:
-        factor = 9.0
+        factor = 4.5
     if check_interval_sec <= 0:
         check_interval_sec = page_timeout_sec
 
