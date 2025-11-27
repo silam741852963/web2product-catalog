@@ -65,22 +65,43 @@ $strictRetryCount = 0
 while ($true) {
     Write-Host "[retry-wrapper] iteration $iter (phase=$phase)"
 
-    # Decide RETRY_COMPANY_MODE for this iteration
+    # Decide retry mode for this iteration (passed as --retry-mode to run.py)
     $retryCompanyMode = "all"
     if ($phase -eq "primary") {
         if (Test-Path $retryFile) {
+            # In primary phase, once we have a retry file, skip those IDs
             $retryCompanyMode = "skip-retry"
         }
     }
     else {
+        # In retry phase we only work on the retry list
         $retryCompanyMode = "only-retry"
     }
 
     Write-Host "[retry-wrapper] RETRY_COMPANY_MODE=$retryCompanyMode"
-    $env:RETRY_COMPANY_MODE = $retryCompanyMode
+
+    # Check if caller already provided --retry-mode in RunArgs
+    $hasUserRetryMode = $false
+    if ($RunArgs) {
+        for ($i = 0; $i -lt $RunArgs.Length; $i++) {
+            if ($RunArgs[$i] -eq "--retry-mode") {
+                $hasUserRetryMode = $true
+                break
+            }
+        }
+    }
+
+    # Build final argument list for run.py
+    $cmdArgs = @()
+    if (-not $hasUserRetryMode) {
+        $cmdArgs += @("--retry-mode", $retryCompanyMode)
+    }
+    if ($RunArgs) {
+        $cmdArgs += $RunArgs
+    }
 
     # Run the crawler
-    & python "scripts/run.py" @RunArgs
+    & python "scripts/run.py" @cmdArgs
     $exitCode = $LASTEXITCODE
 
     # ---------------- Clean exit path ----------------
@@ -100,7 +121,7 @@ while ($true) {
             }
         }
 
-        # Match bash behavior  current_retry_count field is 0 on clean exit
+        # Match bash behavior: current_retry_count field is 0 on clean exit
         Write-RetryHistory -Iteration $iter -ExitCode $exitCode -CurrentRetryCount 0 -PrevRetryCount $prevRetryCount -Reason "clean_exit"
 
         if ($phase -eq "primary" -and $currentRetryCount -gt 0) {

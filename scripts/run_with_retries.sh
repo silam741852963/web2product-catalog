@@ -59,8 +59,20 @@ while :; do
 
   echo "[retry-wrapper] RETRY_COMPANY_MODE=${RETRY_COMPANY_MODE}"
 
-  # Run the crawler
-  RETRY_COMPANY_MODE="$RETRY_COMPANY_MODE" python3 scripts/run.py "$@"
+  # Check if caller already provided --retry-mode in "$@"
+  HAS_USER_RETRY_MODE=0
+  for arg in "$@"; do
+    if [[ "$arg" == "--retry-mode" ]]; then
+      HAS_USER_RETRY_MODE=1
+      break
+    fi
+  done
+
+  if [[ "$HAS_USER_RETRY_MODE" -eq 1 ]]; then
+    python3 scripts/run.py "$@"
+  else
+    python3 scripts/run.py --retry-mode "$RETRY_COMPANY_MODE" "$@"
+  fi
   EXIT_CODE=$?
 
   # --- Clean exit path ---------------------------------------------------

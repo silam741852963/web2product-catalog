@@ -1364,6 +1364,20 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--retry-mode",
+        type=str,
+        choices=["all", "skip-retry", "only-retry"],
+        default="all",
+        help=(
+            "How to treat existing retry_companies.json: "
+            "'all' = ignore it and consider all eligible companies; "
+            "'skip-retry' = skip companies listed in retry_companies.json; "
+            "'only-retry' = process only companies listed there."
+        ),
+    )
+
+
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -1380,14 +1394,8 @@ async def main_async(args: argparse.Namespace) -> None:
     global _RETRY_FILE_PATH
     _RETRY_FILE_PATH = out_dir / "retry_companies.json"
 
-    # Retry phase mode driven by env, for coordination with a wrapper script.
-    retry_company_mode = os.environ.get("RETRY_COMPANY_MODE", "all").strip().lower()
-    if retry_company_mode not in ("all", "skip-retry", "only-retry"):
-        logger.warning(
-            "Unknown RETRY_COMPANY_MODE=%s; falling back to 'all'",
-            retry_company_mode,
-        )
-        retry_company_mode = "all"
+    # Retry mode driven by CLI flag. Default is 'all'.
+    retry_company_mode: str = getattr(args, "retry_mode", "all")
 
     prev_retry_data: Dict[str, Any] = {}
     prev_retry_ids: set[str] = set()
