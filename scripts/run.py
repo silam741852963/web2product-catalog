@@ -1377,7 +1377,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         ),
     )
 
-
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -1591,8 +1590,7 @@ async def main_async(args: argparse.Namespace) -> None:
             companies = [Company(company_id=company_id, domain_url=url)]
 
         total = len(companies)
-
-        total_input = len(companies)
+        total_input = total
 
         # Optional filtering based on previous retry_companies.json.
         if retry_company_mode == "skip-retry" and prev_retry_ids:
@@ -1720,10 +1718,9 @@ async def main_async(args: argparse.Namespace) -> None:
         )
 
         abort_run = False
-        global_hard_stall_triggered = False
 
         async def _global_stall_watchdog() -> None:
-            nonlocal abort_run, global_hard_stall_triggered
+            nonlocal abort_run
             try:
                 idle = await wait_for_global_hard_stall(
                     stall_guard,
@@ -1734,7 +1731,6 @@ async def main_async(args: argparse.Namespace) -> None:
             except asyncio.CancelledError:
                 return
 
-            global_hard_stall_triggered = True
             abort_run = True
 
             logger.error(
@@ -1847,7 +1843,7 @@ async def main_async(args: argparse.Namespace) -> None:
                         break
 
     finally:
-        if global_stall_task is not None:
+        if "global_stall_task" in locals() and global_stall_task is not None:
             global_stall_task.cancel()
             try:
                 await global_stall_task
