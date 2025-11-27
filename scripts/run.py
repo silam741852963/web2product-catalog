@@ -1722,13 +1722,13 @@ async def main_async(args: argparse.Namespace) -> None:
         # Configure host-level limits for MemoryGuard and provide a global
         # callback to cancel all running company tasks if we hit the hard limit.
         memory_guard.config.host_soft_limit = float(
-            os.environ.get("HOST_MEM_SOFT_LIMIT", "0.88")
+            os.environ.get("HOST_MEM_SOFT_LIMIT", "0.98")
         )
         memory_guard.config.host_hard_limit = float(
-            os.environ.get("HOST_MEM_HARD_LIMIT", "0.94")
+            os.environ.get("HOST_MEM_HARD_LIMIT", "0.99")
         )
         memory_guard.config.check_interval_sec = float(
-            os.environ.get("HOST_MEM_CHECK_INTERVAL", "1.0")
+            os.environ.get("HOST_MEM_CHECK_INTERVAL", "2.0")
         )
 
         def _on_critical_memory(company_id: str) -> None:

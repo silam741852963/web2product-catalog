@@ -34,8 +34,8 @@ class MemoryGuardConfig:
     - on_critical: optional callback(company_id) when host_hard_limit is hit
     """
     marker: str = MEMORY_PRESSURE_MARKER
-    host_soft_limit: float = 0.88
-    host_hard_limit: float = 0.94
+    host_soft_limit: float = 0.98
+    host_hard_limit: float = 0.99
     check_interval_sec: float = 1.0
     on_critical: Optional[Callable[[str], None]] = None
 
