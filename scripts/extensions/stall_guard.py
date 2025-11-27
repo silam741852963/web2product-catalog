@@ -20,10 +20,10 @@ class StallGuardConfig:
     """
     Configuration for StallGuard.
 
-    Purely *time-based* stall detection at the **company level**.
+    Purely time-based stall detection at the company level.
 
     A company is considered stalled when no progress has been recorded for
-    longer than `hard_timeout_sec = page_timeout_sec * hard_timeout_factor`.
+    longer than hard_timeout_sec = page_timeout_sec * hard_timeout_factor.
     """
 
     page_timeout_sec: float = 60.0
@@ -43,7 +43,7 @@ class StallGuardConfig:
 @dataclass(slots=True)
 class StallSnapshot:
     """
-    Immutable snapshot of a *company-level* stall.
+    Immutable snapshot of a company-level stall.
     """
 
     detected_at: str
@@ -75,7 +75,7 @@ class _CompanyState:
 
 class StallGuard:
     """
-    Async stall monitor working at *company level*.
+    Async stall monitor working at company level.
 
     - Each company gets its own independent idle timer.
     - Progress is recorded via:
@@ -83,10 +83,10 @@ class StallGuard:
         * record_company_completed(company_id)
         * record_heartbeat(source, company_id=...)
     - A stall is declared for a company when the time since its last
-      progress exceeds `hard_timeout_sec`.
+      progress exceeds hard_timeout_sec.
 
-    Disk I/O is deliberately **not** handled here anymore; StallGuard only
-    keeps snapshots in memory and notifies an optional `on_stall` callback.
+    StallGuard itself does not stop the run or write to disk.
+    It only keeps snapshots in memory and optionally calls on_stall.
     """
 
     def __init__(
@@ -121,11 +121,30 @@ class StallGuard:
     # ------------------------------------------------------------------ #
 
     async def start(self) -> None:
+        """
+        Start the background monitor task.
+
+        Safe to call multiple times; subsequent calls are ignored.
+        If no running event loop is available, the guard logs and does nothing.
+        """
         if self._running:
+            self._log.debug("StallGuard.start() called but already running")
             return
-        self._running = True
+
         self._stall_event.clear()
-        self._monitor_task = asyncio.create_task(
+        self._running = True
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Called from a context without an event loop (bug in caller).
+            self._running = False
+            self._log.error(
+                "StallGuard.start() called without a running event loop; guard not started"
+            )
+            return
+
+        self._monitor_task = loop.create_task(
             self._monitor_loop(),
             name="stall-guard-monitor",
         )
@@ -139,6 +158,15 @@ class StallGuard:
         )
 
     async def stop(self) -> None:
+        """
+        Stop the background monitor task.
+
+        This is best-effort and will not raise if the task is already done
+        or if cancellation fails.
+        """
+        if not self._running and self._monitor_task is None:
+            return
+
         self._running = False
         task = self._monitor_task
         self._monitor_task = None
@@ -154,7 +182,7 @@ class StallGuard:
 
     async def wait_for_stall(self) -> StallSnapshot:
         """
-        Wait until the *first* stall is detected and return its snapshot.
+        Wait until the first stall is detected and return its snapshot.
         """
         await self._stall_event.wait()
         assert self._first_snapshot is not None
@@ -194,19 +222,23 @@ class StallGuard:
 
     def record_company_start(self, company_id: str) -> None:
         """
-        Mark the beginning of a company pipeline. This ensures that
-        timeouts can trigger even if we never manage to fetch a single page.
+        Mark the beginning of a company pipeline.
+
+        This ensures that timeouts can trigger even if we never manage to
+        fetch a single page.
         """
         st = self._companies.get(company_id)
         if st is None:
             st = _CompanyState(company_id=company_id)
             self._companies[company_id] = st
         st.active = True
+        st.stalled = False
         self._touch_progress(st, reason="company_start")
 
     def record_company_completed(self, company_id: str) -> None:
         """
         Record that a company's pipeline has completed successfully.
+
         The company will no longer be monitored for stalls.
         """
         st = self._companies.get(company_id)
@@ -225,15 +257,15 @@ class StallGuard:
         Record a generic heartbeat.
 
         - If company_id is provided, it is treated as company-level progress.
-        - If company_id is None, it's treated as a global heartbeat and does
-          *not* affect stall detection.
+        - If company_id is None, it is treated as a global heartbeat and does
+          not affect stall detection.
 
-        This lets you use StallGuard in "DB checking / resume" scripts
-        without it killing anything — just omit the company_id argument.
+        This lets you use StallGuard in scripts that only want its logging
+        without it killing anything. Just omit the company_id argument.
         """
         if company_id is None:
             self._log.debug(
-                "StallGuard global heartbeat (%s) – ignored for stall detection",
+                "StallGuard global heartbeat (%s) - ignored for stall detection",
                 source,
             )
             return
@@ -265,12 +297,18 @@ class StallGuard:
     async def _monitor_loop(self) -> None:
         try:
             while self._running:
-                await asyncio.sleep(self.config.check_interval_sec)
+                try:
+                    await asyncio.sleep(self.config.check_interval_sec)
+                except asyncio.CancelledError:
+                    # Normal shutdown path.
+                    break
+
                 try:
                     self._check_for_stalls()
                 except Exception as e:
                     self._log.exception("StallGuard monitor iteration failed: %s", e)
         except asyncio.CancelledError:
+            # Defensive double catch in case cancellation lands here directly.
             return
 
     def _check_for_stalls(self) -> None:
@@ -297,6 +335,15 @@ class StallGuard:
 
             idle = now - st.last_progress_mono
 
+            if idle < 0:
+                # Monotonic clock should not go backwards, but be defensive.
+                self._log.debug(
+                    "StallGuard check: company=%s had negative idle %.3fs, skipping",
+                    company_id,
+                    idle,
+                )
+                continue
+
             self._log.debug(
                 "StallGuard check: company=%s idle=%.1fs soft>=%.1fs hard>=%.1fs",
                 company_id,
@@ -305,7 +352,7 @@ class StallGuard:
                 hard,
             )
 
-            # PURELY TIME-BASED STALL: only condition is idle >= hard_timeout_sec
+            # Pure time-based stall: only condition is idle >= hard_timeout_sec
             if idle >= hard:
                 self._declare_company_stall(st, idle_seconds=idle)
 
@@ -333,7 +380,7 @@ class StallGuard:
             ),
         )
 
-        # Store the *first* snapshot for wait_for_stall()
+        # Store the first snapshot for wait_for_stall()
         if self._first_snapshot is None:
             self._first_snapshot = snapshot
             self._stall_event.set()
@@ -373,9 +420,77 @@ class StallGuard:
             self._log.exception("StallGuard on_stall callback failed: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# Global hard stall helper
+# ---------------------------------------------------------------------------
+
+
+async def wait_for_global_hard_stall(
+    stall_guard: StallGuard,
+    *,
+    page_timeout_sec: float,
+    factor: float = 9.0,
+    check_interval_sec: float = 30.0,
+) -> float:
+    """
+    Wait until the whole run appears globally stalled.
+
+    Definition here:
+      - StallGuard.last_progress_age() returns the minimum idle time across
+        all active companies.
+      - If that age is greater than or equal to page_timeout_sec * factor,
+        we consider the system globally stalled.
+
+    Returns the observed idle seconds at the moment of detection.
+    """
+
+    if factor <= 0:
+        factor = 9.0
+    if check_interval_sec <= 0:
+        check_interval_sec = page_timeout_sec
+
+    hard = page_timeout_sec * factor
+
+    logger.info(
+        "Global StallGuard watchdog started: page_timeout=%.1fs factor=%.1f hard>=%.1fs check_interval=%.1fs",
+        page_timeout_sec,
+        factor,
+        hard,
+        check_interval_sec,
+    )
+
+    while True:
+        await asyncio.sleep(check_interval_sec)
+        age = stall_guard.last_progress_age()
+
+        if age is None:
+            # No active companies with progress timestamps yet.
+            # This normally happens only at startup or when all companies
+            # have been completed or already stalled at the company level.
+            logger.debug(
+                "Global StallGuard: last_progress_age() is None, skipping iteration"
+            )
+            continue
+
+        logger.debug(
+            "Global StallGuard: min idle across companies = %.1fs (hard>=%.1fs)",
+            age,
+            hard,
+        )
+
+        if age >= hard:
+            logger.error(
+                "Global StallGuard: hard stall detected, min idle=%.1fs >= %.1fs",
+                age,
+                hard,
+            )
+            return age
+
+
 __all__ = [
     "StallGuardConfig",
     "StallSnapshot",
     "StallGuard",
     "StallDetectedError",
+    "wait_for_global_hard_stall",
 ]

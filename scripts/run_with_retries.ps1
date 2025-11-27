@@ -3,14 +3,14 @@ param(
     [string[]]$RunArgs
 )
 
-# Basic config
+# Basic config from env or defaults
 $retryExitCode = $env:RETRY_EXIT_CODE
 if (-not $retryExitCode) { $retryExitCode = 17 }
 
 $outDir = $env:OUT_DIR
 if (-not $outDir) { $outDir = "outputs" }
 
-# Strict mode config: only applied once all companies have been attempted at least once
+# Strict retry config
 $strictMinSuccessRate = $env:STRICT_MIN_RETRY_SUCCESS_RATE
 if (-not $strictMinSuccessRate) { $strictMinSuccessRate = 0.1 }
 
@@ -51,95 +51,178 @@ function Write-RetryHistory {
     Add-Content -Path $retryHistoryFile -Value $jsonLine
 }
 
+$retryFile = Join-Path $outDir "retry_companies.json"
+
 $prevRetryCount = 0
 $iter = 1
 
-# Strict mode state
-$strictMode = $false
+# Phase
+# - primary  focus on non retry companies, skipping known retry ids
+# - retry    focus on retry list only, with strict limits
+$phase = "primary"
 $strictRetryCount = 0
 
 while ($true) {
-    Write-Host "[retry-wrapper] iteration ${iter}: running crawler..."
-    & python scripts/run.py @RunArgs
+    Write-Host "[retry-wrapper] iteration $iter (phase=$phase)"
+
+    # Decide RETRY_COMPANY_MODE for this iteration
+    $retryCompanyMode = "all"
+    if ($phase -eq "primary") {
+        if (Test-Path $retryFile) {
+            $retryCompanyMode = "skip-retry"
+        }
+    }
+    else {
+        $retryCompanyMode = "only-retry"
+    }
+
+    Write-Host "[retry-wrapper] RETRY_COMPANY_MODE=$retryCompanyMode"
+    $env:RETRY_COMPANY_MODE = $retryCompanyMode
+
+    # Run the crawler
+    & python "scripts/run.py" @RunArgs
     $exitCode = $LASTEXITCODE
 
+    # ---------------- Clean exit path ----------------
     if ($exitCode -eq 0) {
-        Write-Host "[retry-wrapper] run finished cleanly (exit 0); stopping."
+        # No new retry ids were produced by this run.
+        # Still check if older retry file has pending companies.
+        $currentRetryCount = 0
+        if (Test-Path $retryFile) {
+            try {
+                $json = Get-Content $retryFile -Raw | ConvertFrom-Json
+                if ($null -ne $json.retry_companies) {
+                    $currentRetryCount = ($json.retry_companies | Measure-Object).Count
+                }
+            }
+            catch {
+                $currentRetryCount = 0
+            }
+        }
+
+        # Match bash behavior  current_retry_count field is 0 on clean exit
         Write-RetryHistory -Iteration $iter -ExitCode $exitCode -CurrentRetryCount 0 -PrevRetryCount $prevRetryCount -Reason "clean_exit"
+
+        if ($phase -eq "primary" -and $currentRetryCount -gt 0) {
+            Write-Host "[retry-wrapper] primary phase finished (no more non retry companies to process in this file)"
+            Write-Host "[retry-wrapper] switching to retry phase with $currentRetryCount stalled or timeout companies."
+            $phase = "retry"
+            $prevRetryCount = $currentRetryCount
+            $iter += 1
+            continue
+        }
+
+        if ($phase -eq "retry" -and $currentRetryCount -gt 0) {
+            Write-Host "[retry-wrapper] run exited with 0 but retry_companies.json still lists $currentRetryCount companies  stopping anyway."
+        }
+        else {
+            Write-Host "[retry-wrapper] run finished cleanly and no pending retry companies remain  stopping."
+        }
         break
     }
 
+    # ---------------- Non retry exit code path ----------------
     if ($exitCode -ne [int]$retryExitCode) {
-        Write-Host "[retry-wrapper] run exited with non-retry code $exitCode; stopping."
+        Write-Host "[retry-wrapper] run exited with non retry code $exitCode  stopping."
         Write-RetryHistory -Iteration $iter -ExitCode $exitCode -CurrentRetryCount -1 -PrevRetryCount $prevRetryCount -Reason "non_retry_exit"
         exit $exitCode
     }
 
-    $retryFile = Join-Path $outDir "retry_companies.json"
+    # ---------------- RETRY_EXIT_CODE path ----------------
     if (-not (Test-Path $retryFile)) {
-        Write-Host "[retry-wrapper] retry exit code but $retryFile not found; stopping."
+        Write-Host "[retry-wrapper] retry exit code but $retryFile not found  stopping."
         Write-RetryHistory -Iteration $iter -ExitCode $exitCode -CurrentRetryCount -1 -PrevRetryCount $prevRetryCount -Reason "retry_exit_missing_retry_file"
         exit 1
     }
 
-    $json = Get-Content $retryFile -Raw | ConvertFrom-Json
+    # Read fields from retry_companies.json
+    try {
+        $json = Get-Content $retryFile -Raw | ConvertFrom-Json
+    }
+    catch {
+        Write-Host "[retry-wrapper] failed to parse $retryFile  stopping."
+        Write-RetryHistory -Iteration $iter -ExitCode $exitCode -CurrentRetryCount -1 -PrevRetryCount $prevRetryCount -Reason "retry_exit_invalid_retry_file"
+        exit 1
+    }
 
     $currentRetryCount = 0
-    if ($json.retry_companies) {
+    if ($null -ne $json.retry_companies) {
         $currentRetryCount = ($json.retry_companies | Measure-Object).Count
     }
 
     $allAttemptedFlag = $false
-    if ($null -ne $json.all_attempted -and $json.all_attempted) {
-        $allAttemptedFlag = $true
+    if ($json.PSObject.Properties.Name -contains "all_attempted") {
+        if ($json.all_attempted) { $allAttemptedFlag = $true }
+    }
+
+    $totalCompanies = 0
+    if ($json.PSObject.Properties.Name -contains "total_companies") {
+        $totalCompanies = [int]$json.total_companies
+    }
+
+    $attemptedTotal = 0
+    if ($json.PSObject.Properties.Name -contains "attempted_total") {
+        $attemptedTotal = [int]$json.attempted_total
     }
 
     Write-Host "[retry-wrapper] $currentRetryCount companies need retry."
-    Write-Host "[retry-wrapper] all_attempted=$allAttemptedFlag"
+    Write-Host "[retry-wrapper] all_attempted=$allAttemptedFlag total_companies=$totalCompanies attempted_total=$attemptedTotal"
 
     $reason = "retry_exit_continue"
 
-    # Enable strict mode once all companies have been attempted at least once
-    if (-not $strictMode -and $allAttemptedFlag) {
-        $strictMode = $true
-        $strictRetryCount = 0
-        Write-Host "[retry-wrapper] all companies have been attempted at least once; enabling strict retry policy (min success rate=$strictMinSuccessRate, max strict retries=$strictMaxRetryIter)."
+    # -------------- PHASE primary --------------
+    if ($phase -eq "primary") {
+        if ($totalCompanies -eq 0) {
+            Write-Host "[retry-wrapper] primary phase run had no companies to process in this file  switching to retry phase."
+            $phase = "retry"
+        }
+        else {
+            if ($attemptedTotal -lt $totalCompanies) {
+                Write-Host "[retry-wrapper] run did not attempt all primary companies ($attemptedTotal/$totalCompanies)  staying in primary phase."
+            }
+            else {
+                Write-Host "[retry-wrapper] all primary companies for this run were attempted at least once  switching to retry phase."
+                $phase = "retry"
+            }
+        }
+
+        Write-RetryHistory -Iteration $iter -ExitCode $exitCode -CurrentRetryCount $currentRetryCount -PrevRetryCount $prevRetryCount -Reason $reason
+        $prevRetryCount = $currentRetryCount
+        $iter += 1
+        continue
     }
 
-    # In strict mode, once we have a previous retry count, require improvement
-    if ($strictMode -and $prevRetryCount -gt 0) {
+    # -------------- PHASE retry (strict) --------------
+    if ($prevRetryCount -eq 0) {
+        $prevRetryCount = $currentRetryCount
+    }
+
+    if ($prevRetryCount -gt 0) {
         $succeeded = $prevRetryCount - $currentRetryCount
         $rate = 0.0
         if ($prevRetryCount -gt 0) {
             $rate = $succeeded / [double]$prevRetryCount
         }
         $percent = "{0:P1}" -f $rate
-        Write-Host "[retry-wrapper] progress from last retry set: $succeeded / $prevRetryCount ($percent)"
+        Write-Host "[retry-wrapper] progress from last retry set  $succeeded/$prevRetryCount ($percent)"
 
         if ($currentRetryCount -eq 0) {
-            Write-Host "[retry-wrapper] no companies left to retry; stopping."
+            Write-Host "[retry-wrapper] no companies left to retry  stopping."
             $reason = "retry_exit_stop_empty"
         }
         elseif ($rate -lt [double]$strictMinSuccessRate) {
-            Write-Host "[retry-wrapper] progress below STRICT_MIN_RETRY_SUCCESS_RATE=$strictMinSuccessRate; stopping."
+            Write-Host "[retry-wrapper] progress below STRICT_MIN_RETRY_SUCCESS_RATE=$strictMinSuccessRate  stopping."
             $reason = "retry_exit_stop_progress"
         }
     }
 
-    # In strict mode, also enforce a hard cap on number of strict retries
-    if ($strictMode -and $reason -eq "retry_exit_continue") {
+    if ($reason -eq "retry_exit_continue") {
         if ($strictRetryCount -ge [int]$strictMaxRetryIter) {
-            Write-Host "[retry-wrapper] reached STRICT_MAX_RETRY_ITER=$strictMaxRetryIter; stopping."
+            Write-Host "[retry-wrapper] reached STRICT_MAX_RETRY_ITER=$strictMaxRetryIter  stopping."
             $reason = "retry_exit_stop_max_iter"
         }
     }
 
-    # Default behavior when not in strict mode:
-    # - No improvement required
-    # - No retry limit
-    # So we just loop while reason stays "retry_exit_continue".
-
-    # Log this iteration's outcome
     Write-RetryHistory -Iteration $iter -ExitCode $exitCode -CurrentRetryCount $currentRetryCount -PrevRetryCount $prevRetryCount -Reason $reason
 
     if ($reason -ne "retry_exit_continue") {
@@ -147,8 +230,6 @@ while ($true) {
     }
 
     $prevRetryCount = $currentRetryCount
-    if ($strictMode) {
-        $strictRetryCount += 1
-    }
+    $strictRetryCount += 1
     $iter += 1
 }
