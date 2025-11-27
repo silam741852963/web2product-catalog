@@ -41,34 +41,45 @@ ITER=1
 PHASE="primary"
 STRICT_RETRY_COUNT=0
 
+# Detect user supplied --retry-mode once
+USER_RETRY_MODE=0
+USER_RETRY_MODE_VALUE=""
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+  if [[ "${args[$i]}" == "--retry-mode" ]]; then
+    USER_RETRY_MODE=1
+    if (( i + 1 < ${#args[@]} )); then
+      USER_RETRY_MODE_VALUE="${args[$i+1]}"
+    fi
+    break
+  fi
+done
+if [[ "$USER_RETRY_MODE" -eq 1 ]]; then
+  echo "[retry-wrapper] user-specified --retry-mode=${USER_RETRY_MODE_VALUE} (wrapper will not override retry-mode)."
+fi
+
 while :; do
   echo "[retry-wrapper] iteration ${ITER} (phase=${PHASE})"
 
   # Decide how run.py should treat existing retry_companies.json
-  RETRY_COMPANY_MODE="all"
-  if [[ "$PHASE" == "primary" ]]; then
-    # After the first run, if we already have a retry file, skip those
-    # companies so we move forward on the rest of the dataset.
-    if [[ -f "$RETRY_FILE" ]]; then
-      RETRY_COMPANY_MODE="skip-retry"
+  if [[ "$USER_RETRY_MODE" -eq 0 ]]; then
+    RETRY_COMPANY_MODE="all"
+    if [[ "$PHASE" == "primary" ]]; then
+      # After the first run, if we already have a retry file, skip those
+      # companies so we move forward on the rest of the dataset.
+      if [[ -f "$RETRY_FILE" ]]; then
+        RETRY_COMPANY_MODE="skip-retry"
+      fi
+    else
+      # In retry phase we only work on the retry list
+      RETRY_COMPANY_MODE="only-retry"
     fi
+    echo "[retry-wrapper] RETRY_COMPANY_MODE=${RETRY_COMPANY_MODE}"
   else
-    # In retry phase we only work on the retry list
-    RETRY_COMPANY_MODE="only-retry"
+    echo "[retry-wrapper] using user-specified --retry-mode=${USER_RETRY_MODE_VALUE}"
   fi
 
-  echo "[retry-wrapper] RETRY_COMPANY_MODE=${RETRY_COMPANY_MODE}"
-
-  # Check if caller already provided --retry-mode in "$@"
-  HAS_USER_RETRY_MODE=0
-  for arg in "$@"; do
-    if [[ "$arg" == "--retry-mode" ]]; then
-      HAS_USER_RETRY_MODE=1
-      break
-    fi
-  done
-
-  if [[ "$HAS_USER_RETRY_MODE" -eq 1 ]]; then
+  if [[ "$USER_RETRY_MODE" -eq 1 ]]; then
     python3 scripts/run.py "$@"
   else
     python3 scripts/run.py --retry-mode "$RETRY_COMPANY_MODE" "$@"

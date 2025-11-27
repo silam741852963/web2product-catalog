@@ -62,38 +62,49 @@ $iter = 1
 $phase = "primary"
 $strictRetryCount = 0
 
+# Detect user supplied --retry-mode once
+$userRetryModeProvided = $false
+$userRetryModeValue = $null
+if ($RunArgs) {
+    for ($i = 0; $i -lt $RunArgs.Length; $i++) {
+        if ($RunArgs[$i] -eq "--retry-mode") {
+            $userRetryModeProvided = $true
+            if ($i + 1 -lt $RunArgs.Length) {
+                $userRetryModeValue = $RunArgs[$i + 1]
+            }
+            break
+        }
+    }
+}
+if ($userRetryModeProvided) {
+    Write-Host "[retry-wrapper] user-specified --retry-mode=$userRetryModeValue (wrapper will not override retry-mode)."
+}
+
 while ($true) {
     Write-Host "[retry-wrapper] iteration $iter (phase=$phase)"
 
-    # Decide retry mode for this iteration (passed as --retry-mode to run.py)
+    # Decide retry mode for this iteration (only if user did not force one)
     $retryCompanyMode = "all"
-    if ($phase -eq "primary") {
-        if (Test-Path $retryFile) {
-            # In primary phase, once we have a retry file, skip those IDs
-            $retryCompanyMode = "skip-retry"
-        }
-    }
-    else {
-        # In retry phase we only work on the retry list
-        $retryCompanyMode = "only-retry"
-    }
-
-    Write-Host "[retry-wrapper] RETRY_COMPANY_MODE=$retryCompanyMode"
-
-    # Check if caller already provided --retry-mode in RunArgs
-    $hasUserRetryMode = $false
-    if ($RunArgs) {
-        for ($i = 0; $i -lt $RunArgs.Length; $i++) {
-            if ($RunArgs[$i] -eq "--retry-mode") {
-                $hasUserRetryMode = $true
-                break
+    if (-not $userRetryModeProvided) {
+        if ($phase -eq "primary") {
+            if (Test-Path $retryFile) {
+                # In primary phase, once we have a retry file, skip those IDs
+                $retryCompanyMode = "skip-retry"
             }
         }
+        else {
+            # In retry phase we only work on the retry list
+            $retryCompanyMode = "only-retry"
+        }
+        Write-Host "[retry-wrapper] RETRY_COMPANY_MODE=$retryCompanyMode"
+    }
+    else {
+        Write-Host "[retry-wrapper] using user-specified --retry-mode=$userRetryModeValue"
     }
 
     # Build final argument list for run.py
     $cmdArgs = @()
-    if (-not $hasUserRetryMode) {
+    if (-not $userRetryModeProvided) {
         $cmdArgs += @("--retry-mode", $retryCompanyMode)
     }
     if ($RunArgs) {
@@ -121,7 +132,7 @@ while ($true) {
             }
         }
 
-        # Match bash behavior: current_retry_count field is 0 on clean exit
+        # current_retry_count field is 0 on clean exit
         Write-RetryHistory -Iteration $iter -ExitCode $exitCode -CurrentRetryCount 0 -PrevRetryCount $prevRetryCount -Reason "clean_exit"
 
         if ($phase -eq "primary" -and $currentRetryCount -gt 0) {
