@@ -3,12 +3,29 @@ param(
     [string[]]$RunArgs
 )
 
-# Basic config from env or defaults
+# Retry exit code: prefer RETRY_EXIT_CODE, then DEEP_CRAWL_RETRY_EXIT_CODE, then default 17
 $retryExitCode = $env:RETRY_EXIT_CODE
+if (-not $retryExitCode) { $retryExitCode = $env:DEEP_CRAWL_RETRY_EXIT_CODE }
 if (-not $retryExitCode) { $retryExitCode = 17 }
 
+# Sync both env vars so run.py and wrapper agree
+$env:RETRY_EXIT_CODE = $retryExitCode
+$env:DEEP_CRAWL_RETRY_EXIT_CODE = $retryExitCode
+
+# Derive OUT_DIR from env or --out-dir argument
 $outDir = $env:OUT_DIR
-if (-not $outDir) { $outDir = "outputs" }
+if (-not $outDir) {
+    $outDir = "outputs"
+    if ($RunArgs) {
+        for ($i = 0; $i -lt $RunArgs.Length; $i++) {
+            if ($RunArgs[$i] -eq "--out-dir" -and ($i + 1 -lt $RunArgs.Length)) {
+                $outDir = $RunArgs[$i + 1]
+                break
+            }
+        }
+    }
+}
+$env:OUT_DIR = $outDir
 
 # Strict retry config
 $strictMinSuccessRate = $env:STRICT_MIN_RETRY_SUCCESS_RATE

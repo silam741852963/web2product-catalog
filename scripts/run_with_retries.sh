@@ -1,9 +1,33 @@
 #!/usr/bin/env bash
 set -uo pipefail   # no -e because we handle non-zero exits manually
 
-# Configurable via env vars
-RETRY_EXIT_CODE="${RETRY_EXIT_CODE:-17}"
-OUT_DIR="${OUT_DIR:-outputs}"                           # must match --out-dir in run.py
+# Preserve original args
+args=("$@")
+
+# Retry exit code: prefer RETRY_EXIT_CODE, then DEEP_CRAWL_RETRY_EXIT_CODE, then default 17
+: "${RETRY_EXIT_CODE:=}"
+if [[ -z "$RETRY_EXIT_CODE" && -n "${DEEP_CRAWL_RETRY_EXIT_CODE:-}" ]]; then
+  RETRY_EXIT_CODE="${DEEP_CRAWL_RETRY_EXIT_CODE}"
+fi
+if [[ -z "$RETRY_EXIT_CODE" ]]; then
+  RETRY_EXIT_CODE=17
+fi
+export RETRY_EXIT_CODE
+export DEEP_CRAWL_RETRY_EXIT_CODE="$RETRY_EXIT_CODE"
+
+# Derive OUT_DIR from env or --out-dir argument
+if [[ -n "${OUT_DIR:-}" ]]; then
+  OUT_DIR="${OUT_DIR}"
+else
+  OUT_DIR="outputs"
+  for ((i=0; i<${#args[@]}; i++)); do
+    if [[ "${args[$i]}" == "--out-dir" && $((i+1)) -lt ${#args[@]} ]]; then
+      OUT_DIR="${args[$i+1]}"
+      break
+    fi
+  done
+fi
+export OUT_DIR
 
 # Strict mode config used in retry phase only
 STRICT_MIN_RETRY_SUCCESS_RATE="${STRICT_MIN_RETRY_SUCCESS_RATE:-0.1}"  # 10 percent
@@ -44,7 +68,6 @@ STRICT_RETRY_COUNT=0
 # Detect user supplied --retry-mode once
 USER_RETRY_MODE=0
 USER_RETRY_MODE_VALUE=""
-args=("$@")
 for ((i=0; i<${#args[@]}; i++)); do
   if [[ "${args[$i]}" == "--retry-mode" ]]; then
     USER_RETRY_MODE=1
@@ -80,9 +103,9 @@ while :; do
   fi
 
   if [[ "$USER_RETRY_MODE" -eq 1 ]]; then
-    python3 scripts/run.py "$@"
+    python3 scripts/run.py "${args[@]}"
   else
-    python3 scripts/run.py --retry-mode "$RETRY_COMPANY_MODE" "$@"
+    python3 scripts/run.py --retry-mode "$RETRY_COMPANY_MODE" "${args[@]}"
   fi
   EXIT_CODE=$?
 
