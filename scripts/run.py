@@ -559,7 +559,7 @@ async def run_full_pass_for_company(
                 {"extracted": 0, "status": "llm_full_write_error"},
             )
             if stall_guard is not None:
-                stall_guard.record_heartbeat("llm_full", company.company_id)
+                stall_guard.record_heartbeat("llm_full", company_id=company.company_id)
             continue
 
         presence_flag = 1 if payload.offerings else 0
@@ -576,7 +576,7 @@ async def run_full_pass_for_company(
         updated += 1
 
         if stall_guard is not None:
-            stall_guard.record_heartbeat("llm_full", company.company_id)
+            stall_guard.record_heartbeat("llm_full", company_id=company.company_id)
 
     logger.info(
         "LLM full: wrote product JSON for %d URLs (company_id=%s)",
@@ -935,6 +935,7 @@ async def wait_for_adaptive_slot(
 # Company pipeline runner (per-company, concurrent)
 # ---------------------------------------------------------------------------
 
+
 async def run_company_pipeline(
     company: Company,
     idx: int,
@@ -966,20 +967,20 @@ async def run_company_pipeline(
     """
     One company pipeline.
 
-    Important concurrency semantics:
+    Concurrency semantics:
 
-    - `company_concurrency` sets:
-        - the semaphore size (`sem`)
-        - the AdaptiveConcurrency max_concurrency
+    - company_concurrency sets:
+        - the semaphore size (sem)
+        - AdaptiveConcurrency max_concurrency
       so it is a hard upper bound.
 
     - We only:
-        - create per company dirs
+        - create per company dirs (via LoggingExtension and writes)
         - attach per company logging
         - start StallGuard for the company
         - write crawl_meta.json
 
-      *after* we successfully acquire an adaptive slot.
+      after we successfully acquire an adaptive slot.
     """
 
     acquired_adaptive_slot = False
@@ -989,7 +990,7 @@ async def run_company_pipeline(
     try:
         async with sem:
             # -------------------------------
-            # 1. Pre check state (cheap, no dirs)
+            # 1. Pre check state (cheap, no dirs/logs)
             # -------------------------------
             try:
                 snap = await state.get_company_snapshot(company.company_id)
@@ -1069,7 +1070,7 @@ async def run_company_pipeline(
 
             # -------------------------------
             # 2. From here on we WILL do work (crawl and/or LLM)
-            #    - acquire adaptive slot first
+            #    Acquire adaptive slot first.
             # -------------------------------
             record_company_attempt(company.company_id)
 
@@ -1240,6 +1241,7 @@ async def run_company_pipeline(
 
             await active_counter.release()
 
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1335,7 +1337,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=2048,
         help=(
             "Maximum number of companies to process concurrently. "
-            "Default: 1 (sequential)."
+            "Acts as a hard upper bound for adaptive concurrency."
         ),
     )
     parser.add_argument(
@@ -1382,6 +1384,16 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "'all' = ignore it and consider all eligible companies; "
             "'skip-retry' = skip companies listed in retry_companies.json; "
             "'only-retry' = process only companies listed there."
+        ),
+    )
+    parser.add_argument(
+        "--enable-hard-memory-guard",
+        action="store_true",
+        help=(
+            "Enable hard-stop behavior on critical host memory usage. "
+            "When enabled, MemoryGuard will cancel running company tasks and "
+            "cause the run to exit with the retry exit code when host memory "
+            "crosses the configured hard limit. Default: disabled."
         ),
     )
 
@@ -1526,7 +1538,16 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     stall_guard = StallGuard(config=stall_cfg)
 
-    memory_guard = MemoryGuard()
+    # Hard memory guard is optional now.
+    memory_guard: Optional[MemoryGuard] = None
+    if getattr(args, "enable_hard_memory_guard", False):
+        memory_guard = MemoryGuard()
+        logger.info("Hard memory guard enabled (process will abort on critical host memory).")
+    else:
+        logger.info(
+            "Hard memory guard disabled (process will not auto-stop on critical host memory; "
+            "rely on OS or container limits)."
+        )
 
     company_tasks: Dict[str, asyncio.Task] = {}
 
@@ -1539,6 +1560,8 @@ async def main_async(args: argparse.Namespace) -> None:
                 "StallGuard on_stall called without company_id in snapshot: %r",
                 snapshot,
             )
+       
+
             return
 
         mark_company_stalled(company_id)
@@ -1709,8 +1732,8 @@ async def main_async(args: argparse.Namespace) -> None:
         ac_cfg = AdaptiveConcurrencyConfig(
             max_concurrency=max_companies,
             min_concurrency=1,
-            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.40")),
-            target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.50")),
+            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.60")),
+            target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.70")),
             target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.80")),
             target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "0.90")),
             sample_interval_sec=float(os.environ.get("AC_SAMPLE_INTERVAL", "1.0")),
@@ -1736,42 +1759,44 @@ async def main_async(args: argparse.Namespace) -> None:
 
         abort_run = False
 
-        memory_guard.config.host_soft_limit = float(
-            os.environ.get("HOST_MEM_SOFT_LIMIT", "0.98")
-        )
-        memory_guard.config.host_hard_limit = float(
-            os.environ.get("HOST_MEM_HARD_LIMIT", "0.99")
-        )
-        memory_guard.config.check_interval_sec = float(
-            os.environ.get("HOST_MEM_CHECK_INTERVAL", "2.0")
-        )
-
-        def _on_critical_memory(company_id: str) -> None:
-            nonlocal abort_run
-            abort_run = True
-            logger.error(
-                "Host memory usage exceeded hard limit; cancelling all running company tasks (triggered by company_id=%s).",
-                company_id,
+        # Configure hard memory guard only if enabled.
+        if memory_guard is not None:
+            memory_guard.config.host_soft_limit = float(
+                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.98")
+            )
+            memory_guard.config.host_hard_limit = float(
+                os.environ.get("HOST_MEM_HARD_LIMIT", "0.99")
+            )
+            memory_guard.config.check_interval_sec = float(
+                os.environ.get("HOST_MEM_CHECK_INTERVAL", "2.0")
             )
 
-            if ac_controller is not None:
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = None
-                if loop is not None:
-                    loop.create_task(ac_controller.on_memory_pressure())
+            def _on_critical_memory(company_id: str) -> None:
+                nonlocal abort_run
+                abort_run = True
+                logger.error(
+                    "Host memory usage exceeded hard limit; cancelling all running company tasks (triggered by company_id=%s).",
+                    company_id,
+                )
 
-            for cid, task in list(company_tasks.items()):
-                if not task.done():
-                    logger.error(
-                        "MemoryGuard: cancelling company task company_id=%s",
-                        cid,
-                    )
-                    mark_company_memory_pressure(cid)
-                    task.cancel()
+                if ac_controller is not None:
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+                    if loop is not None:
+                        loop.create_task(ac_controller.on_memory_pressure())
 
-        memory_guard.config.on_critical = _on_critical_memory
+                for cid, task in list(company_tasks.items()):
+                    if not task.done():
+                        logger.error(
+                            "MemoryGuard: cancelling company task company_id=%s",
+                            cid,
+                        )
+                        mark_company_memory_pressure(cid)
+                        task.cancel()
+
+            memory_guard.config.on_critical = _on_critical_memory
 
         async def _global_stall_watchdog() -> None:
             nonlocal abort_run
@@ -1883,7 +1908,11 @@ async def main_async(args: argparse.Namespace) -> None:
                     company_tasks.pop(company.company_id, None)
 
                 for r in results:
-                    if isinstance(r, CriticalMemoryPressure):
+                    # Treat CriticalMemoryPressure as a global abort only when the hard guard is enabled.
+                    if (
+                        isinstance(r, CriticalMemoryPressure)
+                        and getattr(args, "enable_hard_memory_guard", False)
+                    ):
                         logger.error(
                             "Critical memory pressure reported by at least one company; aborting remaining batches so the wrapper can restart the run.",
                         )
