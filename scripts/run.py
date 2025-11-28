@@ -1709,8 +1709,8 @@ async def main_async(args: argparse.Namespace) -> None:
         ac_cfg = AdaptiveConcurrencyConfig(
             max_concurrency=max_companies,
             min_concurrency=1,
-            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.88")),
-            target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.95")),
+            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.83")),
+            target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.90")),
             target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.90")),
             target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "1.00")),
             sample_interval_sec=float(os.environ.get("AC_SAMPLE_INTERVAL", "2.0")),

@@ -55,8 +55,8 @@ class AdaptiveConcurrencyConfig:
 
     max_concurrency: int
     min_concurrency: int = 1
-    target_mem_low: float = 0.88
-    target_mem_high: float = 0.95
+    target_mem_low: float = 0.83
+    target_mem_high: float = 0.90
     target_cpu_low: float = 0.90
     target_cpu_high: float = 1.00
     sample_interval_sec: float = 2.0
