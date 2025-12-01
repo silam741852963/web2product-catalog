@@ -1744,8 +1744,8 @@ async def main_async(args: argparse.Namespace) -> None:
             min_concurrency=1,
             target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.60")),
             target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.70")),
-            target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.80")),
-            target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "0.90")),
+            target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.85")),
+            target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "0.95")),
             sample_interval_sec=float(os.environ.get("AC_SAMPLE_INTERVAL", "1.0")),
             smoothing_window_sec=float(
                 os.environ.get("AC_SMOOTHING_WINDOW_SEC", "10.0")
