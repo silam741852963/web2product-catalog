@@ -39,8 +39,8 @@ class AdaptiveConcurrencyConfig:
 
     target_cpu_low / target_cpu_high:
         CPU usage band (fraction 0..1). We only scale up when both
-        CPU and memory are below the lower band. We scale down when
-        either is above the upper band.
+        CPU and memory are below the lower band (if enabled). We
+        scale down when either enabled dimension is above the upper band.
 
     sample_interval_sec:
         How often to sample CPU/memory and recompute the limit.
@@ -51,6 +51,11 @@ class AdaptiveConcurrencyConfig:
 
     log_path:
         Optional path to a line based JSON log for debugging decisions.
+
+    use_cpu / use_mem:
+        Whether to take CPU and/or memory into account. This lets you
+        run in CPU-only mode, mem-only mode, or disable both (which
+        effectively drives concurrency toward max_concurrency).
     """
 
     max_concurrency: int
@@ -62,7 +67,8 @@ class AdaptiveConcurrencyConfig:
     sample_interval_sec: float = 2.0
     smoothing_window_sec: float = 10.0
     log_path: Optional[Path] = None
-
+    use_cpu: bool = True
+    use_mem: bool = True
 
 class AdaptiveConcurrencyController:
     """
@@ -312,24 +318,30 @@ class AdaptiveConcurrencyController:
             old_limit = self._current_limit
             new_limit = old_limit
 
+            use_cpu = self.cfg.use_cpu
+            use_mem = self.cfg.use_mem
+
             if not self._has_seen_work:
                 # Before any company has actually started work, do not scale up
                 # just because the machine is idle. Keep the limit fixed at min.
                 new_limit = self._clamp_limit(self.cfg.min_concurrency)
             else:
-                # Decrease if either CPU or memory is above the high threshold
-                if (
-                    avg_mem >= self.cfg.target_mem_high
-                    or avg_cpu >= self.cfg.target_cpu_high
-                ):
+                # Interpret disabled dimensions as:
+                #   - they never trigger "high" conditions
+                #   - they are always considered "low" for scaling up decisions
+                high_mem = use_mem and avg_mem >= self.cfg.target_mem_high
+                high_cpu = use_cpu and avg_cpu >= self.cfg.target_cpu_high
+                low_mem = (not use_mem) or avg_mem <= self.cfg.target_mem_low
+                low_cpu = (not use_cpu) or avg_cpu <= self.cfg.target_cpu_low
+
+                # Decrease if any enabled dimension is too high
+                if high_mem or high_cpu:
                     new_limit = self._clamp_limit(old_limit - 1)
-                # Increase if both CPU and memory are below the low threshold
-                elif (
-                    avg_mem <= self.cfg.target_mem_low
-                    and avg_cpu <= self.cfg.target_cpu_low
-                ):
+
+                # Increase if all enabled dimensions are comfortably low
+                elif low_mem and low_cpu:
                     new_limit = self._clamp_limit(old_limit + 1)
-                # Else leave unchanged
+
 
             self._current_limit = new_limit
             self._last_avg_cpu = avg_cpu

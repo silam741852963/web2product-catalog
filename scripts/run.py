@@ -87,8 +87,7 @@ _HTTP_LANG_MAP: Dict[str, str] = {
     "fr": "fr-FR",
 }
 
-# Special exit code to tell an outer wrapper that the run finished
-# but some companies should be retried (stalled or page timeouts).
+# Special exit code so outer wrapper knows there are companies to retry.
 RETRY_EXIT_CODE = int(os.environ.get("DEEP_CRAWL_RETRY_EXIT_CODE", "17"))
 
 _retry_tracker: Optional[RetryTracker] = None
@@ -145,21 +144,17 @@ def _companies_from_source(path: Path) -> List[Company]:
 
 
 # ---------------------------------------------------------------------------
-# URL/meta helpers (crawl_meta.json only; url_index via crawl_state)
+# crawl_meta helpers
 # ---------------------------------------------------------------------------
 
 
-def _company_metadata_dir(company_id: str) -> Path:
+def _crawl_meta_path(company_id: str) -> Path:
     dirs = ensure_company_dirs(company_id)
     meta_dir = dirs.get("metadata") or dirs.get("checkpoints")
     if meta_dir is None:
         meta_dir = Path(output_paths.OUTPUT_ROOT) / company_id / "metadata"
         meta_dir.mkdir(parents=True, exist_ok=True)
-    return meta_dir
-
-
-def _crawl_meta_path(company_id: str) -> Path:
-    return _company_metadata_dir(company_id) / "crawl_meta.json"
+    return meta_dir / "crawl_meta.json"
 
 
 def _write_crawl_meta(company: Company, snapshot: Any) -> None:
@@ -230,14 +225,13 @@ async def process_page_result(
             mark_company_memory=mark_company_memory_pressure,
         )
 
-    timeout_exceeded = False
-    if isinstance(error, str) and timeout_error_marker in error:
-        timeout_exceeded = True
+    timeout_exceeded = isinstance(error, str) and timeout_error_marker in error
+    if timeout_exceeded:
         mark_company_timeout(company.company_id)
 
-    html = _getattr(page_result, "html", None)
-    if html is None:
-        html = _getattr(page_result, "final_html", None)
+    html = _getattr(page_result, "html", None) or _getattr(
+        page_result, "final_html", None
+    )
 
     action, reason, stats = md_gating.evaluate_markdown(
         markdown or "",
@@ -278,7 +272,7 @@ async def process_page_result(
 
     gating_accept = action == "save"
     md_path: Optional[str] = None
-    md_status: Optional[str] = None
+    md_status: str
 
     if gating_accept and markdown:
         try:
@@ -298,6 +292,7 @@ async def process_page_result(
                 company.company_id,
                 e,
             )
+            md_status = "markdown_error"
     else:
         md_status = "markdown_suppressed"
 
@@ -316,14 +311,13 @@ async def process_page_result(
         "gating_action": action,
         "gating_reason": reason,
         "md_total_words": stats.get("total_words"),
+        "status": md_status,
     }
 
     if timeout_exceeded:
         entry["timeout_page_exceeded"] = True
         entry["scheduled_retry"] = True
 
-    if md_status is not None:
-        entry["status"] = md_status
     if md_path is not None:
         entry["markdown_path"] = md_path
     if html_path is not None:
@@ -368,7 +362,7 @@ async def run_presence_pass_for_company(
     index = load_url_index(company.company_id) or {}
     updated = 0
 
-    def _update_and_heartbeat(url: str, patch: Dict[str, Any], reason: str) -> None:
+    def _update(url: str, patch: Dict[str, Any], reason: str) -> None:
         nonlocal updated
         patch_full = {
             "presence": 0,
@@ -387,7 +381,7 @@ async def run_presence_pass_for_company(
         md_path = ent.get("markdown_path")
 
         if not md_path:
-            _update_and_heartbeat(url, {}, "no_markdown")
+            _update(url, {}, "no_markdown")
             continue
 
         try:
@@ -399,11 +393,11 @@ async def run_presence_pass_for_company(
                 company.company_id,
                 e,
             )
-            _update_and_heartbeat(url, {}, "markdown_read_error")
+            _update(url, {}, "markdown_read_error")
             continue
 
         if not text.strip():
-            _update_and_heartbeat(url, {}, "empty_markdown")
+            _update(url, {}, "empty_markdown")
             continue
 
         try:
@@ -420,7 +414,7 @@ async def run_presence_pass_for_company(
                 url,
                 f"presence_error:{type(e).__name__}",
             )
-            _update_and_heartbeat(url, {}, "presence_exception")
+            _update(url, {}, "presence_exception")
             continue
 
         has_offering, confidence, preview = parse_presence_result(
@@ -620,7 +614,7 @@ async def crawl_company(
         company.domain_url,
     )
 
-    _company_metadata_dir(company.company_id)
+    ensure_company_dirs(company.company_id)
 
     start_urls: List[str] = list(root_urls) if root_urls else [company.domain_url]
     pages_processed = 0
@@ -932,6 +926,69 @@ async def wait_for_adaptive_slot(
 
 
 # ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_filter_chain(
+    company: Company,
+    args: argparse.Namespace,
+    dataset_externals: List[str],
+    bm25_filter: Optional[DualBM25Filter],
+) -> FilterChain:
+    html_filter = HTMLContentFilter()
+    lang_filter = LanguageAwareURLFilter(lang_code=args.lang)
+    universal_filter = UniversalExternalFilter(
+        dataset_externals=dataset_externals,
+        name=f"UniversalExternalFilter[{company.company_id}]",
+    )
+    universal_filter.set_company_url(company.domain_url)
+
+    filters = [universal_filter, html_filter, lang_filter]
+    if bm25_filter is not None:
+        filters.append(bm25_filter)
+    return FilterChain(filters)
+
+
+def _build_deep_strategy(
+    args: argparse.Namespace,
+    filter_chain: FilterChain,
+    url_scorer: Optional[DualBM25Scorer],
+    dfs_factory: Optional[DeepCrawlStrategyFactory],
+) -> Any:
+    if args.strategy == "bestfirst":
+        return default_bestfirst_factory.create(
+            filter_chain=filter_chain,
+            url_scorer=url_scorer,
+        )
+    if args.strategy == "bfs_internal":
+        return default_bfs_internal_factory.create(
+            filter_chain=filter_chain,
+            url_scorer=None,
+        )
+    assert dfs_factory is not None
+    return dfs_factory.create(
+        filter_chain=filter_chain,
+        url_scorer=None,
+    )
+
+
+def _should_skip_company(status: str, llm_mode: str) -> bool:
+    if llm_mode == "none":
+        return status in (COMPANY_STATUS_MD_DONE, COMPANY_STATUS_LLM_DONE)
+    return status == COMPANY_STATUS_LLM_DONE
+
+
+def _session_ranges(n: int, per_session: int) -> List[tuple[int, int]]:
+    if per_session <= 0:
+        return [(0, n)]
+    return [
+        (start, min(start + per_session, n))
+        for start in range(0, n, per_session)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Company pipeline runner (per-company, concurrent)
 # ---------------------------------------------------------------------------
 
@@ -959,39 +1016,18 @@ async def run_company_pipeline(
     memory_guard: Optional[MemoryGuard],
     ac_controller: AdaptiveConcurrencyController,
     active_counter: ActiveCounter,
+    dfs_factory: Optional[DeepCrawlStrategyFactory],
     crawler_base_cfg: Any = None,
     page_policy: Optional[PageInteractionPolicy] = None,
     page_interaction_factory: Optional[PageInteractionFactory] = None,
     page_timeout_ms: Optional[int] = None,
 ) -> None:
-    """
-    One company pipeline.
-
-    Concurrency semantics:
-
-    - company_concurrency sets:
-        - the semaphore size (sem)
-        - AdaptiveConcurrency max_concurrency
-      so it is a hard upper bound.
-
-    - We only:
-        - create per company dirs (via LoggingExtension and writes)
-        - attach per company logging
-        - start StallGuard for the company
-        - write crawl_meta.json
-
-      after we successfully acquire an adaptive slot.
-    """
-
     acquired_adaptive_slot = False
     completed_ok = False
     token: Optional[Any] = None
 
     try:
         async with sem:
-            # -------------------------------
-            # 1. Pre check state (cheap, no dirs/logs)
-            # -------------------------------
             try:
                 snap = await state.get_company_snapshot(company.company_id)
                 status = snap.status or COMPANY_STATUS_PENDING
@@ -1006,7 +1042,6 @@ async def run_company_pipeline(
             do_crawl = False
             resume_roots: Optional[List[str]] = None
 
-            # We buffer the state message for when the company really starts.
             state_log_tpl: Optional[str] = None
             state_log_args: tuple[Any, ...] = ()
 
@@ -1026,7 +1061,6 @@ async def run_company_pipeline(
                     )
                     state_log_args = (company.company_id, len(pending_md))
                 else:
-                    # No pending URLs for markdown, nothing to crawl.
                     state_log_tpl = (
                         "State=MARKDOWN_NOT_DONE but no pending URLs for %s; treating as no-crawl"
                     )
@@ -1036,11 +1070,9 @@ async def run_company_pipeline(
                 COMPANY_STATUS_LLM_DONE,
                 COMPANY_STATUS_LLM_NOT_DONE,
             ):
-                # No crawl, but we might still run LLM depending on llm_mode.
                 state_log_tpl = "State=%s -> skipping crawl for %s"
                 state_log_args = (status, company.company_id)
             else:
-                # Unknown status, treat as pending for behavior.
                 do_crawl = True
                 state_log_tpl = "State=%s (unknown) -> treating as PENDING for %s"
                 state_log_args = (status, company.company_id)
@@ -1051,7 +1083,6 @@ async def run_company_pipeline(
             will_run_llm_full = args.llm_mode == "full" and full_llm is not None
             will_run_llm = will_run_llm_presence or will_run_llm_full
 
-            # If neither crawl nor LLM work is needed for this run, skip early.
             if not do_crawl and not will_run_llm:
                 logger.info(
                     "Company %s has status=%s, no crawl or LLM work needed in this run -> skipping.",
@@ -1060,7 +1091,6 @@ async def run_company_pipeline(
                 )
                 return
 
-            # If there is no crawl and llm_mode=none, also skip.
             if not do_crawl and args.llm_mode == "none":
                 logger.info(
                     "Company %s: no crawl required and llm_mode=none -> skipping.",
@@ -1068,10 +1098,6 @@ async def run_company_pipeline(
                 )
                 return
 
-            # -------------------------------
-            # 2. From here on we WILL do work (crawl and/or LLM)
-            #    Acquire adaptive slot first.
-            # -------------------------------
             record_company_attempt(company.company_id)
 
             await wait_for_adaptive_slot(
@@ -1085,7 +1111,6 @@ async def run_company_pipeline(
             if stall_guard is not None:
                 stall_guard.record_company_start(company.company_id)
 
-            # Only now create per-company logs and dirs.
             token = logging_ext.set_company_context(company.company_id)
             company_logger = logging_ext.get_company_logger(company.company_id)
 
@@ -1100,54 +1125,24 @@ async def run_company_pipeline(
                 company.domain_url,
             )
 
-            # -------------------------------
-            # 3. Build filters and deep strategy
-            # -------------------------------
-            html_filter = HTMLContentFilter()
-            lang_filter = LanguageAwareURLFilter(lang_code=args.lang)
-
-            universal_filter = UniversalExternalFilter(
+            filter_chain = _build_filter_chain(
+                company=company,
+                args=args,
                 dataset_externals=dataset_externals,
-                name=f"UniversalExternalFilter[{company.company_id}]",
+                bm25_filter=bm25_filter,
             )
-            universal_filter.set_company_url(company.domain_url)
-
-            filters = [universal_filter, html_filter, lang_filter]
-            if bm25_filter is not None:
-                filters.append(bm25_filter)
-
-            filter_chain = FilterChain(filters)
 
             max_pages_per_company: Optional[int] = None
             if getattr(args, "max_pages", None) and args.max_pages > 0:
                 max_pages_per_company = args.max_pages
 
-            if args.strategy == "bestfirst":
-                deep_strategy = default_bestfirst_factory.create(
-                    filter_chain=filter_chain,
-                    url_scorer=url_scorer,
-                )
-            elif args.strategy == "bfs_internal":
-                deep_strategy = default_bfs_internal_factory.create(
-                    filter_chain=filter_chain,
-                    url_scorer=None,
-                )
-            else:
-                dfs_factory = DeepCrawlStrategyFactory(
-                    provider=DFSDeepCrawlStrategyProvider(
-                        default_max_depth=3,
-                        default_include_external=False,
-                        default_score_threshold=None,
-                    )
-                )
-                deep_strategy = dfs_factory.create(
-                    filter_chain=filter_chain,
-                    url_scorer=None,
-                )
+            deep_strategy = _build_deep_strategy(
+                args=args,
+                filter_chain=filter_chain,
+                url_scorer=url_scorer,
+                dfs_factory=dfs_factory,
+            )
 
-            # -------------------------------
-            # 4. Main work: crawl + LLM
-            # -------------------------------
             if do_crawl:
                 await guard.wait_until_healthy()
                 await crawl_company(
@@ -1210,8 +1205,6 @@ async def run_company_pipeline(
         )
 
     finally:
-        # Only companies that actually acquired a slot count as "started"
-        # and get crawl_meta, StallGuard completion, and AC release.
         if acquired_adaptive_slot:
             try:
                 snap_meta = await state.get_company_snapshot(company.company_id)
@@ -1396,6 +1389,36 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "crosses the configured hard limit. Default: disabled."
         ),
     )
+    parser.add_argument(
+        "--adaptive-disable-cpu",
+        action="store_true",
+        help=(
+            "Disable CPU-based adaptive concurrency decisions. "
+            "When set, only memory (if enabled) will influence scaling."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive-disable-mem",
+        action="store_true",
+        help=(
+            "Disable memory-based adaptive concurrency decisions. "
+            "When set, only CPU (if enabled) will influence scaling. "
+            "If both CPU and memory are disabled, concurrency will slowly "
+            "rise to --company-concurrency and stay there (fixed mode)."
+        ),
+    )
+    parser.add_argument(
+        "--companies-per-session",
+        type=int,
+        default=0,
+        help=(
+            "Optional limit on how many companies to process per browser session. "
+            "When > 0, the crawler will close and recreate the Playwright/Chromium "
+            "stack after each block of this many companies to reduce long-term "
+            "memory accumulation. Default: 0 (use a single browser session for "
+            "the whole run)."
+        ),
+    )
 
     return parser.parse_args(list(argv) if argv is not None else None)
 
@@ -1420,10 +1443,10 @@ async def main_async(args: argparse.Namespace) -> None:
     retry_company_mode: str = getattr(args, "retry_mode", "all")
 
     prev_retry_data: Dict[str, Any] = retry_tracker.load_existing()
-    prev_retry_ids: set[str] = set()
     retry_list = prev_retry_data.get("retry_companies") or []
-    if isinstance(retry_list, list):
-        prev_retry_ids = {str(x) for x in retry_list}
+    prev_retry_ids: set[str] = set(str(x) for x in retry_list) if isinstance(
+        retry_list, list
+    ) else set()
 
     if prev_retry_ids:
         logger.info(
@@ -1538,7 +1561,7 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     stall_guard = StallGuard(config=stall_cfg)
 
-    # Hard memory guard is optional now.
+    # Optional hard memory guard.
     memory_guard: Optional[MemoryGuard] = None
     if getattr(args, "enable_hard_memory_guard", False):
         memory_guard = MemoryGuard()
@@ -1560,8 +1583,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 "StallGuard on_stall called without company_id in snapshot: %r",
                 snapshot,
             )
-       
-
             return
 
         mark_company_stalled(company_id)
@@ -1594,28 +1615,26 @@ async def main_async(args: argparse.Namespace) -> None:
 
     state = get_crawl_state()
 
-    global_stall_task: Optional[asyncio.Task] = None
     ac_controller: Optional[AdaptiveConcurrencyController] = None
     active_counter: Optional[ActiveCounter] = None
+    global_stall_task: Optional[asyncio.Task] = None
 
     try:
+        # Load companies
         if args.company_file:
             companies: List[Company] = _companies_from_source(Path(args.company_file))
         else:
             url = args.url
             assert url is not None
-            company_id = args.company_id
-            if not company_id:
+            cid = args.company_id
+            if not cid:
                 parsed = urlparse(url)
-                company_id = (parsed.netloc or parsed.path or "company").replace(
-                    ":",
-                    "_",
-                )
-            companies = [Company(company_id=company_id, domain_url=url)]
+                cid = (parsed.netloc or parsed.path or "company").replace(":", "_")
+            companies = [Company(company_id=cid, domain_url=url)]
 
-        total = len(companies)
-        total_input = total
+        total_input = len(companies)
 
+        # Apply retry filter
         if retry_company_mode == "skip-retry" and prev_retry_ids:
             before = len(companies)
             companies = [c for c in companies if c.company_id not in prev_retry_ids]
@@ -1646,7 +1665,6 @@ async def main_async(args: argparse.Namespace) -> None:
             version=None,
             args_hash=None,
         )
-        await state.update_run_totals(run_id, total_companies=total)
 
         for c in companies:
             await state.upsert_company(
@@ -1660,12 +1678,14 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception:
             logger.exception("Failed to recompute global crawl state at startup")
 
+        # Pre-check statuses and skip already-completed companies.
         companies_to_run: List[Company] = []
         skipped_companies: List[Company] = []
 
         for c in companies:
             try:
                 snap = await state.get_company_snapshot(c.company_id)
+                status = getattr(snap, "status", None) or COMPANY_STATUS_PENDING
             except Exception as e:
                 logger.exception(
                     "Pre-check: failed to get snapshot for company_id=%s: %s",
@@ -1675,17 +1695,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 companies_to_run.append(c)
                 continue
 
-            status = getattr(snap, "status", None) or COMPANY_STATUS_PENDING
-
-            skip = False
-            if args.llm_mode == "none":
-                if status in (COMPANY_STATUS_MD_DONE, COMPANY_STATUS_LLM_DONE):
-                    skip = True
-            else:
-                if status == COMPANY_STATUS_LLM_DONE:
-                    skip = True
-
-            if skip:
+            if _should_skip_company(status, args.llm_mode):
                 skipped_companies.append(c)
             else:
                 companies_to_run.append(c)
@@ -1708,7 +1718,6 @@ async def main_async(args: argparse.Namespace) -> None:
         companies = companies_to_run
         total = len(companies)
         await state.update_run_totals(run_id, total_companies=total)
-
         retry_tracker.set_total_companies(total)
 
         if not companies:
@@ -1729,6 +1738,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
         max_companies = max(1, int(args.company_concurrency))
 
+        # Adaptive concurrency config
         ac_cfg = AdaptiveConcurrencyConfig(
             max_concurrency=max_companies,
             min_concurrency=1,
@@ -1745,10 +1755,23 @@ async def main_async(args: argparse.Namespace) -> None:
                 if os.environ.get("AC_LOG_PATH")
                 else None
             ),
+            use_cpu=not getattr(args, "adaptive_disable_cpu", False),
+            use_mem=not getattr(args, "adaptive_disable_mem", False),
         )
         ac_controller = AdaptiveConcurrencyController(cfg=ac_cfg)
         await ac_controller.start()
         active_counter = ActiveCounter()
+
+        # DFS factory only needed when selected.
+        dfs_factory: Optional[DeepCrawlStrategyFactory] = None
+        if args.strategy == "dfs":
+            dfs_factory = DeepCrawlStrategyFactory(
+                provider=DFSDeepCrawlStrategyProvider(
+                    default_max_depth=3,
+                    default_include_external=False,
+                    default_score_threshold=None,
+                )
+            )
 
         http_lang = _HTTP_LANG_MAP.get(args.lang, f"{args.lang}-US")
         browser_cfg = default_browser_factory.create(
@@ -1841,83 +1864,126 @@ async def main_async(args: argparse.Namespace) -> None:
                     )
                     task.cancel()
 
-        async with AsyncWebCrawler(config=browser_cfg) as crawler:
-            global_stall_task = asyncio.create_task(
-                _global_stall_watchdog(),
-                name="global-stall-watchdog",
+        # Session / browser lifecycle
+        total = len(companies)
+        companies_per_session = int(getattr(args, "companies_per_session", 0) or 0)
+        ranges = _session_ranges(total, companies_per_session)
+        session_count = len(ranges)
+
+        for session_idx, (session_start, session_end) in enumerate(ranges, start=1):
+            if abort_run:
+                logger.error(
+                    "Abort flag set (memory pressure or global stall). "
+                    "Not starting browser session %d/%d.",
+                    session_idx,
+                    session_count,
+                )
+                break
+
+            logger.info(
+                "Starting browser session %d/%d for companies[%d:%d]",
+                session_idx,
+                session_count,
+                session_start,
+                session_end,
             )
 
-            sem = asyncio.Semaphore(max_companies)
+            async with AsyncWebCrawler(config=browser_cfg) as crawler:
+                global_stall_task = asyncio.create_task(
+                    _global_stall_watchdog(),
+                    name=f"global-stall-watchdog-{session_idx}",
+                )
 
-            batch_size = max_companies * 2
-            if batch_size < max_companies:
-                batch_size = max_companies
+                sem = asyncio.Semaphore(max_companies)
+                batch_size = max(max_companies * 2, max_companies)
 
-            total = len(companies)
-
-            for batch_start in range(0, total, batch_size):
-                if abort_run:
-                    logger.error(
-                        "Abort flag set (memory pressure or global stall). Not scheduling further batches.",
-                    )
-                    break
-
-                batch = companies[batch_start : batch_start + batch_size]
-
-                tasks: List[asyncio.Task] = []
-                for offset, company in enumerate(batch, start=batch_start + 1):
-                    task = asyncio.create_task(
-                        run_company_pipeline(
-                            company=company,
-                            idx=offset,
-                            total=total,
-                            logging_ext=logging_ext,
-                            state=state,
-                            guard=guard,
-                            gating_cfg=gating_cfg,
-                            timeout_error_marker=timeout_error_marker,
-                            crawler=crawler,
-                            args=args,
-                            dataset_externals=dataset_externals,
-                            url_scorer=url_scorer,
-                            bm25_filter=bm25_filter,
-                            sem=sem,
-                            run_id=run_id,
-                            presence_llm=presence_llm,
-                            full_llm=full_llm,
-                            stall_guard=stall_guard,
-                            memory_guard=memory_guard,
-                            ac_controller=ac_controller,
-                            active_counter=active_counter,
-                            crawler_base_cfg=crawler_base_cfg,
-                            page_policy=page_policy,
-                            page_interaction_factory=page_interaction_factory,
-                            page_timeout_ms=page_timeout_ms,
-                        ),
-                        name=f"company-{company.company_id}",
-                    )
-                    company_tasks[company.company_id] = task
-                    tasks.append(task)
-
-                if not tasks:
-                    continue
-
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                for company in batch:
-                    company_tasks.pop(company.company_id, None)
-
-                for r in results:
-                    # Treat CriticalMemoryPressure as a global abort only when the hard guard is enabled.
-                    if (
-                        isinstance(r, CriticalMemoryPressure)
-                        and getattr(args, "enable_hard_memory_guard", False)
-                    ):
+                for batch_start in range(session_start, session_end, batch_size):
+                    if abort_run:
                         logger.error(
-                            "Critical memory pressure reported by at least one company; aborting remaining batches so the wrapper can restart the run.",
+                            "Abort flag set (memory pressure or global stall). "
+                            "Not scheduling further batches in session %d.",
+                            session_idx,
                         )
-                        abort_run = True
                         break
+
+                    batch = companies[
+                        batch_start : min(batch_start + batch_size, session_end)
+                    ]
+
+                    tasks: List[asyncio.Task] = []
+                    for offset, company in enumerate(batch, start=batch_start + 1):
+                        task = asyncio.create_task(
+                            run_company_pipeline(
+                                company=company,
+                                idx=offset,
+                                total=total,
+                                logging_ext=logging_ext,
+                                state=state,
+                                guard=guard,
+                                gating_cfg=gating_cfg,
+                                timeout_error_marker=timeout_error_marker,
+                                crawler=crawler,
+                                args=args,
+                                dataset_externals=dataset_externals,
+                                url_scorer=url_scorer,
+                                bm25_filter=bm25_filter,
+                                sem=sem,
+                                run_id=run_id,
+                                presence_llm=presence_llm,
+                                full_llm=full_llm,
+                                stall_guard=stall_guard,
+                                memory_guard=memory_guard,
+                                ac_controller=ac_controller,
+                                active_counter=active_counter,
+                                dfs_factory=dfs_factory,
+                                crawler_base_cfg=crawler_base_cfg,
+                                page_policy=page_policy,
+                                page_interaction_factory=page_interaction_factory,
+                                page_timeout_ms=page_timeout_ms,
+                            ),
+                            name=f"company-{company.company_id}",
+                        )
+                        company_tasks[company.company_id] = task
+                        tasks.append(task)
+
+                    if not tasks:
+                        continue
+
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for company in batch:
+                        company_tasks.pop(company.company_id, None)
+
+                    for r in results:
+                        # CriticalMemoryPressure triggers global abort only when hard guard enabled.
+                        if (
+                            isinstance(r, CriticalMemoryPressure)
+                            and getattr(args, "enable_hard_memory_guard", False)
+                        ):
+                            logger.error(
+                                "Critical memory pressure reported by at least one "
+                                "company; aborting remaining batches so the wrapper "
+                                "can restart the run.",
+                            )
+                            abort_run = True
+                            break
+
+                if global_stall_task is not None:
+                    global_stall_task.cancel()
+                    try:
+                        await global_stall_task
+                    except asyncio.CancelledError:
+                        pass
+                    global_stall_task = None
+
+            # Exiting async-with closes AsyncWebCrawler and Chromium
+            if abort_run:
+                logger.error(
+                    "Abort flag set; stopping after browser session %d/%d.",
+                    session_idx,
+                    session_count,
+                )
+                break
 
     finally:
         if global_stall_task is not None:
