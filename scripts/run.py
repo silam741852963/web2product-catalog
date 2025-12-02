@@ -640,6 +640,7 @@ async def crawl_company(
                 "cache_mode": CacheMode.BYPASS,
                 "remove_overlay_elements": True,
                 "deep_crawl_strategy": deep_strategy,
+                "stream": True,
             }
 
             if page_policy is not None and page_interaction_factory is not None:
