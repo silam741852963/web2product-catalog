@@ -1786,10 +1786,10 @@ async def main_async(args: argparse.Namespace) -> None:
         # Configure hard memory guard only if enabled.
         if memory_guard is not None:
             memory_guard.config.host_soft_limit = float(
-                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.98")
+                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.90")
             )
             memory_guard.config.host_hard_limit = float(
-                os.environ.get("HOST_MEM_HARD_LIMIT", "0.99")
+                os.environ.get("HOST_MEM_HARD_LIMIT", "0.94")
             )
             memory_guard.config.check_interval_sec = float(
                 os.environ.get("HOST_MEM_CHECK_INTERVAL", "2.0")
