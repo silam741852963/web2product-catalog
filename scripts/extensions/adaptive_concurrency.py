@@ -70,6 +70,21 @@ class AdaptiveConcurrencyConfig:
     use_cpu: bool = True
     use_mem: bool = True
 
+    # How fast we move when scaling up or down
+    scale_up_step: int = 1
+    scale_down_step: int = 1
+
+    # Minimum time between consecutive scale up or scale down decisions
+    scale_up_cooldown_sec: float = 5.0
+    scale_down_cooldown_sec: float = 0.0
+
+    # Extra safety margin before allowing new workers to start
+    # Example: if target_mem_high = 0.90 and startup_mem_headroom = 0.03,
+    # then new workers will be blocked once avg_mem >= 0.87.
+    startup_mem_headroom: float = 0.03
+    startup_cpu_headroom: float = 0.05
+
+
 class AdaptiveConcurrencyController:
     """
     Adaptive controller that adjusts an integer concurrency limit based on
@@ -78,10 +93,10 @@ class AdaptiveConcurrencyController:
     Policy (using averages over a sliding window):
 
       - If mem >= target_mem_high OR cpu >= target_cpu_high:
-          decrease limit by 1 (down to min_concurrency).
+          decrease limit (down to min_concurrency).
 
       - Else if mem <= target_mem_low AND cpu <= target_cpu_low:
-          increase limit by 1 (up to max_concurrency).
+          increase limit (up to max_concurrency).
 
       - Otherwise:
           leave limit unchanged.
@@ -110,6 +125,10 @@ class AdaptiveConcurrencyController:
         self._last_raw_cpu: float = 0.0
         self._last_raw_mem: float = 0.0
         self._last_update_ts: float = 0.0
+
+        # Track last scale up / scale down moments (monotonic time)
+        self._last_scale_up_ts: float = 0.0
+        self._last_scale_down_ts: float = 0.0
 
         # Do not scale up until at least one company has actually started work
         self._has_seen_work: bool = False
@@ -195,6 +214,9 @@ class AdaptiveConcurrencyController:
         async with self._lock:
             self._memory_pressure_hits += 1
             self._current_limit = self.cfg.min_concurrency
+            # Treat this as a recent scale down so we do not immediately
+            # climb back up.
+            self._last_scale_down_ts = time.monotonic()
             logger.warning(
                 "[AdaptiveConcurrency] memory pressure event; forcing limit=%d "
                 "(hits=%d)",
@@ -220,7 +242,7 @@ class AdaptiveConcurrencyController:
                 "last_update_ts": self._last_update_ts,
                 "psutil_available": PSUTIL_AVAILABLE,
             }
-        
+
     async def notify_work_started(self) -> None:
         """
         Mark that at least one company has actually started doing work.
@@ -234,6 +256,27 @@ class AdaptiveConcurrencyController:
                     "[AdaptiveConcurrency] first work observed; enabling scale up."
                 )
 
+    async def can_start_new_worker(self) -> bool:
+        """
+        Decide if it is safe to start one more worker right now, based on
+        the latest smoothed CPU and memory.
+
+        This does not look at the active count, only at resource headroom.
+        wait_for_adaptive_slot still enforces active_count < limit.
+        """
+        async with self._lock:
+            # If no work has started yet, always allow the first worker.
+            if not self._has_seen_work:
+                return True
+
+            mem_block = self.cfg.target_mem_high - self.cfg.startup_mem_headroom
+            cpu_block = self.cfg.target_cpu_high - self.cfg.startup_cpu_headroom
+
+            if self.cfg.use_mem and self._last_avg_mem >= mem_block:
+                return False
+            if self.cfg.use_cpu and self._last_avg_cpu >= cpu_block:
+                return False
+            return True
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -334,14 +377,34 @@ class AdaptiveConcurrencyController:
                 low_mem = (not use_mem) or avg_mem <= self.cfg.target_mem_low
                 low_cpu = (not use_cpu) or avg_cpu <= self.cfg.target_cpu_low
 
-                # Decrease if any enabled dimension is too high
+                now_mono = now
+
+                # Decrease if any enabled dimension is too high, but respect cooldown
                 if high_mem or high_cpu:
-                    new_limit = self._clamp_limit(old_limit - 1)
+                    if (
+                        self.cfg.scale_down_step > 0
+                        and now_mono - self._last_scale_down_ts
+                        >= self.cfg.scale_down_cooldown_sec
+                    ):
+                        new_limit = self._clamp_limit(
+                            old_limit - self.cfg.scale_down_step
+                        )
+                        if new_limit != old_limit:
+                            self._last_scale_down_ts = now_mono
 
-                # Increase if all enabled dimensions are comfortably low
+                # Increase if all enabled dimensions are comfortably low,
+                # and enough time has passed since last scale up.
                 elif low_mem and low_cpu:
-                    new_limit = self._clamp_limit(old_limit + 1)
-
+                    if (
+                        self.cfg.scale_up_step > 0
+                        and now_mono - self._last_scale_up_ts
+                        >= self.cfg.scale_up_cooldown_sec
+                    ):
+                        new_limit = self._clamp_limit(
+                            old_limit + self.cfg.scale_up_step
+                        )
+                        if new_limit != old_limit:
+                            self._last_scale_up_ts = now_mono
 
             self._current_limit = new_limit
             self._last_avg_cpu = avg_cpu
