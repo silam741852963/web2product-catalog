@@ -33,6 +33,11 @@ export OUT_DIR
 STRICT_MIN_RETRY_SUCCESS_RATE="${STRICT_MIN_RETRY_SUCCESS_RATE:-0.1}"  # 10 percent
 STRICT_MAX_RETRY_ITER="${STRICT_MAX_RETRY_ITER:-10}"                    # 10 strict retries
 
+# OOM auto restart config
+OOM_RESTART_LIMIT="${OOM_RESTART_LIMIT:-100}"
+OOM_RESTART_DELAY="${OOM_RESTART_DELAY:-10}"
+OOM_RESTART_COUNT=0
+
 # Persistent retry history file (JSONL)
 RETRY_HISTORY_FILE="${RETRY_HISTORY_FILE:-${OUT_DIR}/retry_history.jsonl}"
 mkdir -p "$(dirname "$RETRY_HISTORY_FILE")"
@@ -150,8 +155,28 @@ PYEOF
     break
   fi
 
-  # --- Non retry exit code path -----------------------------------------
+  # --- Non retry exit code path (handle OOM first) ----------------------
   if [[ "$EXIT_CODE" -ne "$RETRY_EXIT_CODE" ]]; then
+    # If process was killed by a signal, exit code is 128 + signal number.
+    if (( EXIT_CODE >= 128 )); then
+      SIGNAL=$((EXIT_CODE - 128))
+      if (( SIGNAL == 9 )); then
+        # Likely OOM killer or kill -9
+        if (( OOM_RESTART_COUNT < OOM_RESTART_LIMIT )); then
+          OOM_RESTART_COUNT=$((OOM_RESTART_COUNT + 1))
+          echo "[retry-wrapper] run terminated by signal 9 (likely OOM); auto restart ${OOM_RESTART_COUNT}/${OOM_RESTART_LIMIT} after ${OOM_RESTART_DELAY}s."
+          log_history "$ITER" "$EXIT_CODE" "-1" "$PREV_RETRY_COUNT" "oom_signal_restart"
+          sleep "$OOM_RESTART_DELAY"
+          ITER=$((ITER + 1))
+          continue
+        else
+          echo "[retry-wrapper] run repeatedly terminated by signal 9; reached OOM_RESTART_LIMIT=${OOM_RESTART_LIMIT}, stopping."
+          log_history "$ITER" "$EXIT_CODE" "-1" "$PREV_RETRY_COUNT" "oom_signal_stop"
+          exit "$EXIT_CODE"
+        fi
+      fi
+    fi
+
     echo "[retry-wrapper] run exited with non retry code ${EXIT_CODE}; stopping."
     log_history "$ITER" "$EXIT_CODE" "-1" "$PREV_RETRY_COUNT" "non_retry_exit"
     exit "$EXIT_CODE"
