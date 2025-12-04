@@ -1451,6 +1451,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "equivalent to unbounded scheduling)."
         ),
     )
+    parser.add_argument(
+        "--enable-session-log",
+        action="store_true",
+        help="Enable writing a session.log file with global events. Default: disabled.",
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -1496,12 +1501,15 @@ async def main_async(args: argparse.Namespace) -> None:
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
 
+
+    enable_session_log = getattr(args, "enable_session_log", False)
+
     logging_ext = LoggingExtension(
         global_level=log_level,
         per_company_level=log_level,
         max_open_company_logs=128,
-        enable_session_log=True,
-        session_log_path=out_dir / "session.log",
+        enable_session_log=enable_session_log,
+        session_log_path=(out_dir / "session.log") if enable_session_log else None,
     )
 
     logging.basicConfig(
