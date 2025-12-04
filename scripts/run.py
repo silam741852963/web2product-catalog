@@ -905,7 +905,7 @@ async def wait_for_adaptive_slot(
     company_id: str,
     ac_controller: AdaptiveConcurrencyController,
     active_counter: ActiveCounter,
-    poll_interval: float = 0.5,
+    poll_interval: float = 0.2,
 ) -> None:
     """
     Block until:
@@ -1959,69 +1959,69 @@ async def main_async(args: argparse.Namespace) -> None:
                 )
 
                 sem = asyncio.Semaphore(max_companies)
-                batch_size = max(max_companies * 2, max_companies)
 
-                for batch_start in range(session_start, session_end, batch_size):
+                # Schedule ALL companies in this session at once.
+                # Concurrency is still limited by:
+                #   - sem (max_companies)
+                #   - AdaptiveConcurrencyController + ActiveCounter
+                session_companies = companies[session_start:session_end]
+
+                tasks: List[asyncio.Task] = []
+                for offset, company in enumerate(
+                    session_companies, start=session_start + 1
+                ):
                     if abort_run:
                         logger.error(
                             "Abort flag set (memory pressure or global stall). "
-                            "Not scheduling further batches in session %d.",
+                            "Not scheduling further companies in session %d.",
                             session_idx,
                         )
                         break
 
-                    batch = companies[
-                        batch_start : min(batch_start + batch_size, session_end)
-                    ]
+                    # Let StallGuard know this company is considered active as
+                    # soon as we schedule its task. This protects against
+                    # hangs before run_company_pipeline can call record_company_start.
+                    if stall_guard is not None:
+                        stall_guard.record_company_start(company.company_id)
 
-                    tasks: List[asyncio.Task] = []
-                    for offset, company in enumerate(batch, start=batch_start + 1):
-                        # Let StallGuard know this company is considered active as
-                        # soon as we schedule its task. This protects against
-                        # hangs before run_company_pipeline can call record_company_start.
-                        if stall_guard is not None:
-                            stall_guard.record_company_start(company.company_id)
+                    task = asyncio.create_task(
+                        run_company_pipeline(
+                            company=company,
+                            idx=offset,
+                            total=total,
+                            logging_ext=logging_ext,
+                            state=state,
+                            guard=guard,
+                            gating_cfg=gating_cfg,
+                            timeout_error_marker=timeout_error_marker,
+                            crawler=crawler,
+                            args=args,
+                            dataset_externals=dataset_externals,
+                            url_scorer=url_scorer,
+                            bm25_filter=bm25_filter,
+                            sem=sem,
+                            run_id=run_id,
+                            presence_llm=presence_llm,
+                            full_llm=full_llm,
+                            stall_guard=stall_guard,
+                            memory_guard=memory_guard,
+                            ac_controller=ac_controller,
+                            active_counter=active_counter,
+                            dfs_factory=dfs_factory,
+                            crawler_base_cfg=crawler_base_cfg,
+                            page_policy=page_policy,
+                            page_interaction_factory=page_interaction_factory,
+                            page_timeout_ms=page_timeout_ms,
+                        ),
+                        name=f"company-{company.company_id}",
+                    )
+                    company_tasks[company.company_id] = task
+                    tasks.append(task)
 
-                        task = asyncio.create_task(
-                            run_company_pipeline(
-                                company=company,
-                                idx=offset,
-                                total=total,
-                                logging_ext=logging_ext,
-                                state=state,
-                                guard=guard,
-                                gating_cfg=gating_cfg,
-                                timeout_error_marker=timeout_error_marker,
-                                crawler=crawler,
-                                args=args,
-                                dataset_externals=dataset_externals,
-                                url_scorer=url_scorer,
-                                bm25_filter=bm25_filter,
-                                sem=sem,
-                                run_id=run_id,
-                                presence_llm=presence_llm,
-                                full_llm=full_llm,
-                                stall_guard=stall_guard,
-                                memory_guard=memory_guard,
-                                ac_controller=ac_controller,
-                                active_counter=active_counter,
-                                dfs_factory=dfs_factory,
-                                crawler_base_cfg=crawler_base_cfg,
-                                page_policy=page_policy,
-                                page_interaction_factory=page_interaction_factory,
-                                page_timeout_ms=page_timeout_ms,
-                            ),
-                            name=f"company-{company.company_id}",
-                        )
-                        company_tasks[company.company_id] = task
-                        tasks.append(task)
-
-                    if not tasks:
-                        continue
-
+                if tasks:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                    for company in batch:
+                    for company in session_companies:
                         company_tasks.pop(company.company_id, None)
 
                     for r in results:
@@ -2036,7 +2036,7 @@ async def main_async(args: argparse.Namespace) -> None:
                         if severity == "emergency":
                             logger.error(
                                 "Emergency memory pressure reported by one company; "
-                                "aborting remaining batches so the wrapper can restart "
+                                "aborting remaining sessions so the wrapper can restart "
                                 "the run.",
                             )
                             abort_run = True

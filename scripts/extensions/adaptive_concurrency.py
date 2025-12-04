@@ -430,6 +430,7 @@ class AdaptiveConcurrencyController:
 
             old_limit = self._current_limit
             new_limit = old_limit
+            increased = False  # track if we actually scaled up
 
             use_cpu = self.cfg.use_cpu
             use_mem = self.cfg.use_mem
@@ -475,8 +476,15 @@ class AdaptiveConcurrencyController:
                         )
                         if new_limit != old_limit:
                             self._last_scale_up_ts = now_mono
+                            increased = True
 
             self._current_limit = new_limit
+
+            # If we scaled up the limit, drop the admission cooldown so that
+            # waiting workers can start immediately.
+            if increased and new_limit > old_limit:
+                self._last_admission_ts = 0.0
+
             self._last_avg_cpu = avg_cpu
             self._last_avg_mem = avg_mem
             self._last_raw_cpu = raw_cpu
