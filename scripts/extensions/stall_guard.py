@@ -116,6 +116,10 @@ class StallGuard:
         # Snapshots for all companies stalled during this process
         self._stalled_snapshots: Dict[str, StallSnapshot] = {}
 
+        # Global progress trackers (across all companies, active or not)
+        self._last_any_progress_mono: Optional[float] = None
+        self._last_any_progress_wall: Optional[datetime] = None
+
     # ------------------------------------------------------------------ #
     # Public API: lifecycle
     # ------------------------------------------------------------------ #
@@ -209,6 +213,25 @@ class StallGuard:
             return None
         return min(ages)
 
+    def last_any_progress_age(self) -> Optional[float]:
+        """
+        Age in seconds since the last progress event on any company,
+        active or inactive. None if no progress has ever been recorded.
+        """
+        if self._last_any_progress_mono is None:
+            return None
+        age = time.monotonic() - self._last_any_progress_mono
+        if age < 0:
+            # Monotonic clock should not go backwards, but be defensive.
+            return 0.0
+        return age
+
+    def active_company_count(self) -> int:
+        """
+        Current number of companies marked as active.
+        """
+        return sum(1 for st in self._companies.values() if st.active)
+
     def stalled_companies(self) -> Dict[str, StallSnapshot]:
         """
         Return a mapping company_id -> StallSnapshot for all companies that
@@ -287,6 +310,10 @@ class StallGuard:
         st.last_progress_mono = now_mono
         st.last_progress_wall = now_wall
         st.last_event = reason
+
+        # Global progress trackers
+        self._last_any_progress_mono = now_mono
+        self._last_any_progress_wall = now_wall
 
         self._log.debug(
             "StallGuard progress heartbeat (%s): company=%s",
@@ -441,7 +468,14 @@ async def wait_for_global_hard_stall(
       - If that age is greater than or equal to page_timeout_sec * factor,
         we consider the system globally stalled.
 
-    Returns the observed idle seconds at the moment of detection.
+    In addition, this helper also detects a "zombie" condition where:
+
+      * there are active companies but no per company timestamps, or
+      * there are zero active companies but no progress anywhere for a long
+        time (browser shutdown or outer logic stuck).
+
+    In both cases it falls back to the age since the last progress on any
+    company and returns once that exceeds the same hard threshold.
     """
 
     if factor <= 0:
@@ -461,30 +495,74 @@ async def wait_for_global_hard_stall(
 
     while True:
         await asyncio.sleep(check_interval_sec)
-        age = stall_guard.last_progress_age()
 
-        if age is None:
-            # No active companies with progress timestamps yet.
-            # This normally happens only at startup or when all companies
-            # have been completed or already stalled at the company level.
+        age_active = stall_guard.last_progress_age()
+        age_any = stall_guard.last_any_progress_age()
+        active_count = stall_guard.active_company_count()
+
+        # If nothing has ever progressed, there is nothing meaningful to watch.
+        if age_active is None and age_any is None:
             logger.debug(
-                "Global StallGuard: last_progress_age() is None, skipping iteration"
+                "Global StallGuard: no progress recorded yet; skipping iteration"
             )
             continue
 
-        logger.debug(
-            "Global StallGuard: min idle across companies = %.1fs (hard>=%.1fs)",
-            age,
-            hard,
-        )
-
-        if age >= hard:
-            logger.error(
-                "Global StallGuard: hard stall detected, min idle=%.1fs >= %.1fs",
-                age,
+        # Normal global hard stall: at least one active company with a known
+        # progress timestamp and that idle time exceeds the threshold.
+        if age_active is not None:
+            logger.debug(
+                "Global StallGuard: min idle across ACTIVE companies = %.1fs (hard>=%.1fs)",
+                age_active,
                 hard,
             )
-            return age
+            if age_active >= hard:
+                logger.error(
+                    "Global StallGuard: hard stall detected, min idle (active) = %.1fs >= %.1fs",
+                    age_active,
+                    hard,
+                )
+                return age_active
+
+        # Zombie branch 1: active companies but last_progress_age() could not
+        # compute anything. Fall back to global last progress age.
+        if active_count > 0 and age_active is None and age_any is not None:
+            logger.warning(
+                "Global StallGuard: %d active companies but no per company "
+                "progress timestamps; using last_any_progress_age=%.1fs "
+                "(hard>=%.1fs) for stall detection",
+                active_count,
+                age_any,
+                hard,
+            )
+            if age_any >= hard:
+                logger.error(
+                    "Global StallGuard: zombie stall detected "
+                    "(active companies, no progress for %.1fs >= %.1fs)",
+                    age_any,
+                    hard,
+                )
+                return age_any
+
+        # Zombie branch 2: no active companies, but the watchdog is still
+        # running and there has been no progress anywhere for a long time.
+        if active_count == 0 and age_any is not None:
+            logger.debug(
+                "Global StallGuard: zero active companies, "
+                "last_any_progress_age=%.1fs (hard>=%.1fs)",
+                age_any,
+                hard,
+            )
+            if age_any >= hard:
+                logger.error(
+                    "Global StallGuard: zombie stall detected with zero active "
+                    "companies; no progress for %.1fs >= %.1fs",
+                    age_any,
+                    hard,
+                )
+                return age_any
+
+        # Otherwise we are either making progress or not yet past the
+        # threshold; keep waiting.
 
 
 __all__ = [
