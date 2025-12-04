@@ -1586,12 +1586,16 @@ async def main_async(args: argparse.Namespace) -> None:
             )
             return
 
+        # Always mark in retry tracker first
         mark_company_stalled(company_id)
 
         task = company_tasks.get(company_id)
         if task is None:
-            logger.warning(
-                "StallGuard: stall detected for company_id=%s but no active task found",
+            # Usually means the task has already finished or crashed and was
+            # removed from company_tasks. Company is already marked stalled.
+            logger.debug(
+                "StallGuard: stall detected for company_id=%s but no active "
+                "task found to cancel (likely already finished).",
                 company_id,
             )
             return
@@ -1913,6 +1917,12 @@ async def main_async(args: argparse.Namespace) -> None:
 
                     tasks: List[asyncio.Task] = []
                     for offset, company in enumerate(batch, start=batch_start + 1):
+                        # Let StallGuard know this company is considered active as
+                        # soon as we schedule its task. This protects against
+                        # hangs before run_company_pipeline can call record_company_start.
+                        if stall_guard is not None:
+                            stall_guard.record_company_start(company.company_id)
+
                         task = asyncio.create_task(
                             run_company_pipeline(
                                 company=company,

@@ -20,7 +20,7 @@ class StallGuardConfig:
     """
     Configuration for StallGuard.
 
-    Purely time-based stall detection at the company level.
+    Purely time based stall detection at the company level.
 
     A company is considered stalled when no progress has been recorded for
     longer than hard_timeout_sec = page_timeout_sec * hard_timeout_factor.
@@ -43,7 +43,7 @@ class StallGuardConfig:
 @dataclass(slots=True)
 class StallSnapshot:
     """
-    Immutable snapshot of a company-level stall.
+    Immutable snapshot of a company level stall.
     """
 
     detected_at: str
@@ -69,7 +69,7 @@ class _CompanyState:
 
 
 # ---------------------------------------------------------------------------
-# StallGuard: async company-level monitor
+# StallGuard: async company level monitor
 # ---------------------------------------------------------------------------
 
 
@@ -141,7 +141,7 @@ class StallGuard:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # Called from a context without an event loop (bug in caller).
+            # Called from a context without an event loop.
             self._running = False
             self._log.error(
                 "StallGuard.start() called without a running event loop; guard not started"
@@ -154,7 +154,7 @@ class StallGuard:
         )
 
         self._log.info(
-            "StallGuard started (company-level): page_timeout=%.1fs soft>=%.1fs hard>=%.1fs interval=%.1fs",
+            "StallGuard started (company level): page_timeout=%.1fs soft>=%.1fs hard>=%.1fs interval=%.1fs",
             self.config.page_timeout_sec,
             self.config.soft_timeout_sec,
             self.config.hard_timeout_sec,
@@ -165,7 +165,7 @@ class StallGuard:
         """
         Stop the background monitor task.
 
-        This is best-effort and will not raise if the task is already done
+        This is best effort and will not raise if the task is already done
         or if cancellation fails.
         """
         if not self._running and self._monitor_task is None:
@@ -279,12 +279,9 @@ class StallGuard:
         """
         Record a generic heartbeat.
 
-        - If company_id is provided, it is treated as company-level progress.
+        - If company_id is provided, it is treated as company level progress.
         - If company_id is None, it is treated as a global heartbeat and does
           not affect stall detection.
-
-        This lets you use StallGuard in scripts that only want its logging
-        without it killing anything. Just omit the company_id argument.
         """
         if company_id is None:
             self._log.debug(
@@ -379,7 +376,7 @@ class StallGuard:
                 hard,
             )
 
-            # Pure time-based stall: only condition is idle >= hard_timeout_sec
+            # Pure time based stall: only condition is idle >= hard_timeout_sec
             if idle >= hard:
                 self._declare_company_stall(st, idle_seconds=idle)
 
@@ -470,9 +467,9 @@ async def wait_for_global_hard_stall(
 
     In addition, this helper also detects a "zombie" condition where:
 
-      * there are active companies but no per company timestamps, or
+      * there are active companies but no per company timestamps at all, or
       * there are zero active companies but no progress anywhere for a long
-        time (browser shutdown or outer logic stuck).
+        time.
 
     In both cases it falls back to the age since the last progress on any
     company and returns once that exceeds the same hard threshold.
@@ -493,6 +490,9 @@ async def wait_for_global_hard_stall(
         check_interval_sec,
     )
 
+    # Track how long we have been waiting when there is no progress at all.
+    start_mono = time.monotonic()
+
     while True:
         await asyncio.sleep(check_interval_sec)
 
@@ -500,11 +500,35 @@ async def wait_for_global_hard_stall(
         age_any = stall_guard.last_any_progress_age()
         active_count = stall_guard.active_company_count()
 
-        # If nothing has ever progressed, there is nothing meaningful to watch.
+        # New: handle the "no progress at all yet" zombie case
         if age_active is None and age_any is None:
-            logger.debug(
-                "Global StallGuard: no progress recorded yet; skipping iteration"
-            )
+            elapsed = time.monotonic() - start_mono
+
+            if active_count > 0:
+                logger.warning(
+                    "Global StallGuard: %d active companies but no progress "
+                    "recorded yet; elapsed=%.1fs (hard>=%.1fs)",
+                    active_count,
+                    elapsed,
+                    hard,
+                )
+            else:
+                logger.debug(
+                    "Global StallGuard: no progress recorded yet; "
+                    "elapsed=%.1fs (hard>=%.1fs)",
+                    elapsed,
+                    hard,
+                )
+
+            if elapsed >= hard:
+                logger.error(
+                    "Global StallGuard: zombie stall detected before first "
+                    "heartbeat; no progress for %.1fs >= %.1fs",
+                    elapsed,
+                    hard,
+                )
+                return elapsed
+
             continue
 
         # Normal global hard stall: at least one active company with a known
@@ -524,7 +548,7 @@ async def wait_for_global_hard_stall(
                 return age_active
 
         # Zombie branch 1: active companies but last_progress_age() could not
-        # compute anything. Fall back to global last progress age.
+        # compute anything, fall back to global last progress age.
         if active_count > 0 and age_active is None and age_any is not None:
             logger.warning(
                 "Global StallGuard: %d active companies but no per company "
@@ -543,8 +567,8 @@ async def wait_for_global_hard_stall(
                 )
                 return age_any
 
-        # Zombie branch 2: no active companies, but the watchdog is still
-        # running and there has been no progress anywhere for a long time.
+        # Zombie branch 2: no active companies, but there has been no progress
+        # anywhere for a long time. This can happen if the outer logic is stuck.
         if active_count == 0 and age_any is not None:
             logger.debug(
                 "Global StallGuard: zero active companies, "
