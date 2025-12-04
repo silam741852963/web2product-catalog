@@ -901,19 +901,37 @@ class ActiveCounter:
         async with self._lock:
             return self._value
 
-
 async def wait_for_adaptive_slot(
     company_id: str,
     ac_controller: AdaptiveConcurrencyController,
     active_counter: ActiveCounter,
     poll_interval: float = 0.5,
 ) -> None:
+    """
+    Block until:
+
+      - adaptive controller says we are allowed to admit a new worker
+        based on recent CPU/RAM samples, and
+      - active_counter < current adaptive limit.
+
+    This implements:
+      - below lower threshold: admit freely (subject to limit)
+      - between lower and upper: admit slowly, one every admission_cooldown_sec
+      - above upper: stop admitting completely
+    """
     while True:
         limit = await ac_controller.get_limit()
         if limit <= 0:
             await asyncio.sleep(poll_interval)
             continue
 
+        # Check resource headroom
+        can_start = await ac_controller.can_start_new_worker()
+        if not can_start:
+            await asyncio.sleep(poll_interval)
+            continue
+
+        # Check limit vs active count
         acquired = await active_counter.try_acquire(limit)
         if acquired:
             logger.debug(
@@ -1562,14 +1580,20 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     stall_guard = StallGuard(config=stall_cfg)
 
-    # Optional hard memory guard.
+    # Optional multi level memory guard.
     memory_guard: Optional[MemoryGuard] = None
+    company_tasks: Dict[str, asyncio.Task] = {}
+
     if getattr(args, "enable_hard_memory_guard", False):
         memory_guard = MemoryGuard()
-        logger.info("Hard memory guard enabled (process will abort on critical host memory).")
+        logger.info(
+            "Memory guard enabled with soft, hard and emergency limits "
+            "(soft kills company, hard kills company and clamps concurrency, "
+            "emergency cancels everything and exits with retry code)."
+        )
     else:
         logger.info(
-            "Hard memory guard disabled (process will not auto-stop on critical host memory; "
+            "Memory guard disabled (process will not auto-stop on host memory; "
             "rely on OS or container limits)."
         )
 
@@ -1787,26 +1811,47 @@ async def main_async(args: argparse.Namespace) -> None:
 
         abort_run = False
 
-        # Configure hard memory guard only if enabled.
+        # Configure memory guard thresholds and callback if enabled.
         if memory_guard is not None:
-            memory_guard.config.host_soft_limit = float(
-                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.85")
+            cfg = memory_guard.config
+            cfg.host_soft_limit = float(
+                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.88")
             )
-            memory_guard.config.host_hard_limit = float(
+            cfg.host_hard_limit = float(
                 os.environ.get("HOST_MEM_HARD_LIMIT", "0.94")
             )
-            memory_guard.config.check_interval_sec = float(
+            cfg.host_emergency_limit = float(
+                os.environ.get("HOST_MEM_EMERGENCY_LIMIT", "0.98")
+            )
+            cfg.check_interval_sec = float(
                 os.environ.get("HOST_MEM_CHECK_INTERVAL", "0.5")
             )
 
-            def _on_critical_memory(company_id: str) -> None:
+            def _on_critical_memory(company_id: str, severity: str) -> None:
                 nonlocal abort_run
-                abort_run = True
-                logger.error(
-                    "Host memory usage exceeded hard limit; cancelling all running company tasks (triggered by company_id=%s).",
-                    company_id,
-                )
 
+                # Map severity to policy.
+                if severity == "soft":
+                    logger.warning(
+                        "MemoryGuard soft limit hit by company_id=%s; "
+                        "cancelling its task and clamping concurrency.",
+                        company_id,
+                    )
+                elif severity == "hard":
+                    logger.error(
+                        "MemoryGuard hard limit hit by company_id=%s; "
+                        "cancelling its task and tightening concurrency.",
+                        company_id,
+                    )
+                else:
+                    logger.critical(
+                        "MemoryGuard emergency limit hit by company_id=%s; "
+                        "cancelling all tasks and aborting run.",
+                        company_id,
+                    )
+                    abort_run = True
+
+                # Clamp adaptive concurrency aggressively for all severities.
                 if ac_controller is not None:
                     try:
                         loop = asyncio.get_running_loop()
@@ -1815,16 +1860,30 @@ async def main_async(args: argparse.Namespace) -> None:
                     if loop is not None:
                         loop.create_task(ac_controller.on_memory_pressure())
 
-                for cid, task in list(company_tasks.items()):
-                    if not task.done():
-                        logger.error(
-                            "MemoryGuard: cancelling company task company_id=%s",
-                            cid,
-                        )
-                        mark_company_memory_pressure(cid)
-                        task.cancel()
+                # Cancel the triggering company task.
+                task = company_tasks.get(company_id)
+                if task is not None and not task.done():
+                    logger.error(
+                        "MemoryGuard: cancelling company task company_id=%s severity=%s",
+                        company_id,
+                        severity,
+                    )
+                    mark_company_memory_pressure(company_id)
+                    task.cancel()
 
-            memory_guard.config.on_critical = _on_critical_memory
+                # On emergency, cancel all company tasks as a last resort.
+                if severity == "emergency":
+                    for cid, t in list(company_tasks.items()):
+                        if not t.done():
+                            logger.error(
+                                "MemoryGuard: emergency cancel company_id=%s",
+                                cid,
+                            )
+                            mark_company_memory_pressure(cid)
+                            t.cancel()
+
+            cfg.on_critical = _on_critical_memory
+
 
         async def _global_stall_watchdog() -> None:
             nonlocal abort_run
@@ -1966,18 +2025,31 @@ async def main_async(args: argparse.Namespace) -> None:
                         company_tasks.pop(company.company_id, None)
 
                     for r in results:
-                        # CriticalMemoryPressure triggers global abort only when hard guard enabled.
-                        if (
-                            isinstance(r, CriticalMemoryPressure)
-                            and getattr(args, "enable_hard_memory_guard", False)
-                        ):
+                        if not isinstance(r, CriticalMemoryPressure):
+                            continue
+
+                        if not getattr(args, "enable_hard_memory_guard", False):
+                            continue
+
+                        severity = getattr(r, "severity", "emergency")
+
+                        if severity == "emergency":
                             logger.error(
-                                "Critical memory pressure reported by at least one "
-                                "company; aborting remaining batches so the wrapper "
-                                "can restart the run.",
+                                "Emergency memory pressure reported by one company; "
+                                "aborting remaining batches so the wrapper can restart "
+                                "the run.",
                             )
                             abort_run = True
                             break
+                        else:
+                            # Soft or hard pressure already handled by MemoryGuard
+                            # via its on_critical callback. We keep the run alive
+                            # with reduced concurrency.
+                            logger.warning(
+                                "Non emergency memory pressure reported (severity=%s); "
+                                "run will continue with fewer workers.",
+                                severity,
+                            )
 
                 if global_stall_task is not None:
                     global_stall_task.cancel()
