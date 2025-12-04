@@ -901,6 +901,7 @@ class ActiveCounter:
         async with self._lock:
             return self._value
 
+
 async def wait_for_adaptive_slot(
     company_id: str,
     ac_controller: AdaptiveConcurrencyController,
@@ -1608,7 +1609,7 @@ async def main_async(args: argparse.Namespace) -> None:
             "rely on OS or container limits)."
         )
 
-    company_tasks: Dict[str, asyncio.Task] = {}
+    company_tasks = {}
 
     async def _handle_stall(snapshot: Any) -> None:
         company_id = getattr(snapshot, "company_id", None)
@@ -1626,8 +1627,6 @@ async def main_async(args: argparse.Namespace) -> None:
 
         task = company_tasks.get(company_id)
         if task is None:
-            # Usually means the task has already finished or crashed and was
-            # removed from company_tasks. Company is already marked stalled.
             logger.debug(
                 "StallGuard: stall detected for company_id=%s but no active "
                 "task found to cancel (likely already finished).",
@@ -1772,7 +1771,6 @@ async def main_async(args: argparse.Namespace) -> None:
             dataset_file=args.dataset_file,
         )
 
-
         bm25_components = build_dual_bm25_components()
         url_scorer: Optional[DualBM25Scorer] = bm25_components["url_scorer"]
         bm25_filter: Optional[DualBM25Filter] = bm25_components["url_filter"]
@@ -1780,8 +1778,6 @@ async def main_async(args: argparse.Namespace) -> None:
         max_companies = max(1, int(args.company_concurrency))
 
         # Sliding batch limit: how many company tasks are scheduled at once.
-        # If not set, default to max_companies so we do not build up a huge
-        # backlog of tasks just waiting on sem/adaptive slots.
         batch_size = int(getattr(args, "company_batch_size", 0) or 0)
         if batch_size <= 0:
             batch_size = max_companies
@@ -1849,7 +1845,6 @@ async def main_async(args: argparse.Namespace) -> None:
             def _on_critical_memory(company_id: str, severity: str) -> None:
                 nonlocal abort_run
 
-                # Map severity to policy.
                 if severity == "soft":
                     logger.warning(
                         "MemoryGuard soft limit hit by company_id=%s; "
@@ -1870,7 +1865,6 @@ async def main_async(args: argparse.Namespace) -> None:
                     )
                     abort_run = True
 
-                # Clamp adaptive concurrency aggressively for all severities.
                 if ac_controller is not None:
                     try:
                         loop = asyncio.get_running_loop()
@@ -1879,7 +1873,6 @@ async def main_async(args: argparse.Namespace) -> None:
                     if loop is not None:
                         loop.create_task(ac_controller.on_memory_pressure())
 
-                # Cancel the triggering company task.
                 task = company_tasks.get(company_id)
                 if task is not None and not task.done():
                     logger.error(
@@ -1890,7 +1883,6 @@ async def main_async(args: argparse.Namespace) -> None:
                     mark_company_memory_pressure(company_id)
                     task.cancel()
 
-                # On emergency, cancel all company tasks as a last resort.
                 if severity == "emergency":
                     for cid, t in list(company_tasks.items()):
                         if not t.done():
@@ -1902,7 +1894,6 @@ async def main_async(args: argparse.Namespace) -> None:
                             t.cancel()
 
             cfg.on_critical = _on_critical_memory
-
 
         async def _global_stall_watchdog() -> None:
             nonlocal abort_run
@@ -2049,7 +2040,17 @@ async def main_async(args: argparse.Namespace) -> None:
                                 company_tasks.pop(cid, None)
                                 break
 
-                        exc = t.exception()
+                        # Skip tasks that were cancelled intentionally
+                        if t.cancelled():
+                            continue
+
+                        try:
+                            exc = t.exception()
+                        except asyncio.CancelledError:
+                            # Extra safety: in some Python versions,
+                            # Task.exception() may still raise CancelledError
+                            continue
+
                         if isinstance(exc, CriticalMemoryPressure):
                             if not getattr(args, "enable_hard_memory_guard", False):
                                 continue
@@ -2077,7 +2078,6 @@ async def main_async(args: argparse.Namespace) -> None:
                         if not t.done():
                             t.cancel()
                     inflight.clear()
-
 
                 if global_stall_task is not None:
                     global_stall_task.cancel()
