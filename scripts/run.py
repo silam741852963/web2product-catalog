@@ -1438,7 +1438,18 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "the whole run)."
         ),
     )
-
+    parser.add_argument(
+        "--company-batch-size",
+        type=int,
+        default=200,
+        help=(
+            "Maximum number of company tasks to have scheduled at once. "
+            "This bounds the size of the pending task queue, while actual "
+            "parallelism is still governed by adaptive concurrency and "
+            "--company-concurrency. Default: 0 (no extra batch limit, "
+            "equivalent to unbounded scheduling)."
+        ),
+    )
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
@@ -1761,11 +1772,19 @@ async def main_async(args: argparse.Namespace) -> None:
             dataset_file=args.dataset_file,
         )
 
+
         bm25_components = build_dual_bm25_components()
         url_scorer: Optional[DualBM25Scorer] = bm25_components["url_scorer"]
         bm25_filter: Optional[DualBM25Filter] = bm25_components["url_filter"]
 
         max_companies = max(1, int(args.company_concurrency))
+
+        # Sliding batch limit: how many company tasks are scheduled at once.
+        # If not set, default to max_companies so we do not build up a huge
+        # backlog of tasks just waiting on sem/adaptive slots.
+        batch_size = int(getattr(args, "company_batch_size", 0) or 0)
+        if batch_size <= 0:
+            batch_size = max_companies
 
         # Adaptive concurrency config
         ac_cfg = AdaptiveConcurrencyConfig(
@@ -1960,96 +1979,105 @@ async def main_async(args: argparse.Namespace) -> None:
 
                 sem = asyncio.Semaphore(max_companies)
 
-                # Schedule ALL companies in this session at once.
-                # Concurrency is still limited by:
-                #   - sem (max_companies)
-                #   - AdaptiveConcurrencyController + ActiveCounter
                 session_companies = companies[session_start:session_end]
 
-                tasks: List[asyncio.Task] = []
-                for offset, company in enumerate(
-                    session_companies, start=session_start + 1
-                ):
-                    if abort_run:
-                        logger.error(
-                            "Abort flag set (memory pressure or global stall). "
-                            "Not scheduling further companies in session %d.",
-                            session_idx,
+                # Precompute global indices for nicer logging
+                indexed_session = list(
+                    enumerate(session_companies, start=session_start + 1)
+                )
+
+                # Sliding batch: at most batch_size tasks scheduled at once.
+                inflight: set[asyncio.Task] = set()
+                next_idx = 0
+
+                while (next_idx < len(indexed_session) or inflight) and not abort_run:
+                    # Top up the batch
+                    while (
+                        next_idx < len(indexed_session)
+                        and len(inflight) < batch_size
+                        and not abort_run
+                    ):
+                        offset, company = indexed_session[next_idx]
+                        next_idx += 1
+
+                        task = asyncio.create_task(
+                            run_company_pipeline(
+                                company=company,
+                                idx=offset,
+                                total=total,
+                                logging_ext=logging_ext,
+                                state=state,
+                                guard=guard,
+                                gating_cfg=gating_cfg,
+                                timeout_error_marker=timeout_error_marker,
+                                crawler=crawler,
+                                args=args,
+                                dataset_externals=dataset_externals,
+                                url_scorer=url_scorer,
+                                bm25_filter=bm25_filter,
+                                sem=sem,
+                                run_id=run_id,
+                                presence_llm=presence_llm,
+                                full_llm=full_llm,
+                                stall_guard=stall_guard,
+                                memory_guard=memory_guard,
+                                ac_controller=ac_controller,
+                                active_counter=active_counter,
+                                dfs_factory=dfs_factory,
+                                crawler_base_cfg=crawler_base_cfg,
+                                page_policy=page_policy,
+                                page_interaction_factory=page_interaction_factory,
+                                page_timeout_ms=page_timeout_ms,
+                            ),
+                            name=f"company-{company.company_id}",
                         )
+                        company_tasks[company.company_id] = task
+                        inflight.add(task)
+
+                    if not inflight:
                         break
 
-                    # Let StallGuard know this company is considered active as
-                    # soon as we schedule its task. This protects against
-                    # hangs before run_company_pipeline can call record_company_start.
-                    if stall_guard is not None:
-                        stall_guard.record_company_start(company.company_id)
-
-                    task = asyncio.create_task(
-                        run_company_pipeline(
-                            company=company,
-                            idx=offset,
-                            total=total,
-                            logging_ext=logging_ext,
-                            state=state,
-                            guard=guard,
-                            gating_cfg=gating_cfg,
-                            timeout_error_marker=timeout_error_marker,
-                            crawler=crawler,
-                            args=args,
-                            dataset_externals=dataset_externals,
-                            url_scorer=url_scorer,
-                            bm25_filter=bm25_filter,
-                            sem=sem,
-                            run_id=run_id,
-                            presence_llm=presence_llm,
-                            full_llm=full_llm,
-                            stall_guard=stall_guard,
-                            memory_guard=memory_guard,
-                            ac_controller=ac_controller,
-                            active_counter=active_counter,
-                            dfs_factory=dfs_factory,
-                            crawler_base_cfg=crawler_base_cfg,
-                            page_policy=page_policy,
-                            page_interaction_factory=page_interaction_factory,
-                            page_timeout_ms=page_timeout_ms,
-                        ),
-                        name=f"company-{company.company_id}",
+                    done, pending = await asyncio.wait(
+                        inflight, return_when=asyncio.FIRST_COMPLETED
                     )
-                    company_tasks[company.company_id] = task
-                    tasks.append(task)
+                    inflight = pending
 
-                if tasks:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for t in done:
+                        # Remove from company_tasks
+                        for cid, ct in list(company_tasks.items()):
+                            if ct is t:
+                                company_tasks.pop(cid, None)
+                                break
 
-                    for company in session_companies:
-                        company_tasks.pop(company.company_id, None)
+                        exc = t.exception()
+                        if isinstance(exc, CriticalMemoryPressure):
+                            if not getattr(args, "enable_hard_memory_guard", False):
+                                continue
 
-                    for r in results:
-                        if not isinstance(r, CriticalMemoryPressure):
-                            continue
+                            severity = getattr(exc, "severity", "emergency")
+                            if severity == "emergency":
+                                logger.error(
+                                    "Emergency memory pressure reported by one company; "
+                                    "aborting remaining sessions so the wrapper can "
+                                    "restart the run.",
+                                )
+                                abort_run = True
+                                break
+                            else:
+                                logger.warning(
+                                    "Non emergency memory pressure reported "
+                                    "(severity=%s); run will continue with fewer "
+                                    "workers.",
+                                    severity,
+                                )
 
-                        if not getattr(args, "enable_hard_memory_guard", False):
-                            continue
+                if abort_run:
+                    # Cancel any remaining inflight tasks for this session
+                    for t in inflight:
+                        if not t.done():
+                            t.cancel()
+                    inflight.clear()
 
-                        severity = getattr(r, "severity", "emergency")
-
-                        if severity == "emergency":
-                            logger.error(
-                                "Emergency memory pressure reported by one company; "
-                                "aborting remaining sessions so the wrapper can restart "
-                                "the run.",
-                            )
-                            abort_run = True
-                            break
-                        else:
-                            # Soft or hard pressure already handled by MemoryGuard
-                            # via its on_critical callback. We keep the run alive
-                            # with reduced concurrency.
-                            logger.warning(
-                                "Non emergency memory pressure reported (severity=%s); "
-                                "run will continue with fewer workers.",
-                                severity,
-                            )
 
                 if global_stall_task is not None:
                     global_stall_task.cancel()
