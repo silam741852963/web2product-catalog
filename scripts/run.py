@@ -1743,7 +1743,7 @@ async def main_async(args: argparse.Namespace) -> None:
         ac_cfg = AdaptiveConcurrencyConfig(
             max_concurrency=max_companies,
             min_concurrency=1,
-            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.70")),
+            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.65")),
             target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.80")),
             target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.90")),
             target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "1.00")),
@@ -1786,7 +1786,7 @@ async def main_async(args: argparse.Namespace) -> None:
         # Configure hard memory guard only if enabled.
         if memory_guard is not None:
             memory_guard.config.host_soft_limit = float(
-                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.80")
+                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.85")
             )
             memory_guard.config.host_hard_limit = float(
                 os.environ.get("HOST_MEM_HARD_LIMIT", "0.94")
