@@ -1429,7 +1429,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--companies-per-session",
         type=int,
-        default=0,
+        default=128,
         help=(
             "Optional limit on how many companies to process per browser session. "
             "When > 0, the crawler will close and recreate the Playwright/Chromium "
@@ -1441,7 +1441,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-batch-size",
         type=int,
-        default=200,
+        default=512,
         help=(
             "Maximum number of company tasks to have scheduled at once. "
             "This bounds the size of the pending task queue, while actual "
