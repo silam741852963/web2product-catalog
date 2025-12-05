@@ -1028,180 +1028,167 @@ async def run_company_pipeline(
     dataset_externals: List[str],
     url_scorer: Optional[DualBM25Scorer],
     bm25_filter: Optional[DualBM25Filter],
-    sem: asyncio.Semaphore,
     run_id: Optional[str],
     presence_llm: Any,
     full_llm: Any,
     stall_guard: Optional[StallGuard],
     memory_guard: Optional[MemoryGuard],
-    ac_controller: AdaptiveConcurrencyController,
-    active_counter: ActiveCounter,
     dfs_factory: Optional[DeepCrawlStrategyFactory],
     crawler_base_cfg: Any = None,
     page_policy: Optional[PageInteractionPolicy] = None,
     page_interaction_factory: Optional[PageInteractionFactory] = None,
     page_timeout_ms: Optional[int] = None,
 ) -> None:
-    acquired_adaptive_slot = False
     completed_ok = False
     token: Optional[Any] = None
 
     try:
-        async with sem:
-            try:
-                snap = await state.get_company_snapshot(company.company_id)
-                status = snap.status or COMPANY_STATUS_PENDING
-            except Exception as e:
-                logger.exception(
-                    "Pre-check: failed to get snapshot for company_id=%s: %s",
-                    company.company_id,
-                    e,
-                )
-                status = COMPANY_STATUS_PENDING
-
-            do_crawl = False
-            resume_roots: Optional[List[str]] = None
-
-            state_log_tpl: Optional[str] = None
-            state_log_args: tuple[Any, ...] = ()
-
-            if status == COMPANY_STATUS_PENDING:
-                do_crawl = True
-                state_log_tpl = "State=PENDING -> fresh crawl for %s"
-                state_log_args = (company.company_id,)
-            elif status == COMPANY_STATUS_MD_NOT_DONE:
-                pending_md = await state.get_pending_urls_for_markdown(
-                    company.company_id
-                )
-                if pending_md:
-                    do_crawl = True
-                    resume_roots = pending_md
-                    state_log_tpl = (
-                        "State=MARKDOWN_NOT_DONE -> resuming crawl for %s from %d pending URLs"
-                    )
-                    state_log_args = (company.company_id, len(pending_md))
-                else:
-                    state_log_tpl = (
-                        "State=MARKDOWN_NOT_DONE but no pending URLs for %s; treating as no-crawl"
-                    )
-                    state_log_args = (company.company_id,)
-            elif status in (
-                COMPANY_STATUS_MD_DONE,
-                COMPANY_STATUS_LLM_DONE,
-                COMPANY_STATUS_LLM_NOT_DONE,
-            ):
-                state_log_tpl = "State=%s -> skipping crawl for %s"
-                state_log_args = (status, company.company_id)
-            else:
-                do_crawl = True
-                state_log_tpl = "State=%s (unknown) -> treating as PENDING for %s"
-                state_log_args = (status, company.company_id)
-
-            will_run_llm_presence = (
-                args.llm_mode == "presence" and presence_llm is not None
-            )
-            will_run_llm_full = args.llm_mode == "full" and full_llm is not None
-            will_run_llm = will_run_llm_presence or will_run_llm_full
-
-            if not do_crawl and not will_run_llm:
-                logger.info(
-                    "Company %s has status=%s, no crawl or LLM work needed in this run -> skipping.",
-                    company.company_id,
-                    status,
-                )
-                return
-
-            if not do_crawl and args.llm_mode == "none":
-                logger.info(
-                    "Company %s: no crawl required and llm_mode=none -> skipping.",
-                    company.company_id,
-                )
-                return
-
-            record_company_attempt(company.company_id)
-
-            await wait_for_adaptive_slot(
-                company_id=company.company_id,
-                ac_controller=ac_controller,
-                active_counter=active_counter,
-            )
-            acquired_adaptive_slot = True
-            await ac_controller.notify_work_started()
-
-            if stall_guard is not None:
-                stall_guard.record_company_start(company.company_id)
-
-            token = logging_ext.set_company_context(company.company_id)
-            company_logger = logging_ext.get_company_logger(company.company_id)
-
-            if state_log_tpl:
-                company_logger.info(state_log_tpl, *state_log_args)
-
-            company_logger.info(
-                "=== [%d/%d] Company company_id=%s url=%s ===",
-                idx,
-                total,
+        try:
+            snap = await state.get_company_snapshot(company.company_id)
+            status = snap.status or COMPANY_STATUS_PENDING
+        except Exception as e:
+            logger.exception(
+                "Pre-check: failed to get snapshot for company_id=%s: %s",
                 company.company_id,
-                company.domain_url,
+                e,
             )
+            status = COMPANY_STATUS_PENDING
 
-            filter_chain = _build_filter_chain(
+        do_crawl = False
+        resume_roots: Optional[List[str]] = None
+
+        state_log_tpl: Optional[str] = None
+        state_log_args: tuple[Any, ...] = ()
+
+        if status == COMPANY_STATUS_PENDING:
+            do_crawl = True
+            state_log_tpl = "State=PENDING -> fresh crawl for %s"
+            state_log_args = (company.company_id,)
+        elif status == COMPANY_STATUS_MD_NOT_DONE:
+            pending_md = await state.get_pending_urls_for_markdown(
+                company.company_id
+            )
+            if pending_md:
+                do_crawl = True
+                resume_roots = pending_md
+                state_log_tpl = (
+                    "State=MARKDOWN_NOT_DONE -> resuming crawl for %s from %d pending URLs"
+                )
+                state_log_args = (company.company_id, len(pending_md))
+            else:
+                state_log_tpl = (
+                    "State=MARKDOWN_NOT_DONE but no pending URLs for %s; treating as no-crawl"
+                )
+                state_log_args = (company.company_id,)
+        elif status in (
+            COMPANY_STATUS_MD_DONE,
+            COMPANY_STATUS_LLM_DONE,
+            COMPANY_STATUS_LLM_NOT_DONE,
+        ):
+            state_log_tpl = "State=%s -> skipping crawl for %s"
+            state_log_args = (status, company.company_id)
+        else:
+            do_crawl = True
+            state_log_tpl = "State=%s (unknown) -> treating as PENDING for %s"
+            state_log_args = (status, company.company_id)
+
+        will_run_llm_presence = (
+            args.llm_mode == "presence" and presence_llm is not None
+        )
+        will_run_llm_full = args.llm_mode == "full" and full_llm is not None
+        will_run_llm = will_run_llm_presence or will_run_llm_full
+
+        if not do_crawl and not will_run_llm:
+            logger.info(
+                "Company %s has status=%s, no crawl or LLM work needed in this run -> skipping.",
+                company.company_id,
+                status,
+            )
+            return
+
+        if not do_crawl and args.llm_mode == "none":
+            logger.info(
+                "Company %s: no crawl required and llm_mode=none -> skipping.",
+                company.company_id,
+            )
+            return
+
+        record_company_attempt(company.company_id)
+
+        if stall_guard is not None:
+            stall_guard.record_company_start(company.company_id)
+
+        token = logging_ext.set_company_context(company.company_id)
+        company_logger = logging_ext.get_company_logger(company.company_id)
+
+        if state_log_tpl:
+            company_logger.info(state_log_tpl, *state_log_args)
+
+        company_logger.info(
+            "=== [%d/%d] Company company_id=%s url=%s ===",
+            idx,
+            total,
+            company.company_id,
+            company.domain_url,
+        )
+
+        filter_chain = _build_filter_chain(
+            company=company,
+            args=args,
+            dataset_externals=dataset_externals,
+            bm25_filter=bm25_filter,
+        )
+
+        max_pages_per_company: Optional[int] = None
+        if getattr(args, "max_pages", None) and args.max_pages > 0:
+            max_pages_per_company = args.max_pages
+
+        deep_strategy = _build_deep_strategy(
+            args=args,
+            filter_chain=filter_chain,
+            url_scorer=url_scorer,
+            dfs_factory=dfs_factory,
+        )
+
+        if do_crawl:
+            await guard.wait_until_healthy()
+            await crawl_company(
                 company=company,
-                args=args,
-                dataset_externals=dataset_externals,
-                bm25_filter=bm25_filter,
+                crawler=crawler,
+                deep_strategy=deep_strategy,
+                guard=guard,
+                gating_cfg=gating_cfg,
+                timeout_error_marker=timeout_error_marker,
+                stall_guard=stall_guard,
+                root_urls=resume_roots,
+                crawler_base_cfg=crawler_base_cfg,
+                page_policy=page_policy,
+                page_interaction_factory=page_interaction_factory,
+                max_pages=max_pages_per_company,
+                page_timeout_ms=page_timeout_ms,
+                memory_guard=memory_guard,
             )
 
-            max_pages_per_company: Optional[int] = None
-            if getattr(args, "max_pages", None) and args.max_pages > 0:
-                max_pages_per_company = args.max_pages
-
-            deep_strategy = _build_deep_strategy(
-                args=args,
-                filter_chain=filter_chain,
-                url_scorer=url_scorer,
-                dfs_factory=dfs_factory,
+            await state.recompute_company_from_index(
+                company.company_id,
+                name=None,
+                root_url=company.domain_url,
             )
 
-            if do_crawl:
-                await guard.wait_until_healthy()
-                await crawl_company(
-                    company=company,
-                    crawler=crawler,
-                    deep_strategy=deep_strategy,
-                    guard=guard,
-                    gating_cfg=gating_cfg,
-                    timeout_error_marker=timeout_error_marker,
-                    stall_guard=stall_guard,
-                    root_urls=resume_roots,
-                    crawler_base_cfg=crawler_base_cfg,
-                    page_policy=page_policy,
-                    page_interaction_factory=page_interaction_factory,
-                    max_pages=max_pages_per_company,
-                    page_timeout_ms=page_timeout_ms,
-                    memory_guard=memory_guard,
-                )
+        if args.llm_mode == "presence" and presence_llm is not None:
+            await run_presence_pass_for_company(
+                company,
+                presence_strategy=presence_llm,
+                stall_guard=stall_guard,
+            )
+        elif args.llm_mode == "full" and full_llm is not None:
+            await run_full_pass_for_company(
+                company,
+                full_strategy=full_llm,
+                stall_guard=stall_guard,
+            )
 
-                await state.recompute_company_from_index(
-                    company.company_id,
-                    name=None,
-                    root_url=company.domain_url,
-                )
-
-            if args.llm_mode == "presence" and presence_llm is not None:
-                await run_presence_pass_for_company(
-                    company,
-                    presence_strategy=presence_llm,
-                    stall_guard=stall_guard,
-                )
-            elif args.llm_mode == "full" and full_llm is not None:
-                await run_full_pass_for_company(
-                    company,
-                    full_strategy=full_llm,
-                    stall_guard=stall_guard,
-                )
-
-            completed_ok = True
+        completed_ok = True
 
     except asyncio.CancelledError:
         logger.warning(
@@ -1225,34 +1212,31 @@ async def run_company_pipeline(
         )
 
     finally:
-        if acquired_adaptive_slot:
-            try:
-                snap_meta = await state.get_company_snapshot(company.company_id)
-                _write_crawl_meta(company, snap_meta)
-            except Exception:
-                logger.exception(
-                    "Failed to write crawl_meta for company_id=%s",
-                    company.company_id,
-                )
+        try:
+            snap_meta = await state.get_company_snapshot(company.company_id)
+            _write_crawl_meta(company, snap_meta)
+        except Exception:
+            logger.exception(
+                "Failed to write crawl_meta for company_id=%s",
+                company.company_id,
+            )
 
-            try:
-                if run_id is not None and completed_ok:
-                    await state.mark_company_completed(run_id, company.company_id)
-                    await state.recompute_global_state()
-            except Exception:
-                logger.exception(
-                    "Failed to update run/global state for company_id=%s",
-                    company.company_id,
-                )
+        try:
+            if run_id is not None and completed_ok:
+                await state.mark_company_completed(run_id, company.company_id)
+                await state.recompute_global_state()
+        except Exception:
+            logger.exception(
+                "Failed to update run/global state for company_id=%s",
+                company.company_id,
+            )
 
-            if stall_guard is not None and completed_ok:
-                stall_guard.record_company_completed(company.company_id)
+        if stall_guard is not None and completed_ok:
+            stall_guard.record_company_completed(company.company_id)
 
-            if token is not None:
-                logging_ext.reset_company_context(token)
-                logging_ext.close_company(company.company_id)
-
-            await active_counter.release()
+        if token is not None:
+            logging_ext.reset_company_context(token)
+            logging_ext.close_company(company.company_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1435,20 +1419,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "Optional limit on how many companies to process per browser session. "
             "When > 0, the crawler will close and recreate the Playwright/Chromium "
             "stack after each block of this many companies to reduce long-term "
-            "memory accumulation. Default: 0 (use a single browser session for "
-            "the whole run)."
-        ),
-    )
-    parser.add_argument(
-        "--company-batch-size",
-        type=int,
-        default=512,
-        help=(
-            "Maximum number of company tasks to have scheduled at once. "
-            "This bounds the size of the pending task queue, while actual "
-            "parallelism is still governed by adaptive concurrency and "
-            "--company-concurrency. Default: 0 (no extra batch limit, "
-            "equivalent to unbounded scheduling)."
+            "memory accumulation. Default: 128."
         ),
     )
     parser.add_argument(
@@ -1500,7 +1471,6 @@ async def main_async(args: argparse.Namespace) -> None:
     timeout_error_marker = f"Timeout {page_timeout_ms}ms exceeded."
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
-
 
     enable_session_log = getattr(args, "enable_session_log", False)
 
@@ -1617,8 +1587,6 @@ async def main_async(args: argparse.Namespace) -> None:
             "rely on OS or container limits)."
         )
 
-    company_tasks = {}
-
     async def _handle_stall(snapshot: Any) -> None:
         company_id = getattr(snapshot, "company_id", None)
         idle_seconds = getattr(snapshot, "idle_seconds", None)
@@ -1630,7 +1598,6 @@ async def main_async(args: argparse.Namespace) -> None:
             )
             return
 
-        # Always mark in retry tracker first
         mark_company_stalled(company_id)
 
         task = company_tasks.get(company_id)
@@ -1784,11 +1751,6 @@ async def main_async(args: argparse.Namespace) -> None:
         bm25_filter: Optional[DualBM25Filter] = bm25_components["url_filter"]
 
         max_companies = max(1, int(args.company_concurrency))
-
-        # Sliding batch limit: how many company tasks are scheduled at once.
-        batch_size = int(getattr(args, "company_batch_size", 0) or 0)
-        if batch_size <= 0:
-            batch_size = max_companies
 
         # Adaptive concurrency config
         ac_cfg = AdaptiveConcurrencyConfig(
@@ -1976,8 +1938,6 @@ async def main_async(args: argparse.Namespace) -> None:
                     name=f"global-stall-watchdog-{session_idx}",
                 )
 
-                sem = asyncio.Semaphore(max_companies)
-
                 session_companies = companies[session_start:session_end]
 
                 # Precompute global indices for nicer logging
@@ -1985,49 +1945,73 @@ async def main_async(args: argparse.Namespace) -> None:
                     enumerate(session_companies, start=session_start + 1)
                 )
 
-                # Sliding batch: at most batch_size tasks scheduled at once.
                 inflight: set[asyncio.Task] = set()
                 next_idx = 0
 
+                # Upper bound on how many company tasks can exist at once.
+                max_inflight = max_companies
+
                 while (next_idx < len(indexed_session) or inflight) and not abort_run:
-                    # Top up the batch
+                    # Top up inflight up to max_inflight, but only after
+                    # adaptive concurrency grants a slot for each new company.
                     while (
                         next_idx < len(indexed_session)
-                        and len(inflight) < batch_size
+                        and len(inflight) < max_inflight
                         and not abort_run
                     ):
                         offset, company = indexed_session[next_idx]
                         next_idx += 1
 
-                        task = asyncio.create_task(
-                            run_company_pipeline(
-                                company=company,
-                                idx=offset,
-                                total=total,
-                                logging_ext=logging_ext,
-                                state=state,
-                                guard=guard,
-                                gating_cfg=gating_cfg,
-                                timeout_error_marker=timeout_error_marker,
-                                crawler=crawler,
-                                args=args,
-                                dataset_externals=dataset_externals,
-                                url_scorer=url_scorer,
-                                bm25_filter=bm25_filter,
-                                sem=sem,
-                                run_id=run_id,
-                                presence_llm=presence_llm,
-                                full_llm=full_llm,
-                                stall_guard=stall_guard,
-                                memory_guard=memory_guard,
+                        if ac_controller is not None and active_counter is not None:
+                            await wait_for_adaptive_slot(
+                                company_id=company.company_id,
                                 ac_controller=ac_controller,
                                 active_counter=active_counter,
-                                dfs_factory=dfs_factory,
-                                crawler_base_cfg=crawler_base_cfg,
-                                page_policy=page_policy,
-                                page_interaction_factory=page_interaction_factory,
-                                page_timeout_ms=page_timeout_ms,
-                            ),
+                            )
+                            await ac_controller.notify_work_started()
+
+                        async def _run_and_release(
+                            company: Company = company,
+                            offset: int = offset,
+                        ) -> None:
+                            try:
+                                await run_company_pipeline(
+                                    company=company,
+                                    idx=offset,
+                                    total=total,
+                                    logging_ext=logging_ext,
+                                    state=state,
+                                    guard=guard,
+                                    gating_cfg=gating_cfg,
+                                    timeout_error_marker=timeout_error_marker,
+                                    crawler=crawler,
+                                    args=args,
+                                    dataset_externals=dataset_externals,
+                                    url_scorer=url_scorer,
+                                    bm25_filter=bm25_filter,
+                                    run_id=run_id,
+                                    presence_llm=presence_llm,
+                                    full_llm=full_llm,
+                                    stall_guard=stall_guard,
+                                    memory_guard=memory_guard,
+                                    dfs_factory=dfs_factory,
+                                    crawler_base_cfg=crawler_base_cfg,
+                                    page_policy=page_policy,
+                                    page_interaction_factory=page_interaction_factory,
+                                    page_timeout_ms=page_timeout_ms,
+                                )
+                            finally:
+                                if active_counter is not None:
+                                    try:
+                                        await active_counter.release()
+                                    except Exception:
+                                        logger.exception(
+                                            "Failed to release ActiveCounter for company_id=%s",
+                                            company.company_id,
+                                        )
+
+                        task = asyncio.create_task(
+                            _run_and_release(),
                             name=f"company-{company.company_id}",
                         )
                         company_tasks[company.company_id] = task
@@ -2048,15 +2032,12 @@ async def main_async(args: argparse.Namespace) -> None:
                                 company_tasks.pop(cid, None)
                                 break
 
-                        # Skip tasks that were cancelled intentionally
                         if t.cancelled():
                             continue
 
                         try:
                             exc = t.exception()
                         except asyncio.CancelledError:
-                            # Extra safety: in some Python versions,
-                            # Task.exception() may still raise CancelledError
                             continue
 
                         if isinstance(exc, CriticalMemoryPressure):
