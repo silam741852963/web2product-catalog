@@ -266,6 +266,25 @@ class MemoryGuard:
             severity=severity,
         )
 
+    def check_host_only(
+        self,
+        *,
+        company_id: str,
+        url: Optional[str],
+        mark_company_memory: Callable[[str], None],
+    ) -> None:
+        """
+        Check host level memory pressure only, without looking at any page error.
+
+        Use this in tight crawl loops or right after starting a browser session
+        so we can bail out before the kernel OOM killer fires.
+        """
+        self._check_host_memory(
+            company_id=company_id,
+            url=url,
+            mark_company_memory=mark_company_memory,
+        )
+
     def check_page_error(
         self,
         *,
@@ -282,7 +301,7 @@ class MemoryGuard:
           and raises CriticalMemoryPressure(severity="soft").
         """
         # First: host wide memory check (may raise CriticalMemoryPressure)
-        self._check_host_memory(
+        self.check_host_only(
             company_id=company_id,
             url=url,
             mark_company_memory=mark_company_memory,
