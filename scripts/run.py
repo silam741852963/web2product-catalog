@@ -914,86 +914,8 @@ def _build_dataset_externals(
 # Adaptive concurrency helpers
 # ---------------------------------------------------------------------------
 
-
-class ActiveCounter:
-    def __init__(self) -> None:
-        self._value: int = 0
-        self._lock = asyncio.Lock()
-
-    async def try_acquire(self, limit: int) -> bool:
-        async with self._lock:
-            if self._value < limit:
-                self._value += 1
-                return True
-            return False
-
-    async def release(self) -> None:
-        async with self._lock:
-            if self._value > 0:
-                self._value -= 0 or 1  # keep it concise but safe
-
-    async def current(self) -> int:
-        async with self._lock:
-            return self._value
-
-
-async def wait_for_adaptive_slot(
-    company_id: str,
-    ac_controller: AdaptiveConcurrencyController,
-    active_counter: ActiveCounter,
-    poll_interval: float = 0.3,
-) -> None:
-    """
-    Block until:
-
-      - adaptive controller says we are allowed to admit a new worker
-        based on recent CPU/RAM samples, and
-      - active_counter < current adaptive limit.
-
-    If the controller itself encounters an error, this function logs and
-    backs off instead of spinning endlessly.
-    """
-    while True:
-        try:
-            limit = await ac_controller.get_limit()
-        except Exception as e:
-            logger.exception(
-                "[AdaptiveConcurrency] get_limit failed for company_id=%s: %s",
-                company_id,
-                e,
-            )
-            await asyncio.sleep(poll_interval)
-            continue
-
-        if limit <= 0:
-            await asyncio.sleep(poll_interval)
-            continue
-
-        try:
-            can_start = await ac_controller.can_start_new_worker()
-        except Exception as e:
-            logger.exception(
-                "[AdaptiveConcurrency] can_start_new_worker failed for company_id=%s: %s",
-                company_id,
-                e,
-            )
-            await asyncio.sleep(poll_interval)
-            continue
-
-        if not can_start:
-            await asyncio.sleep(poll_interval)
-            continue
-
-        acquired = await active_counter.try_acquire(limit)
-        if acquired:
-            logger.debug(
-                "[AdaptiveConcurrency] company_id=%s acquired slot (limit=%d)",
-                company_id,
-                limit,
-            )
-            return
-
-        await asyncio.sleep(poll_interval)
+# ActiveCounter and wait_for_adaptive_slot have been removed.
+# Scheduling is now driven directly by the adaptive limit in the main loop.
 
 
 # ---------------------------------------------------------------------------
@@ -1679,7 +1601,6 @@ async def main_async(args: argparse.Namespace) -> None:
     state = get_crawl_state()
 
     ac_controller: Optional[AdaptiveConcurrencyController] = None
-    active_counter: Optional[ActiveCounter] = None
     global_stall_task: Optional[asyncio.Task] = None
 
     try:
@@ -1807,8 +1728,8 @@ async def main_async(args: argparse.Namespace) -> None:
             min_concurrency=1,
             target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.60")),
             target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.80")),
-            target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.90")),
-            target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "1.00")),
+            target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.80")),
+            target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "0.90")),
             sample_interval_sec=float(os.environ.get("AC_SAMPLE_INTERVAL", "0.75")),
             smoothing_window_sec=float(
                 os.environ.get("AC_SMOOTHING_WINDOW_SEC", "10.0")
@@ -1823,7 +1744,6 @@ async def main_async(args: argparse.Namespace) -> None:
         )
         ac_controller = AdaptiveConcurrencyController(cfg=ac_cfg)
         await ac_controller.start()
-        active_counter = ActiveCounter()
 
         # DFS factory only needed when selected.
         dfs_factory: Optional[DeepCrawlStrategyFactory] = None
@@ -1995,81 +1915,102 @@ async def main_async(args: argparse.Namespace) -> None:
                 inflight: set[asyncio.Task] = set()
                 next_idx = 0
 
-                max_inflight = max_companies
+                while not abort_run and (
+                    next_idx < len(indexed_session) or inflight
+                ):
+                    # Determine current adaptive limit and how many more we can start.
+                    if ac_controller is not None:
+                        try:
+                            current_limit = await ac_controller.get_limit()
+                        except Exception as e:
+                            logger.exception(
+                                "[AdaptiveConcurrency] get_limit failed: %s",
+                                e,
+                            )
+                            current_limit = max_companies
 
-                while (next_idx < len(indexed_session) or inflight) and not abort_run:
+                        if current_limit <= 0:
+                            # Temporarily no capacity: small sleep and re-check.
+                            if not inflight:
+                                await asyncio.sleep(ac_cfg.sample_interval_sec)
+                                continue
+                            effective_limit = 0
+                        else:
+                            effective_limit = max(
+                                1, min(current_limit, max_companies)
+                            )
+                    else:
+                        effective_limit = max_companies
+
+                    # Start new companies while we are under the effective limit.
                     while (
                         next_idx < len(indexed_session)
-                        and len(inflight) < max_inflight
+                        and len(inflight) < effective_limit
                         and not abort_run
                     ):
                         offset, company = indexed_session[next_idx]
                         next_idx += 1
 
-                        if ac_controller is not None and active_counter is not None:
-                            await wait_for_adaptive_slot(
-                                company_id=company.company_id,
-                                ac_controller=ac_controller,
-                                active_counter=active_counter,
-                            )
+                        if ac_controller is not None:
                             await ac_controller.notify_work_started()
 
-                        async def _run_and_release(
+                        async def _run_company(
                             company: Company = company,
                             offset: int = offset,
                         ) -> None:
-                            try:
-                                await run_company_pipeline(
-                                    company=company,
-                                    idx=offset,
-                                    total=total,
-                                    logging_ext=logging_ext,
-                                    state=state,
-                                    guard=guard,
-                                    gating_cfg=gating_cfg,
-                                    timeout_error_marker=timeout_error_marker,
-                                    crawler=crawler,
-                                    args=args,
-                                    dataset_externals=dataset_externals,
-                                    url_scorer=url_scorer,
-                                    bm25_filter=bm25_filter,
-                                    run_id=run_id,
-                                    presence_llm=presence_llm,
-                                    full_llm=full_llm,
-                                    stall_guard=stall_guard,
-                                    memory_guard=memory_guard,
-                                    dfs_factory=dfs_factory,
-                                    crawler_base_cfg=crawler_base_cfg,
-                                    page_policy=page_policy,
-                                    page_interaction_factory=page_interaction_factory,
-                                    page_timeout_ms=page_timeout_ms,
-                                )
-                            finally:
-                                if active_counter is not None:
-                                    try:
-                                        await active_counter.release()
-                                    except Exception:
-                                        logger.exception(
-                                            "Failed to release ActiveCounter for company_id=%s",
-                                            company.company_id,
-                                        )
+                            await run_company_pipeline(
+                                company=company,
+                                idx=offset,
+                                total=total,
+                                logging_ext=logging_ext,
+                                state=state,
+                                guard=guard,
+                                gating_cfg=gating_cfg,
+                                timeout_error_marker=timeout_error_marker,
+                                crawler=crawler,
+                                args=args,
+                                dataset_externals=dataset_externals,
+                                url_scorer=url_scorer,
+                                bm25_filter=bm25_filter,
+                                run_id=run_id,
+                                presence_llm=presence_llm,
+                                full_llm=full_llm,
+                                stall_guard=stall_guard,
+                                memory_guard=memory_guard,
+                                dfs_factory=dfs_factory,
+                                crawler_base_cfg=crawler_base_cfg,
+                                page_policy=page_policy,
+                                page_interaction_factory=page_interaction_factory,
+                                page_timeout_ms=page_timeout_ms,
+                            )
 
                         task = asyncio.create_task(
-                            _run_and_release(),
+                            _run_company(),
                             name=f"company-{company.company_id}",
                         )
                         company_tasks[company.company_id] = task
                         inflight.add(task)
 
-                    if not inflight:
+                    if not inflight and next_idx >= len(indexed_session):
+                        # Nothing to run and nothing in flight.
                         break
 
+                    # Wait for at least one company to finish, or wake up on timeout
+                    # to re-check the adaptive limit and potentially start more.
+                    if ac_controller is not None:
+                        timeout = ac_cfg.sample_interval_sec
+                    else:
+                        timeout = None
+
                     done, pending = await asyncio.wait(
-                        inflight, return_when=asyncio.FIRST_COMPLETED
+                        inflight,
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=timeout,
                     )
                     inflight = pending
 
                     for t in done:
+                        # Remove mapping entry if this was a company task.
                         for cid, ct in list(company_tasks.items()):
                             if ct is t:
                                 company_tasks.pop(cid, None)
@@ -2084,7 +2025,9 @@ async def main_async(args: argparse.Namespace) -> None:
                             continue
 
                         if isinstance(exc, CriticalMemoryPressure):
-                            if not getattr(args, "enable_hard_memory_guard", False):
+                            if not getattr(
+                                args, "enable_hard_memory_guard", False
+                            ):
                                 continue
 
                             severity = getattr(exc, "severity", "emergency")
