@@ -178,6 +178,7 @@ def _write_crawl_meta(company: Company, snapshot: Any) -> None:
         try:
             f.flush()
         except Exception:
+            # Not fatal; OS will flush on close.
             pass
     tmp.replace(path)
 
@@ -906,7 +907,7 @@ async def wait_for_adaptive_slot(
     company_id: str,
     ac_controller: AdaptiveConcurrencyController,
     active_counter: ActiveCounter,
-    poll_interval: float = 0.2,
+    poll_interval: float = 0.3,
 ) -> None:
     """
     Block until:
@@ -915,24 +916,40 @@ async def wait_for_adaptive_slot(
         based on recent CPU/RAM samples, and
       - active_counter < current adaptive limit.
 
-    This implements:
-      - below lower threshold: admit freely (subject to limit)
-      - between lower and upper: admit slowly, one every admission_cooldown_sec
-      - above upper: stop admitting completely
+    If the controller itself encounters an error, this function logs and
+    backs off instead of spinning endlessly.
     """
     while True:
-        limit = await ac_controller.get_limit()
+        try:
+            limit = await ac_controller.get_limit()
+        except Exception as e:
+            logger.exception(
+                "[AdaptiveConcurrency] get_limit failed for company_id=%s: %s",
+                company_id,
+                e,
+            )
+            await asyncio.sleep(poll_interval)
+            continue
+
         if limit <= 0:
             await asyncio.sleep(poll_interval)
             continue
 
-        # Check resource headroom
-        can_start = await ac_controller.can_start_new_worker()
+        try:
+            can_start = await ac_controller.can_start_new_worker()
+        except Exception as e:
+            logger.exception(
+                "[AdaptiveConcurrency] can_start_new_worker failed for company_id=%s: %s",
+                company_id,
+                e,
+            )
+            await asyncio.sleep(poll_interval)
+            continue
+
         if not can_start:
             await asyncio.sleep(poll_interval)
             continue
 
-        # Check limit vs active count
         acquired = await active_counter.try_acquire(limit)
         if acquired:
             logger.debug(
@@ -1752,15 +1769,15 @@ async def main_async(args: argparse.Namespace) -> None:
 
         max_companies = max(1, int(args.company_concurrency))
 
-        # Adaptive concurrency config
+        # Adaptive concurrency config (more conservative memory thresholds).
         ac_cfg = AdaptiveConcurrencyConfig(
             max_concurrency=max_companies,
             min_concurrency=1,
-            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.65")),
-            target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.80")),
+            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.50")),
+            target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.70")),
             target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.90")),
             target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "1.00")),
-            sample_interval_sec=float(os.environ.get("AC_SAMPLE_INTERVAL", "0.5")),
+            sample_interval_sec=float(os.environ.get("AC_SAMPLE_INTERVAL", "0.75")),
             smoothing_window_sec=float(
                 os.environ.get("AC_SMOOTHING_WINDOW_SEC", "10.0")
             ),
@@ -1799,11 +1816,12 @@ async def main_async(args: argparse.Namespace) -> None:
         # Configure memory guard thresholds and callback if enabled.
         if memory_guard is not None:
             cfg = memory_guard.config
+            # More aggressive defaults: soft=0.80, hard=0.90, emergency=0.98
             cfg.host_soft_limit = float(
-                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.88")
+                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.80")
             )
             cfg.host_hard_limit = float(
-                os.environ.get("HOST_MEM_HARD_LIMIT", "0.94")
+                os.environ.get("HOST_MEM_HARD_LIMIT", "0.90")
             )
             cfg.host_emergency_limit = float(
                 os.environ.get("HOST_MEM_EMERGENCY_LIMIT", "0.98")
@@ -1875,6 +1893,13 @@ async def main_async(args: argparse.Namespace) -> None:
                     check_interval_sec=stall_cfg.check_interval_sec,
                 )
             except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.exception(
+                    "Global StallGuard watchdog encountered an unexpected error: %s",
+                    e,
+                )
+                # Be conservative: do not flip abort_run here; just log.
                 return
 
             abort_run = True
