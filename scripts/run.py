@@ -66,11 +66,14 @@ from extensions.crawl_state import (
     COMPANY_STATUS_LLM_NOT_DONE,
 )
 from extensions.resource_monitor import ResourceMonitor, ResourceMonitorConfig
+
 from extensions.stall_guard import (
     StallGuard,
     StallGuardConfig,
     wait_for_global_hard_stall,
+    GlobalStallDetectedError,
 )
+
 from extensions.memory_guard import MemoryGuard, CriticalMemoryPressure
 from extensions.retry_tracker import RetryTracker, RetryTrackerConfig
 from extensions.adaptive_concurrency import (
@@ -1904,17 +1907,38 @@ async def main_async(args: argparse.Namespace) -> None:
 
             cfg.on_critical = _on_critical_memory
 
+
         async def _global_stall_watchdog() -> None:
             nonlocal abort_run
+            idle: float = -1.0
+
             try:
+                # Use raise_on_stall so the helper can signal via exception too.
                 idle = await wait_for_global_hard_stall(
                     stall_guard,
                     page_timeout_sec=page_timeout_ms / 1000.0,
                     factor=float(os.environ.get("GLOBAL_STALL_FACTOR", "4.5")),
                     check_interval_sec=stall_cfg.check_interval_sec,
+                    raise_on_stall=True,
                 )
             except asyncio.CancelledError:
+                # Normal shutdown for this watchdog.
                 return
+            except GlobalStallDetectedError as e:
+                # Helper already logged the exact stall condition.
+                logger.error(
+                    "Global StallGuard watchdog: hard stall signaled: %s",
+                    e,
+                )
+                # Try to recover a best effort idle value for logging.
+                idle_active = stall_guard.last_progress_age()
+                idle_any = stall_guard.last_any_progress_age()
+                if idle_active is not None:
+                    idle = idle_active
+                elif idle_any is not None:
+                    idle = idle_any
+                else:
+                    idle = -1.0
             except Exception as e:
                 logger.exception(
                     "Global StallGuard watchdog encountered an unexpected error: %s",
@@ -1922,13 +1946,25 @@ async def main_async(args: argparse.Namespace) -> None:
                 )
                 return
 
+            # If we reach here either:
+            #   - wait_for_global_hard_stall returned (idle>=hard), or
+            #   - it raised GlobalStallDetectedError and we handled it above.
             abort_run = True
 
-            logger.error(
-                "Global StallGuard: no company-level progress for %.1fs, treating this run as globally stalled. Marking companies for retry.",
-                idle,
-            )
+            if idle >= 0:
+                logger.error(
+                    "Global StallGuard: treating this run as globally stalled "
+                    "(no company-level progress for %.1fs). Marking companies for retry.",
+                    idle,
+                )
+            else:
+                logger.error(
+                    "Global StallGuard: treating this run as globally stalled "
+                    "(idle exceeded hard threshold). Marking companies for retry.",
+                )
 
+            # Mark all non fully completed companies as stalled so the retry
+            # wrapper can pick them up.
             for c in companies:
                 try:
                     snap = await state.get_company_snapshot(c.company_id)
@@ -1945,6 +1981,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 if status != COMPANY_STATUS_LLM_DONE:
                     mark_company_stalled(c.company_id)
 
+            # Cancel all in flight company tasks.
             for company_id, task in list(company_tasks.items()):
                 if not task.done():
                     logger.error(
@@ -1952,6 +1989,7 @@ async def main_async(args: argparse.Namespace) -> None:
                         company_id,
                     )
                     task.cancel()
+
 
         # Session / browser lifecycle
         total = len(companies)

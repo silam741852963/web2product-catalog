@@ -55,7 +55,7 @@ class AdaptiveConcurrencyConfig:
 
     use_cpu / use_mem:
         Whether to take CPU and/or memory into account. This lets you
-        run in CPU-only mode, mem-only mode, or disable both (which
+        run in CPU only mode, mem only mode, or disable both (which
         effectively drives concurrency toward max_concurrency).
 
     scale_up_step / scale_down_step:
@@ -94,6 +94,17 @@ class AdaptiveConcurrencyConfig:
 
         When detected, the controller temporarily relaxes caution-band
         admission limits so the run does not stall.
+
+    cpu_hot_threshold_for_low_mem / cpu_hot_mem_low_fraction:
+        Extra guard for the "CPU hot, memory well below target" case.
+
+        When both CPU and memory are enabled and:
+          - avg_cpu >= cpu_hot_threshold_for_low_mem
+          - avg_mem <= target_mem_low * cpu_hot_mem_low_fraction
+
+        we treat CPU as "not low" for scaling decisions so we do not keep
+        scaling up the concurrency limit in a regime where RAM is far below
+        the target but CPU is already working hard.
     """
 
     max_concurrency: int
@@ -132,6 +143,10 @@ class AdaptiveConcurrencyConfig:
     stall_mem_band_width: float = 0.05
     stall_release_cooldown_sec: float = 30.0
 
+    # CPU hot with low memory guard
+    cpu_hot_threshold_for_low_mem: float = 0.85
+    cpu_hot_mem_low_fraction: float = 0.8
+
 
 class AdaptiveConcurrencyController:
     """
@@ -157,6 +172,10 @@ class AdaptiveConcurrencyController:
     Additionally, when we detect that we are stuck in the caution band with
     very low CPU and almost flat memory usage over a window, we temporarily
     relax the caution-band admission limits so they do not stall the run.
+
+    Finally, when CPU is already hot while memory is well below the target
+    band, we freeze scale up based on CPU so the limit does not keep growing
+    without meaningful memory pressure.
     """
 
     def __init__(self, cfg: AdaptiveConcurrencyConfig) -> None:
@@ -682,6 +701,28 @@ class AdaptiveConcurrencyController:
                 high_cpu = use_cpu and avg_cpu >= self.cfg.target_cpu_high
                 low_mem = (not use_mem) or avg_mem <= self.cfg.target_mem_low
                 low_cpu = (not use_cpu) or avg_cpu <= self.cfg.target_cpu_low
+
+                # Extra guard: CPU is already hot while memory is far below
+                # the lower target band. In that case, we freeze scale up
+                # driven by CPU so the limit does not keep growing.
+                cpu_hot_low_mem = (
+                    use_cpu
+                    and use_mem
+                    and avg_cpu >= self.cfg.cpu_hot_threshold_for_low_mem
+                    and avg_mem
+                    <= self.cfg.target_mem_low * self.cfg.cpu_hot_mem_low_fraction
+                )
+                if cpu_hot_low_mem:
+                    if low_cpu:
+                        logger.debug(
+                            "[AdaptiveConcurrency] cpu hot with low mem "
+                            "(avg_cpu=%.3f, avg_mem=%.3f, limit=%d); "
+                            "freezing scale up based on CPU.",
+                            avg_cpu,
+                            avg_mem,
+                            old_limit,
+                        )
+                    low_cpu = False
 
                 # Decrease if any enabled dimension is too high, but respect cooldown
                 if high_mem or high_cpu:
