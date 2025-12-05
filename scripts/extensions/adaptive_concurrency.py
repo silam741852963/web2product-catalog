@@ -124,7 +124,7 @@ class AdaptiveConcurrencyConfig:
     scale_down_step: int = 1
 
     # Minimum time between consecutive scale up or scale down decisions
-    scale_up_cooldown_sec: float = 5.0
+    scale_up_cooldown_sec: float = 60.0
     scale_down_cooldown_sec: float = 0.0
 
     # Extra safety margin before allowing new workers to start
@@ -132,7 +132,7 @@ class AdaptiveConcurrencyConfig:
     startup_cpu_headroom: float = 0.06
 
     # How slowly to admit new workers when we enter the caution band
-    admission_cooldown_sec: float = 10.0
+    admission_cooldown_sec: float = 60.0
 
     # Local admission budget in the memory caution band.
     caution_band_fraction: float = 0.2
