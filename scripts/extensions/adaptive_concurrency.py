@@ -100,9 +100,9 @@ class AdaptiveConcurrencyConfig:
     startup_mem_headroom: float = 0.03
     startup_cpu_headroom: float = 0.05
 
-    # New: how slowly to admit new workers when we enter the caution band
+    # How slowly to admit new workers when we enter the caution band
     # between target_mem_low/target_mem_high or target_cpu_low/target_cpu_high.
-    admission_cooldown_sec: float = 3.0
+    admission_cooldown_sec: float = 10.0
 
 
 class AdaptiveConcurrencyController:

@@ -1773,8 +1773,8 @@ async def main_async(args: argparse.Namespace) -> None:
         ac_cfg = AdaptiveConcurrencyConfig(
             max_concurrency=max_companies,
             min_concurrency=1,
-            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.50")),
-            target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.70")),
+            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.55")),
+            target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.80")),
             target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.90")),
             target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "1.00")),
             sample_interval_sec=float(os.environ.get("AC_SAMPLE_INTERVAL", "0.75")),
@@ -1816,7 +1816,6 @@ async def main_async(args: argparse.Namespace) -> None:
         # Configure memory guard thresholds and callback if enabled.
         if memory_guard is not None:
             cfg = memory_guard.config
-            # More aggressive defaults: soft=0.80, hard=0.90, emergency=0.98
             cfg.host_soft_limit = float(
                 os.environ.get("HOST_MEM_SOFT_LIMIT", "0.80")
             )
@@ -1829,23 +1828,34 @@ async def main_async(args: argparse.Namespace) -> None:
             cfg.check_interval_sec = float(
                 os.environ.get("HOST_MEM_CHECK_INTERVAL", "0.5")
             )
+            # Optional: how many consecutive soft hits before actually killing.
+            cfg.soft_kill_hits = int(
+                os.environ.get("HOST_MEM_SOFT_KILL_HITS", "3")
+            )
 
             def _on_critical_memory(company_id: str, severity: str) -> None:
                 nonlocal abort_run
 
                 if severity == "soft":
+                    # This is called both for "warning" soft hits and for the
+                    # eventual soft kill. The actual kill is driven by
+                    # CriticalMemoryPressure from MemoryGuard; here we just
+                    # clamp concurrency.
                     logger.warning(
-                        "MemoryGuard soft limit hit by company_id=%s; "
-                        "cancelling its task and clamping concurrency.",
+                        "MemoryGuard soft limit event for company_id=%s; "
+                        "clamping concurrency.",
                         company_id,
                     )
                 elif severity == "hard":
+                    # Hard limit always results in an immediate kill via
+                    # CriticalMemoryPressure; we only tighten concurrency here.
                     logger.error(
                         "MemoryGuard hard limit hit by company_id=%s; "
-                        "cancelling its task and tightening concurrency.",
+                        "tightening concurrency.",
                         company_id,
                     )
                 else:
+                    # Emergency: we want to bail out as fast as possible.
                     logger.critical(
                         "MemoryGuard emergency limit hit by company_id=%s; "
                         "cancelling all tasks and aborting run.",
@@ -1853,6 +1863,8 @@ async def main_async(args: argparse.Namespace) -> None:
                     )
                     abort_run = True
 
+                # Any memory pressure (soft/hard/emergency) should cause the
+                # adaptive controller to shrink concurrency if possible.
                 if ac_controller is not None:
                     try:
                         loop = asyncio.get_running_loop()
@@ -1861,16 +1873,9 @@ async def main_async(args: argparse.Namespace) -> None:
                     if loop is not None:
                         loop.create_task(ac_controller.on_memory_pressure())
 
-                task = company_tasks.get(company_id)
-                if task is not None and not task.done():
-                    logger.error(
-                        "MemoryGuard: cancelling company task company_id=%s severity=%s",
-                        company_id,
-                        severity,
-                    )
-                    mark_company_memory_pressure(company_id)
-                    task.cancel()
-
+                # Only in the emergency case do we explicitly cancel tasks here.
+                # Soft/hard kills are handled by CriticalMemoryPressure inside
+                # the company task itself; cancelling here would just be noisy.
                 if severity == "emergency":
                     for cid, t in list(company_tasks.items()):
                         if not t.done():
@@ -1878,6 +1883,8 @@ async def main_async(args: argparse.Namespace) -> None:
                                 "MemoryGuard: emergency cancel company_id=%s",
                                 cid,
                             )
+                            # Marking here is extra; the triggering company is
+                            # already marked by MemoryGuard itself.
                             mark_company_memory_pressure(cid)
                             t.cancel()
 
