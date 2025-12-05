@@ -16,6 +16,7 @@ if not logger.handlers:
 # psutil is optional; degrade gracefully if missing
 try:
     import psutil  # type: ignore
+
     PSUTIL_AVAILABLE = True
 except Exception:  # pragma: no cover
     psutil = None  # type: ignore
@@ -69,10 +70,29 @@ class AdaptiveConcurrencyConfig:
         explicit lower/upper thresholds instead.
 
     admission_cooldown_sec:
-        Minimum gap between admitting *new workers* when resource
+        Minimum gap between admitting new workers when resource
         usage is in the caution band (between lower and upper threshold).
         Below lower thresholds we admit freely (subject to limit).
         Above upper thresholds we stop admitting completely.
+
+    caution_band_fraction:
+        When memory is in the caution band (target_mem_low < mem < target_mem_high),
+        we apply a local admission budget that limits how many new workers
+        can be admitted in this band.
+
+        The budget is computed as:
+
+            band_budget = int(last_low_mem_limit * caution_band_fraction)
+
+        where last_low_mem_limit is the concurrency limit recorded the last
+        time smoothed memory was strictly below target_mem_low.
+
+        The budget is:
+          - reset whenever memory goes back below target_mem_low
+          - recomputed whenever memory goes from below-low into the caution band
+
+        This reduces the risk that you sit at mem just below target_mem_high
+        and suddenly admit a large number of extra tasks that push memory to 100%.
     """
 
     max_concurrency: int
@@ -104,6 +124,10 @@ class AdaptiveConcurrencyConfig:
     # between target_mem_low/target_mem_high or target_cpu_low/target_cpu_high.
     admission_cooldown_sec: float = 20.0
 
+    # New: local admission budget in the memory caution band.
+    # See the class docstring for details.
+    caution_band_fraction: float = 0.5
+
 
 class AdaptiveConcurrencyController:
     """
@@ -117,7 +141,10 @@ class AdaptiveConcurrencyController:
           - Potentially scale down the limit (down to min_concurrency).
 
       - Else if mem >= target_mem_low OR cpu >= target_cpu_low:
-          - Admit new workers slowly: at most one every admission_cooldown_sec.
+          - Admit new workers slowly:
+              - at most one every admission_cooldown_sec
+              - and, if memory is in the caution band (low < mem < high),
+                at most 'band_budget' workers per entry into that band.
 
       - Else (both below their lower thresholds):
           - Admit new workers freely (subject to limit) and allow slow scale up
@@ -158,6 +185,13 @@ class AdaptiveConcurrencyController:
 
         # Do not scale up until at least one company has actually started work
         self._has_seen_work: bool = False
+
+        # Memory zone and band admission control
+        # zone_mem: "safe" (< low), "caution" (low <= mem < high),
+        #           "high" (>= high), "unknown" (initial)
+        self._zone_mem: str = "unknown"
+        self._last_low_mem_limit: int = self._current_limit
+        self._band_admission_budget: int = 0
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -243,6 +277,9 @@ class AdaptiveConcurrencyController:
             # Treat this as a recent scale down so we do not immediately
             # climb back up.
             self._last_scale_down_ts = time.monotonic()
+            # Also treat this like a high memory zone event.
+            self._zone_mem = "high"
+            self._band_admission_budget = 0
             logger.warning(
                 "[AdaptiveConcurrency] memory pressure event; forcing limit=%d "
                 "(hits=%d)",
@@ -267,6 +304,9 @@ class AdaptiveConcurrencyController:
                 "memory_pressure_hits": self._memory_pressure_hits,
                 "last_update_ts": self._last_update_ts,
                 "psutil_available": PSUTIL_AVAILABLE,
+                "zone_mem": self._zone_mem,
+                "last_low_mem_limit": self._last_low_mem_limit,
+                "band_admission_budget": self._band_admission_budget,
             }
 
     async def notify_work_started(self) -> None:
@@ -289,7 +329,10 @@ class AdaptiveConcurrencyController:
 
         - If avg mem or cpu is above the upper threshold, deny admission.
         - If any is above the lower threshold, allow admission only once
-          every admission_cooldown_sec.
+          every admission_cooldown_sec and, if memory is in the caution
+          band (low < mem < high), also consume from a finite admission
+          budget. When the budget reaches zero, further admissions are
+          denied until memory returns to the safe zone again.
         - Otherwise, admit freely (subject to the current limit).
 
         This does not look at the active count, only at resource headroom.
@@ -313,9 +356,11 @@ class AdaptiveConcurrencyController:
             now = time.monotonic()
 
             # If we have never recorded a sample yet, admit slowly to avoid
-            #-spiking before we have any feedback.
+            # spiking before we have any feedback.
             if self._last_update_ts <= 0.0:
-                cooldown = max(self.cfg.admission_cooldown_sec, self.cfg.sample_interval_sec)
+                cooldown = max(
+                    self.cfg.admission_cooldown_sec, self.cfg.sample_interval_sec
+                )
                 if now - self._last_admission_ts < cooldown:
                     return False
                 self._last_admission_ts = now
@@ -335,11 +380,35 @@ class AdaptiveConcurrencyController:
             if use_cpu and avg_cpu >= self.cfg.target_cpu_low:
                 in_caution = True
 
+            mem_in_caution_band = (
+                use_mem
+                and avg_mem >= self.cfg.target_mem_low
+                and avg_mem < self.cfg.target_mem_high
+            )
+
             if in_caution:
-                cooldown = max(self.cfg.admission_cooldown_sec, self.cfg.sample_interval_sec)
+                # If memory is in the caution band, enforce the local admission
+                # budget based on the last safe limit.
+                if (
+                    mem_in_caution_band
+                    and self.cfg.caution_band_fraction > 0.0
+                    and self._band_admission_budget <= 0
+                ):
+                    # Budget exhausted for this band episode.
+                    return False
+
+                cooldown = max(
+                    self.cfg.admission_cooldown_sec, self.cfg.sample_interval_sec
+                )
                 if now - self._last_admission_ts < cooldown:
                     return False
+
                 self._last_admission_ts = now
+
+                if mem_in_caution_band and self.cfg.caution_band_fraction > 0.0:
+                    # Consume from the band admission budget.
+                    self._band_admission_budget -= 1
+
                 return True
 
             # Safe zone: both dimensions below their lower thresholds.
@@ -428,6 +497,45 @@ class AdaptiveConcurrencyController:
                 avg_cpu = raw_cpu
                 avg_mem = raw_mem
 
+            # Update memory zone and band admission budget based on smoothed memory
+            prev_zone = self._zone_mem
+            if not self.cfg.use_mem:
+                # If memory is disabled, treat it as always safe
+                new_zone = "safe"
+            else:
+                if avg_mem >= self.cfg.target_mem_high:
+                    new_zone = "high"
+                elif avg_mem >= self.cfg.target_mem_low:
+                    new_zone = "caution"
+                else:
+                    new_zone = "safe"
+
+            if new_zone != prev_zone:
+                if new_zone == "safe":
+                    # Record the limit that was stable at low memory and reset budget.
+                    self._last_low_mem_limit = self._current_limit
+                    self._band_admission_budget = 0
+                elif new_zone == "caution":
+                    # Entering caution band: compute new budget based on the
+                    # last safe limit. If that is zero, fall back to current limit.
+                    base = self._last_low_mem_limit or self._current_limit
+                    frac = max(self.cfg.caution_band_fraction, 0.0)
+                    self._band_admission_budget = int(base * frac)
+                else:
+                    # High memory: no new budget here.
+                    self._band_admission_budget = 0
+
+                self._zone_mem = new_zone
+                logger.debug(
+                    "[AdaptiveConcurrency] mem zone change %s -> %s "
+                    "(avg_mem=%.3f, budget=%d, last_low_limit=%d)",
+                    prev_zone,
+                    new_zone,
+                    avg_mem,
+                    self._band_admission_budget,
+                    self._last_low_mem_limit,
+                )
+
             old_limit = self._current_limit
             new_limit = old_limit
             increased = False  # track if we actually scaled up
@@ -503,6 +611,9 @@ class AdaptiveConcurrencyController:
                 "samples_window_sec": window,
                 "samples_count": len(self._samples),
                 "memory_pressure_hits": self._memory_pressure_hits,
+                "zone_mem": self._zone_mem,
+                "last_low_mem_limit": self._last_low_mem_limit,
+                "band_admission_budget": self._band_admission_budget,
             }
 
         # Logging outside the lock
@@ -511,20 +622,28 @@ class AdaptiveConcurrencyController:
         if state_snapshot["limit_new"] != state_snapshot["limit_old"]:
             logger.info(
                 "[AdaptiveConcurrency] limit change %d -> %d "
-                "(avg_cpu=%.3f, avg_mem=%.3f, raw_cpu=%.3f, raw_mem=%.3f)",
+                "(avg_cpu=%.3f, avg_mem=%.3f, raw_cpu=%.3f, raw_mem=%.3f, zone=%s, "
+                "budget=%d, last_low_limit=%d)",
                 state_snapshot["limit_old"],
                 state_snapshot["limit_new"],
                 state_snapshot["avg_cpu"],
                 state_snapshot["avg_mem"],
                 state_snapshot["raw_cpu"],
                 state_snapshot["raw_mem"],
+                state_snapshot["zone_mem"],
+                state_snapshot["band_admission_budget"],
+                state_snapshot["last_low_mem_limit"],
             )
         else:
             logger.debug(
-                "[AdaptiveConcurrency] limit=%d (avg_cpu=%.3f, avg_mem=%.3f)",
+                "[AdaptiveConcurrency] limit=%d (avg_cpu=%.3f, avg_mem=%.3f, "
+                "zone=%s, budget=%d, last_low_limit=%d)",
                 state_snapshot["limit_new"],
                 state_snapshot["avg_cpu"],
                 state_snapshot["avg_mem"],
+                state_snapshot["zone_mem"],
+                state_snapshot["band_admission_budget"],
+                state_snapshot["last_low_mem_limit"],
             )
 
     def _maybe_log_state(self, state: Dict[str, Any]) -> None:
