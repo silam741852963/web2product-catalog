@@ -66,8 +66,6 @@ class AdaptiveConcurrencyConfig:
 
     startup_mem_headroom / startup_cpu_headroom:
         Extra safety margin before allowing new workers to start.
-        Kept for compatibility but the admission logic now uses
-        explicit lower/upper thresholds instead.
 
     admission_cooldown_sec:
         Minimum gap between admitting new workers when resource
@@ -87,12 +85,15 @@ class AdaptiveConcurrencyConfig:
         where last_low_mem_limit is the concurrency limit recorded the last
         time smoothed memory was strictly below target_mem_low.
 
-        The budget is:
-          - reset whenever memory goes back below target_mem_low
-          - recomputed whenever memory goes from below-low into the caution band
+    stall_detection_window_sec / stall_cpu_idle_threshold /
+    stall_mem_band_width / stall_release_cooldown_sec:
+        Parameters for detecting a "caution-zone hurdle" where:
+          - memory sits just above target_mem_low
+          - CPU is mostly idle
+          - and memory does not change much over time.
 
-        This reduces the risk that you sit at mem just below target_mem_high
-        and suddenly admit a large number of extra tasks that push memory to 100%.
+        When detected, the controller temporarily relaxes caution-band
+        admission limits so the run does not stall.
     """
 
     max_concurrency: int
@@ -116,17 +117,20 @@ class AdaptiveConcurrencyConfig:
     scale_down_cooldown_sec: float = 0.0
 
     # Extra safety margin before allowing new workers to start
-    # (kept for backward compatibility but no longer central)
     startup_mem_headroom: float = 0.03
     startup_cpu_headroom: float = 0.05
 
     # How slowly to admit new workers when we enter the caution band
-    # between target_mem_low/target_mem_high or target_cpu_low/target_cpu_high.
     admission_cooldown_sec: float = 10.0
 
-    # New: local admission budget in the memory caution band.
-    # See the class docstring for details.
+    # Local admission budget in the memory caution band.
     caution_band_fraction: float = 0.2
+
+    # Caution-zone stall detection / release
+    stall_detection_window_sec: float = 30.0
+    stall_cpu_idle_threshold: float = 0.05
+    stall_mem_band_width: float = 0.05
+    stall_release_cooldown_sec: float = 30.0
 
 
 class AdaptiveConcurrencyController:
@@ -150,9 +154,9 @@ class AdaptiveConcurrencyController:
           - Admit new workers freely (subject to limit) and allow slow scale up
             controlled by scale_up_cooldown_sec.
 
-    Host resource usage is sampled with psutil if available. If psutil is
-    not available, the controller simply keeps the limit at max_concurrency
-    and always admits new workers.
+    Additionally, when we detect that we are stuck in the caution band with
+    very low CPU and almost flat memory usage over a window, we temporarily
+    relax the caution-band admission limits so they do not stall the run.
     """
 
     def __init__(self, cfg: AdaptiveConcurrencyConfig) -> None:
@@ -192,6 +196,10 @@ class AdaptiveConcurrencyController:
         self._zone_mem: str = "unknown"
         self._last_low_mem_limit: int = self._current_limit
         self._band_admission_budget: int = 0
+
+        # Caution-zone stall override
+        self._stall_override_active: bool = False
+        self._last_stall_release_ts: float = 0.0
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -280,6 +288,9 @@ class AdaptiveConcurrencyController:
             # Also treat this like a high memory zone event.
             self._zone_mem = "high"
             self._band_admission_budget = 0
+            # When we get hard memory pressure, we definitely do not want
+            # any stall override to be active.
+            self._stall_override_active = False
             logger.warning(
                 "[AdaptiveConcurrency] memory pressure event; forcing limit=%d "
                 "(hits=%d)",
@@ -307,6 +318,7 @@ class AdaptiveConcurrencyController:
                 "zone_mem": self._zone_mem,
                 "last_low_mem_limit": self._last_low_mem_limit,
                 "band_admission_budget": self._band_admission_budget,
+                "stall_override_active": self._stall_override_active,
             }
 
     async def notify_work_started(self) -> None:
@@ -388,25 +400,39 @@ class AdaptiveConcurrencyController:
 
             if in_caution:
                 # If memory is in the caution band, enforce the local admission
-                # budget based on the last safe limit.
+                # budget based on the last safe limit, unless we have explicitly
+                # detected a caution-zone stall and enabled override.
                 if (
                     mem_in_caution_band
                     and self.cfg.caution_band_fraction > 0.0
                     and self._band_admission_budget <= 0
+                    and not self._stall_override_active
                 ):
                     # Budget exhausted for this band episode.
                     return False
 
+                # Base cooldown for caution band.
                 cooldown = max(
                     self.cfg.admission_cooldown_sec, self.cfg.sample_interval_sec
                 )
+
+                # When stall override is active, we relax the hurdle: admit
+                # more eagerly by using only the sampling interval as cooldown.
+                if self._stall_override_active:
+                    cooldown = self.cfg.sample_interval_sec
+
                 if now - self._last_admission_ts < cooldown:
                     return False
 
                 self._last_admission_ts = now
 
-                if mem_in_caution_band and self.cfg.caution_band_fraction > 0.0:
-                    # Consume from the band admission budget.
+                if (
+                    mem_in_caution_band
+                    and self.cfg.caution_band_fraction > 0.0
+                    and not self._stall_override_active
+                ):
+                    # Consume from the band admission budget only when we are
+                    # not in override mode.
                     self._band_admission_budget -= 1
 
                 return True
@@ -453,6 +479,102 @@ class AdaptiveConcurrencyController:
 
         return cpu_frac, mem_frac
 
+    def _maybe_detect_caution_stall(
+        self,
+        now_mono: float,
+        avg_cpu: float,
+        avg_mem: float,
+    ) -> None:
+        """
+        Detect the "caution-zone hurdle" case and, if needed, enable an
+        override that relaxes admission limits in the caution band.
+
+        We trigger override when:
+          - memory is in the 'caution' zone
+          - CPU is mostly idle
+          - memory has stayed within a small band over a time window
+
+        This is exactly the situation where the band budget and admission
+        cooldown can stall the run, even though the host is healthy.
+        """
+        cfg = self.cfg
+
+        # If we are not using memory as a control signal, there is nothing
+        # meaningful to do here.
+        if not cfg.use_mem:
+            self._stall_override_active = False
+            return
+
+        # If we are not currently in the caution zone, clear any override.
+        if self._zone_mem != "caution":
+            if self._stall_override_active:
+                self._stall_override_active = False
+                self._last_stall_release_ts = now_mono
+            return
+
+        # If CPU is being used as a control signal and is not idle, we do
+        # not treat this as a stall.
+        if cfg.use_cpu and avg_cpu > cfg.stall_cpu_idle_threshold:
+            if self._stall_override_active:
+                self._stall_override_active = False
+                self._last_stall_release_ts = now_mono
+            return
+
+        # Avoid thrashing: after clearing an override, wait a bit before
+        # enabling another one.
+        if (
+            self._stall_override_active is False
+            and now_mono - self._last_stall_release_ts
+            < cfg.stall_release_cooldown_sec
+        ):
+            return
+
+        # Take the subset of samples inside the stall detection window.
+        window_len = max(float(cfg.stall_detection_window_sec), 0.0)
+        if window_len <= 0.0:
+            return
+
+        cutoff = now_mono - window_len
+        mem_vals: List[float] = [m for (t, _, m) in self._samples if t >= cutoff]
+
+        if len(mem_vals) < 2:
+            # Not enough history to make a decision.
+            return
+
+        mem_span = max(mem_vals) - min(mem_vals)
+
+        if mem_span <= cfg.stall_mem_band_width:
+            # Memory is essentially flat in the caution band while CPU is idle:
+            # treat this as a stalled caution zone, and open the van.
+            if not self._stall_override_active:
+                self._stall_override_active = True
+                # Give a generous local budget so can_start_new_worker is
+                # not blocked by band_budget during this override.
+                base = max(self._current_limit, self._last_low_mem_limit, 1)
+                self._band_admission_budget = max(
+                    self._band_admission_budget,
+                    max(base, self.cfg.max_concurrency),
+                )
+                logger.warning(
+                    "[AdaptiveConcurrency] detected caution-zone stall "
+                    "(avg_cpu=%.3f, avg_mem=%.3f, mem_span=%.3f over %.1fs); "
+                    "opening admission in caution band (budget=%d)",
+                    avg_cpu,
+                    avg_mem,
+                    mem_span,
+                    window_len,
+                    self._band_admission_budget,
+                )
+        else:
+            # Memory started moving again; clear any existing override.
+            if self._stall_override_active:
+                self._stall_override_active = False
+                self._last_stall_release_ts = now_mono
+                logger.info(
+                    "[AdaptiveConcurrency] caution-zone stall cleared; "
+                    "restoring normal admission controls."
+                )
+
     async def _sample_and_adjust(self) -> None:
         """
         Take one resource usage sample and adjust concurrency limit if needed.
@@ -469,7 +591,7 @@ class AdaptiveConcurrencyController:
             return
 
         raw_cpu, raw_mem = self._read_usage()
-        now = time.monotonic()
+        now_mono = time.monotonic()
         wall_ts = time.time()
 
         if self.cfg.smoothing_window_sec <= 0.0:
@@ -479,10 +601,10 @@ class AdaptiveConcurrencyController:
 
         # Compute new limit and smoothed averages under lock
         async with self._lock:
-            self._samples.append((now, raw_cpu, raw_mem))
+            self._samples.append((now_mono, raw_cpu, raw_mem))
 
             if window > 0.0:
-                cutoff = now - window
+                cutoff = now_mono - window
                 self._samples = [
                     (t, c, m) for (t, c, m) in self._samples if t >= cutoff
                 ]
@@ -511,6 +633,8 @@ class AdaptiveConcurrencyController:
                     new_zone = "safe"
 
             if new_zone != prev_zone:
+                # On any zone change, normal admission rules apply; any stall
+                # override will be revised by _maybe_detect_caution_stall below.
                 if new_zone == "safe":
                     # Record the limit that was stable at low memory and reset budget.
                     self._last_low_mem_limit = self._current_limit
@@ -536,6 +660,9 @@ class AdaptiveConcurrencyController:
                     self._last_low_mem_limit,
                 )
 
+            # Check for caution-zone stall and possibly enable override.
+            self._maybe_detect_caution_stall(now_mono, avg_cpu, avg_mem)
+
             old_limit = self._current_limit
             new_limit = old_limit
             increased = False  # track if we actually scaled up
@@ -555,8 +682,6 @@ class AdaptiveConcurrencyController:
                 high_cpu = use_cpu and avg_cpu >= self.cfg.target_cpu_high
                 low_mem = (not use_mem) or avg_mem <= self.cfg.target_mem_low
                 low_cpu = (not use_cpu) or avg_cpu <= self.cfg.target_cpu_low
-
-                now_mono = now
 
                 # Decrease if any enabled dimension is too high, but respect cooldown
                 if high_mem or high_cpu:
@@ -601,7 +726,7 @@ class AdaptiveConcurrencyController:
 
             state_snapshot = {
                 "ts": wall_ts,
-                "monotonic": now,
+                "monotonic": now_mono,
                 "limit_old": old_limit,
                 "limit_new": new_limit,
                 "avg_cpu": avg_cpu,
@@ -612,8 +737,9 @@ class AdaptiveConcurrencyController:
                 "samples_count": len(self._samples),
                 "memory_pressure_hits": self._memory_pressure_hits,
                 "zone_mem": self._zone_mem,
-                "last_low_mem_limit": self._last_low_mem_limit,
+                "last_low_limit": self._last_low_mem_limit,
                 "band_admission_budget": self._band_admission_budget,
+                "stall_override_active": self._stall_override_active,
             }
 
         # Logging outside the lock
@@ -622,8 +748,8 @@ class AdaptiveConcurrencyController:
         if state_snapshot["limit_new"] != state_snapshot["limit_old"]:
             logger.info(
                 "[AdaptiveConcurrency] limit change %d -> %d "
-                "(avg_cpu=%.3f, avg_mem=%.3f, raw_cpu=%.3f, raw_mem=%.3f, zone=%s, "
-                "budget=%d, last_low_limit=%d)",
+                "(avg_cpu=%.3f, avg_mem=%.3f, raw_cpu=%.3f, raw_mem=%.3f, "
+                "zone=%s, budget=%d, last_low_limit=%d, stall_override=%s)",
                 state_snapshot["limit_old"],
                 state_snapshot["limit_new"],
                 state_snapshot["avg_cpu"],
@@ -632,18 +758,20 @@ class AdaptiveConcurrencyController:
                 state_snapshot["raw_mem"],
                 state_snapshot["zone_mem"],
                 state_snapshot["band_admission_budget"],
-                state_snapshot["last_low_mem_limit"],
+                state_snapshot["last_low_limit"],
+                state_snapshot["stall_override_active"],
             )
         else:
             logger.debug(
                 "[AdaptiveConcurrency] limit=%d (avg_cpu=%.3f, avg_mem=%.3f, "
-                "zone=%s, budget=%d, last_low_limit=%d)",
+                "zone=%s, budget=%d, last_low_limit=%d, stall_override=%s)",
                 state_snapshot["limit_new"],
                 state_snapshot["avg_cpu"],
                 state_snapshot["avg_mem"],
                 state_snapshot["zone_mem"],
                 state_snapshot["band_admission_budget"],
-                state_snapshot["last_low_mem_limit"],
+                state_snapshot["last_low_limit"],
+                state_snapshot["stall_override_active"],
             )
 
     def _maybe_log_state(self, state: Dict[str, Any]) -> None:

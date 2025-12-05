@@ -1846,10 +1846,10 @@ async def main_async(args: argparse.Namespace) -> None:
         if memory_guard is not None:
             cfg = memory_guard.config
             cfg.host_soft_limit = float(
-                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.80")
+                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.87")
             )
             cfg.host_hard_limit = float(
-                os.environ.get("HOST_MEM_HARD_LIMIT", "0.90")
+                os.environ.get("HOST_MEM_HARD_LIMIT", "0.94")
             )
             cfg.host_emergency_limit = float(
                 os.environ.get("HOST_MEM_EMERGENCY_LIMIT", "0.98")
