@@ -687,12 +687,31 @@ async def crawl_company(
 
         results_or_gen = await crawler.arun(start_url, config=config)
 
+        # Early host memory check right after starting the deep crawl for this root.
+        # This guards the initial Chrome / Playwright ramp up which can spike RAM.
+        if memory_guard is not None:
+            memory_guard.check_host_only(
+                company_id=company.company_id,
+                url=start_url,
+                mark_company_memory=mark_company_memory_pressure,
+            )
+
         if not isinstance(results_or_gen, list):
             agen = results_or_gen
             if hasattr(agen, "__aiter__"):
                 agen = agen.__aiter__()
 
             while True:
+                # Check host memory before pulling the next page from the stream.
+                # This lets us kill the company if RAM is already under pressure,
+                # even if no page error has been returned yet.
+                if memory_guard is not None:
+                    memory_guard.check_host_only(
+                        company_id=company.company_id,
+                        url=start_url,
+                        mark_company_memory=mark_company_memory_pressure,
+                    )
+
                 if max_pages is not None and pages_processed >= max_pages:
                     logger.info(
                         "Per-company max_pages limit (%d) reached for company_id=%s, stopping crawl for this company",
@@ -753,6 +772,12 @@ async def crawl_company(
 
         else:
             for page_result in results_or_gen:
+                if memory_guard is not None:
+                    memory_guard.check_host_only(
+                        company_id=company.company_id,
+                        url=getattr(page_result, "url", start_url),
+                        mark_company_memory=mark_company_memory_pressure,
+                    )
                 try:
                     await process_page_result(
                         page_result=page_result,
@@ -1366,7 +1391,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=500,
+        default=200,
         help=(
             "Maximum number of pages to crawl per company. "
             "Enforced here as a per-company limit."
