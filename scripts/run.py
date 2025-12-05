@@ -118,6 +118,13 @@ def record_company_attempt(company_id: str) -> None:
         _retry_tracker.record_attempt(company_id)
 
 
+def mark_company_completed(company_id: str) -> None:
+    if _retry_tracker is not None:
+        # Remove this company from all retry categories, regardless
+        # of why it was previously scheduled.
+        _retry_tracker.clear_company(company_id)
+
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -178,7 +185,6 @@ def _write_crawl_meta(company: Company, snapshot: Any) -> None:
         try:
             f.flush()
         except Exception:
-            # Not fatal; OS will flush on close.
             pass
     tmp.replace(path)
 
@@ -896,7 +902,7 @@ class ActiveCounter:
     async def release(self) -> None:
         async with self._lock:
             if self._value > 0:
-                self._value -= 1
+                self._value -= 0 or 1  # keep it concise but safe
 
     async def current(self) -> int:
         async with self._lock:
@@ -1019,10 +1025,7 @@ def _should_skip_company(status: str, llm_mode: str) -> bool:
 def _session_ranges(n: int, per_session: int) -> List[tuple[int, int]]:
     if per_session <= 0:
         return [(0, n)]
-    return [
-        (start, min(start + per_session, n))
-        for start in range(0, n, per_session)
-    ]
+    return [(start, min(start + per_session, n)) for start in range(0, n, per_session)]
 
 
 # ---------------------------------------------------------------------------
@@ -1248,6 +1251,12 @@ async def run_company_pipeline(
                 company.company_id,
             )
 
+        # If the company completed without unhandled exceptions or
+        # CriticalMemoryPressure, we consider it recovered and drop it
+        # from retry_companies.json.
+        if completed_ok:
+            mark_company_completed(company.company_id)
+
         if stall_guard is not None and completed_ok:
             stall_guard.record_company_completed(company.company_id)
 
@@ -1465,12 +1474,7 @@ async def main_async(args: argparse.Namespace) -> None:
     set_retry_tracker(retry_tracker)
 
     retry_company_mode: str = getattr(args, "retry_mode", "all")
-
-    prev_retry_data: Dict[str, Any] = retry_tracker.load_existing()
-    retry_list = prev_retry_data.get("retry_companies") or []
-    prev_retry_ids: set[str] = set(str(x) for x in retry_list) if isinstance(
-        retry_list, list
-    ) else set()
+    prev_retry_ids: set[str] = retry_tracker.get_previous_retry_ids()
 
     if prev_retry_ids:
         logger.info(
@@ -1774,7 +1778,7 @@ async def main_async(args: argparse.Namespace) -> None:
             max_concurrency=max_companies,
             min_concurrency=1,
             target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.55")),
-            target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.80")),
+            target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.75")),
             target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.90")),
             target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "1.00")),
             sample_interval_sec=float(os.environ.get("AC_SAMPLE_INTERVAL", "0.75")),
@@ -1828,7 +1832,6 @@ async def main_async(args: argparse.Namespace) -> None:
             cfg.check_interval_sec = float(
                 os.environ.get("HOST_MEM_CHECK_INTERVAL", "0.5")
             )
-            # Optional: how many consecutive soft hits before actually killing.
             cfg.soft_kill_hits = int(
                 os.environ.get("HOST_MEM_SOFT_KILL_HITS", "3")
             )
@@ -1837,25 +1840,18 @@ async def main_async(args: argparse.Namespace) -> None:
                 nonlocal abort_run
 
                 if severity == "soft":
-                    # This is called both for "warning" soft hits and for the
-                    # eventual soft kill. The actual kill is driven by
-                    # CriticalMemoryPressure from MemoryGuard; here we just
-                    # clamp concurrency.
                     logger.warning(
                         "MemoryGuard soft limit event for company_id=%s; "
                         "clamping concurrency.",
                         company_id,
                     )
                 elif severity == "hard":
-                    # Hard limit always results in an immediate kill via
-                    # CriticalMemoryPressure; we only tighten concurrency here.
                     logger.error(
                         "MemoryGuard hard limit hit by company_id=%s; "
                         "tightening concurrency.",
                         company_id,
                     )
                 else:
-                    # Emergency: we want to bail out as fast as possible.
                     logger.critical(
                         "MemoryGuard emergency limit hit by company_id=%s; "
                         "cancelling all tasks and aborting run.",
@@ -1863,8 +1859,6 @@ async def main_async(args: argparse.Namespace) -> None:
                     )
                     abort_run = True
 
-                # Any memory pressure (soft/hard/emergency) should cause the
-                # adaptive controller to shrink concurrency if possible.
                 if ac_controller is not None:
                     try:
                         loop = asyncio.get_running_loop()
@@ -1873,9 +1867,6 @@ async def main_async(args: argparse.Namespace) -> None:
                     if loop is not None:
                         loop.create_task(ac_controller.on_memory_pressure())
 
-                # Only in the emergency case do we explicitly cancel tasks here.
-                # Soft/hard kills are handled by CriticalMemoryPressure inside
-                # the company task itself; cancelling here would just be noisy.
                 if severity == "emergency":
                     for cid, t in list(company_tasks.items()):
                         if not t.done():
@@ -1883,8 +1874,6 @@ async def main_async(args: argparse.Namespace) -> None:
                                 "MemoryGuard: emergency cancel company_id=%s",
                                 cid,
                             )
-                            # Marking here is extra; the triggering company is
-                            # already marked by MemoryGuard itself.
                             mark_company_memory_pressure(cid)
                             t.cancel()
 
@@ -1906,7 +1895,6 @@ async def main_async(args: argparse.Namespace) -> None:
                     "Global StallGuard watchdog encountered an unexpected error: %s",
                     e,
                 )
-                # Be conservative: do not flip abort_run here; just log.
                 return
 
             abort_run = True
@@ -1972,7 +1960,6 @@ async def main_async(args: argparse.Namespace) -> None:
 
                 session_companies = companies[session_start:session_end]
 
-                # Precompute global indices for nicer logging
                 indexed_session = list(
                     enumerate(session_companies, start=session_start + 1)
                 )
@@ -1980,12 +1967,9 @@ async def main_async(args: argparse.Namespace) -> None:
                 inflight: set[asyncio.Task] = set()
                 next_idx = 0
 
-                # Upper bound on how many company tasks can exist at once.
                 max_inflight = max_companies
 
                 while (next_idx < len(indexed_session) or inflight) and not abort_run:
-                    # Top up inflight up to max_inflight, but only after
-                    # adaptive concurrency grants a slot for each new company.
                     while (
                         next_idx < len(indexed_session)
                         and len(inflight) < max_inflight
@@ -2058,7 +2042,6 @@ async def main_async(args: argparse.Namespace) -> None:
                     inflight = pending
 
                     for t in done:
-                        # Remove from company_tasks
                         for cid, ct in list(company_tasks.items()):
                             if ct is t:
                                 company_tasks.pop(cid, None)
@@ -2094,7 +2077,6 @@ async def main_async(args: argparse.Namespace) -> None:
                                 )
 
                 if abort_run:
-                    # Cancel any remaining inflight tasks for this session
                     for t in inflight:
                         if not t.done():
                             t.cancel()
@@ -2108,7 +2090,6 @@ async def main_async(args: argparse.Namespace) -> None:
                         pass
                     global_stall_task = None
 
-            # Exiting async-with closes AsyncWebCrawler and Chromium
             if abort_run:
                 logger.error(
                     "Abort flag set; stopping after browser session %d/%d.",
@@ -2152,15 +2133,22 @@ async def main_async(args: argparse.Namespace) -> None:
             except Exception:
                 logger.exception("Error while stopping AdaptiveConcurrencyController")
 
-    if _retry_tracker is not None:
-        exit_code = _retry_tracker.finalize_and_exit_code(RETRY_EXIT_CODE)
-        if exit_code != 0:
-            raise SystemExit(exit_code)
-
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
     args = parse_args(argv)
-    asyncio.run(main_async(args))
+
+    try:
+        asyncio.run(main_async(args))
+    except KeyboardInterrupt:
+        logger.warning("Received KeyboardInterrupt (Ctrl+C); shutting down gracefully.")
+    finally:
+        if _retry_tracker is not None:
+            exit_code = _retry_tracker.finalize_and_exit_code(RETRY_EXIT_CODE)
+        else:
+            exit_code = 0
+
+        if exit_code != 0:
+            raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

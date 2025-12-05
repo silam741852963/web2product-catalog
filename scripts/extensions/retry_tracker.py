@@ -47,6 +47,12 @@ class RetryTracker:
         "attempted_total": K,
         "all_attempted": true | false
       }
+
+    IMPORTANT: This implementation now:
+      - Loads existing stalled/timeout/memory sets from any prior
+        retry_companies.json on initialization (merge).
+      - Removes companies from those sets on successful completion.
+      - Always writes the full current state atomically to disk.
     """
 
     def __init__(self, cfg: RetryTrackerConfig) -> None:
@@ -61,12 +67,14 @@ class RetryTracker:
         self._attempted_companies: Set[str] = set()
         self._dirty: int = 0
 
+        # Merge any existing state on disk into our in-memory sets.
+        self._load_existing_into_sets()
+
     # ---------------- Existing file handling ----------------
 
     def load_existing(self) -> Dict[str, Any]:
         """
         Best effort load of an existing retry_companies.json.
-        Used by run.py to support retry_mode (all, skip-retry, only-retry).
 
         Returns an empty dict on any error and logs a warning.
         """
@@ -79,10 +87,47 @@ class RetryTracker:
             logger.warning("Failed to load existing retry file %s: %s", self.path, e)
             return {}
 
+    def _load_existing_into_sets(self) -> None:
+        """
+        Merge the contents of any existing retry_companies.json into our
+        in-memory sets. This makes the tracker persistent across runs.
+        """
+        data = self.load_existing()
+        if not data:
+            return
+
+        stalled = data.get("stalled_companies") or []
+        timeout = data.get("timeout_companies") or []
+        memory = data.get("memory_companies") or []
+
+        def _add_all(target: Set[str], src: Any) -> None:
+            if not isinstance(src, list):
+                return
+            for x in src:
+                target.add(str(x))
+
+        _add_all(self._stalled, stalled)
+        _add_all(self._timeout, timeout)
+        _add_all(self._memory, memory)
+
+        # We do NOT import total_companies / attempted_total because those
+        # are per-run stats. They will be set for the current run via
+        # set_total_companies() and record_attempt().
+
+        if self._stalled or self._timeout or self._memory:
+            logger.info(
+                "RetryTracker: loaded existing retry state from %s "
+                "(stalled=%d, timeout=%d, memory=%d)",
+                self.path,
+                len(self._stalled),
+                len(self._timeout),
+                len(self._memory),
+            )
+
     def get_previous_retry_ids(self) -> Set[str]:
         """
         Convenience helper to get the set of company_ids from the
-        previous run's retry_companies.json.
+        previous run's retry_companies.json (union of all causes).
         """
         data = self.load_existing()
         retry_list = data.get("retry_companies") or []
@@ -96,6 +141,9 @@ class RetryTracker:
         """
         Set the total number of companies that this run intends to process.
         Used to compute all_attempted flag in the JSON payload.
+
+        NOTE: This overwrites any previous total from prior runs. The
+        retry sets themselves remain merged/persistent.
         """
         self._total_companies = max(0, int(total))
 
@@ -131,11 +179,38 @@ class RetryTracker:
         self._dirty += 1
         self.flush()
 
+    def clear_company(self, company_id: str) -> None:
+        """
+        Remove a company from all retry categories.
+
+        Call this when a company has completed successfully in any run.
+        This is what keeps retry_companies.json accurate over time.
+        """
+        removed = False
+
+        if company_id in self._stalled:
+            self._stalled.remove(company_id)
+            removed = True
+        if company_id in self._timeout:
+            self._timeout.remove(company_id)
+            removed = True
+        if company_id in self._memory:
+            self._memory.remove(company_id)
+            removed = True
+
+        if removed:
+            self._dirty += 1
+            self.flush()
+
     # ---------------- Flush and summary ----------------
 
     def flush(self, force: bool = False) -> None:
         """
         Persist current retry state atomically to disk if needed.
+
+        The file is always written as a single, consistent snapshot:
+          - write to <filename>.tmp
+          - fsync + replace original
         """
         if not force and self._dirty < self.flush_threshold:
             return
@@ -163,6 +238,11 @@ class RetryTracker:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+            try:
+                f.flush()
+            except Exception:
+                # Not fatal; OS will flush on close.
+                pass
         tmp.replace(self.path)
         self._dirty = 0
 
