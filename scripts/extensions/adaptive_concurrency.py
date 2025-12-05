@@ -122,11 +122,11 @@ class AdaptiveConcurrencyConfig:
 
     # How slowly to admit new workers when we enter the caution band
     # between target_mem_low/target_mem_high or target_cpu_low/target_cpu_high.
-    admission_cooldown_sec: float = 20.0
+    admission_cooldown_sec: float = 10.0
 
     # New: local admission budget in the memory caution band.
     # See the class docstring for details.
-    caution_band_fraction: float = 0.5
+    caution_band_fraction: float = 0.2
 
 
 class AdaptiveConcurrencyController:
