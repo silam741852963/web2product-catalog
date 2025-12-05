@@ -129,7 +129,7 @@ class AdaptiveConcurrencyConfig:
 
     # Extra safety margin before allowing new workers to start
     startup_mem_headroom: float = 0.03
-    startup_cpu_headroom: float = 0.05
+    startup_cpu_headroom: float = 0.06
 
     # How slowly to admit new workers when we enter the caution band
     admission_cooldown_sec: float = 10.0
@@ -143,9 +143,6 @@ class AdaptiveConcurrencyConfig:
     stall_mem_band_width: float = 0.05
     stall_release_cooldown_sec: float = 30.0
 
-    # CPU hot with low memory guard
-    cpu_hot_threshold_for_low_mem: float = 0.85
-    cpu_hot_mem_low_fraction: float = 0.8
 
 
 class AdaptiveConcurrencyController:
@@ -612,18 +609,20 @@ class AdaptiveConcurrencyController:
         raw_cpu, raw_mem = self._read_usage()
         now_mono = time.monotonic()
         wall_ts = time.time()
+        cfg = self.cfg
 
-        if self.cfg.smoothing_window_sec <= 0.0:
-            window = 0.0
-        else:
-            window = float(self.cfg.smoothing_window_sec)
+        window = float(cfg.smoothing_window_sec) if cfg.smoothing_window_sec > 0.0 else 0.0
 
         # Compute new limit and smoothed averages under lock
         async with self._lock:
+            # ------------------------------------------------------------------
+            # Update samples (sliding window)
+            # ------------------------------------------------------------------
             self._samples.append((now_mono, raw_cpu, raw_mem))
 
             if window > 0.0:
                 cutoff = now_mono - window
+                # Keep only samples within the window
                 self._samples = [
                     (t, c, m) for (t, c, m) in self._samples if t >= cutoff
                 ]
@@ -632,21 +631,30 @@ class AdaptiveConcurrencyController:
                 self._samples = self._samples[-1:]
 
             if self._samples:
-                avg_cpu = sum(c for _, c, _ in self._samples) / len(self._samples)
-                avg_mem = sum(m for _, _, m in self._samples) / len(self._samples)
+                # Simple average; window is small, so this is cheap
+                count = len(self._samples)
+                sum_cpu = 0.0
+                sum_mem = 0.0
+                for _, c, m in self._samples:
+                    sum_cpu += c
+                    sum_mem += m
+                avg_cpu = sum_cpu / count
+                avg_mem = sum_mem / count
             else:
                 avg_cpu = raw_cpu
                 avg_mem = raw_mem
 
-            # Update memory zone and band admission budget based on smoothed memory
+            # ------------------------------------------------------------------
+            # Update memory zone and admission band based on smoothed memory
+            # ------------------------------------------------------------------
             prev_zone = self._zone_mem
-            if not self.cfg.use_mem:
+            if not cfg.use_mem:
                 # If memory is disabled, treat it as always safe
                 new_zone = "safe"
             else:
-                if avg_mem >= self.cfg.target_mem_high:
+                if avg_mem >= cfg.target_mem_high:
                     new_zone = "high"
-                elif avg_mem >= self.cfg.target_mem_low:
+                elif avg_mem >= cfg.target_mem_low:
                     new_zone = "caution"
                 else:
                     new_zone = "safe"
@@ -662,7 +670,7 @@ class AdaptiveConcurrencyController:
                     # Entering caution band: compute new budget based on the
                     # last safe limit. If that is zero, fall back to current limit.
                     base = self._last_low_mem_limit or self._current_limit
-                    frac = max(self.cfg.caution_band_fraction, 0.0)
+                    frac = max(cfg.caution_band_fraction, 0.0)
                     self._band_admission_budget = int(base * frac)
                 else:
                     # High memory: no new budget here.
@@ -679,60 +687,73 @@ class AdaptiveConcurrencyController:
                     self._last_low_mem_limit,
                 )
 
-            # Check for caution-zone stall and possibly enable override.
+            # ------------------------------------------------------------------
+            # Caution-zone stall detection
+            # ------------------------------------------------------------------
             self._maybe_detect_caution_stall(now_mono, avg_cpu, avg_mem)
 
+            # ------------------------------------------------------------------
+            # Scaling logic
+            # ------------------------------------------------------------------
             old_limit = self._current_limit
             new_limit = old_limit
             increased = False  # track if we actually scaled up
 
-            use_cpu = self.cfg.use_cpu
-            use_mem = self.cfg.use_mem
+            use_cpu = cfg.use_cpu
+            use_mem = cfg.use_mem
 
             if not self._has_seen_work:
                 # Before any company has actually started work, do not scale up
                 # just because the machine is idle. Keep the limit fixed at min.
-                new_limit = self._clamp_limit(self.cfg.min_concurrency)
+                new_limit = self._clamp_limit(cfg.min_concurrency)
             else:
                 # Interpret disabled dimensions as:
                 #   - they never trigger "high" conditions
                 #   - they are always considered "low" for scaling up decisions
-                high_mem = use_mem and avg_mem >= self.cfg.target_mem_high
-                high_cpu = use_cpu and avg_cpu >= self.cfg.target_cpu_high
-                low_mem = (not use_mem) or avg_mem <= self.cfg.target_mem_low
-                low_cpu = (not use_cpu) or avg_cpu <= self.cfg.target_cpu_low
+                high_mem = use_mem and avg_mem >= cfg.target_mem_high
+                high_cpu = use_cpu and avg_cpu >= cfg.target_cpu_high
+                low_mem = (not use_mem) or avg_mem <= cfg.target_mem_low
+                low_cpu = (not use_cpu) or avg_cpu <= cfg.target_cpu_low
 
-                # Extra guard: CPU is already hot while memory is far below
-                # the lower target band. In that case, we freeze scale up
-                # driven by CPU so the limit does not keep growing.
-                cpu_hot_low_mem = (
-                    use_cpu
-                    and use_mem
-                    and avg_cpu >= self.cfg.cpu_hot_threshold_for_low_mem
-                    and avg_mem
-                    <= self.cfg.target_mem_low * self.cfg.cpu_hot_mem_low_fraction
-                )
-                if cpu_hot_low_mem:
-                    if low_cpu:
-                        logger.debug(
-                            "[AdaptiveConcurrency] cpu hot with low mem "
-                            "(avg_cpu=%.3f, avg_mem=%.3f, limit=%d); "
-                            "freezing scale up based on CPU.",
-                            avg_cpu,
-                            avg_mem,
-                            old_limit,
+                # Dynamic scale-up aggressiveness based on memory underuse.
+                # This only matters when memory is enabled and below the low band.
+                scale_up_step = cfg.scale_up_step
+                scale_up_cooldown = cfg.scale_up_cooldown_sec
+
+                if use_mem and cfg.target_mem_low > 0.0 and avg_mem < cfg.target_mem_low:
+                    mem_deficit = cfg.target_mem_low - avg_mem
+                    # Only consider "underuse" when we are clearly below the band.
+                    if mem_deficit >= 0.30:
+                        # Very under-used memory: ramp fast
+                        scale_up_step *= 8
+                        scale_up_cooldown = max(
+                            cfg.sample_interval_sec,
+                            scale_up_cooldown / 4.0,
                         )
-                    low_cpu = False
+                    elif mem_deficit >= 0.20:
+                        # Moderately under-used
+                        scale_up_step *= 4
+                        scale_up_cooldown = max(
+                            cfg.sample_interval_sec,
+                            scale_up_cooldown / 3.0,
+                        )
+                    elif mem_deficit >= 0.10:
+                        # Slightly under-used
+                        scale_up_step *= 2
+                        scale_up_cooldown = max(
+                            cfg.sample_interval_sec,
+                            scale_up_cooldown / 2.0,
+                        )
 
                 # Decrease if any enabled dimension is too high, but respect cooldown
                 if high_mem or high_cpu:
                     if (
-                        self.cfg.scale_down_step > 0
+                        cfg.scale_down_step > 0
                         and now_mono - self._last_scale_down_ts
-                        >= self.cfg.scale_down_cooldown_sec
+                        >= cfg.scale_down_cooldown_sec
                     ):
                         new_limit = self._clamp_limit(
-                            old_limit - self.cfg.scale_down_step
+                            old_limit - cfg.scale_down_step
                         )
                         if new_limit != old_limit:
                             self._last_scale_down_ts = now_mono
@@ -741,13 +762,10 @@ class AdaptiveConcurrencyController:
                 # and enough time has passed since last scale up.
                 elif low_mem and low_cpu:
                     if (
-                        self.cfg.scale_up_step > 0
-                        and now_mono - self._last_scale_up_ts
-                        >= self.cfg.scale_up_cooldown_sec
+                        scale_up_step > 0
+                        and now_mono - self._last_scale_up_ts >= scale_up_cooldown
                     ):
-                        new_limit = self._clamp_limit(
-                            old_limit + self.cfg.scale_up_step
-                        )
+                        new_limit = self._clamp_limit(old_limit + scale_up_step)
                         if new_limit != old_limit:
                             self._last_scale_up_ts = now_mono
                             increased = True
@@ -759,6 +777,9 @@ class AdaptiveConcurrencyController:
             if increased and new_limit > old_limit:
                 self._last_admission_ts = 0.0
 
+            # ------------------------------------------------------------------
+            # Persist last readings for introspection and logging
+            # ------------------------------------------------------------------
             self._last_avg_cpu = avg_cpu
             self._last_avg_mem = avg_mem
             self._last_raw_cpu = raw_cpu
@@ -783,7 +804,9 @@ class AdaptiveConcurrencyController:
                 "stall_override_active": self._stall_override_active,
             }
 
+        # ----------------------------------------------------------------------
         # Logging outside the lock
+        # ----------------------------------------------------------------------
         self._maybe_log_state(state_snapshot)
 
         if state_snapshot["limit_new"] != state_snapshot["limit_old"]:
