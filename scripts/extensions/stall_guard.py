@@ -58,6 +58,10 @@ class StallDetectedError(RuntimeError):
     """Raised when StallGuard detects a stall (optional use)."""
 
 
+class GlobalStallDetectedError(RuntimeError):
+    """Raised when wait_for_global_hard_stall detects a global stall."""
+
+
 @dataclass(slots=True)
 class _CompanyState:
     company_id: str
@@ -455,6 +459,7 @@ async def wait_for_global_hard_stall(
     page_timeout_sec: float,
     factor: float = 4.5,
     check_interval_sec: float = 30.0,
+    raise_on_stall: bool = False,
 ) -> float:
     """
     Wait until the whole run appears globally stalled.
@@ -473,6 +478,11 @@ async def wait_for_global_hard_stall(
 
     In both cases it falls back to the age since the last progress on any
     company and returns once that exceeds the same hard threshold.
+
+    If raise_on_stall is True, the helper raises GlobalStallDetectedError
+    instead of just returning the age. This is useful if you want to abort
+    the whole run on a global stall and let an outer retry wrapper restart
+    the process.
     """
 
     if factor <= 0:
@@ -521,12 +531,14 @@ async def wait_for_global_hard_stall(
                 )
 
             if elapsed >= hard:
-                logger.error(
+                msg = (
                     "Global StallGuard: zombie stall detected before first "
-                    "heartbeat; no progress for %.1fs >= %.1fs",
-                    elapsed,
-                    hard,
+                    "heartbeat; no progress for %.1fs >= %.1fs"
+                    % (elapsed, hard)
                 )
+                logger.error(msg)
+                if raise_on_stall:
+                    raise GlobalStallDetectedError(msg)
                 return elapsed
 
             continue
@@ -540,11 +552,13 @@ async def wait_for_global_hard_stall(
                 hard,
             )
             if age_active >= hard:
-                logger.error(
-                    "Global StallGuard: hard stall detected, min idle (active) = %.1fs >= %.1fs",
-                    age_active,
-                    hard,
+                msg = (
+                    "Global StallGuard: hard stall detected, "
+                    "min idle (active) = %.1fs >= %.1fs" % (age_active, hard)
                 )
+                logger.error(msg)
+                if raise_on_stall:
+                    raise GlobalStallDetectedError(msg)
                 return age_active
 
         # Zombie branch 1: active companies but last_progress_age() could not
@@ -559,12 +573,14 @@ async def wait_for_global_hard_stall(
                 hard,
             )
             if age_any >= hard:
-                logger.error(
+                msg = (
                     "Global StallGuard: zombie stall detected "
-                    "(active companies, no progress for %.1fs >= %.1fs)",
-                    age_any,
-                    hard,
+                    "(active companies, no progress for %.1fs >= %.1fs)"
+                    % (age_any, hard)
                 )
+                logger.error(msg)
+                if raise_on_stall:
+                    raise GlobalStallDetectedError(msg)
                 return age_any
 
         # Zombie branch 2: no active companies, but there has been no progress
@@ -577,12 +593,14 @@ async def wait_for_global_hard_stall(
                 hard,
             )
             if age_any >= hard:
-                logger.error(
+                msg = (
                     "Global StallGuard: zombie stall detected with zero active "
-                    "companies; no progress for %.1fs >= %.1fs",
-                    age_any,
-                    hard,
+                    "companies; no progress for %.1fs >= %.1fs"
+                    % (age_any, hard)
                 )
+                logger.error(msg)
+                if raise_on_stall:
+                    raise GlobalStallDetectedError(msg)
                 return age_any
 
         # Otherwise we are either making progress or not yet past the
@@ -594,5 +612,6 @@ __all__ = [
     "StallSnapshot",
     "StallGuard",
     "StallDetectedError",
+    "GlobalStallDetectedError",
     "wait_for_global_hard_stall",
 ]
