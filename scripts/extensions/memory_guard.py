@@ -71,7 +71,7 @@ class MemoryGuardConfig:
     """
 
     marker: str = MEMORY_PRESSURE_MARKER
-    host_soft_limit: float = 0.90
+    host_soft_limit: float = 0.87
     host_hard_limit: float = 0.94
     host_emergency_limit: float = 0.98
     soft_kill_hits: int = 3

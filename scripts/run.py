@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,19 +65,17 @@ from extensions.crawl_state import (
     COMPANY_STATUS_LLM_NOT_DONE,
 )
 from extensions.resource_monitor import ResourceMonitor, ResourceMonitorConfig
-
 from extensions.stall_guard import (
     StallGuard,
     StallGuardConfig,
     wait_for_global_hard_stall,
     GlobalStallDetectedError,
 )
-
 from extensions.memory_guard import MemoryGuard, CriticalMemoryPressure
 from extensions.retry_tracker import RetryTracker, RetryTrackerConfig
-from extensions.adaptive_concurrency import (
-    AdaptiveConcurrencyConfig,
-    AdaptiveConcurrencyController,
+from extensions.adaptive_scheduling import (
+    AdaptiveSchedulingConfig,
+    AdaptiveScheduler,
 )
 
 logger = logging.getLogger("deep_crawl_runner")
@@ -91,7 +88,8 @@ _HTTP_LANG_MAP: Dict[str, str] = {
 }
 
 # Special exit code so outer wrapper knows there are companies to retry.
-RETRY_EXIT_CODE = int(os.environ.get("DEEP_CRAWL_RETRY_EXIT_CODE", "17"))
+# Previously configurable via DEEP_CRAWL_RETRY_EXIT_CODE env var; now fixed.
+RETRY_EXIT_CODE = 17
 
 _retry_tracker: Optional[RetryTracker] = None
 
@@ -123,13 +121,11 @@ def record_company_attempt(company_id: str) -> None:
 
 def mark_company_completed(company_id: str) -> None:
     if _retry_tracker is not None:
-        # Remove this company from all retry categories, regardless
-        # of why it was previously scheduled.
         _retry_tracker.clear_company(company_id)
 
 
 # ---------------------------------------------------------------------------
-# Models
+# Models and company loading
 # ---------------------------------------------------------------------------
 
 
@@ -137,11 +133,6 @@ def mark_company_completed(company_id: str) -> None:
 class Company:
     company_id: str
     domain_url: str
-
-
-# ---------------------------------------------------------------------------
-# Company loading
-# ---------------------------------------------------------------------------
 
 
 def _companies_from_source(path: Path) -> List[Company]:
@@ -193,7 +184,7 @@ def _write_crawl_meta(company: Company, snapshot: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-page processing
+# Per page processing
 # ---------------------------------------------------------------------------
 
 
@@ -597,7 +588,7 @@ async def run_full_pass_for_company(
 
 
 # ---------------------------------------------------------------------------
-# Company-level crawl
+# Company level crawl
 # ---------------------------------------------------------------------------
 
 
@@ -611,9 +602,9 @@ async def crawl_company(
     timeout_error_marker: str,
     stall_guard: Optional[StallGuard] = None,
     root_urls: Optional[List[str]] = None,
-    crawler_base_cfg: Any = None,
-    page_policy: Optional[PageInteractionPolicy] = None,
-    page_interaction_factory: Optional[PageInteractionFactory] = None,
+    crawler_base_cfg: Any,
+    page_policy: PageInteractionPolicy,
+    page_interaction_factory: PageInteractionFactory,
     max_pages: Optional[int] = None,
     page_timeout_ms: Optional[int] = None,
     memory_guard: Optional[MemoryGuard] = None,
@@ -632,7 +623,7 @@ async def crawl_company(
     for start_url in start_urls:
         if max_pages is not None and pages_processed >= max_pages:
             logger.info(
-                "Per-company max_pages limit (%d) already reached for company_id=%s, skipping remaining roots",
+                "Per company max_pages limit (%d) reached for company_id=%s, skipping remaining roots",
                 max_pages,
                 company.company_id,
             )
@@ -645,52 +636,35 @@ async def crawl_company(
             len(start_urls),
         )
 
-        if crawler_base_cfg is not None:
-            clone_kwargs: Dict[str, Any] = {
-                "cache_mode": CacheMode.BYPASS,
-                "remove_overlay_elements": True,
-                "deep_crawl_strategy": deep_strategy,
-                "stream": True,
-            }
+        clone_kwargs: Dict[str, Any] = {
+            "cache_mode": CacheMode.BYPASS,
+            "remove_overlay_elements": True,
+            "deep_crawl_strategy": deep_strategy,
+            "stream": True,
+        }
 
-            if page_policy is not None and page_interaction_factory is not None:
-                interaction_cfg = page_interaction_factory.base_config(
-                    url=start_url,
-                    policy=page_policy,
-                    js_only=False,
-                )
+        interaction_cfg = page_interaction_factory.base_config(
+            url=start_url,
+            policy=page_policy,
+            js_only=False,
+        )
+        js_code = "\n\n".join(interaction_cfg.js_code) if interaction_cfg.js_code else ""
 
-                js_code = (
-                    "\n\n".join(interaction_cfg.js_code)
-                    if interaction_cfg.js_code
-                    else ""
-                )
+        clone_kwargs.update(
+            js_code=js_code,
+            js_only=interaction_cfg.js_only,
+            wait_for=interaction_cfg.wait_for,
+        )
 
-                clone_kwargs.update(
-                    js_code=js_code,
-                    js_only=interaction_cfg.js_only,
-                    wait_for=interaction_cfg.wait_for,
-                )
-
-            config = crawler_base_cfg.clone(**clone_kwargs)
-        else:
-            from crawl4ai import CrawlerRunConfig
-
-            config_kwargs: Dict[str, Any] = dict(
-                deep_crawl_strategy=deep_strategy,
-                cache_mode=CacheMode.BYPASS,
-                remove_overlay_elements=True,
-                stream=True,
-                verbose=False,
-            )
-            if page_timeout_ms is not None:
-                config_kwargs["page_timeout"] = page_timeout_ms
-
-            config = CrawlerRunConfig(**config_kwargs)
+        config = crawler_base_cfg.clone(**clone_kwargs)
+        if page_timeout_ms is not None:
+            try:
+                config.page_timeout = page_timeout_ms  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
         results_or_gen = await crawler.arun(start_url, config=config)
 
-        # Early host memory check right after starting the deep crawl for this root.
         if memory_guard is not None:
             memory_guard.check_host_only(
                 company_id=company.company_id,
@@ -704,7 +678,6 @@ async def crawl_company(
                 agen = agen.__aiter__()
 
             while True:
-                # Check host memory before pulling the next page.
                 if memory_guard is not None:
                     memory_guard.check_host_only(
                         company_id=company.company_id,
@@ -714,7 +687,7 @@ async def crawl_company(
 
                 if max_pages is not None and pages_processed >= max_pages:
                     logger.info(
-                        "Per-company max_pages limit (%d) reached for company_id=%s, stopping crawl for this company",
+                        "Per company max_pages limit (%d) reached for company_id=%s, stopping crawl for this company",
                         max_pages,
                         company.company_id,
                     )
@@ -802,7 +775,7 @@ async def crawl_company(
 
                 if max_pages is not None and pages_processed >= max_pages:
                     logger.info(
-                        "Per-company max_pages limit (%d) reached for company_id=%s, stopping crawl for this company",
+                        "Per company max_pages limit (%d) reached for company_id=%s, stopping crawl for this company",
                         max_pages,
                         company.company_id,
                     )
@@ -810,7 +783,7 @@ async def crawl_company(
 
 
 # ---------------------------------------------------------------------------
-# BM25 helpers
+# BM25 and dataset helpers
 # ---------------------------------------------------------------------------
 
 
@@ -869,11 +842,6 @@ def build_dual_bm25_components() -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Dataset externals helper
-# ---------------------------------------------------------------------------
-
-
 def _build_dataset_externals(
     companies: List[Company],
     dataset_file: Optional[str],
@@ -905,11 +873,6 @@ def _build_dataset_externals(
             logger.exception("Failed to load dataset-file %s: %s", dataset_file, e)
 
     return sorted(dataset_hosts)
-
-
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
 
 
 def _build_filter_chain(
@@ -962,7 +925,7 @@ def _should_skip_company(status: str, llm_mode: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Company pipeline runner (per-company, concurrent)
+# Company pipeline runner
 # ---------------------------------------------------------------------------
 
 
@@ -987,10 +950,10 @@ async def run_company_pipeline(
     stall_guard: Optional[StallGuard],
     memory_guard: Optional[MemoryGuard],
     dfs_factory: Optional[DeepCrawlStrategyFactory],
-    crawler_base_cfg: Any = None,
-    page_policy: Optional[PageInteractionPolicy] = None,
-    page_interaction_factory: Optional[PageInteractionFactory] = None,
-    page_timeout_ms: Optional[int] = None,
+    crawler_base_cfg: Any,
+    page_policy: PageInteractionPolicy,
+    page_interaction_factory: PageInteractionFactory,
+    page_timeout_ms: Optional[int],
 ) -> None:
     completed_ok = False
     token: Optional[Any] = None
@@ -1184,9 +1147,6 @@ async def run_company_pipeline(
                 company.company_id,
             )
 
-        # If the company completed without unhandled exceptions or
-        # CriticalMemoryPressure, we consider it recovered and drop it
-        # from retry_companies.json.
         if completed_ok:
             mark_company_completed(company.company_id)
 
@@ -1205,7 +1165,7 @@ async def run_company_pipeline(
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Deep crawl corporate websites (per-company pipeline)."
+        description="Deep crawl corporate websites (per company pipeline)."
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
@@ -1217,7 +1177,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--company-file",
         type=str,
         help=(
-            "Path to input file OR directory with company data. "
+            "Path to input file or directory with company data. "
             "Supports CSV or TSV or Excel or JSON or Parquet via extensions.load_source."
         ),
     )
@@ -1293,7 +1253,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=2048,
         help=(
             "Maximum number of companies to process concurrently. "
-            "Acts as a hard upper bound for adaptive concurrency."
+            "Acts as a hard upper bound for adaptive scheduling."
         ),
     )
     parser.add_argument(
@@ -1356,7 +1316,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--adaptive-disable-cpu",
         action="store_true",
         help=(
-            "Disable CPU-based adaptive concurrency decisions. "
+            "Disable CPU-based adaptive scheduling decisions. "
             "When set, only memory (if enabled) will influence scaling."
         ),
     )
@@ -1364,10 +1324,10 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--adaptive-disable-mem",
         action="store_true",
         help=(
-            "Disable memory-based adaptive concurrency decisions. "
+            "Disable memory-based adaptive scheduling decisions. "
             "When set, only CPU (if enabled) will influence scaling. "
-            "If both CPU and memory are disabled, concurrency will slowly "
-            "rise to --company-concurrency and stay there (fixed mode)."
+            "If both CPU and memory are disabled, concurrency will rise "
+            "to --company-concurrency and stay there (fixed mode)."
         ),
     )
     parser.add_argument(
@@ -1388,10 +1348,8 @@ async def main_async(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     output_paths.OUTPUT_ROOT = out_dir  # type: ignore[attr-defined]
 
-    retry_cfg = RetryTrackerConfig(
-        out_dir=out_dir,
-        flush_threshold=int(os.environ.get("RETRY_FLUSH_THRESHOLD", "1")),
-    )
+    # Retry tracker: rely on defaults inside RetryTrackerConfig except for out_dir.
+    retry_cfg = RetryTrackerConfig(out_dir=out_dir)
     retry_tracker = RetryTracker(retry_cfg)
     set_retry_tracker(retry_tracker)
 
@@ -1414,7 +1372,6 @@ async def main_async(args: argparse.Namespace) -> None:
     timeout_error_marker = f"Timeout {page_timeout_ms}ms exceeded."
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
-
     enable_session_log = getattr(args, "enable_session_log", False)
 
     logging_ext = LoggingExtension(
@@ -1433,9 +1390,8 @@ async def main_async(args: argparse.Namespace) -> None:
 
     resource_monitor: Optional[ResourceMonitor] = None
     if getattr(args, "enable_resource_monitor", False):
-        rm_config = ResourceMonitorConfig(
-            interval_sec=float(getattr(args, "resource_monitor_interval", 2.0))
-        )
+        # Let ResourceMonitorConfig use its own defaults; only output_path is pipeline-specific.
+        rm_config = ResourceMonitorConfig()
         resource_monitor = ResourceMonitor(
             output_path=out_dir / "resource_usage.json",
             config=rm_config,
@@ -1505,22 +1461,19 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     page_interaction_factory = default_page_interaction_factory
 
+    # Stall guard: tie its timeouts to page_timeout_ms, but rely on StallGuard defaults otherwise.
     stall_cfg = StallGuardConfig(
         page_timeout_sec=page_timeout_ms / 1000.0,
-        soft_timeout_factor=1.5,
-        hard_timeout_factor=3.0,
-        check_interval_sec=30.0,
     )
     stall_guard = StallGuard(config=stall_cfg)
 
-    # Optional multi level memory guard.
     memory_guard: Optional[MemoryGuard] = None
     company_tasks: Dict[str, asyncio.Task] = {}
 
     if getattr(args, "enable_hard_memory_guard", False):
         memory_guard = MemoryGuard()
         logger.info(
-            "Memory guard enabled with soft, hard and emergency limits "
+            "Memory guard enabled with built-in thresholds "
             "(soft kills company, hard kills company and clamps concurrency, "
             "emergency cancels everything and exits with retry code)."
         )
@@ -1572,7 +1525,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
     state = get_crawl_state()
 
-    ac_controller: Optional[AdaptiveConcurrencyController] = None
+    scheduler: Optional[AdaptiveScheduler] = None
     global_stall_task: Optional[asyncio.Task] = None
 
     try:
@@ -1694,28 +1647,15 @@ async def main_async(args: argparse.Namespace) -> None:
 
         max_companies = max(1, int(args.company_concurrency))
 
-        # Adaptive concurrency config.
-        ac_cfg = AdaptiveConcurrencyConfig(
+        # Adaptive scheduling config: let the extension's defaults handle thresholds,
+        # only override what is truly run-specific (max_concurrency and CPU/mem toggles).
+        sched_cfg = AdaptiveSchedulingConfig(
             max_concurrency=max_companies,
-            min_concurrency=1,
-            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.80")),
-            target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.90")),
-            target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.90")),
-            target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "1.00")),
-            sample_interval_sec=float(os.environ.get("AC_SAMPLE_INTERVAL", "0.75")),
-            smoothing_window_sec=float(
-                os.environ.get("AC_SMOOTHING_WINDOW_SEC", "10.0")
-            ),
-            log_path=(
-                Path(os.environ["AC_LOG_PATH"]).resolve()
-                if os.environ.get("AC_LOG_PATH")
-                else None
-            ),
             use_cpu=not getattr(args, "adaptive_disable_cpu", False),
             use_mem=not getattr(args, "adaptive_disable_mem", False),
         )
-        ac_controller = AdaptiveConcurrencyController(cfg=ac_cfg)
-        await ac_controller.start()
+        scheduler = AdaptiveScheduler(cfg=sched_cfg)
+        await scheduler.start()
 
         # DFS factory only needed when selected.
         dfs_factory: Optional[DeepCrawlStrategyFactory] = None
@@ -1737,24 +1677,9 @@ async def main_async(args: argparse.Namespace) -> None:
 
         abort_run = False
 
-        # Configure memory guard thresholds and callback if enabled.
+        # Configure memory guard callback if enabled (thresholds use defaults in MemoryGuard).
         if memory_guard is not None:
             cfg = memory_guard.config
-            cfg.host_soft_limit = float(
-                os.environ.get("HOST_MEM_SOFT_LIMIT", "0.87")
-            )
-            cfg.host_hard_limit = float(
-                os.environ.get("HOST_MEM_HARD_LIMIT", "0.94")
-            )
-            cfg.host_emergency_limit = float(
-                os.environ.get("HOST_MEM_EMERGENCY_LIMIT", "0.98")
-            )
-            cfg.check_interval_sec = float(
-                os.environ.get("HOST_MEM_CHECK_INTERVAL", "0.5")
-            )
-            cfg.soft_kill_hits = int(
-                os.environ.get("HOST_MEM_SOFT_KILL_HITS", "3")
-            )
 
             def _on_critical_memory(company_id: str, severity: str) -> None:
                 nonlocal abort_run
@@ -1779,13 +1704,15 @@ async def main_async(args: argparse.Namespace) -> None:
                     )
                     abort_run = True
 
-                if ac_controller is not None:
+                if scheduler is not None:
                     try:
                         loop = asyncio.get_running_loop()
                     except RuntimeError:
                         loop = None
                     if loop is not None:
-                        loop.create_task(ac_controller.on_memory_pressure())
+                        loop.create_task(
+                            scheduler.on_memory_pressure(severity=severity)
+                        )
 
                 if severity == "emergency":
                     for cid, t in list(company_tasks.items()):
@@ -1802,13 +1729,16 @@ async def main_async(args: argparse.Namespace) -> None:
         async def _global_stall_watchdog() -> None:
             nonlocal abort_run
             try:
+                # Previously GLOBAL_STALL_FACTOR was tunable via env; now we fix it at 4.5.
                 idle = await wait_for_global_hard_stall(
                     stall_guard,
-                    page_timeout_sec=page_timeout_ms / 1000.0,
-                    factor=float(os.environ.get("GLOBAL_STALL_FACTOR", "4.5")),
+                    page_timeout_sec=stall_cfg.page_timeout_sec,
                     check_interval_sec=stall_cfg.check_interval_sec,
                 )
             except asyncio.CancelledError:
+                return
+            except GlobalStallDetectedError:
+                # Already handled in wait_for_global_hard_stall
                 return
             except Exception as e:
                 logger.exception(
@@ -1820,11 +1750,11 @@ async def main_async(args: argparse.Namespace) -> None:
             abort_run = True
 
             logger.error(
-                "Global StallGuard: no company-level progress for %.1fs, treating this run as globally stalled. Marking active companies for retry.",
+                "Global StallGuard: no company-level progress for %.1fs, treating this run as globally stalled. "
+                "Marking active companies for retry.",
                 idle,
             )
 
-            # Only mark currently running companies as stalled.
             active_company_ids: List[str] = []
             for cid, task in list(company_tasks.items()):
                 if not task.done():
@@ -1857,71 +1787,31 @@ async def main_async(args: argparse.Namespace) -> None:
 
             inflight: set[asyncio.Task] = set()
             next_idx = 0
-            last_effective_limit = 0
 
             while not abort_run and (next_idx < total_companies or inflight):
-                # 1) Read current adaptive limit and clamp to [1, max_companies].
-                if ac_controller is not None:
-                    try:
-                        current_limit = await ac_controller.get_limit()
-                    except Exception as e:
-                        logger.exception(
-                            "[AdaptiveConcurrency] get_limit failed: %s",
-                            e,
-                        )
-                        current_limit = max_companies
-                else:
-                    current_limit = max_companies
+                active_tasks = len(inflight)
+                started = False
 
-                effective_limit = max(1, min(current_limit, max_companies))
-                desired = min(effective_limit, total_companies)
-
-                limit_increased = effective_limit > last_effective_limit
-                available_slots = desired - len(inflight)
-
-                if limit_increased:
-                    logger.info(
-                        "[Scheduler] limit change %d -> %d (inflight=%d, desired=%d, available_slots=%d, next_idx=%d/%d)",
-                        last_effective_limit,
-                        effective_limit,
-                        len(inflight),
-                        desired,
-                        available_slots,
-                        next_idx,
-                        total_companies,
+                if scheduler is not None:
+                    can_start, reason = await scheduler.can_start_new_company(
+                        active_tasks=active_tasks
                     )
-                    if available_slots <= 0 or abort_run or next_idx >= total_companies:
-                        reasons: List[str] = []
-                        if abort_run:
-                            reasons.append("abort_run")
-                        if next_idx >= total_companies:
-                            reasons.append("no_companies_left")
-                        if available_slots <= 0 and len(inflight) >= desired:
-                            reasons.append("inflight>=desired")
-                        reason_str = ",".join(reasons) if reasons else "none"
-                        logger.info(
-                            "[Scheduler] limit increased but no new company started (reason=%s)",
-                            reason_str,
-                        )
+                else:
+                    can_start = active_tasks < max_companies
+                    reason = "no_scheduler"
 
-                # 2) Start as many new companies as available_slots allows.
-                started_now = 0
-                while (
-                    available_slots > 0
+                if (
+                    can_start
                     and next_idx < total_companies
                     and not abort_run
                 ):
                     company = companies[next_idx]
                     next_idx += 1
-                    available_slots -= 1
-                    started_now += 1
-
-                    if ac_controller is not None:
-                        await ac_controller.notify_work_started()
+                    idx_for_log = next_idx
 
                     async def _run_company(
                         company: Company = company,
-                        offset: int = next_idx,
+                        offset: int = idx_for_log,
                     ) -> None:
                         await run_company_pipeline(
                             company=company,
@@ -1950,12 +1840,12 @@ async def main_async(args: argparse.Namespace) -> None:
                         )
 
                     logger.info(
-                        "[Scheduler] starting company company_id=%s (idx=%d/%d, inflight_before=%d, target_concurrency=%d)",
+                        "[Scheduler] starting company company_id=%s (idx=%d/%d, active_before=%d, reason=%s)",
                         company.company_id,
-                        next_idx,
+                        idx_for_log,
                         total_companies,
-                        len(inflight),
-                        desired,
+                        active_tasks,
+                        reason,
                     )
 
                     task = asyncio.create_task(
@@ -1964,72 +1854,80 @@ async def main_async(args: argparse.Namespace) -> None:
                     )
                     company_tasks[company.company_id] = task
                     inflight.add(task)
+                    if scheduler is not None:
+                        scheduler.notify_admitted(
+                            company_id=company.company_id,
+                            reason=reason,
+                        )
+                    started = True
+                else:
+                    if not started and not abort_run and next_idx < total_companies:
+                        logger.info(
+                            "[Scheduler] not starting new company (active=%d, reason=%s, next_idx=%d/%d)",
+                            active_tasks,
+                            reason,
+                            next_idx,
+                            total_companies,
+                        )
 
-                if started_now == 0 and not limit_increased:
-                    # Optional debug on steady state.
-                    logger.debug(
-                        "[Scheduler] no new companies started (inflight=%d, desired=%d, next_idx=%d/%d, abort_run=%s)",
-                        len(inflight),
-                        desired,
-                        next_idx,
-                        total_companies,
-                        abort_run,
-                    )
-
-                last_effective_limit = effective_limit
-
-                # 3) If nothing left to run and no inflight tasks, we are done.
                 if not inflight and next_idx >= total_companies:
                     break
 
-                # 4) Wait for some progress or for the next sampling tick.
-                if ac_controller is not None:
-                    timeout = ac_cfg.sample_interval_sec
-                else:
-                    timeout = None
+                if inflight:
+                    timeout = (
+                        scheduler.sample_interval_sec
+                        if scheduler is not None
+                        else None
+                    )
 
-                done, pending = await asyncio.wait(
-                    inflight,
-                    return_when=asyncio.FIRST_COMPLETED,
-                    timeout=timeout,
-                )
-                inflight = pending
+                    done, pending = await asyncio.wait(
+                        inflight,
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=timeout,
+                    )
+                    inflight = pending
 
-                for t in done:
-                    # Remove mapping entry if this was a company task.
-                    for cid, ct in list(company_tasks.items()):
-                        if ct is t:
-                            company_tasks.pop(cid, None)
-                            break
+                    for t in done:
+                        for cid, ct in list(company_tasks.items()):
+                            if ct is t:
+                                company_tasks.pop(cid, None)
+                                break
 
-                    if t.cancelled():
-                        continue
-
-                    try:
-                        exc = t.exception()
-                    except asyncio.CancelledError:
-                        continue
-
-                    if isinstance(exc, CriticalMemoryPressure):
-                        if not getattr(
-                            args, "enable_hard_memory_guard", False
-                        ):
+                        if t.cancelled():
                             continue
 
-                        severity = getattr(exc, "severity", "emergency")
-                        if severity == "emergency":
-                            logger.error(
-                                "Emergency memory pressure reported by one company; "
-                                "aborting remaining run so the wrapper can restart.",
-                            )
-                            abort_run = True
-                            break
-                        else:
-                            logger.warning(
-                                "Non emergency memory pressure reported (severity=%s); "
-                                "run will continue with the same scheduling policy.",
-                                severity,
-                            )
+                        try:
+                            exc = t.exception()
+                        except asyncio.CancelledError:
+                            continue
+
+                        if isinstance(exc, CriticalMemoryPressure):
+                            if not getattr(
+                                args, "enable_hard_memory_guard", False
+                            ):
+                                continue
+
+                            severity = getattr(exc, "severity", "emergency")
+                            if severity == "emergency":
+                                logger.error(
+                                    "Emergency memory pressure reported by one company; "
+                                    "aborting remaining run so the wrapper can restart.",
+                                )
+                                abort_run = True
+                                break
+                            else:
+                                logger.warning(
+                                    "Non emergency memory pressure reported (severity=%s); "
+                                    "run will continue with the same scheduling policy.",
+                                    severity,
+                                )
+                    if abort_run:
+                        break
+                else:
+                    if scheduler is not None:
+                        await asyncio.sleep(scheduler.sample_interval_sec)
+                    else:
+                        await asyncio.sleep(0.5)
 
             if abort_run:
                 for t in inflight:
@@ -2074,11 +1972,11 @@ async def main_async(args: argparse.Namespace) -> None:
             except Exception:
                 logger.exception("Error while stopping ResourceMonitor")
 
-        if ac_controller is not None:
+        if scheduler is not None:
             try:
-                await ac_controller.stop()
+                await scheduler.stop()
             except Exception:
-                logger.exception("Error while stopping AdaptiveConcurrencyController")
+                logger.exception("Error while stopping AdaptiveScheduler")
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
