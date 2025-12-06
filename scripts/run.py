@@ -107,7 +107,7 @@ def mark_company_timeout(company_id: str) -> None:
 
 
 def mark_company_stalled(company_id: str) -> None:
-    if _retry_tracker is not None:
+    if _retry_tracker is not not None:
         _retry_tracker.mark_stalled(company_id)
 
 
@@ -911,14 +911,6 @@ def _build_dataset_externals(
 
 
 # ---------------------------------------------------------------------------
-# Adaptive concurrency helpers
-# ---------------------------------------------------------------------------
-
-# ActiveCounter and wait_for_adaptive_slot have been removed.
-# Scheduling is now driven directly by the adaptive limit in the main loop.
-
-
-# ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
 
@@ -1411,7 +1403,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-
 async def main_async(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1849,31 +1840,30 @@ async def main_async(args: argparse.Namespace) -> None:
             abort_run = True
 
             logger.error(
-                "Global StallGuard: no company-level progress for %.1fs, treating this run as globally stalled. Marking companies for retry.",
+                "Global StallGuard: no company-level progress for %.1fs, treating this run as globally stalled. Marking active companies for retry.",
                 idle,
             )
 
-            for c in companies:
-                try:
-                    snap = await state.get_company_snapshot(c.company_id)
-                    status = getattr(snap, "status", None)
-                except Exception as e:
-                    logger.warning(
-                        "Global StallGuard: failed to get snapshot for %s while marking stall: %s",
-                        c.company_id,
-                        e,
-                    )
-                    mark_company_stalled(c.company_id)
-                    continue
-
-                if status != COMPANY_STATUS_LLM_DONE:
-                    mark_company_stalled(c.company_id)
-
-            for company_id, task in list(company_tasks.items()):
+            # Only mark currently running companies as stalled.
+            active_company_ids: List[str] = []
+            for cid, task in list(company_tasks.items()):
                 if not task.done():
+                    active_company_ids.append(cid)
+
+            if not active_company_ids:
+                logger.error(
+                    "Global StallGuard: no active company tasks found at stall detection time."
+                )
+
+            for cid in active_company_ids:
+                mark_company_stalled(cid)
+
+            for cid in active_company_ids:
+                task = company_tasks.get(cid)
+                if task is not None and not task.done():
                     logger.error(
                         "Global StallGuard: cancelling company task company_id=%s",
-                        company_id,
+                        cid,
                     )
                     task.cancel()
 
@@ -1914,8 +1904,6 @@ async def main_async(args: argparse.Namespace) -> None:
 
                 inflight: set[asyncio.Task] = set()
                 next_idx = 0
-                # Track last effective adaptive limit to convert increases into slots.
-                last_effective_limit = 0
 
                 while not abort_run and (
                     next_idx < len(indexed_session) or inflight
@@ -1935,79 +1923,67 @@ async def main_async(args: argparse.Namespace) -> None:
 
                     effective_limit = max(1, min(current_limit, max_companies))
 
-                    # 2) If the effective limit increased, treat the delta as new slots
-                    #    and immediately start that many new companies, ignoring inflight.
-                    if (
-                        effective_limit > last_effective_limit
+                    # 2) Desired concurrency is min(effective_limit, total companies in this session).
+                    desired = min(effective_limit, len(indexed_session))
+
+                    # 3) Compute available slots based on current inflight tasks.
+                    available_slots = desired - len(inflight)
+
+                    # 4) Start as many new companies as available_slots allows.
+                    while (
+                        available_slots > 0
                         and next_idx < len(indexed_session)
                         and not abort_run
                     ):
-                        slots_to_fill = effective_limit - last_effective_limit
+                        offset, company = indexed_session[next_idx]
+                        next_idx += 1
+                        available_slots -= 1
 
-                        logger.debug(
-                            "New adaptive slots allocated: old_effective=%d new_effective=%d slots_to_fill=%d",
-                            last_effective_limit,
-                            effective_limit,
-                            slots_to_fill,
-                        )
+                        if ac_controller is not None:
+                            await ac_controller.notify_work_started()
 
-                        while (
-                            slots_to_fill > 0
-                            and next_idx < len(indexed_session)
-                            and not abort_run
-                        ):
-                            offset, company = indexed_session[next_idx]
-                            next_idx += 1
-                            slots_to_fill -= 1
-
-                            if ac_controller is not None:
-                                await ac_controller.notify_work_started()
-
-                            async def _run_company(
-                                company: Company = company,
-                                offset: int = offset,
-                            ) -> None:
-                                await run_company_pipeline(
-                                    company=company,
-                                    idx=offset,
-                                    total=total,
-                                    logging_ext=logging_ext,
-                                    state=state,
-                                    guard=guard,
-                                    gating_cfg=gating_cfg,
-                                    timeout_error_marker=timeout_error_marker,
-                                    crawler=crawler,
-                                    args=args,
-                                    dataset_externals=dataset_externals,
-                                    url_scorer=url_scorer,
-                                    bm25_filter=bm25_filter,
-                                    run_id=run_id,
-                                    presence_llm=presence_llm,
-                                    full_llm=full_llm,
-                                    stall_guard=stall_guard,
-                                    memory_guard=memory_guard,
-                                    dfs_factory=dfs_factory,
-                                    crawler_base_cfg=crawler_base_cfg,
-                                    page_policy=page_policy,
-                                    page_interaction_factory=page_interaction_factory,
-                                    page_timeout_ms=page_timeout_ms,
-                                )
-
-                            task = asyncio.create_task(
-                                _run_company(),
-                                name=f"company-{company.company_id}",
+                        async def _run_company(
+                            company: Company = company,
+                            offset: int = offset,
+                        ) -> None:
+                            await run_company_pipeline(
+                                company=company,
+                                idx=offset,
+                                total=total,
+                                logging_ext=logging_ext,
+                                state=state,
+                                guard=guard,
+                                gating_cfg=gating_cfg,
+                                timeout_error_marker=timeout_error_marker,
+                                crawler=crawler,
+                                args=args,
+                                dataset_externals=dataset_externals,
+                                url_scorer=url_scorer,
+                                bm25_filter=bm25_filter,
+                                run_id=run_id,
+                                presence_llm=presence_llm,
+                                full_llm=full_llm,
+                                stall_guard=stall_guard,
+                                memory_guard=memory_guard,
+                                dfs_factory=dfs_factory,
+                                crawler_base_cfg=crawler_base_cfg,
+                                page_policy=page_policy,
+                                page_interaction_factory=page_interaction_factory,
+                                page_timeout_ms=page_timeout_ms,
                             )
-                            company_tasks[company.company_id] = task
-                            inflight.add(task)
 
-                    # Update last_effective_limit even when the limit decreases.
-                    last_effective_limit = effective_limit
+                        task = asyncio.create_task(
+                            _run_company(),
+                            name=f"company-{company.company_id}",
+                        )
+                        company_tasks[company.company_id] = task
+                        inflight.add(task)
 
-                    # 3) If no companies left and nothing inflight, we are done for this session.
+                    # 5) If nothing left to run and no inflight tasks, session is done.
                     if not inflight and next_idx >= len(indexed_session):
                         break
 
-                    # 4) Wait for some progress or a timeout to recheck the limit.
+                    # 6) Wait for some progress or for the next sampling tick.
                     if ac_controller is not None:
                         timeout = ac_cfg.sample_interval_sec
                     else:
