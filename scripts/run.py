@@ -691,7 +691,6 @@ async def crawl_company(
         results_or_gen = await crawler.arun(start_url, config=config)
 
         # Early host memory check right after starting the deep crawl for this root.
-        # This guards the initial Chrome / Playwright ramp up which can spike RAM.
         if memory_guard is not None:
             memory_guard.check_host_only(
                 company_id=company.company_id,
@@ -705,9 +704,7 @@ async def crawl_company(
                 agen = agen.__aiter__()
 
             while True:
-                # Check host memory before pulling the next page from the stream.
-                # This lets us kill the company if RAM is already under pressure,
-                # even if no page error has been returned yet.
+                # Check host memory before pulling the next page.
                 if memory_guard is not None:
                     memory_guard.check_host_only(
                         company_id=company.company_id,
@@ -962,12 +959,6 @@ def _should_skip_company(status: str, llm_mode: str) -> bool:
     if llm_mode == "none":
         return status in (COMPANY_STATUS_MD_DONE, COMPANY_STATUS_LLM_DONE)
     return status == COMPANY_STATUS_LLM_DONE
-
-
-def _session_ranges(n: int, per_session: int) -> List[tuple[int, int]]:
-    if per_session <= 0:
-        return [(0, n)]
-    return [(start, min(start + per_session, n)) for start in range(0, n, per_session)]
 
 
 # ---------------------------------------------------------------------------
@@ -1380,17 +1371,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--companies-per-session",
-        type=int,
-        default=128,
-        help=(
-            "Optional limit on how many companies to process per browser session. "
-            "When > 0, the crawler will close and recreate the Playwright/Chromium "
-            "stack after each block of this many companies to reduce long-term "
-            "memory accumulation. Default: 128."
-        ),
-    )
-    parser.add_argument(
         "--enable-session-log",
         action="store_true",
         help="Enable writing a session.log file with global events. Default: disabled.",
@@ -1654,7 +1634,7 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception:
             logger.exception("Failed to recompute global crawl state at startup")
 
-        # Pre-check statuses and skip already-completed companies.
+        # Pre-check statuses and skip already completed companies.
         companies_to_run: List[Company] = []
         skipped_companies: List[Company] = []
 
@@ -1718,7 +1698,7 @@ async def main_async(args: argparse.Namespace) -> None:
         ac_cfg = AdaptiveConcurrencyConfig(
             max_concurrency=max_companies,
             min_concurrency=1,
-            target_mem_low=float(os.environ.get("ac_target_mem_low", "0.80")),
+            target_mem_low=float(os.environ.get("AC_TARGET_MEM_LOW", "0.80")),
             target_mem_high=float(os.environ.get("AC_TARGET_MEM_HIGH", "0.90")),
             target_cpu_low=float(os.environ.get("AC_TARGET_CPU_LOW", "0.90")),
             target_cpu_high=float(os.environ.get("AC_TARGET_CPU_HIGH", "1.00")),
@@ -1867,192 +1847,203 @@ async def main_async(args: argparse.Namespace) -> None:
                     )
                     task.cancel()
 
-        # Session / browser lifecycle
-        total = len(companies)
-        companies_per_session = int(getattr(args, "companies_per_session", 0) or 0)
-        ranges = _session_ranges(total, companies_per_session)
-        session_count = len(ranges)
+        total_companies = len(companies)
 
-        for session_idx, (session_start, session_end) in enumerate(ranges, start=1):
-            if abort_run:
-                logger.error(
-                    "Abort flag set (memory pressure or global stall). "
-                    "Not starting browser session %d/%d.",
-                    session_idx,
-                    session_count,
-                )
-                break
-
-            logger.info(
-                "Starting browser session %d/%d for companies[%d:%d]",
-                session_idx,
-                session_count,
-                session_start,
-                session_end,
+        async with AsyncWebCrawler(config=browser_cfg) as crawler:
+            global_stall_task = asyncio.create_task(
+                _global_stall_watchdog(),
+                name="global-stall-watchdog",
             )
 
-            async with AsyncWebCrawler(config=browser_cfg) as crawler:
-                global_stall_task = asyncio.create_task(
-                    _global_stall_watchdog(),
-                    name=f"global-stall-watchdog-{session_idx}",
-                )
+            inflight: set[asyncio.Task] = set()
+            next_idx = 0
+            last_effective_limit = 0
 
-                session_companies = companies[session_start:session_end]
-                indexed_session = list(
-                    enumerate(session_companies, start=session_start + 1)
-                )
-
-                inflight: set[asyncio.Task] = set()
-                next_idx = 0
-
-                while not abort_run and (
-                    next_idx < len(indexed_session) or inflight
-                ):
-                    # 1) Read current adaptive limit and clamp to [1, max_companies].
-                    if ac_controller is not None:
-                        try:
-                            current_limit = await ac_controller.get_limit()
-                        except Exception as e:
-                            logger.exception(
-                                "[AdaptiveConcurrency] get_limit failed: %s",
-                                e,
-                            )
-                            current_limit = max_companies
-                    else:
-                        current_limit = max_companies
-
-                    effective_limit = max(1, min(current_limit, max_companies))
-
-                    # 2) Desired concurrency is min(effective_limit, total companies in this session).
-                    desired = min(effective_limit, len(indexed_session))
-
-                    # 3) Compute available slots based on current inflight tasks.
-                    available_slots = desired - len(inflight)
-
-                    # 4) Start as many new companies as available_slots allows.
-                    while (
-                        available_slots > 0
-                        and next_idx < len(indexed_session)
-                        and not abort_run
-                    ):
-                        offset, company = indexed_session[next_idx]
-                        next_idx += 1
-                        available_slots -= 1
-
-                        if ac_controller is not None:
-                            await ac_controller.notify_work_started()
-
-                        async def _run_company(
-                            company: Company = company,
-                            offset: int = offset,
-                        ) -> None:
-                            await run_company_pipeline(
-                                company=company,
-                                idx=offset,
-                                total=total,
-                                logging_ext=logging_ext,
-                                state=state,
-                                guard=guard,
-                                gating_cfg=gating_cfg,
-                                timeout_error_marker=timeout_error_marker,
-                                crawler=crawler,
-                                args=args,
-                                dataset_externals=dataset_externals,
-                                url_scorer=url_scorer,
-                                bm25_filter=bm25_filter,
-                                run_id=run_id,
-                                presence_llm=presence_llm,
-                                full_llm=full_llm,
-                                stall_guard=stall_guard,
-                                memory_guard=memory_guard,
-                                dfs_factory=dfs_factory,
-                                crawler_base_cfg=crawler_base_cfg,
-                                page_policy=page_policy,
-                                page_interaction_factory=page_interaction_factory,
-                                page_timeout_ms=page_timeout_ms,
-                            )
-
-                        task = asyncio.create_task(
-                            _run_company(),
-                            name=f"company-{company.company_id}",
-                        )
-                        company_tasks[company.company_id] = task
-                        inflight.add(task)
-
-                    # 5) If nothing left to run and no inflight tasks, session is done.
-                    if not inflight and next_idx >= len(indexed_session):
-                        break
-
-                    # 6) Wait for some progress or for the next sampling tick.
-                    if ac_controller is not None:
-                        timeout = ac_cfg.sample_interval_sec
-                    else:
-                        timeout = None
-
-                    done, pending = await asyncio.wait(
-                        inflight,
-                        return_when=asyncio.FIRST_COMPLETED,
-                        timeout=timeout,
-                    )
-                    inflight = pending
-
-                    for t in done:
-                        # Remove mapping entry if this was a company task.
-                        for cid, ct in list(company_tasks.items()):
-                            if ct is t:
-                                company_tasks.pop(cid, None)
-                                break
-
-                        if t.cancelled():
-                            continue
-
-                        try:
-                            exc = t.exception()
-                        except asyncio.CancelledError:
-                            continue
-
-                        if isinstance(exc, CriticalMemoryPressure):
-                            if not getattr(
-                                args, "enable_hard_memory_guard", False
-                            ):
-                                continue
-
-                            severity = getattr(exc, "severity", "emergency")
-                            if severity == "emergency":
-                                logger.error(
-                                    "Emergency memory pressure reported by one company; "
-                                    "aborting remaining sessions so the wrapper can restart the run.",
-                                )
-                                abort_run = True
-                                break
-                            else:
-                                logger.warning(
-                                    "Non emergency memory pressure reported (severity=%s); "
-                                    "run will continue with the same scheduling policy.",
-                                    severity,
-                                )
-
-                if abort_run:
-                    for t in inflight:
-                        if not t.done():
-                            t.cancel()
-                    inflight.clear()
-
-                if global_stall_task is not None:
-                    global_stall_task.cancel()
+            while not abort_run and (next_idx < total_companies or inflight):
+                # 1) Read current adaptive limit and clamp to [1, max_companies].
+                if ac_controller is not None:
                     try:
-                        await global_stall_task
+                        current_limit = await ac_controller.get_limit()
+                    except Exception as e:
+                        logger.exception(
+                            "[AdaptiveConcurrency] get_limit failed: %s",
+                            e,
+                        )
+                        current_limit = max_companies
+                else:
+                    current_limit = max_companies
+
+                effective_limit = max(1, min(current_limit, max_companies))
+                desired = min(effective_limit, total_companies)
+
+                limit_increased = effective_limit > last_effective_limit
+                available_slots = desired - len(inflight)
+
+                if limit_increased:
+                    logger.info(
+                        "[Scheduler] limit change %d -> %d (inflight=%d, desired=%d, available_slots=%d, next_idx=%d/%d)",
+                        last_effective_limit,
+                        effective_limit,
+                        len(inflight),
+                        desired,
+                        available_slots,
+                        next_idx,
+                        total_companies,
+                    )
+                    if available_slots <= 0 or abort_run or next_idx >= total_companies:
+                        reasons: List[str] = []
+                        if abort_run:
+                            reasons.append("abort_run")
+                        if next_idx >= total_companies:
+                            reasons.append("no_companies_left")
+                        if available_slots <= 0 and len(inflight) >= desired:
+                            reasons.append("inflight>=desired")
+                        reason_str = ",".join(reasons) if reasons else "none"
+                        logger.info(
+                            "[Scheduler] limit increased but no new company started (reason=%s)",
+                            reason_str,
+                        )
+
+                # 2) Start as many new companies as available_slots allows.
+                started_now = 0
+                while (
+                    available_slots > 0
+                    and next_idx < total_companies
+                    and not abort_run
+                ):
+                    company = companies[next_idx]
+                    next_idx += 1
+                    available_slots -= 1
+                    started_now += 1
+
+                    if ac_controller is not None:
+                        await ac_controller.notify_work_started()
+
+                    async def _run_company(
+                        company: Company = company,
+                        offset: int = next_idx,
+                    ) -> None:
+                        await run_company_pipeline(
+                            company=company,
+                            idx=offset,
+                            total=total_companies,
+                            logging_ext=logging_ext,
+                            state=state,
+                            guard=guard,
+                            gating_cfg=gating_cfg,
+                            timeout_error_marker=timeout_error_marker,
+                            crawler=crawler,
+                            args=args,
+                            dataset_externals=dataset_externals,
+                            url_scorer=url_scorer,
+                            bm25_filter=bm25_filter,
+                            run_id=run_id,
+                            presence_llm=presence_llm,
+                            full_llm=full_llm,
+                            stall_guard=stall_guard,
+                            memory_guard=memory_guard,
+                            dfs_factory=dfs_factory,
+                            crawler_base_cfg=crawler_base_cfg,
+                            page_policy=page_policy,
+                            page_interaction_factory=page_interaction_factory,
+                            page_timeout_ms=page_timeout_ms,
+                        )
+
+                    logger.info(
+                        "[Scheduler] starting company company_id=%s (idx=%d/%d, inflight_before=%d, target_concurrency=%d)",
+                        company.company_id,
+                        next_idx,
+                        total_companies,
+                        len(inflight),
+                        desired,
+                    )
+
+                    task = asyncio.create_task(
+                        _run_company(),
+                        name=f"company-{company.company_id}",
+                    )
+                    company_tasks[company.company_id] = task
+                    inflight.add(task)
+
+                if started_now == 0 and not limit_increased:
+                    # Optional debug on steady state.
+                    logger.debug(
+                        "[Scheduler] no new companies started (inflight=%d, desired=%d, next_idx=%d/%d, abort_run=%s)",
+                        len(inflight),
+                        desired,
+                        next_idx,
+                        total_companies,
+                        abort_run,
+                    )
+
+                last_effective_limit = effective_limit
+
+                # 3) If nothing left to run and no inflight tasks, we are done.
+                if not inflight and next_idx >= total_companies:
+                    break
+
+                # 4) Wait for some progress or for the next sampling tick.
+                if ac_controller is not None:
+                    timeout = ac_cfg.sample_interval_sec
+                else:
+                    timeout = None
+
+                done, pending = await asyncio.wait(
+                    inflight,
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=timeout,
+                )
+                inflight = pending
+
+                for t in done:
+                    # Remove mapping entry if this was a company task.
+                    for cid, ct in list(company_tasks.items()):
+                        if ct is t:
+                            company_tasks.pop(cid, None)
+                            break
+
+                    if t.cancelled():
+                        continue
+
+                    try:
+                        exc = t.exception()
                     except asyncio.CancelledError:
-                        pass
-                    global_stall_task = None
+                        continue
+
+                    if isinstance(exc, CriticalMemoryPressure):
+                        if not getattr(
+                            args, "enable_hard_memory_guard", False
+                        ):
+                            continue
+
+                        severity = getattr(exc, "severity", "emergency")
+                        if severity == "emergency":
+                            logger.error(
+                                "Emergency memory pressure reported by one company; "
+                                "aborting remaining run so the wrapper can restart.",
+                            )
+                            abort_run = True
+                            break
+                        else:
+                            logger.warning(
+                                "Non emergency memory pressure reported (severity=%s); "
+                                "run will continue with the same scheduling policy.",
+                                severity,
+                            )
 
             if abort_run:
-                logger.error(
-                    "Abort flag set; stopping after browser session %d/%d.",
-                    session_idx,
-                    session_count,
-                )
-                break
+                for t in inflight:
+                    if not t.done():
+                        t.cancel()
+                inflight.clear()
+
+            if global_stall_task is not None:
+                global_stall_task.cancel()
+                try:
+                    await global_stall_task
+                except asyncio.CancelledError:
+                    pass
+                global_stall_task = None
 
     finally:
         if global_stall_task is not None:
