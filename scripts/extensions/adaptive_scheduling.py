@@ -116,8 +116,8 @@ class AdaptiveSchedulingConfig:
 
     target_mem_low: float = 0.50
     target_mem_high: float = 0.80
-    target_cpu_low: float = 0.90
-    target_cpu_high: float = 1.00
+    target_cpu_low: float = 0.85
+    target_cpu_high: float = 0.95
 
     sample_interval_sec: float = 1.0
     smoothing_window_sec: float = 10.0
@@ -130,14 +130,14 @@ class AdaptiveSchedulingConfig:
     # Cooldowns
     admission_cooldown_sec: float = 5.0
     cautious_admission_cooldown_sec: float = 15.0
-    block_cooldown_sec: float = 15.0
+    block_cooldown_sec: float = 30.0
 
     mem_pressure_block_sec: float = 15.0
 
     # Rush / plateau settings
     rush_enabled: bool = True
     rush_cpu_threshold: float = 0.50     # 50 percent
-    rush_mem_threshold: float = 0.80     # 50 percent
+    rush_mem_threshold: float = 0.80     # 80 percent
     rush_band_width: float = 0.05        # ±5 percent band
     rush_min_samples: int = 4
     rush_duration_sec: float = 30.0
