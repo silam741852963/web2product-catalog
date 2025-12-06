@@ -111,7 +111,7 @@ class AdaptiveConcurrencyConfig:
 
     # Caution-zone stall detection / release
     stall_detection_window_sec: float = 30.0
-    stall_cpu_idle_threshold: float = 0.05
+    stall_cpu_idle_threshold: float = 0.5
     stall_mem_band_width: float = 0.05
     stall_release_cooldown_sec: float = 30.0
 
