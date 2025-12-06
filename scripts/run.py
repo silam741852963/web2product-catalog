@@ -591,7 +591,6 @@ async def run_full_pass_for_company(
 # Company level crawl
 # ---------------------------------------------------------------------------
 
-
 async def crawl_company(
     company: Company,
     *,
@@ -605,10 +604,16 @@ async def crawl_company(
     crawler_base_cfg: Any,
     page_policy: PageInteractionPolicy,
     page_interaction_factory: PageInteractionFactory,
-    max_pages: Optional[int] = None,
     page_timeout_ms: Optional[int] = None,
     memory_guard: Optional[MemoryGuard] = None,
 ) -> None:
+    """
+    Run a deep crawl for a single company.
+
+    The per-company page limit (if any) is now enforced by the deep
+    crawl strategy itself via its max_pages parameter. This function
+    no longer tracks pages_processed or checks --max-pages.
+    """
     logger.info(
         "Starting crawl for company_id=%s url=%s",
         company.company_id,
@@ -618,17 +623,8 @@ async def crawl_company(
     ensure_company_dirs(company.company_id)
 
     start_urls: List[str] = list(root_urls) if root_urls else [company.domain_url]
-    pages_processed = 0
 
     for start_url in start_urls:
-        if max_pages is not None and pages_processed >= max_pages:
-            logger.info(
-                "Per company max_pages limit (%d) reached for company_id=%s, skipping remaining roots",
-                max_pages,
-                company.company_id,
-            )
-            break
-
         logger.info(
             "Deep crawl: company_id=%s root=%s pending_roots=%d",
             company.company_id,
@@ -672,6 +668,7 @@ async def crawl_company(
                 mark_company_memory=mark_company_memory_pressure,
             )
 
+        # Async streaming deep crawl
         if not isinstance(results_or_gen, list):
             agen = results_or_gen
             if hasattr(agen, "__aiter__"):
@@ -684,24 +681,6 @@ async def crawl_company(
                         url=start_url,
                         mark_company_memory=mark_company_memory_pressure,
                     )
-
-                if max_pages is not None and pages_processed >= max_pages:
-                    logger.info(
-                        "Per company max_pages limit (%d) reached for company_id=%s, stopping crawl for this company",
-                        max_pages,
-                        company.company_id,
-                    )
-                    aclose = getattr(agen, "aclose", None)
-                    if aclose is not None:
-                        try:
-                            await aclose()
-                        except Exception as e:
-                            logger.debug(
-                                "Error while closing deep crawl generator for company=%s: %s",
-                                company.company_id,
-                                e,
-                            )
-                    break
 
                 try:
                     page_result = await agen.__anext__()
@@ -731,7 +710,6 @@ async def crawl_company(
                         stall_guard=stall_guard,
                         memory_guard=memory_guard,
                     )
-                    pages_processed += 1
                 except CriticalMemoryPressure:
                     raise
                 except Exception as e:
@@ -743,6 +721,7 @@ async def crawl_company(
                         e,
                     )
 
+        # Non streaming list result
         else:
             for page_result in results_or_gen:
                 if memory_guard is not None:
@@ -761,7 +740,6 @@ async def crawl_company(
                         stall_guard=stall_guard,
                         memory_guard=memory_guard,
                     )
-                    pages_processed += 1
                 except CriticalMemoryPressure:
                     raise
                 except Exception as e:
@@ -772,15 +750,6 @@ async def crawl_company(
                         company.company_id,
                         e,
                     )
-
-                if max_pages is not None and pages_processed >= max_pages:
-                    logger.info(
-                        "Per company max_pages limit (%d) reached for company_id=%s, stopping crawl for this company",
-                        max_pages,
-                        company.company_id,
-                    )
-                    break
-
 
 # ---------------------------------------------------------------------------
 # BM25 and dataset helpers
@@ -895,27 +864,40 @@ def _build_filter_chain(
     return FilterChain(filters)
 
 
+
 def _build_deep_strategy(
     args: argparse.Namespace,
     filter_chain: FilterChain,
     url_scorer: Optional[DualBM25Scorer],
     dfs_factory: Optional[DeepCrawlStrategyFactory],
+    max_pages: Optional[int],
 ) -> Any:
+    """
+    Build the deep crawl strategy with the correct max_pages wiring.
+
+    max_pages comes from --max-pages and is passed through to the
+    DeepCrawlStrategyFactory/Provider so that Crawl4AI enforces the
+    per-company page limit internally.
+    """
     if args.strategy == "bestfirst":
         return default_bestfirst_factory.create(
             filter_chain=filter_chain,
             url_scorer=url_scorer,
+            max_pages=max_pages,
         )
     if args.strategy == "bfs_internal":
         return default_bfs_internal_factory.create(
             filter_chain=filter_chain,
             url_scorer=None,
+            max_pages=max_pages,
         )
     assert dfs_factory is not None
     return dfs_factory.create(
         filter_chain=filter_chain,
         url_scorer=None,
+        max_pages=max_pages,
     )
+
 
 
 def _should_skip_company(status: str, llm_mode: str) -> bool:
@@ -1055,15 +1037,18 @@ async def run_company_pipeline(
             bm25_filter=bm25_filter,
         )
 
-        max_pages_per_company: Optional[int] = None
-        if getattr(args, "max_pages", None) and args.max_pages > 0:
-            max_pages_per_company = args.max_pages
+        # Wire --max-pages into the deep crawl strategy itself.
+        # <= 0 means "no explicit limit" (let depth/other settings control it).
+        max_pages_for_strategy: Optional[int] = None
+        if getattr(args, "max_pages", None) is not None and args.max_pages > 0:
+            max_pages_for_strategy = int(args.max_pages)
 
         deep_strategy = _build_deep_strategy(
             args=args,
             filter_chain=filter_chain,
             url_scorer=url_scorer,
             dfs_factory=dfs_factory,
+            max_pages=max_pages_for_strategy,
         )
 
         if do_crawl:
@@ -1080,11 +1065,9 @@ async def run_company_pipeline(
                 crawler_base_cfg=crawler_base_cfg,
                 page_policy=page_policy,
                 page_interaction_factory=page_interaction_factory,
-                max_pages=max_pages_per_company,
                 page_timeout_ms=page_timeout_ms,
                 memory_guard=memory_guard,
             )
-
             await state.recompute_company_from_index(
                 company.company_id,
                 name=None,

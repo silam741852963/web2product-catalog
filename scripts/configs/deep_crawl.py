@@ -64,7 +64,7 @@ class BFSDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
 
     default_max_depth: int = 3
     default_include_external: bool = False
-    default_max_pages: Optional[int] = None
+    default_max_pages: Optional[int] = 200
     default_score_threshold: Optional[float] = None
     default_filter_chain: Optional[FilterChain] = None
     default_url_scorer: Optional[Any] = None
