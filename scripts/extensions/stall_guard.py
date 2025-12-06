@@ -606,6 +606,90 @@ async def wait_for_global_hard_stall(
         # Otherwise we are either making progress or not yet past the
         # threshold; keep waiting.
 
+async def global_stall_watchdog(
+    *,
+    stall_guard: StallGuard,
+    stall_cfg: StallGuardConfig,
+    company_tasks: Dict[str, asyncio.Task[Any]],
+    mark_company_stalled: Callable[[str], None],
+    on_global_stall: Optional[Callable[[float], None]] = None,
+) -> None:
+    """
+    Background task that waits for a global hard stall and then:
+
+      - optionally notifies the caller via `on_global_stall(idle_seconds)`
+      - marks all active companies as stalled via `mark_company_stalled`
+      - cancels their running asyncio tasks
+
+    This is the lifted version of the old `_global_stall_watchdog()` from run.py.
+
+    Parameters
+    ----------
+    stall_guard:
+        The StallGuard instance monitoring per company progress.
+    stall_cfg:
+        Its StallGuardConfig, used to pick page_timeout and check interval.
+    company_tasks:
+        Mapping company_id -> asyncio.Task for active company pipelines.
+    mark_company_stalled:
+        Callback that records stalled companies in the retry tracker or logs.
+    on_global_stall:
+        Optional callback that is invoked once with the detected idle duration
+        (in seconds) before cancelling tasks. You can use this to set an
+        `abort_run` flag in the caller.
+    """
+    try:
+        idle = await wait_for_global_hard_stall(
+            stall_guard,
+            page_timeout_sec=stall_cfg.page_timeout_sec,
+            check_interval_sec=stall_cfg.check_interval_sec,
+        )
+    except asyncio.CancelledError:
+        return
+    except GlobalStallDetectedError:
+        # Already handled inside wait_for_global_hard_stall when raise_on_stall=True.
+        return
+    except Exception as e:
+        logger.exception(
+            "Global StallGuard watchdog encountered an unexpected error: %s",
+            e,
+        )
+        return
+
+    # Let the caller flip any outer flags before we touch tasks.
+    if on_global_stall is not None:
+        try:
+            on_global_stall(idle)
+        except Exception as e:
+            logger.exception("Global stall callback failed: %s", e)
+
+    logger.error(
+        "Global StallGuard: no company level progress for %.1fs, treating this run "
+        "as globally stalled and marking active companies for retry.",
+        idle,
+    )
+
+    active_company_ids: list[str] = []
+    for cid, task in list(company_tasks.items()):
+        if not task.done():
+            active_company_ids.append(cid)
+
+    if not active_company_ids:
+        logger.error(
+            "Global StallGuard: no active company tasks found at stall detection time."
+        )
+
+    for cid in active_company_ids:
+        mark_company_stalled(cid)
+
+    for cid in active_company_ids:
+        task = company_tasks.get(cid)
+        if task is not None and not task.done():
+            logger.error(
+                "Global StallGuard: cancelling company task company_id=%s",
+                cid,
+            )
+            task.cancel()
 
 __all__ = [
     "StallGuardConfig",
@@ -614,4 +698,5 @@ __all__ = [
     "StallDetectedError",
     "GlobalStallDetectedError",
     "wait_for_global_hard_stall",
+    "global_stall_watchdog",
 ]

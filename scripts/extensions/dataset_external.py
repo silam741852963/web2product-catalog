@@ -336,3 +336,53 @@ def registrable_domain_from_url(url: str) -> str:
     """
     h = _host_from_url(url)
     return _registrable_domain(h) if h else ""
+
+
+def build_dataset_externals(
+    companies,
+    dataset_file: Optional[str],
+) -> List[str]:
+    """
+    Legacy helper extracted from run.py.
+
+    - Takes a list of company objects (with .domain_url).
+    - Optionally takes a dataset file path readable by extensions.load_source.
+    - Returns a sorted list of hostnames (including www and non www variants)
+      used as dataset_externals for UniversalExternalFilter.
+    """
+    import logging
+    from urllib.parse import urlparse
+    from extensions.load_source import load_companies_from_source, CompanyInput
+
+    logger = logging.getLogger("dataset_externals_legacy")
+
+    dataset_hosts: set[str] = set()
+
+    def _add_host(raw_url: str) -> None:
+        try:
+            host = urlparse(raw_url).hostname or ""
+        except Exception:
+            host = ""
+        if not host:
+            return
+        dataset_hosts.add(host)
+        if host.startswith("www."):
+            dataset_hosts.add(host[4:])
+        else:
+            dataset_hosts.add(f"www.{host}")
+
+    # From current run companies
+    for c in companies:
+        u = getattr(c, "domain_url", "") or ""
+        _add_host(u)
+
+    # From optional dataset file
+    if dataset_file:
+        try:
+            ds_inputs: List[CompanyInput] = load_companies_from_source(Path(dataset_file))
+            for ci in ds_inputs:
+                _add_host(ci.url)
+        except Exception as e:
+            logger.exception("Failed to load dataset-file %s: %s", dataset_file, e)
+
+    return sorted(dataset_hosts)

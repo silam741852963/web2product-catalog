@@ -4,7 +4,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Mapping
+from typing import Any, Dict, List, Optional, Mapping
 
 from crawl4ai.deep_crawling.filters import URLFilter
 from crawl4ai.deep_crawling.scorers import URLScorer
@@ -573,3 +573,74 @@ class DualBM25Scorer(URLScorer):
             )
 
         return fused
+
+
+def build_dual_bm25_components() -> Dict[str, Any]:
+    """
+    Construct BM25 scorer and filter based on the global default_language_factory.
+
+    This is the logic previously in run.py, moved next to the BM25 classes.
+
+    Returns a dict with:
+      - positive_query
+      - negative_query
+      - scorer_cfg       (DualBM25Config for scorer)
+      - filter_cfg       (DualBM25Config for filter)
+      - url_scorer       (DualBM25Scorer instance)
+      - url_filter       (DualBM25Filter instance)
+    """
+    # Local import to avoid hard coupling at module import time
+    from configs.language import default_language_factory
+
+    product_tokens: List[str] = (
+        default_language_factory.get("PRODUCT_TOKENS", []) or []
+    )
+    exclude_tokens: List[str] = (
+        default_language_factory.get("EXCLUDE_TOKENS", []) or []
+    )
+
+    positive_terms = set(product_tokens)
+    negative_terms = set(exclude_tokens)
+
+    positive_query = " ".join(sorted(positive_terms))
+    negative_query = " ".join(sorted(negative_terms))
+
+    scorer_cfg = DualBM25Config(
+        threshold=None,
+        alpha=0.7,
+        k1=1.2,
+        b=0.75,
+        avgdl=1000,
+    )
+
+    filter_cfg = DualBM25Config(
+        threshold=0.5,
+        alpha=0.5,
+        k1=1.2,
+        b=0.75,
+        avgdl=1000,
+    )
+
+    url_scorer = DualBM25Scorer(
+        positive_query=positive_query,
+        negative_query=negative_query,
+        cfg=scorer_cfg,
+        doc_index=None,
+        weight=1.0,
+    )
+
+    url_filter = DualBM25Filter(
+        positive_query=positive_query,
+        negative_query=negative_query,
+        cfg=filter_cfg,
+        name="DualBM25Filter",
+    )
+
+    return {
+        "positive_query": positive_query,
+        "negative_query": negative_query,
+        "scorer_cfg": scorer_cfg,
+        "filter_cfg": filter_cfg,
+        "url_scorer": url_scorer,
+        "url_filter": url_filter,
+    }

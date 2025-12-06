@@ -67,7 +67,7 @@ class RetryTracker:
         self._attempted_companies: Set[str] = set()
         self._dirty: int = 0
 
-        # Merge any existing state on disk into our in-memory sets.
+        # Merge any existing state on disk into our in memory sets.
         self._load_existing_into_sets()
 
     # ---------------- Existing file handling ----------------
@@ -90,7 +90,7 @@ class RetryTracker:
     def _load_existing_into_sets(self) -> None:
         """
         Merge the contents of any existing retry_companies.json into our
-        in-memory sets. This makes the tracker persistent across runs.
+        in memory sets. This makes the tracker persistent across runs.
         """
         data = self.load_existing()
         if not data:
@@ -110,8 +110,8 @@ class RetryTracker:
         _add_all(self._timeout, timeout)
         _add_all(self._memory, memory)
 
-        # We do NOT import total_companies / attempted_total because those
-        # are per-run stats. They will be set for the current run via
+        # We do not import total_companies / attempted_total because those
+        # are per run stats. They will be set for the current run via
         # set_total_companies() and record_attempt().
 
         if self._stalled or self._timeout or self._memory:
@@ -143,7 +143,7 @@ class RetryTracker:
         Used to compute all_attempted flag in the JSON payload.
 
         NOTE: This overwrites any previous total from prior runs. The
-        retry sets themselves remain merged/persistent.
+        retry sets themselves remain merged or persistent.
         """
         self._total_companies = max(0, int(total))
 
@@ -296,3 +296,60 @@ class RetryTracker:
             "No stalled companies, page timeouts, or memory pressure companies detected."
         )
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Global helper API used by run.py
+# ---------------------------------------------------------------------------
+
+_GLOBAL_RETRY_TRACKER: Optional[RetryTracker] = None
+
+
+def set_retry_tracker(tracker: RetryTracker) -> None:
+    """
+    Register the process wide RetryTracker instance.
+
+    This replaces the local function in run.py and lets other helpers
+    delegate to the same tracker without passing it around everywhere.
+    """
+    global _GLOBAL_RETRY_TRACKER
+    _GLOBAL_RETRY_TRACKER = tracker
+
+
+def _get_tracker() -> Optional[RetryTracker]:
+    if _GLOBAL_RETRY_TRACKER is None:
+        logger.debug("RetryTracker helper called without a global tracker set")
+    return _GLOBAL_RETRY_TRACKER
+
+
+def record_company_attempt(company_id: str) -> None:
+    tracker = _get_tracker()
+    if tracker is not None:
+        tracker.record_attempt(company_id)
+
+
+def mark_company_timeout(company_id: str) -> None:
+    tracker = _get_tracker()
+    if tracker is not None:
+        tracker.mark_timeout(company_id)
+
+
+def mark_company_stalled(company_id: str) -> None:
+    tracker = _get_tracker()
+    if tracker is not None:
+        tracker.mark_stalled(company_id)
+
+
+def mark_company_memory_pressure(company_id: str) -> None:
+    tracker = _get_tracker()
+    if tracker is not None:
+        tracker.mark_memory(company_id)
+
+
+def mark_company_completed(company_id: str) -> None:
+    """
+    Remove a company from all retry categories after a successful run.
+    """
+    tracker = _get_tracker()
+    if tracker is not None:
+        tracker.clear_company(company_id)

@@ -331,6 +331,65 @@ default_bestfirst_factory = DeepCrawlStrategyFactory(
     provider=default_bestfirst_provider
 )
 
+def build_deep_strategy(
+    strategy: str,
+    *,
+    filter_chain: FilterChain,
+    url_scorer: Optional[Any],
+    dfs_factory: Optional["DeepCrawlStrategyFactory"],
+    max_pages: Optional[int],
+) -> Any:
+    """
+    Convenience helper to construct a deep crawl strategy from a simple string.
+
+    This moves the old run.py `_build_deep_strategy` logic into the configs
+    layer and decouples it from argparse.
+
+    Parameters
+    ----------
+    strategy:
+        One of "bestfirst", "bfs_internal", "dfs".
+    filter_chain:
+        FilterChain instance to use for all URLs.
+    url_scorer:
+        Optional scorer, only used for "bestfirst" by default.
+    dfs_factory:
+        DeepCrawlStrategyFactory for DFS, required when strategy == "dfs".
+    max_pages:
+        Per company page limit. None means "no explicit limit" and will be
+        converted to the provider default.
+    """
+    if strategy == "bestfirst":
+        # BestFirst uses the BM25 scorer.
+        return default_bestfirst_factory.create(
+            filter_chain=filter_chain,
+            url_scorer=url_scorer,
+            max_pages=max_pages,
+        )
+
+    if strategy == "bfs_internal":
+        # BFS internal does not use a scorer by default.
+        return default_bfs_internal_factory.create(
+            filter_chain=filter_chain,
+            url_scorer=None,
+            max_pages=max_pages,
+        )
+
+    if strategy == "dfs":
+        if dfs_factory is None:
+            raise ValueError(
+                "DFS strategy requested but `dfs_factory` is None. "
+                "Construct a DeepCrawlStrategyFactory with DFSDeepCrawlStrategyProvider "
+                "and pass it in."
+            )
+        return dfs_factory.create(
+            filter_chain=filter_chain,
+            url_scorer=None,
+            max_pages=max_pages,
+        )
+
+    raise ValueError(f"Unknown deep crawl strategy: {strategy!r}")
+
 
 __all__ = [
     "DeepCrawlStrategyProvider",
@@ -342,4 +401,5 @@ __all__ = [
     "default_bestfirst_provider",
     "default_bfs_internal_factory",
     "default_bestfirst_factory",
+    "build_deep_strategy",
 ]
