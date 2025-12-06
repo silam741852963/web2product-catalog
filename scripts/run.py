@@ -1411,6 +1411,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
+
 async def main_async(args: argparse.Namespace) -> None:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1722,7 +1723,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
         max_companies = max(1, int(args.company_concurrency))
 
-        # Adaptive concurrency config (more conservative memory thresholds).
+        # Adaptive concurrency config.
         ac_cfg = AdaptiveConcurrencyConfig(
             max_concurrency=max_companies,
             min_concurrency=1,
@@ -1907,117 +1908,106 @@ async def main_async(args: argparse.Namespace) -> None:
                 )
 
                 session_companies = companies[session_start:session_end]
-
                 indexed_session = list(
                     enumerate(session_companies, start=session_start + 1)
                 )
 
-
                 inflight: set[asyncio.Task] = set()
                 next_idx = 0
+                # Track last effective adaptive limit to convert increases into slots.
+                last_effective_limit = 0
 
                 while not abort_run and (
                     next_idx < len(indexed_session) or inflight
                 ):
-                    # Decide how many companies we are allowed to run right now.
-                    # If CPU and RAM are safely below their low thresholds
-                    # (not in the caution band), bypass all extra conditions and
-                    # allow up to max_companies.
+                    # 1) Read current adaptive limit and clamp to [1, max_companies].
                     if ac_controller is not None:
                         try:
-                            ac_state = await ac_controller.get_state()
-                            current_limit = int(ac_state.get("current_limit", max_companies))
-                            avg_cpu = float(ac_state.get("last_avg_cpu", 0.0))
-                            avg_mem = float(ac_state.get("last_avg_mem", 0.0))
+                            current_limit = await ac_controller.get_limit()
                         except Exception as e:
                             logger.exception(
-                                "[AdaptiveConcurrency] get_state failed: %s",
+                                "[AdaptiveConcurrency] get_limit failed: %s",
                                 e,
                             )
                             current_limit = max_companies
-                            avg_cpu = 0.0
-                            avg_mem = 0.0
-
-                        # Clamp the adaptive limit into [1, max_companies]
-                        if current_limit <= 0:
-                            current_limit = 1
-                        effective_limit = min(current_limit, max_companies)
-
-                        # Safe band check – we are NOT in the caution band
-                        # if both CPU and MEM are below their low thresholds.
-                        safe_mem = (not ac_cfg.use_mem) or (
-                            avg_mem < ac_cfg.target_mem_low
-                        )
-                        safe_cpu = (not ac_cfg.use_cpu) or (
-                            avg_cpu < ac_cfg.target_cpu_low
-                        )
-
-                        if safe_cpu and safe_mem:
-                            # Host is comfortably idle – bypass all other
-                            # admission constraints and run up to max_companies.
-                            target_limit = max_companies
-                        else:
-                            # In caution or high band – respect adaptive limit.
-                            target_limit = effective_limit
                     else:
-                        # No adaptive controller – just use the hard cap.
-                        target_limit = max_companies
+                        current_limit = max_companies
 
-                    # Start new companies while we are under the target limit.
-                    while (
-                        next_idx < len(indexed_session)
-                        and len(inflight) < target_limit
+                    effective_limit = max(1, min(current_limit, max_companies))
+
+                    # 2) If the effective limit increased, treat the delta as new slots
+                    #    and immediately start that many new companies, ignoring inflight.
+                    if (
+                        effective_limit > last_effective_limit
+                        and next_idx < len(indexed_session)
                         and not abort_run
                     ):
-                        offset, company = indexed_session[next_idx]
-                        next_idx += 1
+                        slots_to_fill = effective_limit - last_effective_limit
 
-                        if ac_controller is not None:
-                            await ac_controller.notify_work_started()
-
-                        async def _run_company(
-                            company: Company = company,
-                            offset: int = offset,
-                        ) -> None:
-                            await run_company_pipeline(
-                                company=company,
-                                idx=offset,
-                                total=total,
-                                logging_ext=logging_ext,
-                                state=state,
-                                guard=guard,
-                                gating_cfg=gating_cfg,
-                                timeout_error_marker=timeout_error_marker,
-                                crawler=crawler,
-                                args=args,
-                                dataset_externals=dataset_externals,
-                                url_scorer=url_scorer,
-                                bm25_filter=bm25_filter,
-                                run_id=run_id,
-                                presence_llm=presence_llm,
-                                full_llm=full_llm,
-                                stall_guard=stall_guard,
-                                memory_guard=memory_guard,
-                                dfs_factory=dfs_factory,
-                                crawler_base_cfg=crawler_base_cfg,
-                                page_policy=page_policy,
-                                page_interaction_factory=page_interaction_factory,
-                                page_timeout_ms=page_timeout_ms,
-                            )
-
-                        task = asyncio.create_task(
-                            _run_company(),
-                            name=f"company-{company.company_id}",
+                        logger.debug(
+                            "New adaptive slots allocated: old_effective=%d new_effective=%d slots_to_fill=%d",
+                            last_effective_limit,
+                            effective_limit,
+                            slots_to_fill,
                         )
-                        company_tasks[company.company_id] = task
-                        inflight.add(task)
 
+                        while (
+                            slots_to_fill > 0
+                            and next_idx < len(indexed_session)
+                            and not abort_run
+                        ):
+                            offset, company = indexed_session[next_idx]
+                            next_idx += 1
+                            slots_to_fill -= 1
+
+                            if ac_controller is not None:
+                                await ac_controller.notify_work_started()
+
+                            async def _run_company(
+                                company: Company = company,
+                                offset: int = offset,
+                            ) -> None:
+                                await run_company_pipeline(
+                                    company=company,
+                                    idx=offset,
+                                    total=total,
+                                    logging_ext=logging_ext,
+                                    state=state,
+                                    guard=guard,
+                                    gating_cfg=gating_cfg,
+                                    timeout_error_marker=timeout_error_marker,
+                                    crawler=crawler,
+                                    args=args,
+                                    dataset_externals=dataset_externals,
+                                    url_scorer=url_scorer,
+                                    bm25_filter=bm25_filter,
+                                    run_id=run_id,
+                                    presence_llm=presence_llm,
+                                    full_llm=full_llm,
+                                    stall_guard=stall_guard,
+                                    memory_guard=memory_guard,
+                                    dfs_factory=dfs_factory,
+                                    crawler_base_cfg=crawler_base_cfg,
+                                    page_policy=page_policy,
+                                    page_interaction_factory=page_interaction_factory,
+                                    page_timeout_ms=page_timeout_ms,
+                                )
+
+                            task = asyncio.create_task(
+                                _run_company(),
+                                name=f"company-{company.company_id}",
+                            )
+                            company_tasks[company.company_id] = task
+                            inflight.add(task)
+
+                    # Update last_effective_limit even when the limit decreases.
+                    last_effective_limit = effective_limit
+
+                    # 3) If no companies left and nothing inflight, we are done for this session.
                     if not inflight and next_idx >= len(indexed_session):
-                        # Nothing to run and nothing in flight.
                         break
 
-                    # Wait for at least one company to finish, or wake up on timeout
-                    # to re-check the adaptive limit and potentially start more.
+                    # 4) Wait for some progress or a timeout to recheck the limit.
                     if ac_controller is not None:
                         timeout = ac_cfg.sample_interval_sec
                     else:
@@ -2055,19 +2045,16 @@ async def main_async(args: argparse.Namespace) -> None:
                             if severity == "emergency":
                                 logger.error(
                                     "Emergency memory pressure reported by one company; "
-                                    "aborting remaining sessions so the wrapper can "
-                                    "restart the run.",
+                                    "aborting remaining sessions so the wrapper can restart the run.",
                                 )
                                 abort_run = True
                                 break
                             else:
                                 logger.warning(
-                                    "Non emergency memory pressure reported "
-                                    "(severity=%s); run will continue with fewer "
-                                    "workers.",
+                                    "Non emergency memory pressure reported (severity=%s); "
+                                    "run will continue with the same scheduling policy.",
                                     severity,
                                 )
-
 
                 if abort_run:
                     for t in inflight:
