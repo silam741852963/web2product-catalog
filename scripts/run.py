@@ -107,7 +107,7 @@ def mark_company_timeout(company_id: str) -> None:
 
 
 def mark_company_stalled(company_id: str) -> None:
-    if _retry_tracker is not not None:
+    if _retry_tracker is not None:
         _retry_tracker.mark_stalled(company_id)
 
 
