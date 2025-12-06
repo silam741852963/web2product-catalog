@@ -1912,40 +1912,61 @@ async def main_async(args: argparse.Namespace) -> None:
                     enumerate(session_companies, start=session_start + 1)
                 )
 
+
                 inflight: set[asyncio.Task] = set()
                 next_idx = 0
 
                 while not abort_run and (
                     next_idx < len(indexed_session) or inflight
                 ):
-                    # Determine current adaptive limit and how many more we can start.
+                    # Decide how many companies we are allowed to run right now.
+                    # If CPU and RAM are safely below their low thresholds
+                    # (not in the caution band), bypass all extra conditions and
+                    # allow up to max_companies.
                     if ac_controller is not None:
                         try:
-                            current_limit = await ac_controller.get_limit()
+                            ac_state = await ac_controller.get_state()
+                            current_limit = int(ac_state.get("current_limit", max_companies))
+                            avg_cpu = float(ac_state.get("last_avg_cpu", 0.0))
+                            avg_mem = float(ac_state.get("last_avg_mem", 0.0))
                         except Exception as e:
                             logger.exception(
-                                "[AdaptiveConcurrency] get_limit failed: %s",
+                                "[AdaptiveConcurrency] get_state failed: %s",
                                 e,
                             )
                             current_limit = max_companies
+                            avg_cpu = 0.0
+                            avg_mem = 0.0
 
+                        # Clamp the adaptive limit into [1, max_companies]
                         if current_limit <= 0:
-                            # Temporarily no capacity: small sleep and re-check.
-                            if not inflight:
-                                await asyncio.sleep(ac_cfg.sample_interval_sec)
-                                continue
-                            effective_limit = 0
-                        else:
-                            effective_limit = max(
-                                1, min(current_limit, max_companies)
-                            )
-                    else:
-                        effective_limit = max_companies
+                            current_limit = 1
+                        effective_limit = min(current_limit, max_companies)
 
-                    # Start new companies while we are under the effective limit.
+                        # Safe band check – we are NOT in the caution band
+                        # if both CPU and MEM are below their low thresholds.
+                        safe_mem = (not ac_cfg.use_mem) or (
+                            avg_mem < ac_cfg.target_mem_low
+                        )
+                        safe_cpu = (not ac_cfg.use_cpu) or (
+                            avg_cpu < ac_cfg.target_cpu_low
+                        )
+
+                        if safe_cpu and safe_mem:
+                            # Host is comfortably idle – bypass all other
+                            # admission constraints and run up to max_companies.
+                            target_limit = max_companies
+                        else:
+                            # In caution or high band – respect adaptive limit.
+                            target_limit = effective_limit
+                    else:
+                        # No adaptive controller – just use the hard cap.
+                        target_limit = max_companies
+
+                    # Start new companies while we are under the target limit.
                     while (
                         next_idx < len(indexed_session)
-                        and len(inflight) < effective_limit
+                        and len(inflight) < target_limit
                         and not abort_run
                     ):
                         offset, company = indexed_session[next_idx]
@@ -2046,6 +2067,7 @@ async def main_async(args: argparse.Namespace) -> None:
                                     "workers.",
                                     severity,
                                 )
+
 
                 if abort_run:
                     for t in inflight:
