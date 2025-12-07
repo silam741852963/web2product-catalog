@@ -8,7 +8,7 @@ from extensions import md_gating
 from extensions.output_paths import save_stage_output
 from extensions.crawl_state import upsert_url_index_entry
 from extensions.stall_guard import StallGuard
-from extensions.memory_guard import MemoryGuard
+from extensions.adaptive_scheduling import MemoryGuard
 
 logger = logging.getLogger("page_pipeline")
 
@@ -49,7 +49,7 @@ async def process_page_result(
     stall_guard
         Optional StallGuard for heartbeat updates.
     memory_guard
-        Optional MemoryGuard for host memory error detection.
+        Optional MemoryGuard for memory marker detection at page level.
     mark_company_timeout_cb
         Optional callback mark_company_timeout(company_id: str).
     mark_company_memory_cb
@@ -60,7 +60,9 @@ async def process_page_result(
 
     company_id = getattr(company, "company_id", None)
     if not company_id:
-        logger.warning("process_page_result called without company_id on company=%r", company)
+        logger.warning(
+            "process_page_result called without company_id on company=%r", company
+        )
         return
 
     _getattr = getattr
@@ -68,7 +70,9 @@ async def process_page_result(
     requested_url = _getattr(page_result, "url", None)
     final_url = _getattr(page_result, "final_url", None) or requested_url
     if not final_url:
-        logger.warning("Page result missing URL; skipping entry (company_id=%s)", company_id)
+        logger.warning(
+            "Page result missing URL; skipping entry (company_id=%s)", company_id
+        )
         return
     url = final_url
 
@@ -80,8 +84,9 @@ async def process_page_result(
         None,
     )
 
-    # Memory guard - company level marking is done through the callback.
+    # Page level memory guard (marker only). Host level is handled by AdaptiveScheduler.
     if memory_guard is not None:
+
         def _mark_mem(cid: str) -> None:
             if mark_company_memory_cb is not None:
                 mark_company_memory_cb(cid)
@@ -196,4 +201,3 @@ async def process_page_result(
 
     if stall_guard is not None:
         stall_guard.record_heartbeat("page", company_id=company_id)
-

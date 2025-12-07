@@ -69,7 +69,6 @@ from extensions.stall_guard import (
     StallGuardConfig,
     global_stall_watchdog,
 )
-from extensions.memory_guard import MemoryGuard, CriticalMemoryPressure
 from extensions.retry_tracker import (
     RetryTracker,
     RetryTrackerConfig,
@@ -83,6 +82,8 @@ from extensions.retry_tracker import (
 from extensions.adaptive_scheduling import (
     AdaptiveSchedulingConfig,
     AdaptiveScheduler,
+    MemoryGuard,
+    CriticalMemoryPressure,
 )
 from extensions.page_pipeline import process_page_result
 from extensions.llm_passes import (
@@ -242,13 +243,6 @@ async def crawl_company(
 
         results_or_gen = await crawler.arun(start_url, config=config)
 
-        if memory_guard is not None:
-            memory_guard.check_host_only(
-                company_id=company.company_id,
-                url=start_url,
-                mark_company_memory=mark_company_memory_pressure,
-            )
-
         # Async streaming deep crawl
         if not isinstance(results_or_gen, list):
             agen = results_or_gen
@@ -256,13 +250,6 @@ async def crawl_company(
                 agen = agen.__aiter__()
 
             while True:
-                if memory_guard is not None:
-                    memory_guard.check_host_only(
-                        company_id=company.company_id,
-                        url=start_url,
-                        mark_company_memory=mark_company_memory_pressure,
-                    )
-
                 try:
                     page_result = await agen.__anext__()
                 except StopAsyncIteration:
@@ -294,6 +281,7 @@ async def crawl_company(
                         mark_company_memory_cb=mark_company_memory_pressure,
                     )
                 except CriticalMemoryPressure:
+                    # Propagate to top level
                     raise
                 except Exception as e:
                     url = getattr(page_result, "url", None)
@@ -307,12 +295,6 @@ async def crawl_company(
         # Non streaming list result
         else:
             for page_result in results_or_gen:
-                if memory_guard is not None:
-                    memory_guard.check_host_only(
-                        company_id=company.company_id,
-                        url=getattr(page_result, "url", start_url),
-                        mark_company_memory=mark_company_memory_pressure,
-                    )
                 try:
                     await process_page_result(
                         page_result=page_result,
@@ -742,10 +724,8 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--enable-hard-memory-guard",
         action="store_true",
         help=(
-            "Enable hard stop behavior on critical host memory usage. "
-            "When enabled, MemoryGuard will cancel running company tasks and "
-            "cause the run to exit with the retry exit code when host memory "
-            "crosses the configured hard limit."
+            "Enable host level memory based cancellation in the adaptive scheduler. "
+            "Page level memory markers are always active."
         ),
     )
     parser.add_argument(
@@ -904,21 +884,15 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     stall_guard = StallGuard(config=stall_cfg)
 
-    memory_guard: Optional[MemoryGuard] = None
+    # Page level memory guard (marker only). Host level handled by AdaptiveScheduler.
+    memory_guard: Optional[MemoryGuard] = MemoryGuard()
+
     company_tasks: Dict[str, asyncio.Task] = {}
 
-    if getattr(args, "enable_hard_memory_guard", False):
-        memory_guard = MemoryGuard()
-        logger.info(
-            "Memory guard enabled with built in thresholds "
-            "(soft kills company, hard kills company and clamps concurrency, "
-            "emergency cancels everything and exits with retry code)."
-        )
-    else:
-        logger.info(
-            "Memory guard disabled (process will not auto stop on host memory; "
-            "rely on OS or container limits)."
-        )
+    logger.info(
+        "Page level MemoryGuard enabled (marker based). "
+        "Host level memory protection is handled by AdaptiveScheduler."
+    )
 
     async def _handle_stall(snapshot: Any) -> None:
         company_id = getattr(snapshot, "company_id", None)
@@ -1088,6 +1062,7 @@ async def main_async(args: argparse.Namespace) -> None:
             max_concurrency=max_companies,
             use_cpu=not getattr(args, "adaptive_disable_cpu", False),
             use_mem=not getattr(args, "adaptive_disable_mem", False),
+            mem_cancel_enabled=bool(getattr(args, "enable_hard_memory_guard", False)),
         )
         scheduler = AdaptiveScheduler(cfg=sched_cfg)
         await scheduler.start()
@@ -1112,60 +1087,13 @@ async def main_async(args: argparse.Namespace) -> None:
 
         abort_run = False
 
-        # Configure memory guard callback if enabled.
-        if memory_guard is not None:
-            cfg = memory_guard.config
-
-            def _on_critical_memory(company_id: str, severity: str) -> None:
-                nonlocal abort_run
-
-                if severity == "soft":
-                    logger.warning(
-                        "MemoryGuard soft limit event for company_id=%s; "
-                        "clamping concurrency.",
-                        company_id,
-                    )
-                elif severity == "hard":
-                    logger.error(
-                        "MemoryGuard hard limit hit by company_id=%s; "
-                        "tightening concurrency.",
-                        company_id,
-                    )
-                else:
-                    logger.critical(
-                        "MemoryGuard emergency limit hit by company_id=%s; "
-                        "cancelling all tasks and aborting run.",
-                        company_id,
-                    )
-                    abort_run = True
-
-                if scheduler is not None:
-                    try:
-                        loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        loop = None
-                    if loop is not None:
-                        loop.create_task(
-                            scheduler.on_memory_pressure(severity=severity)
-                        )
-
-                if severity == "emergency":
-                    for cid, t in list(company_tasks.items()):
-                        if not t.done():
-                            logger.error(
-                                "MemoryGuard: emergency cancel company_id=%s",
-                                cid,
-                            )
-                            mark_company_memory_pressure(cid)
-                            t.cancel()
-
-            cfg.on_critical = _on_critical_memory
-
         def _on_global_stall() -> None:
             nonlocal abort_run
             abort_run = True
 
         total_companies = len(companies)
+        companies_by_id: Dict[str, Company] = {c.company_id: c for c in companies}
+        ready_queue: List[str] = [c.company_id for c in companies]
 
         async with AsyncWebCrawler(config=browser_cfg) as crawler:
             global_stall_task = asyncio.create_task(
@@ -1180,84 +1108,130 @@ async def main_async(args: argparse.Namespace) -> None:
             )
 
             inflight: set[asyncio.Task] = set()
-            next_idx = 0
+            launched_counter = 0
 
-            while not abort_run and (next_idx < total_companies or inflight):
+            while not abort_run and (ready_queue or inflight):
                 active_tasks = len(inflight)
+
+                # Host level memory check: select a company to cancel if needed.
+                if scheduler is not None and company_tasks:
+                    victim_id = await scheduler.maybe_select_company_to_cancel(
+                        active_company_ids=company_tasks.keys()
+                    )
+                    if victim_id is not None:
+                        victim_task = company_tasks.get(victim_id)
+                        if victim_task is not None and not victim_task.done():
+                            logger.error(
+                                "[Scheduler] host memory critical, cancelling company_id=%s",
+                                victim_id,
+                            )
+                            mark_company_memory_pressure(victim_id)
+                            victim_task.cancel()
+                            # Requeue with priority for later restart.
+                            if scheduler is not None:
+                                await scheduler.register_memory_requeued(victim_id)
+                            if victim_id not in ready_queue:
+                                ready_queue.append(victim_id)
+
                 started = False
+                reason = "no_scheduler"
 
                 if scheduler is not None:
                     can_start, reason = await scheduler.can_start_new_company(
                         active_tasks=active_tasks
                     )
-
-                if can_start and next_idx < total_companies and not abort_run:
-                    company = companies[next_idx]
-                    next_idx += 1
-                    idx_for_log = next_idx
-
-                    async def _run_company(
-                        company: Company = company,
-                        offset: int = idx_for_log,
-                    ) -> None:
-                        await run_company_pipeline(
-                            company=company,
-                            idx=offset,
-                            total=total_companies,
-                            logging_ext=logging_ext,
-                            state=state,
-                            guard=guard,
-                            gating_cfg=gating_cfg,
-                            timeout_error_marker=timeout_error_marker,
-                            crawler=crawler,
-                            args=args,
-                            dataset_externals=dataset_externals,
-                            url_scorer=url_scorer,
-                            bm25_filter=bm25_filter,
-                            run_id=run_id,
-                            presence_llm=presence_llm,
-                            full_llm=full_llm,
-                            stall_guard=stall_guard,
-                            memory_guard=memory_guard,
-                            dfs_factory=dfs_factory,
-                            crawler_base_cfg=crawler_base_cfg,
-                            page_policy=page_policy,
-                            page_interaction_factory=page_interaction_factory,
-                            page_timeout_ms=page_timeout_ms,
-                        )
-
-                    logger.info(
-                        "[Scheduler] starting company company_id=%s (idx=%d/%d, active_before=%d, reason=%s)",
-                        company.company_id,
-                        idx_for_log,
-                        total_companies,
-                        active_tasks,
-                        reason,
-                    )
-
-                    task = asyncio.create_task(
-                        _run_company(),
-                        name=f"company-{company.company_id}",
-                    )
-                    company_tasks[company.company_id] = task
-                    inflight.add(task)
-                    if scheduler is not None:
-                        scheduler.notify_admitted(
-                            company_id=company.company_id,
-                            reason=reason,
-                        )
-                    started = True
                 else:
-                    if not started and not abort_run and next_idx < total_companies:
+                    can_start = active_tasks < max_companies
+
+                if can_start and ready_queue and not abort_run:
+                    # Priority: check if scheduler has a memory priority company.
+                    next_company_id: str
+                    if scheduler is not None:
+                        priority_id = await scheduler.pop_priority_company(ready_queue)
+                        if priority_id is not None and priority_id in ready_queue:
+                            next_company_id = priority_id
+                        else:
+                            next_company_id = ready_queue[0]
+                    else:
+                        next_company_id = ready_queue[0]
+
+                    # Remove selected company from ready queue.
+                    try:
+                        ready_queue.remove(next_company_id)
+                    except ValueError:
+                        # Should not happen, but guard anyway.
+                        logger.warning(
+                            "[Scheduler] selected company_id=%s not in ready_queue, skipping.",
+                            next_company_id,
+                        )
+                        next_company_id = None  # type: ignore[assignment]
+
+                    if next_company_id is not None:
+                        company = companies_by_id[next_company_id]
+                        launched_counter += 1
+                        idx_for_log = launched_counter
+
+                        async def _run_company(
+                            company: Company = company,
+                            offset: int = idx_for_log,
+                        ) -> None:
+                            await run_company_pipeline(
+                                company=company,
+                                idx=offset,
+                                total=total_companies,
+                                logging_ext=logging_ext,
+                                state=state,
+                                guard=guard,
+                                gating_cfg=gating_cfg,
+                                timeout_error_marker=timeout_error_marker,
+                                crawler=crawler,
+                                args=args,
+                                dataset_externals=dataset_externals,
+                                url_scorer=url_scorer,
+                                bm25_filter=bm25_filter,
+                                run_id=run_id,
+                                presence_llm=presence_llm,
+                                full_llm=full_llm,
+                                stall_guard=stall_guard,
+                                memory_guard=memory_guard,
+                                dfs_factory=dfs_factory,
+                                crawler_base_cfg=crawler_base_cfg,
+                                page_policy=page_policy,
+                                page_interaction_factory=page_interaction_factory,
+                                page_timeout_ms=page_timeout_ms,
+                            )
+
                         logger.info(
-                            "[Scheduler] not starting new company (active=%d, reason=%s, next_idx=%d/%d)",
+                            "[Scheduler] starting company company_id=%s (idx=%d/%d, active_before=%d, reason=%s)",
+                            company.company_id,
+                            idx_for_log,
+                            total_companies,
                             active_tasks,
                             reason,
-                            next_idx,
-                            total_companies,
                         )
 
-                if not inflight and next_idx >= total_companies:
+                        task = asyncio.create_task(
+                            _run_company(),
+                            name=f"company-{company.company_id}",
+                        )
+                        company_tasks[company.company_id] = task
+                        inflight.add(task)
+                        if scheduler is not None:
+                            scheduler.notify_admitted(
+                                company_id=company.company_id,
+                                reason=reason,
+                            )
+                        started = True
+                else:
+                    if not started and not abort_run and ready_queue:
+                        logger.info(
+                            "[Scheduler] not starting new company (active=%d, reason=%s, remaining=%d)",
+                            active_tasks,
+                            reason,
+                            len(ready_queue),
+                        )
+
+                if not inflight and not ready_queue:
                     break
 
                 if inflight:
@@ -1273,12 +1247,21 @@ async def main_async(args: argparse.Namespace) -> None:
                     inflight = pending
 
                     for t in done:
+                        resolved_cid: Optional[str] = None
                         for cid, ct in list(company_tasks.items()):
                             if ct is t:
+                                resolved_cid = cid
                                 company_tasks.pop(cid, None)
                                 break
 
+                        if resolved_cid is not None and scheduler is not None:
+                            await scheduler.notify_completed(resolved_cid)
+
                         if t.cancelled():
+                            logger.info(
+                                "Company task cancelled for company_id=%s",
+                                resolved_cid,
+                            )
                             continue
 
                         try:
@@ -1287,23 +1270,49 @@ async def main_async(args: argparse.Namespace) -> None:
                             continue
 
                         if isinstance(exc, CriticalMemoryPressure):
-                            if not getattr(args, "enable_hard_memory_guard", False):
+                            severity = getattr(exc, "severity", "emergency")
+                            cid_for_log = resolved_cid or "unknown"
+
+                            logger.warning(
+                                "Company %s terminated due to CriticalMemoryPressure severity=%s",
+                                cid_for_log,
+                                severity,
+                            )
+                            mark_company_memory_pressure(cid_for_log)
+
+                            if severity == "soft":
+                                # Page level marker: requeue with priority.
+                                if scheduler is not None and resolved_cid is not None:
+                                    await scheduler.register_memory_requeued(
+                                        resolved_cid
+                                    )
+                                if (
+                                    resolved_cid is not None
+                                    and resolved_cid not in ready_queue
+                                ):
+                                    ready_queue.append(resolved_cid)
                                 continue
 
-                            severity = getattr(exc, "severity", "emergency")
+                            # Hard or emergency severity: notify scheduler and possibly abort.
+                            if scheduler is not None:
+                                await scheduler.on_memory_pressure(severity=severity)
+
                             if severity == "emergency":
                                 logger.error(
-                                    "Emergency memory pressure reported by one company; "
-                                    "aborting remaining run so the wrapper can restart.",
+                                    "Emergency memory pressure reported; aborting run so wrapper can restart."
                                 )
                                 abort_run = True
                                 break
                             else:
-                                logger.warning(
-                                    "Non emergency memory pressure reported (severity=%s); "
-                                    "run will continue with the same scheduling policy.",
-                                    severity,
-                                )
+                                # Hard severity: continue run with more conservative scheduling.
+                                continue
+
+                        if exc is not None:
+                            logger.error(
+                                "Company task failed with error: %s",
+                                exc,
+                            )
+
                     if abort_run:
                         break
                 else:
