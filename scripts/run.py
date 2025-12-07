@@ -226,7 +226,9 @@ async def crawl_company(
             policy=page_policy,
             js_only=False,
         )
-        js_code = "\n\n".join(interaction_cfg.js_code) if interaction_cfg.js_code else ""
+        js_code = (
+            "\n\n".join(interaction_cfg.js_code) if interaction_cfg.js_code else ""
+        )
 
         clone_kwargs.update(
             js_code=js_code,
@@ -426,20 +428,14 @@ async def run_company_pipeline(
             state_log_tpl = "State=PENDING -> fresh crawl for %s"
             state_log_args = (company.company_id,)
         elif status == COMPANY_STATUS_MD_NOT_DONE:
-            pending_md = await state.get_pending_urls_for_markdown(
-                company.company_id
-            )
+            pending_md = await state.get_pending_urls_for_markdown(company.company_id)
             if pending_md:
                 do_crawl = True
                 resume_roots = pending_md
-                state_log_tpl = (
-                    "State=MARKDOWN_NOT_DONE -> resuming crawl for %s from %d pending URLs"
-                )
+                state_log_tpl = "State=MARKDOWN_NOT_DONE -> resuming crawl for %s from %d pending URLs"
                 state_log_args = (company.company_id, len(pending_md))
             else:
-                state_log_tpl = (
-                    "State=MARKDOWN_NOT_DONE but no pending URLs for %s; treating as no crawl"
-                )
+                state_log_tpl = "State=MARKDOWN_NOT_DONE but no pending URLs for %s; treating as no crawl"
                 state_log_args = (company.company_id,)
         elif status in (
             COMPANY_STATUS_MD_DONE,
@@ -453,9 +449,7 @@ async def run_company_pipeline(
             state_log_tpl = "State=%s (unknown) -> treating as PENDING for %s"
             state_log_args = (status, company.company_id)
 
-        will_run_llm_presence = (
-            args.llm_mode == "presence" and presence_llm is not None
-        )
+        will_run_llm_presence = args.llm_mode == "presence" and presence_llm is not None
         will_run_llm_full = args.llm_mode == "full" and full_llm is not None
         will_run_llm = will_run_llm_presence or will_run_llm_full
 
@@ -695,7 +689,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-concurrency",
         type=int,
-        default=16,
+        default=12,
         help=(
             "Maximum number of companies to process concurrently. "
             "Acts as a hard upper bound for adaptive scheduling."
@@ -1274,9 +1268,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
                 if inflight:
                     timeout = (
-                        scheduler.sample_interval_sec
-                        if scheduler is not None
-                        else None
+                        scheduler.sample_interval_sec if scheduler is not None else None
                     )
 
                     done, pending = await asyncio.wait(
@@ -1301,9 +1293,7 @@ async def main_async(args: argparse.Namespace) -> None:
                             continue
 
                         if isinstance(exc, CriticalMemoryPressure):
-                            if not getattr(
-                                args, "enable_hard_memory_guard", False
-                            ):
+                            if not getattr(args, "enable_hard_memory_guard", False):
                                 continue
 
                             severity = getattr(exc, "severity", "emergency")
