@@ -533,8 +533,7 @@ async def wait_for_global_hard_stall(
             if elapsed >= hard:
                 msg = (
                     "Global StallGuard: zombie stall detected before first "
-                    "heartbeat; no progress for %.1fs >= %.1fs"
-                    % (elapsed, hard)
+                    "heartbeat; no progress for %.1fs >= %.1fs" % (elapsed, hard)
                 )
                 logger.error(msg)
                 if raise_on_stall:
@@ -595,8 +594,7 @@ async def wait_for_global_hard_stall(
             if age_any >= hard:
                 msg = (
                     "Global StallGuard: zombie stall detected with zero active "
-                    "companies; no progress for %.1fs >= %.1fs"
-                    % (age_any, hard)
+                    "companies; no progress for %.1fs >= %.1fs" % (age_any, hard)
                 )
                 logger.error(msg)
                 if raise_on_stall:
@@ -606,13 +604,14 @@ async def wait_for_global_hard_stall(
         # Otherwise we are either making progress or not yet past the
         # threshold; keep waiting.
 
+
 async def global_stall_watchdog(
     *,
     stall_guard: StallGuard,
     stall_cfg: StallGuardConfig,
     company_tasks: Dict[str, asyncio.Task[Any]],
     mark_company_stalled: Callable[[str], None],
-    on_global_stall: Optional[Callable[[float], None]] = None,
+    on_global_stall: Optional[Callable] = None,
 ) -> None:
     """
     Background task that waits for a global hard stall and then:
@@ -690,6 +689,7 @@ async def global_stall_watchdog(
                 cid,
             )
             task.cancel()
+
 
 __all__ = [
     "StallGuardConfig",

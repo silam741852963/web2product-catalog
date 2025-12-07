@@ -1161,7 +1161,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
             cfg.on_critical = _on_critical_memory
 
-        def _on_global_stall(idle: float) -> None:
+        def _on_global_stall() -> None:
             nonlocal abort_run
             abort_run = True
 
