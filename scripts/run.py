@@ -64,11 +64,7 @@ from extensions.crawl_state import (
     COMPANY_STATUS_LLM_NOT_DONE,
 )
 from extensions.resource_monitor import ResourceMonitor, ResourceMonitorConfig
-from extensions.stall_guard import (
-    StallGuard,
-    StallGuardConfig,
-    global_stall_watchdog,
-)
+
 from extensions.retry_tracker import (
     RetryTracker,
     RetryTrackerConfig,
@@ -84,6 +80,9 @@ from extensions.adaptive_scheduling import (
     AdaptiveScheduler,
     MemoryGuard,
     CriticalMemoryPressure,
+    StallGuard,
+    StallGuardConfig,
+    global_stall_watchdog,
 )
 from extensions.page_pipeline import process_page_result
 from extensions.llm_passes import (
@@ -193,6 +192,10 @@ async def crawl_company(
 
     The per company page limit (if any) is enforced by the deep
     crawl strategy via its max_pages parameter.
+
+    This function is cancellation aware and ensures that the deep
+    crawl async generator is closed when the task is cancelled so
+    that Playwright pages and browser contexts are released.
     """
     logger.info(
         "Starting crawl for company_id=%s url=%s",
@@ -249,48 +252,77 @@ async def crawl_company(
             if hasattr(agen, "__aiter__"):
                 agen = agen.__aiter__()
 
-            while True:
-                try:
-                    page_result = await agen.__anext__()
-                except StopAsyncIteration:
-                    break
-                except Exception as e:
-                    logger.exception(
-                        "Error fetching next deep crawl result (company=%s): %s",
-                        company.company_id,
-                        e,
-                    )
-                    aclose = getattr(agen, "aclose", None)
-                    if aclose is not None:
-                        try:
-                            await aclose()
-                        except Exception:
-                            pass
-                    break
+            pending_exc: Optional[BaseException] = None
 
-                try:
-                    await process_page_result(
-                        page_result=page_result,
-                        company=company,
-                        guard=guard,
-                        gating_cfg=gating_cfg,
-                        timeout_error_marker=timeout_error_marker,
-                        stall_guard=stall_guard,
-                        memory_guard=memory_guard,
-                        mark_company_timeout_cb=mark_company_timeout,
-                        mark_company_memory_cb=mark_company_memory_pressure,
-                    )
-                except CriticalMemoryPressure:
-                    # Propagate to top level
-                    raise
-                except Exception as e:
-                    url = getattr(page_result, "url", None)
-                    logger.exception(
-                        "Error processing page %s (company=%s): %s",
-                        url,
-                        company.company_id,
-                        e,
-                    )
+            try:
+                while True:
+                    try:
+                        page_result = await agen.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    except Exception as e:
+                        logger.exception(
+                            "Error fetching next deep crawl result (company=%s): %s",
+                            company.company_id,
+                            e,
+                        )
+                        # Stop consuming this stream; cleanup in finally via aclose.
+                        break
+
+                    try:
+                        await process_page_result(
+                            page_result=page_result,
+                            company=company,
+                            guard=guard,
+                            gating_cfg=gating_cfg,
+                            timeout_error_marker=timeout_error_marker,
+                            stall_guard=stall_guard,
+                            memory_guard=memory_guard,
+                            mark_company_timeout_cb=mark_company_timeout,
+                            mark_company_memory_cb=mark_company_memory_pressure,
+                        )
+                    except CriticalMemoryPressure as e:
+                        # Stop streaming but remember the exception so it can be
+                        # re-raised after we close the generator.
+                        pending_exc = e
+                        break
+                    except Exception as e:
+                        url = getattr(page_result, "url", None)
+                        logger.exception(
+                            "Error processing page %s (company=%s): %s",
+                            url,
+                            company.company_id,
+                            e,
+                        )
+                        # Continue with next page.
+                        continue
+            except asyncio.CancelledError as e:
+                # Task-level cancellation (scheduler or stall).
+                logger.warning(
+                    "crawl_company cancelled for company_id=%s root=%s; closing stream.",
+                    company.company_id,
+                    start_url,
+                )
+                pending_exc = e
+            finally:
+                aclose = getattr(agen, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception as e:
+                        logger.exception(
+                            "Error while closing deep crawl generator (company_id=%s): %s",
+                            company.company_id,
+                            e,
+                        )
+
+            if pending_exc is not None:
+                # Propagate cancellation or memory pressure to the caller.
+                if isinstance(pending_exc, asyncio.CancelledError):
+                    raise pending_exc
+                if isinstance(pending_exc, CriticalMemoryPressure):
+                    raise pending_exc
+                # Other exceptions were already logged; do not abort the whole company.
 
         # Non streaming list result
         else:
@@ -386,166 +418,173 @@ async def run_company_pipeline(
 
     try:
         try:
-            snap = await state.get_company_snapshot(company.company_id)
-            status = snap.status or COMPANY_STATUS_PENDING
+            try:
+                snap = await state.get_company_snapshot(company.company_id)
+                status = snap.status or COMPANY_STATUS_PENDING
+            except Exception as e:
+                logger.exception(
+                    "Pre check: failed to get snapshot for company_id=%s: %s",
+                    company.company_id,
+                    e,
+                )
+                status = COMPANY_STATUS_PENDING
+
+            do_crawl = False
+            resume_roots: Optional[List[str]] = None
+
+            state_log_tpl: Optional[str] = None
+            state_log_args: tuple[Any, ...] = ()
+
+            if status == COMPANY_STATUS_PENDING:
+                do_crawl = True
+                state_log_tpl = "State=PENDING -> fresh crawl for %s"
+                state_log_args = (company.company_id,)
+            elif status == COMPANY_STATUS_MD_NOT_DONE:
+                pending_md = await state.get_pending_urls_for_markdown(
+                    company.company_id
+                )
+                if pending_md:
+                    do_crawl = True
+                    resume_roots = pending_md
+                    state_log_tpl = "State=MARKDOWN_NOT_DONE -> resuming crawl for %s from %d pending URLs"
+                    state_log_args = (company.company_id, len(pending_md))
+                else:
+                    state_log_tpl = "State=MARKDOWN_NOT_DONE but no pending URLs for %s; treating as no crawl"
+                    state_log_args = (company.company_id,)
+            elif status in (
+                COMPANY_STATUS_MD_DONE,
+                COMPANY_STATUS_LLM_DONE,
+                COMPANY_STATUS_LLM_NOT_DONE,
+            ):
+                state_log_tpl = "State=%s -> skipping crawl for %s"
+                state_log_args = (status, company.company_id)
+            else:
+                do_crawl = True
+                state_log_tpl = "State=%s (unknown) -> treating as PENDING for %s"
+                state_log_args = (status, company.company_id)
+
+            will_run_llm_presence = (
+                args.llm_mode == "presence" and presence_llm is not None
+            )
+            will_run_llm_full = args.llm_mode == "full" and full_llm is not None
+            will_run_llm = will_run_llm_presence or will_run_llm_full
+
+            if not do_crawl and not will_run_llm:
+                logger.info(
+                    "Company %s has status=%s, no crawl or LLM work needed in this run -> skipping.",
+                    company.company_id,
+                    status,
+                )
+                return
+
+            if not do_crawl and args.llm_mode == "none":
+                logger.info(
+                    "Company %s: no crawl required and llm_mode=none -> skipping.",
+                    company.company_id,
+                )
+                return
+
+            record_company_attempt(company.company_id)
+
+            if stall_guard is not None:
+                stall_guard.record_company_start(company.company_id)
+
+            token = logging_ext.set_company_context(company.company_id)
+            company_logger = logging_ext.get_company_logger(company.company_id)
+
+            if state_log_tpl:
+                company_logger.info(state_log_tpl, *state_log_args)
+
+            company_logger.info(
+                "=== [%d/%d] Company company_id=%s url=%s ===",
+                idx,
+                total,
+                company.company_id,
+                company.domain_url,
+            )
+
+            filter_chain = _build_filter_chain(
+                company=company,
+                args=args,
+                dataset_externals=dataset_externals,
+                bm25_filter=bm25_filter,
+            )
+
+            # Wire --max-pages into the deep crawl strategy itself.
+            max_pages_for_strategy: Optional[int] = None
+            if getattr(args, "max_pages", None) is not None and args.max_pages > 0:
+                max_pages_for_strategy = int(args.max_pages)
+
+            deep_strategy = build_deep_strategy(
+                strategy=args.strategy,
+                filter_chain=filter_chain,
+                url_scorer=url_scorer,
+                dfs_factory=dfs_factory,
+                max_pages=max_pages_for_strategy,
+            )
+
+            if do_crawl:
+                await guard.wait_until_healthy()
+                await crawl_company(
+                    company=company,
+                    crawler=crawler,
+                    deep_strategy=deep_strategy,
+                    guard=guard,
+                    gating_cfg=gating_cfg,
+                    timeout_error_marker=timeout_error_marker,
+                    stall_guard=stall_guard,
+                    root_urls=resume_roots,
+                    crawler_base_cfg=crawler_base_cfg,
+                    page_policy=page_policy,
+                    page_interaction_factory=page_interaction_factory,
+                    page_timeout_ms=page_timeout_ms,
+                    memory_guard=memory_guard,
+                )
+                await state.recompute_company_from_index(
+                    company.company_id,
+                    name=None,
+                    root_url=company.domain_url,
+                )
+
+            if args.llm_mode == "presence" and presence_llm is not None:
+                await run_presence_pass_for_company(
+                    company,
+                    presence_strategy=presence_llm,
+                    stall_guard=stall_guard,
+                )
+            elif args.llm_mode == "full" and full_llm is not None:
+                await run_full_pass_for_company(
+                    company,
+                    full_strategy=full_llm,
+                    stall_guard=stall_guard,
+                )
+
+            completed_ok = True
+
+        except asyncio.CancelledError:
+            logger.warning(
+                "Company pipeline cancelled for company_id=%s",
+                company.company_id,
+            )
+            # Propagate so outer scheduler can handle it; we do not perform
+            # any further async work in this function after this point.
+            raise
+
+        except CriticalMemoryPressure:
+            logger.error(
+                "Critical memory pressure while processing company_id=%s; propagating to top level.",
+                company.company_id,
+            )
+            raise
+
         except Exception as e:
             logger.exception(
-                "Pre check: failed to get snapshot for company_id=%s: %s",
+                "Unhandled error while processing company_id=%s: %s",
                 company.company_id,
                 e,
             )
-            status = COMPANY_STATUS_PENDING
 
-        do_crawl = False
-        resume_roots: Optional[List[str]] = None
-
-        state_log_tpl: Optional[str] = None
-        state_log_args: tuple[Any, ...] = ()
-
-        if status == COMPANY_STATUS_PENDING:
-            do_crawl = True
-            state_log_tpl = "State=PENDING -> fresh crawl for %s"
-            state_log_args = (company.company_id,)
-        elif status == COMPANY_STATUS_MD_NOT_DONE:
-            pending_md = await state.get_pending_urls_for_markdown(company.company_id)
-            if pending_md:
-                do_crawl = True
-                resume_roots = pending_md
-                state_log_tpl = "State=MARKDOWN_NOT_DONE -> resuming crawl for %s from %d pending URLs"
-                state_log_args = (company.company_id, len(pending_md))
-            else:
-                state_log_tpl = "State=MARKDOWN_NOT_DONE but no pending URLs for %s; treating as no crawl"
-                state_log_args = (company.company_id,)
-        elif status in (
-            COMPANY_STATUS_MD_DONE,
-            COMPANY_STATUS_LLM_DONE,
-            COMPANY_STATUS_LLM_NOT_DONE,
-        ):
-            state_log_tpl = "State=%s -> skipping crawl for %s"
-            state_log_args = (status, company.company_id)
-        else:
-            do_crawl = True
-            state_log_tpl = "State=%s (unknown) -> treating as PENDING for %s"
-            state_log_args = (status, company.company_id)
-
-        will_run_llm_presence = args.llm_mode == "presence" and presence_llm is not None
-        will_run_llm_full = args.llm_mode == "full" and full_llm is not None
-        will_run_llm = will_run_llm_presence or will_run_llm_full
-
-        if not do_crawl and not will_run_llm:
-            logger.info(
-                "Company %s has status=%s, no crawl or LLM work needed in this run -> skipping.",
-                company.company_id,
-                status,
-            )
-            return
-
-        if not do_crawl and args.llm_mode == "none":
-            logger.info(
-                "Company %s: no crawl required and llm_mode=none -> skipping.",
-                company.company_id,
-            )
-            return
-
-        record_company_attempt(company.company_id)
-
-        if stall_guard is not None:
-            stall_guard.record_company_start(company.company_id)
-
-        token = logging_ext.set_company_context(company.company_id)
-        company_logger = logging_ext.get_company_logger(company.company_id)
-
-        if state_log_tpl:
-            company_logger.info(state_log_tpl, *state_log_args)
-
-        company_logger.info(
-            "=== [%d/%d] Company company_id=%s url=%s ===",
-            idx,
-            total,
-            company.company_id,
-            company.domain_url,
-        )
-
-        filter_chain = _build_filter_chain(
-            company=company,
-            args=args,
-            dataset_externals=dataset_externals,
-            bm25_filter=bm25_filter,
-        )
-
-        # Wire --max-pages into the deep crawl strategy itself.
-        max_pages_for_strategy: Optional[int] = None
-        if getattr(args, "max_pages", None) is not None and args.max_pages > 0:
-            max_pages_for_strategy = int(args.max_pages)
-
-        deep_strategy = build_deep_strategy(
-            strategy=args.strategy,
-            filter_chain=filter_chain,
-            url_scorer=url_scorer,
-            dfs_factory=dfs_factory,
-            max_pages=max_pages_for_strategy,
-        )
-
-        if do_crawl:
-            await guard.wait_until_healthy()
-            await crawl_company(
-                company=company,
-                crawler=crawler,
-                deep_strategy=deep_strategy,
-                guard=guard,
-                gating_cfg=gating_cfg,
-                timeout_error_marker=timeout_error_marker,
-                stall_guard=stall_guard,
-                root_urls=resume_roots,
-                crawler_base_cfg=crawler_base_cfg,
-                page_policy=page_policy,
-                page_interaction_factory=page_interaction_factory,
-                page_timeout_ms=page_timeout_ms,
-                memory_guard=memory_guard,
-            )
-            await state.recompute_company_from_index(
-                company.company_id,
-                name=None,
-                root_url=company.domain_url,
-            )
-
-        if args.llm_mode == "presence" and presence_llm is not None:
-            await run_presence_pass_for_company(
-                company,
-                presence_strategy=presence_llm,
-                stall_guard=stall_guard,
-            )
-        elif args.llm_mode == "full" and full_llm is not None:
-            await run_full_pass_for_company(
-                company,
-                full_strategy=full_llm,
-                stall_guard=stall_guard,
-            )
-
-        completed_ok = True
-
-    except asyncio.CancelledError:
-        logger.warning(
-            "Company pipeline cancelled for company_id=%s",
-            company.company_id,
-        )
-        raise
-
-    except CriticalMemoryPressure:
-        logger.error(
-            "Critical memory pressure while processing company_id=%s; propagating to top level.",
-            company.company_id,
-        )
-        raise
-
-    except Exception as e:
-        logger.exception(
-            "Unhandled error while processing company_id=%s: %s",
-            company.company_id,
-            e,
-        )
-
-    finally:
+        # Only executed if we were not cancelled or aborted by CriticalMemoryPressure.
         try:
             snap_meta = await state.get_company_snapshot(company.company_id)
             _write_crawl_meta(company, snap_meta)
@@ -571,6 +610,7 @@ async def run_company_pipeline(
         if stall_guard is not None and completed_ok:
             stall_guard.record_company_completed(company.company_id)
 
+    finally:
         if token is not None:
             logging_ext.reset_company_context(token)
             logging_ext.close_company(company.company_id)
@@ -1145,7 +1185,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
                 if can_start and ready_queue and not abort_run:
                     # Priority: check if scheduler has a memory priority company.
-                    next_company_id: str
+                    next_company_id: Optional[str]
                     if scheduler is not None:
                         priority_id = await scheduler.pop_priority_company(ready_queue)
                         if priority_id is not None and priority_id in ready_queue:
@@ -1156,15 +1196,15 @@ async def main_async(args: argparse.Namespace) -> None:
                         next_company_id = ready_queue[0]
 
                     # Remove selected company from ready queue.
-                    try:
-                        ready_queue.remove(next_company_id)
-                    except ValueError:
-                        # Should not happen, but guard anyway.
-                        logger.warning(
-                            "[Scheduler] selected company_id=%s not in ready_queue, skipping.",
-                            next_company_id,
-                        )
-                        next_company_id = None  # type: ignore[assignment]
+                    if next_company_id is not None:
+                        try:
+                            ready_queue.remove(next_company_id)
+                        except ValueError:
+                            logger.warning(
+                                "[Scheduler] selected company_id=%s not in ready_queue, skipping.",
+                                next_company_id,
+                            )
+                            next_company_id = None
 
                     if next_company_id is not None:
                         company = companies_by_id[next_company_id]
@@ -1299,7 +1339,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
                             if severity == "emergency":
                                 logger.error(
-                                    "Emergency memory pressure reported; aborting run so wrapper can restart."
+                                    "Emergency memory pressure reported; aborting run so wrapper can restart.",
                                 )
                                 abort_run = True
                                 break
@@ -1323,6 +1363,14 @@ async def main_async(args: argparse.Namespace) -> None:
                 for t in inflight:
                     if not t.done():
                         t.cancel()
+                # Give cancelled tasks a brief chance to run their cleanup
+                # (including closing any Playwright contexts) before we
+                # tear down the shared AsyncWebCrawler.
+                if inflight:
+                    try:
+                        await asyncio.gather(*inflight, return_exceptions=True)
+                    except Exception:
+                        logger.exception("Error while waiting for cancelled tasks")
                 inflight.clear()
 
             if global_stall_task is not None:

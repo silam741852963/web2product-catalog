@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -14,7 +13,7 @@ from extensions.crawl_state import (
     upsert_url_index_entry,
 )
 from extensions.output_paths import save_stage_output
-from extensions.stall_guard import StallGuard
+from extensions.adaptive_scheduling import StallGuard
 
 logger = logging.getLogger("llm_passes")
 
@@ -22,6 +21,7 @@ logger = logging.getLogger("llm_passes")
 # ---------------------------------------------------------------------------
 # LLM presence second pass
 # ---------------------------------------------------------------------------
+
 
 async def run_presence_pass_for_company(
     company: Any,
@@ -103,9 +103,7 @@ async def run_presence_pass_for_company(
             continue
 
         try:
-            raw_result = await asyncio.to_thread(
-                presence_strategy.extract, url, text
-            )
+            raw_result = await asyncio.to_thread(presence_strategy.extract, url, text)
         except Exception as e:
             logger.exception(
                 "LLM presence: error for %s (company=%s): %s",
@@ -156,6 +154,7 @@ async def run_presence_pass_for_company(
 # ---------------------------------------------------------------------------
 # LLM full extraction second pass
 # ---------------------------------------------------------------------------
+
 
 async def run_full_pass_for_company(
     company: Any,

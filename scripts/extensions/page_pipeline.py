@@ -7,8 +7,7 @@ from extensions.connectivity_guard import ConnectivityGuard
 from extensions import md_gating
 from extensions.output_paths import save_stage_output
 from extensions.crawl_state import upsert_url_index_entry
-from extensions.stall_guard import StallGuard
-from extensions.adaptive_scheduling import MemoryGuard
+from extensions.adaptive_scheduling import MemoryGuard, StallGuard
 
 logger = logging.getLogger("page_pipeline")
 
