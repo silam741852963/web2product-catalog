@@ -41,7 +41,6 @@ from configs.js_injection import (
 # Extensions
 from extensions.connectivity_guard import ConnectivityGuard
 from extensions.dual_bm25 import (
-    DualBM25Config,
     DualBM25Filter,
     DualBM25Scorer,
     build_dual_bm25_components,
@@ -55,11 +54,9 @@ from extensions.load_source import load_companies_from_source, CompanyInput
 from extensions.logging import LoggingExtension
 from extensions import md_gating
 from extensions import output_paths
-from extensions.output_paths import ensure_company_dirs, save_stage_output
+from extensions.output_paths import ensure_company_dirs
 from extensions.crawl_state import (
     get_crawl_state,
-    load_url_index,
-    upsert_url_index_entry,
     COMPANY_STATUS_PENDING,
     COMPANY_STATUS_MD_DONE,
     COMPANY_STATUS_MD_NOT_DONE,
@@ -689,7 +686,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-concurrency",
         type=int,
-        default=12,
+        default=8,
         help=(
             "Maximum number of companies to process concurrently. "
             "Acts as a hard upper bound for adaptive scheduling."
@@ -1193,9 +1190,6 @@ async def main_async(args: argparse.Namespace) -> None:
                     can_start, reason = await scheduler.can_start_new_company(
                         active_tasks=active_tasks
                     )
-                else:
-                    can_start = active_tasks < max_companies
-                    reason = "no_scheduler"
 
                 if can_start and next_idx < total_companies and not abort_run:
                     company = companies[next_idx]
@@ -1315,8 +1309,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 else:
                     if scheduler is not None:
                         await asyncio.sleep(scheduler.sample_interval_sec)
-                    else:
-                        await asyncio.sleep(0.5)
 
             if abort_run:
                 for t in inflight:
