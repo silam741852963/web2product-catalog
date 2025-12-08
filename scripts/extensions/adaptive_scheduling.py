@@ -288,6 +288,7 @@ class AdaptiveScheduler:
 
         if not self._psutil_available:
             # Conservative fallback: do not ramp without metrics.
+            # Caller still caps by --company-concurrency.
             return 1
 
         async with self._lock:
@@ -376,6 +377,12 @@ class AdaptiveScheduler:
             if company_p95 is not None and company_p95 > effective_est_mb:
                 effective_est_mb = company_p95
 
+            # Bound effective estimate so one bad episode can't permanently
+            # exceed the safe cap.
+            max_safe_mb = (cfg.mem_cap_frac * float(total)) / 1e6
+            if max_safe_mb > 0.0 and effective_est_mb > max_safe_mb:
+                effective_est_mb = max_safe_mb
+
             per_company_bytes = max(
                 int(effective_est_mb * 1e6),
                 int(self.cfg.per_company_min_reservation_mb * 1e6),
@@ -384,6 +391,12 @@ class AdaptiveScheduler:
                 return 0
 
             slots_by_mem = int(headroom_bytes // per_company_bytes)
+
+            # Key anti-stall: if nothing is active, always allow at least one
+            # company to start (below mem_high_frac), even if the model says 0.
+            if num_active == 0 and slots_by_mem <= 0:
+                slots_by_mem = 1
+
             if slots_by_mem <= 0:
                 return 0
 
@@ -427,6 +440,8 @@ class AdaptiveScheduler:
 
                 if not self._psutil_available:
                     continue
+
+                cancel_ids: List[str] = []
 
                 async with self._lock:
                     total, used = self._read_memory_usage_bytes()
@@ -495,6 +510,11 @@ class AdaptiveScheduler:
                     if company_p95 is not None and company_p95 > effective_est_mb:
                         effective_est_mb = company_p95
 
+                    # Bound effective estimate by safe cap here as well
+                    max_safe_mb = (cfg.mem_cap_frac * float(total)) / 1e6
+                    if max_safe_mb > 0.0 and effective_est_mb > max_safe_mb:
+                        effective_est_mb = max_safe_mb
+
                     per_company_bytes = max(
                         int(effective_est_mb * 1e6),
                         int(self.cfg.per_company_min_reservation_mb * 1e6),
@@ -543,7 +563,7 @@ class AdaptiveScheduler:
                         len(to_cancel),
                     )
 
-                    cancel_ids: List[str] = list(to_cancel)
+                    cancel_ids = list(to_cancel)
 
                 if cancel_ids:
                     try:
@@ -700,8 +720,12 @@ class AdaptiveScheduler:
     ) -> None:
         """
         Update the global per-company memory estimate.
+
+        We only learn from situations where at least 2 companies are active.
+        With a single active company, "used / 1" is too noisy and tends to
+        overestimate because it includes process overhead.
         """
-        if used_bytes <= 0 or num_active <= 0 or self._total_mem_bytes is None:
+        if used_bytes <= 0 or num_active <= 1 or self._total_mem_bytes is None:
             return
 
         per_company_now_mb = (float(used_bytes) / float(num_active)) / 1e6
@@ -719,16 +743,27 @@ class AdaptiveScheduler:
         base = max(q95, self.cfg.per_company_min_reservation_mb)
         new_est = self.cfg.per_company_safety_factor * base
 
-        if new_est > self._per_company_est_mb * 1.1:
+        # Bound estimate so it cannot exceed the safe cap.
+        max_safe_mb = (self.cfg.mem_cap_frac * float(self._total_mem_bytes)) / 1e6
+        if max_safe_mb > 0.0 and new_est > max_safe_mb:
+            new_est = max_safe_mb
+
+        old_est = self._per_company_est_mb
+        # Allow both growth and shrink, but never below the minimum reservation.
+        self._per_company_est_mb = max(
+            self.cfg.per_company_min_reservation_mb,
+            new_est,
+        )
+
+        if self._per_company_est_mb > old_est * 1.1:
             logger.info(
                 "[AdaptiveScheduling] per company estimate updated: "
                 "%.1fMB -> %.1fMB (q95=%.1fMB, active=%d)",
+                old_est,
                 self._per_company_est_mb,
-                new_est,
                 q95,
                 num_active,
             )
-        self._per_company_est_mb = max(self._per_company_est_mb, new_est)
 
     def _register_near_oom_locked(
         self,
