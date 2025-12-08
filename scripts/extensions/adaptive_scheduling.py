@@ -169,7 +169,7 @@ class AdaptiveSchedulingConfig:
 
     peak_history_size: int = 100
     per_company_safety_factor: float = 1.3
-    per_company_min_reservation_mb: float = 512.0
+    per_company_min_reservation_mb: float = 256.0
 
     emergency_check_interval_sec: float = 1.0
 
@@ -183,12 +183,12 @@ class AdaptiveSchedulingConfig:
 
     # (2) Trend based throttling
     mem_trend_window_sec: float = 10.0
-    mem_trend_slope_high_mb_per_s: float = 50.0
-    mem_trend_margin_frac: float = 0.05
+    mem_trend_slope_high_mb_per_s: float = 100.0
+    mem_trend_margin_frac: float = 0.03
 
     # (4) AIMD concurrency controller
-    ai_step: int = 1
-    md_factor: float = 0.5
+    ai_step: int = 2
+    md_factor: float = 0.6
     min_target: int = 1
     max_target: int = 512
 
