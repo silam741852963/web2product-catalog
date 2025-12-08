@@ -687,7 +687,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-concurrency",
         type=int,
-        default=12,
+        default=24,
         help=(
             "Maximum number of companies to process concurrently. "
             "Acts as a hard upper bound on top of adaptive scheduling."

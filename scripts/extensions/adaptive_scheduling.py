@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import asyncio
+import gc
 import json
 import logging
 import time
@@ -111,6 +112,12 @@ class AdaptiveSchedulingConfig:
     # Cooldown between automatic resets in seconds
     unstall_cooldown_sec: float = 60.0
 
+    # Emergency cancellation behavior
+    # Minimum time between two emergency cancellations
+    emergency_cancel_cooldown_sec: float = 3.0
+    # Time to wait after canceling a company to allow memory to drop
+    emergency_post_cancel_delay_sec: float = 1.5
+
 
 # ---------------------------------------------------------------------------
 # Scheduler
@@ -190,6 +197,9 @@ class AdaptiveScheduler:
 
         # Unstall bookkeeping
         self._last_unstall_ts: float = 0.0
+
+        # Emergency cancellation bookkeeping
+        self._last_emergency_cancel_ts: float = 0.0
 
     # ------------------------------------------------------------------ #
     # Public properties
@@ -382,7 +392,7 @@ class AdaptiveScheduler:
             if company_p95 is not None and company_p95 > effective_est_mb:
                 effective_est_mb = company_p95
 
-            # Bound effective estimate so one bad episode can't permanently
+            # Bound effective estimate so one bad episode cannot permanently
             # exceed the safe cap.
             max_safe_mb = (cfg.mem_cap_frac * float(total)) / 1e6
             if max_safe_mb > 0.0 and effective_est_mb > max_safe_mb:
@@ -420,7 +430,7 @@ class AdaptiveScheduler:
                     headroom_bytes=headroom_bytes,
                     used_frac=used_frac,
                 )
-                # recompute effective_est_mb and slots_by_mem after reset
+                # Recompute effective_est_mb and slots_by_mem after reset
                 effective_est_mb = self._per_company_est_mb
                 company_p95 = self._get_company_p95_est_mb_locked()
                 if company_p95 is not None and company_p95 > effective_est_mb:
@@ -509,7 +519,7 @@ class AdaptiveScheduler:
         new_est = min(old_est, headroom_mb)
         new_est = max(cfg.per_company_min_reservation_mb, new_est)
 
-        # Clear history and per-company profiles so we don't immediately
+        # Clear history and per-company profiles so we do not immediately
         # re-apply old heavy tails.
         self._peak_history_mb.clear()
         self._company_peak_mb.clear()
@@ -576,6 +586,23 @@ class AdaptiveScheduler:
                     if not in_emergency:
                         continue
 
+                    # Respect emergency cancellation cooldown to avoid rapid-fire cancels
+                    if (
+                        now - self._last_emergency_cancel_ts
+                        < cfg.emergency_cancel_cooldown_sec
+                    ):
+                        self._maybe_log_state_locked(
+                            reason="emergency_cooldown",
+                            extra={
+                                "total_mem_mb": float(total) / 1e6,
+                                "used_mem_mb": float(used) / 1e6,
+                                "used_frac": used_frac,
+                                "swap_used_frac": swap_frac,
+                                "num_active": num_active,
+                            },
+                        )
+                        continue
+
                     # AIMD: strong multiplicative decrease on emergency
                     high_swap = (
                         swap_frac >= cfg.swap_block_frac
@@ -599,37 +626,10 @@ class AdaptiveScheduler:
                             )
                         continue
 
-                    # Determine how many companies we need to cancel to get
-                    # down to mem_crit_low_frac.
-                    target_used_bytes = int(cfg.mem_crit_low_frac * float(total))
-                    excess_bytes = max(0, used - target_used_bytes)
-
-                    # Effective per-company estimate (global + per-company profiles)
-                    effective_est_mb = self._per_company_est_mb
-                    company_p95 = self._get_company_p95_est_mb_locked()
-                    if company_p95 is not None and company_p95 > effective_est_mb:
-                        effective_est_mb = company_p95
-
-                    max_safe_mb = (cfg.mem_cap_frac * float(total)) / 1e6
-                    if max_safe_mb > 0.0 and effective_est_mb > max_safe_mb:
-                        effective_est_mb = max_safe_mb
-
-                    per_company_bytes = max(
-                        int(effective_est_mb * 1e6),
-                        int(self.cfg.per_company_min_reservation_mb * 1e6),
-                    )
-                    if per_company_bytes <= 0:
-                        needed_cancel = 1
-                    else:
-                        needed_cancel = int(
-                            (excess_bytes + per_company_bytes - 1) // per_company_bytes
-                        )
-                        needed_cancel = max(1, needed_cancel)
-
                     # Respect min_active_keep.
                     max_cancelable = max(0, num_active - int(cfg.min_active_keep))
                     if max_cancelable <= 0:
-                        max_cancelable = num_active
+                        # Cannot cancel anything but memory is critical: recommend restart.
                         if not self._restart_recommended:
                             self._restart_recommended = True
                             logger.error(
@@ -642,28 +642,30 @@ class AdaptiveScheduler:
                             )
                         continue
 
-                    to_cancel_count = min(needed_cancel, max_cancelable)
-                    to_cancel = list(active_ids)[-to_cancel_count:]
+                    # Choose exactly one company to cancel, preferring the heaviest known one.
+                    to_cancel_id = self._select_heaviest_company_locked(active_ids)
+                    if to_cancel_id is None:
+                        # Fallback to last active company (should be rare)
+                        to_cancel_id = active_ids[-1]
 
+                    cancel_ids = [to_cancel_id]
+                    self._last_emergency_cancel_ts = now
+
+                    # Log emergency cancellation
                     logger.error(
                         "[AdaptiveScheduling] emergency memory pressure: "
                         "used_frac=%.3f, swap_used_frac=%.3f, "
                         "total_mem_mb=%.1f, used_mem_mb=%.1f, "
                         "num_active=%d, per_company_est_mb=%.1f, "
-                        "effective_per_company_est_mb=%.1f, "
-                        "excess_bytes=%.1fMB, canceling=%d companies.",
+                        "canceling_company_id=%s",
                         used_frac,
                         swap_frac,
                         float(total) / 1e6,
                         float(used) / 1e6,
                         num_active,
                         self._per_company_est_mb,
-                        effective_est_mb,
-                        float(excess_bytes) / 1e6,
-                        len(to_cancel),
+                        to_cancel_id,
                     )
-
-                    cancel_ids = list(to_cancel)
 
                 if cancel_ids:
                     try:
@@ -671,6 +673,27 @@ class AdaptiveScheduler:
                     except Exception:
                         logger.exception(
                             "[AdaptiveScheduling] request_cancel_companies failed"
+                        )
+
+                    # Allow some time for tasks, browser processes and GC to release memory
+                    try:
+                        await asyncio.sleep(cfg.emergency_post_cancel_delay_sec)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # Any error here is non-fatal to the watchdog
+                        logger.debug(
+                            "[AdaptiveScheduling] error during post-cancel sleep",
+                            exc_info=True,
+                        )
+
+                    # Trigger GC to help RSS drop a bit faster
+                    try:
+                        gc.collect()
+                    except Exception:
+                        logger.debug(
+                            "[AdaptiveScheduling] gc.collect() failed",
+                            exc_info=True,
                         )
 
             except asyncio.CancelledError:
@@ -1033,6 +1056,33 @@ class AdaptiveScheduler:
                 self.cfg.log_path,
                 exc_info=True,
             )
+
+    def _select_heaviest_company_locked(
+        self, active_ids: Sequence[str]
+    ) -> Optional[str]:
+        """
+        Select the "heaviest" active company based on recorded peak memory.
+
+        If no peak info is available for any active company, fall back
+        to the last active id in the list.
+        """
+        if not active_ids:
+            return None
+
+        heaviest_id: Optional[str] = None
+        heaviest_mb: float = -1.0
+
+        for cid in active_ids:
+            mb = self._company_peak_mb.get(cid)
+            if mb is not None and mb > heaviest_mb:
+                heaviest_mb = mb
+                heaviest_id = cid
+
+        if heaviest_id is not None:
+            return heaviest_id
+
+        # No peak info for any active company, fallback strategy
+        return active_ids[-1]
 
 
 __all__ = [
