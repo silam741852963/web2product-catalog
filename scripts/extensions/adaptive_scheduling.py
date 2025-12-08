@@ -94,9 +94,9 @@ class AdaptiveSchedulingConfig:
     # initial_target: starting target_parallel
     # warmup_updates: number of AIMD updates to treat as "warmup"
     # warmup_ai_step: additive step during warmup (on top of initial_target)
-    initial_target: int = 2
-    warmup_updates: int = 8
-    warmup_ai_step: int = 4
+    initial_target: int = 4
+    warmup_updates: int = 10
+    warmup_ai_step: int = 8
 
     # (5) Safety margin auto-tuning
     near_oom_used_frac: float = 0.97
