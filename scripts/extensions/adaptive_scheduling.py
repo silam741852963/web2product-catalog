@@ -1,12 +1,13 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Iterable, Callable, Awaitable
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -23,7 +24,7 @@ except Exception:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
-# Memory pressure types (merged from memory_guard)
+# Optional marker and exception kept for compatibility with callers
 # ---------------------------------------------------------------------------
 
 MEMORY_PRESSURE_MARKER = "Requeued due to critical memory pressure"
@@ -31,13 +32,11 @@ MEMORY_PRESSURE_MARKER = "Requeued due to critical memory pressure"
 
 class CriticalMemoryPressure(RuntimeError):
     """
-    Raised when memory pressure is high enough that we should abort
-    the current company task.
+    Raised by external components when memory pressure is high enough that
+    the current company task should be aborted.
 
-    severity:
-        "soft"      - company level problem (e.g. page marker)
-        "hard"      - host reached critical level (but run may continue)
-        "emergency" - host reached emergency limit, run should exit
+    This module no longer uses it internally but keeps the type so that
+    other parts of the codebase can continue to import it.
     """
 
     def __init__(self, message: str, severity: str = "emergency") -> None:
@@ -53,128 +52,155 @@ class CriticalMemoryPressure(RuntimeError):
 @dataclass
 class AdaptiveSchedulingConfig:
     """
-    Configuration for adaptive scheduling based on host CPU and memory,
-    augmented with host-level memory protection, cancellation logic,
-    and coarse-grained stall detection.
+    Memory-based adaptive scheduling configuration.
 
-    Semantics:
+    All thresholds are expressed as fractions of the effective memory limit
+    (host or cgroup).
 
-      - run.py owns:
-          * The list of companies to run.
-          * The creation and tracking of asyncio.Task per company.
-          * The count of active company tasks (active_tasks).
-          * The pending / completed sets and progress persistence.
+    mem_cap_frac:
+        Safe usable cap. The scheduler tries to keep estimated future memory
+        usage (current usage plus reservations for new companies) at or below
+        this value.
 
-      - AdaptiveScheduler:
-          * Periodically samples CPU and memory and maintains smoothed values.
-          * Classifies the current load into three bands:
-                - low band:  both CPU and mem at or below target_*_low
-                - cautious: between low and high thresholds
-                - high:     CPU or mem at or above target_*_high
-          * Decides whether it is safe to admit a single new company.
-          * Enforces cooldowns:
-                - between successful admissions
-                - extra cooldown when in the cautious band
-                - a recheck cooldown for the high band
-          * Can enter a "rush" mode when CPU and memory are underused
-            and stable, which speeds up admissions for a short period.
-          * Enforces a hard cap via max_concurrency, using active_tasks.
+    mem_high_frac:
+        Above this fraction, no new companies are admitted, but the scheduler
+        does not request cancellations yet.
 
-      - Host-level memory safety:
-          * Monitors raw memory usage.
-          * When memory crosses a critical threshold (mem_critical_limit),
-            the scheduler can select a company to cancel (preferably the
-            newest one) to avoid OOM.
-          * Cancel decisions are:
-                - based only on memory, not CPU.
-                - subject to a cooldown: cancel -> wait -> new sample -> maybe cancel again.
-          * After a cancel, new admissions are blocked for
-            mem_post_relief_block_sec seconds to let memory settle.
+    mem_crit_high_frac:
+        Emergency cancellation starts once used memory fraction is at or
+        above this threshold.
 
-      - Priority requeue:
-          * When a company is cancelled due to memory, run.py should:
-                - safely persist its progress
-                - mark it as not-done (e.g. markdown not finished)
-                - put it back into a "priority waiting queue" so that
-                  it can resume immediately once admissions are allowed.
-          * AdaptiveScheduler stores a memory-priority queue of company IDs
-            and exposes helper methods to manage it.
+    mem_crit_low_frac:
+        Emergency cancellation stops once used memory fraction drops back
+        to or below this threshold. This introduces hysteresis so we do not
+        keep cancelling on every small fluctuation.
 
-      - Host-level stall detection (coarse):
-          * Tracks repeated denials with active_tasks == 0
-            (for example, "high_band_cooldown" with active=0).
-          * Tracks long CPU/memory plateaus where both fluctuate in a
-            narrow band (±host_stall_band_width) over host_stall_window_sec,
-            regardless of absolute usage (0..100 percent).
-          * When either condition persists longer than
-            host_stall_min_duration_sec, the scheduler marks
-            host_stall_suspected=True in its state snapshot. The caller
-            (run.py) is responsible for:
-                - saving progress of current tasks, and
-                - exiting the process with code 17 so an outer wrapper
-                  can restart the run.
+    min_active_keep:
+        Minimum number of active companies the scheduler tries to preserve
+        even during emergency cancellation. If memory is still critical and
+        we cannot cancel without going below this, the scheduler marks that
+        a controlled restart is recommended.
 
-      - The caller uses:
-            ok, reason = await scheduler.can_start_new_company(active_tasks)
+    peak_history_size:
+        Number of recent per company estimates kept in the history buffer.
 
-        If ok is True:
-            - run.py should start exactly one new company task
-            - and call scheduler.notify_admitted(company_id, reason)
+    per_company_safety_factor:
+        Multiplicative safety factor applied to the 95th percentile of the
+        history, to give a conservative reservation per company.
 
-        If ok is False:
-            - run.py should not start a new company
-            - and may log or inspect the returned reason.
+    per_company_min_reservation_mb:
+        Minimum reservation per company when little history is available.
+
+    emergency_check_interval_sec:
+        Period for the background emergency watchdog loop.
+
+    log_path:
+        Optional path where the scheduler writes structured JSON snapshots
+        for debugging. Disabled by default.
+
+    use_psutil:
+        If False or psutil is not available, the scheduler falls back to a
+        very conservative mode that always returns at most 1 slot and does
+        not start the emergency watchdog.
+
+    prefer_cgroup_limits:
+        If True, the scheduler prefers cgroup v2 memory limits (memory.max /
+        memory.current) over host-wide memory when available.
+
+    swap_block_frac:
+        If swap_used / swap_total is at or above this fraction, new admissions
+        are blocked even if RAM usage is below mem_high_frac.
+
+    swap_emergency_frac:
+        If swap_used / swap_total is at or above this fraction, the watchdog
+        treats the situation as emergency even if RAM usage is below
+        mem_crit_high_frac.
+
+    mem_trend_window_sec:
+        Window length for memory usage trend estimation.
+
+    mem_trend_slope_high_mb_per_s:
+        If the estimated slope of used memory is at or above this value
+        (MB/s), the scheduler treats it as “precritical” when near mem_cap.
+
+    mem_trend_margin_frac:
+        Margin below mem_cap_frac within which a high positive slope is
+        considered precritical.
+
+    ai_step:
+        Additive increase step for the concurrency target (companies).
+
+    md_factor:
+        Multiplicative decrease factor applied to the concurrency target when
+        memory trouble is detected.
+
+    min_target:
+        Minimum concurrency target (companies).
+
+    max_target:
+        Maximum concurrency target (companies).
+
+    near_oom_used_frac:
+        Used memory fraction threshold for near-OOM detection.
+
+    near_oom_swap_frac:
+        Swap usage fraction threshold for near-OOM detection.
+
+    near_oom_mem_cap_step:
+        Amount by which mem_cap_frac and mem_high_frac are reduced on each
+        new near-OOM event (process lifetime only).
+
+    mem_cap_min_frac:
+        Lower bound for mem_cap_frac during auto-tuning.
+
+    mem_high_min_frac:
+        Lower bound for mem_high_frac during auto-tuning.
+
+    company_profile_max_size:
+        Maximum number of per-company memory profiles kept in memory.
     """
 
-    max_concurrency: int
+    mem_cap_frac: float = 0.85
+    mem_high_frac: float = 0.90
+    mem_crit_high_frac: float = 0.95
+    mem_crit_low_frac: float = 0.90
 
-    target_mem_low: float = 0.60
-    target_mem_high: float = 0.90
-    target_cpu_low: float = 0.70
-    target_cpu_high: float = 0.85
+    min_active_keep: int = 1
 
-    sample_interval_sec: float = 1.0
-    smoothing_window_sec: float = 10.0
+    peak_history_size: int = 100
+    per_company_safety_factor: float = 1.3
+    per_company_min_reservation_mb: float = 512.0
+
+    emergency_check_interval_sec: float = 1.0
 
     log_path: Optional[Path] = None
+    use_psutil: bool = True
 
-    use_cpu: bool = True
-    use_mem: bool = True
+    # (1) Additional signals: cgroup + swap
+    prefer_cgroup_limits: bool = True
+    swap_block_frac: float = 0.60
+    swap_emergency_frac: float = 0.80
 
-    # Cooldowns for admissions
-    admission_cooldown_sec: float = 5.0
-    cautious_admission_cooldown_sec: float = 15.0
-    block_cooldown_sec: float = 30.0
+    # (2) Trend based throttling
+    mem_trend_window_sec: float = 10.0
+    mem_trend_slope_high_mb_per_s: float = 50.0
+    mem_trend_margin_frac: float = 0.05
 
-    # Legacy memory-pressure block, still used by on_memory_pressure()
-    mem_pressure_block_sec: float = 15.0
+    # (4) AIMD concurrency controller
+    ai_step: int = 1
+    md_factor: float = 0.5
+    min_target: int = 1
+    max_target: int = 512
 
-    # Rush / plateau settings
-    rush_enabled: bool = True
-    rush_cpu_threshold: float = 0.50  # 50 percent
-    rush_mem_threshold: float = 0.80  # 80 percent
-    rush_band_width: float = 0.05  # ±5 percent band
-    rush_min_samples: int = 4
-    rush_duration_sec: float = 30.0
+    # (5) Safety margin auto-tuning
+    near_oom_used_frac: float = 0.97
+    near_oom_swap_frac: float = 0.50
+    near_oom_mem_cap_step: float = 0.01
+    mem_cap_min_frac: float = 0.70
+    mem_high_min_frac: float = 0.80
 
-    # Host-level memory cancellation
-    mem_critical_limit: float = 0.94  # 94 percent
-    mem_cancel_cooldown_sec: float = 20.0  # cooldown between cancels
-    mem_post_relief_block_sec: float = 180.0  # block new admissions ~3 minutes
-    mem_cancel_enabled: bool = True
-
-    # Host-level stall detection
-    host_stall_enabled: bool = True
-    # Time window over which to look for CPU/memory plateaus (seconds).
-    host_stall_window_sec: float = 300.0
-    # Narrow band for plateau detection (fraction 0..1, default 1 percent).
-    host_stall_band_width: float = 0.01
-    # Minimum duration (seconds) for either stall condition (plateau or
-    # repeated denials with active=0) before marking host_stall_suspected.
-    host_stall_min_duration_sec: float = 300.0
-
-    # Page-level marker
-    mem_marker: str = MEMORY_PRESSURE_MARKER
+    # (3) Per-company profiles
+    company_profile_max_size: int = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -184,86 +210,118 @@ class AdaptiveSchedulingConfig:
 
 class AdaptiveScheduler:
     """
-    Adaptive scheduler that gates admission of new company tasks based
-    on smoothed CPU and memory usage, three-band classification, rush
-    mode, and cooldowns; and also provides host-level memory protection,
-    a priority queue for memory-cancelled companies, and coarse
-    host-level stall detection.
+    Memory based adaptive scheduler with:
 
-    It does not manage asyncio.Task objects directly. Instead:
+      - Host/cgroup + swap awareness
+      - Memory trend estimation
+      - Optional per-company heaviness profiles
+      - AIMD-style concurrency target
+      - Safety margin auto-tuning
 
-      - Caller:
-          * owns the Task objects
-          * decides when to call cancellation on them
-          * persists progress and crawl_meta
-          * marks company as NOT_DONE before requeue
+    The scheduler itself does not manage asyncio.Task objects or any crawl
+    logic. Callers provide two callbacks:
 
-      - AdaptiveScheduler:
-          * tells caller:
-                - when it's safe to admit more work (can_start_new_company)
-                - which company to cancel when host memory is critical
-                  (maybe_select_company_to_cancel)
-                - which company should be re-prioritized after cancel
-                  (memory priority queue APIs)
-                - whether a host-level stall is suspected, via get_state().
+      get_active_company_ids()
+          Returns the list of company ids currently running.
+
+      request_cancel_companies(company_ids)
+          Called by the scheduler when it wants some companies to be
+          cancelled due to emergency memory pressure.
     """
 
-    def __init__(self, cfg: AdaptiveSchedulingConfig) -> None:
+    def __init__(
+        self,
+        cfg: AdaptiveSchedulingConfig,
+        get_active_company_ids: Callable[[], Sequence[str]],
+        request_cancel_companies: Callable[[Sequence[str]], None],
+    ) -> None:
         self.cfg = cfg
 
+        self._psutil_available: bool = bool(PSUTIL_AVAILABLE and cfg.use_psutil)
+
+        # Callbacks into the caller
+        self._get_active_company_ids = get_active_company_ids
+        self._request_cancel_companies = request_cancel_companies
+
+        # Effective total memory limit (host or cgroup) in bytes
+        self._total_mem_bytes: Optional[int] = None
+
+        # History of approximate per company usage in MB
+        self._peak_history_mb: List[float] = []
+
+        # Estimated per company peak memory in MB (global)
+        self._per_company_est_mb: float = cfg.per_company_min_reservation_mb
+
+        # Per-company heaviness (company_id -> peak_mb), simple LRU
+        self._company_peak_mb: Dict[str, float] = {}
+        self._company_order: List[str] = []
+
+        # Async emergency watchdog task
+        self._emergency_task: Optional[asyncio.Task] = None
+
+        # Lock protecting internal state and estimation history
         self._lock = asyncio.Lock()
-        # Sliding window samples for admission band classification and rush.
-        self._samples: List[
-            Tuple[float, float, float]
-        ] = []  # (ts_mono, cpu_frac, mem_frac)
-        # Longer window for stall plateau detection.
-        self._stall_samples: List[
-            Tuple[float, float, float]
-        ] = []  # (ts_mono, cpu_frac, mem_frac)
-        self._task: Optional[asyncio.Task] = None
 
-        self._last_avg_cpu: float = 0.0
-        self._last_avg_mem: float = 0.0
-        self._last_raw_cpu: float = 0.0
-        self._last_raw_mem: float = 0.0
-        self._last_update_ts: float = 0.0  # wall clock
-        self._last_sample_mono: float = 0.0
+        # Flag that a controlled restart is recommended
+        self._restart_recommended: bool = False
 
-        # Cooldown timestamps (monotonic)
-        self._last_admission_ts: float = 0.0
-        self._last_cautious_admission_ts: float = 0.0
-        self._last_high_block_ts: float = 0.0
-        self._blocked_until_ts: float = 0.0
+        # Last timestamp we wrote a JSON state line to disk
+        self._last_log_ts: float = 0.0
 
-        # Memory pressure tracking
-        self._memory_pressure_hits: int = 0
+        # Cache last memory snapshot for get_state_snapshot
+        self._last_used_bytes: int = 0
+        self._last_used_frac: float = 0.0
+        self._last_swap_used_frac: float = 0.0
 
-        # Rush mode tracking (monotonic times)
-        self._rush_active: bool = False
-        self._rush_start_ts: float = 0.0
-        self._rush_until_ts: float = 0.0
-        self._rush_start_cpu: float = 0.0
-        self._rush_start_mem: float = 0.0
+        # Trend estimation
+        self._mem_samples: List[Tuple[float, int]] = []
+        self._last_trend_slope_mb_s: float = 0.0
 
-        # Memory-based cancellation tracking
-        self._next_mem_cancel_ts: float = 0.0
-        self._last_cancel_sample_mono: float = 0.0
+        # AIMD concurrency target (companies)
+        self._target_parallel: int = max(self.cfg.min_target, 1)
 
-        # Admission order (for picking "newest" company to cancel)
-        # Stores company_ids in order of admission (oldest first).
-        self._admission_order: List[str] = []
+        # Near-OOM bookkeeping for safety margin auto-tuning
+        self._near_oom_events: int = 0
+        self._last_near_oom_flag: bool = False
 
-        # Memory-priority queue: companies cancelled due to memory
-        # that should be resumed as soon as the scheduler allows.
-        # New entries are appended; consumers should treat as FIFO.
-        self._memory_priority_queue: List[str] = []
+    # ------------------------------------------------------------------ #
+    # Public properties
+    # ------------------------------------------------------------------ #
 
-        # Host-level stall detection state
-        self._host_stall_suspected: bool = False
-        self._host_stall_since_mono: float = 0.0
-        self._host_stall_reason: str = ""
-        self._host_stall_last_denial_reason: str = ""
-        self._host_stall_last_denial_ts: float = 0.0
+    @property
+    def psutil_available(self) -> bool:
+        return self._psutil_available
+
+    @property
+    def restart_recommended(self) -> bool:
+        return self._restart_recommended
+
+    # ------------------------------------------------------------------ #
+    # Public API for per-company profiles
+    # ------------------------------------------------------------------ #
+
+    def record_company_peak(self, company_id: str, peak_mb: float) -> None:
+        """
+        Optional hint from the caller: record a per-company peak memory estimate
+        (in MB). This is used to tighten the global estimate for future runs.
+
+        This method is intentionally lightweight and not locked; minor races are
+        acceptable since the data is only used for conservative estimation.
+        """
+        if not company_id or peak_mb <= 0:
+            return
+
+        prev = self._company_peak_mb.get(company_id)
+        if prev is None or peak_mb > prev:
+            self._company_peak_mb[company_id] = peak_mb
+
+        if company_id not in self._company_order:
+            self._company_order.append(company_id)
+
+        max_size = max(1, int(self.cfg.company_profile_max_size))
+        if len(self._company_order) > max_size:
+            oldest = self._company_order.pop(0)
+            self._company_peak_mb.pop(oldest, None)
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -271,1725 +329,711 @@ class AdaptiveScheduler:
 
     async def start(self) -> None:
         """
-        Start background sampling of CPU and memory.
+        Initialize memory information and start the emergency watchdog loop.
+
+        If psutil is not available, this logs a warning and skips starting
+        the watchdog. In that case admissible_slots will behave in a very
+        conservative way.
         """
-        if self._task is not None:
-            return
-        interval = max(float(self.cfg.sample_interval_sec), 0.5)
-        self._task = asyncio.create_task(
-            self._loop(interval),
-            name="adaptive-scheduling-sampler",
-        )
-        logger.info(
-            "[AdaptiveScheduling] started "
-            "(max_concurrency=%d, interval=%.2fs, psutil=%s)",
-            self.cfg.max_concurrency,
-            interval,
-            PSUTIL_AVAILABLE,
-        )
+        if self._psutil_available:
+            # Initialize total memory once
+            total, used = self._read_memory_usage_bytes()
+            self._total_mem_bytes = total or None
+            self._last_used_bytes = used
+            self._last_used_frac = (float(used) / total) if total > 0 else 0.0
+
+            logger.info(
+                "[AdaptiveScheduling] started (total_mem_mb=%.1f, psutil=True)",
+                (float(total) / 1e6) if total > 0 else -1.0,
+            )
+
+            interval = max(0.5, float(self.cfg.emergency_check_interval_sec))
+            self._emergency_task = asyncio.create_task(
+                self._emergency_loop(interval),
+                name="adaptive-scheduling-emergency-watchdog",
+            )
+        else:
+            logger.warning(
+                "[AdaptiveScheduling] psutil not available or disabled; "
+                "running in conservative mode with no emergency watchdog.",
+            )
 
     async def stop(self) -> None:
         """
-        Stop background sampling.
+        Stop the emergency watchdog loop, if any.
         """
-        if self._task is None:
+        task = self._emergency_task
+        self._emergency_task = None
+
+        if task is None:
             return
-        self._task.cancel()
+
+        task.cancel()
         try:
-            await self._task
+            await task
         except asyncio.CancelledError:
             pass
-        self._task = None
-        logger.info(
-            "[AdaptiveScheduling] stopped (memory_pressure_hits=%d)",
-            self._memory_pressure_hits,
-        )
-
-    async def _loop(self, interval: float) -> None:
-        while True:
-            try:
-                await self._sample_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("[AdaptiveScheduling] error in sampling loop")
-            await asyncio.sleep(interval)
+        except Exception:
+            logger.debug(
+                "[AdaptiveScheduling] error while stopping emergency watchdog",
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------ #
-    # Public API for caller: admissions
+    # Admission decision
     # ------------------------------------------------------------------ #
 
-    @property
-    def sample_interval_sec(self) -> float:
+    async def admissible_slots(self, num_waiting: int) -> int:
         """
-        Convenience accessor for callers that want to align their waits
-        with the sampling cadence.
+        Decide how many new companies can be started right now.
+
+        Parameters
+        ----------
+        num_waiting:
+            Number of companies currently in the waiting queue.
+
+        Returns
+        -------
+        int
+            Number of companies that can be safely started now.
+            Always greater than or equal to zero and less than or equal
+            to num_waiting.
+
+        Behavior
+        --------
+        - If psutil is unavailable, returns at most 1 slot (very conservative).
+        - Uses effective memory limit (host or cgroup), host memory usage,
+          swap usage, and the current per company estimate to compute a safe
+          number of new companies:
+
+              M_used + P_est * slots <= M_cap
+
+          where M_cap = mem_cap_frac * total_mem_bytes.
         """
-        return float(self.cfg.sample_interval_sec)
+        if num_waiting <= 0:
+            return 0
 
-    async def can_start_new_company(self, active_tasks: int) -> Tuple[bool, str]:
-        """
-        Decide whether it is safe to admit a single new company task.
+        if not self._psutil_available:
+            # Conservative fallback: do not ramp without metrics.
+            return 1
 
-        Returns (ok, reason):
+        async with self._lock:
+            total, used = self._read_memory_usage_bytes()
+            if total <= 0:
+                return 0
 
-          - ok == True  -> caller should start exactly one new company.
-          - ok == False -> caller should not start a new company now.
+            used_frac = float(used) / float(total)
+            self._last_used_bytes = used
+            self._last_used_frac = used_frac
 
-        Reasons include (non exhaustive):
-          - "max_concurrency"
-          - "mem_pressure_block"
-          - "admission_cooldown"
-          - "cautious_cooldown"
-          - "high_band"
-          - "high_band_cooldown"
-          - "low_band"
-          - "cautious_band"
-          - "rush_mode"
-          - "no_metrics"
+            now = time.time()
+            self._record_memory_sample_locked(ts=now, used_bytes=used)
 
-        Host-level stall detection is passive: it never raises here.
-        Instead, repeated denials with active_tasks == 0 contribute to
-        host_stall_suspected in get_state().
-        """
-        now = time.monotonic()
+            swap_frac = self._read_swap_used_frac()
+            self._last_swap_used_frac = swap_frac
+
+            # Safety margin auto-tuning (near-OOM events)
+            self._register_near_oom_locked(used_frac, swap_frac)
+
+            cfg = self.cfg
+
+            # Precritical detection based on trend
+            precritical = (
+                used_frac >= max(0.0, cfg.mem_cap_frac - cfg.mem_trend_margin_frac)
+                and self._last_trend_slope_mb_s >= cfg.mem_trend_slope_high_mb_per_s
+            )
+            high_swap_block = swap_frac >= cfg.swap_block_frac
+            mem_trouble = used_frac >= cfg.mem_high_frac or high_swap_block
+
+            # AIMD target update
+            self._update_target_parallel_locked(
+                used_frac=used_frac,
+                precritical=precritical,
+                high_swap=high_swap_block,
+                mem_trouble=mem_trouble,
+            )
+
+            # Above high watermark or critical swap: do not admit new work.
+            if mem_trouble:
+                reason = (
+                    "swap_block"
+                    if high_swap_block and used_frac < cfg.mem_high_frac
+                    else "mem_high_block"
+                )
+                self._maybe_log_state_locked(
+                    reason=reason,
+                    extra={
+                        "total_mem_mb": float(total) / 1e6,
+                        "used_mem_mb": float(used) / 1e6,
+                        "used_frac": used_frac,
+                        "swap_used_frac": swap_frac,
+                    },
+                )
+                return 0
+
+            # Headroom with respect to the safe cap.
+            mem_cap_bytes = int(cfg.mem_cap_frac * float(total))
+            headroom_bytes = mem_cap_bytes - used
+            if headroom_bytes <= 0:
+                self._maybe_log_state_locked(
+                    reason="mem_cap_block",
+                    extra={
+                        "total_mem_mb": float(total) / 1e6,
+                        "used_mem_mb": float(used) / 1e6,
+                        "used_frac": used_frac,
+                        "swap_used_frac": swap_frac,
+                    },
+                )
+                return 0
+
+            # Active companies for estimation and target cap
+            active_ids = list(self._get_active_company_ids())
+            num_active = len(active_ids)
+            self._update_per_company_estimate_locked(
+                used_bytes=used, num_active=num_active
+            )
+
+            # Effective per-company estimate (global + per-company profiles)
+            effective_est_mb = self._per_company_est_mb
+            company_p95 = self._get_company_p95_est_mb_locked()
+            if company_p95 is not None and company_p95 > effective_est_mb:
+                effective_est_mb = company_p95
+
+            per_company_bytes = max(
+                int(effective_est_mb * 1e6),
+                int(self.cfg.per_company_min_reservation_mb * 1e6),
+            )
+            if per_company_bytes <= 0:
+                return 0
+
+            slots_by_mem = int(headroom_bytes // per_company_bytes)
+            if slots_by_mem <= 0:
+                return 0
+
+            # Apply AIMD target cap
+            max_by_target = max(0, self._target_parallel - num_active)
+            slots = min(slots_by_mem, num_waiting, max_by_target)
+
+            # If trend looks precritical, be conservative and clamp to 1 slot
+            if precritical and slots > 1:
+                slots = 1
+
+            self._maybe_log_state_locked(
+                reason="admission",
+                extra={
+                    "slots": slots,
+                    "num_waiting": num_waiting,
+                    "num_active": num_active,
+                    "per_company_est_mb": self._per_company_est_mb,
+                    "effective_per_company_est_mb": effective_est_mb,
+                    "total_mem_mb": float(total) / 1e6,
+                    "used_mem_mb": float(used) / 1e6,
+                    "used_frac": used_frac,
+                    "swap_used_frac": swap_frac,
+                    "trend_slope_mb_s": self._last_trend_slope_mb_s,
+                    "target_parallel": self._target_parallel,
+                },
+            )
+
+            return slots
+
+    # ------------------------------------------------------------------ #
+    # Emergency watchdog
+    # ------------------------------------------------------------------ #
+
+    async def _emergency_loop(self, interval: float) -> None:
         cfg = self.cfg
 
-        # 1) Hard cap by active_tasks vs max_concurrency
-        if active_tasks >= max(1, int(cfg.max_concurrency)):
-            return False, "max_concurrency"
+        while True:
+            try:
+                await asyncio.sleep(interval)
 
-        async with self._lock:
-            # 2) Global block due to memory or external pressure
-            if now < self._blocked_until_ts:
-                reason = "mem_pressure_block"
-                self._update_decision_stall_locked(
-                    active_tasks=active_tasks,
-                    admitted=False,
-                    reason=reason,
-                    now=now,
-                )
-                return False, reason
+                if not self._psutil_available:
+                    continue
 
-            avg_cpu = self._last_avg_cpu
-            avg_mem = self._last_avg_mem
+                async with self._lock:
+                    total, used = self._read_memory_usage_bytes()
+                    if total <= 0:
+                        continue
 
-            # If we have no samples yet and psutil is missing, admit conservatively.
-            if not self._samples and not PSUTIL_AVAILABLE:
-                self._last_admission_ts = now
-                logger.info(
-                    "[AdaptiveScheduling] psutil missing and no prior samples; "
-                    "admitting new company by default.",
-                )
-                # No stall update: we are admitting work.
-                return True, "no_metrics"
+                    used_frac = float(used) / float(total)
+                    self._last_used_bytes = used
+                    self._last_used_frac = used_frac
 
-            # If we have no samples yet but psutil exists, force a sample now.
-            if not self._samples and PSUTIL_AVAILABLE:
-                cpu_frac, mem_frac = self._read_usage()
-                self._update_samples_locked(
-                    now_mono=time.monotonic(),
-                    cpu=cpu_frac,
-                    mem=mem_frac,
-                )
-                avg_cpu = self._last_avg_cpu
-                avg_mem = self._last_avg_mem
+                    now = time.time()
+                    self._record_memory_sample_locked(ts=now, used_bytes=used)
 
-            # Classify the current band.
-            band = self._classify_band_locked()
+                    swap_frac = self._read_swap_used_frac()
+                    self._last_swap_used_frac = swap_frac
 
-            # Rush mode: fast lane when underutilized plateau was detected.
-            if self._rush_active and now < self._rush_until_ts:
-                if band == "high":
-                    # Even in rush, high band is not safe. Do not admit.
-                    self._last_high_block_ts = now
-                    reason = "high_band"
-                    logger.info(
-                        "[AdaptiveScheduling] rush blocked by high band "
-                        "(active=%d, avg_cpu=%.3f, avg_mem=%.3f)",
-                        active_tasks,
-                        avg_cpu,
-                        avg_mem,
+                    # Safety margin auto-tuning (near-OOM events)
+                    self._register_near_oom_locked(used_frac, swap_frac)
+
+                    # Update per company estimate based on current usage and active count
+                    active_ids = list(self._get_active_company_ids())
+                    num_active = len(active_ids)
+                    self._update_per_company_estimate_locked(
+                        used_bytes=used, num_active=num_active
                     )
-                    self._update_decision_stall_locked(
-                        active_tasks=active_tasks,
-                        admitted=False,
-                        reason=reason,
-                        now=now,
+
+                    # Emergency condition: high RAM or very high swap
+                    in_emergency = (
+                        used_frac >= cfg.mem_crit_high_frac
+                        or swap_frac >= cfg.swap_emergency_frac
                     )
-                    return False, reason
-                # In low or cautious band during rush, skip cooldowns and admit.
-                self._last_admission_ts = now
-                if band == "cautious":
-                    self._last_cautious_admission_ts = now
-                logger.info(
-                    "[AdaptiveScheduling] rush admission granted "
-                    "(active=%d, band=%s, avg_cpu=%.3f, avg_mem=%.3f)",
-                    active_tasks,
-                    band,
-                    avg_cpu,
-                    avg_mem,
-                )
-                # Admission resets denial-based stall tracking.
-                self._update_decision_stall_locked(
-                    active_tasks=active_tasks,
-                    admitted=True,
-                    reason="rush_mode",
-                    now=now,
-                )
-                return True, "rush_mode"
+                    if not in_emergency:
+                        continue
 
-            # 3) Band specific logic when not in rush
-
-            # High band: do not admit, respect a separate high band cooldown.
-            if band == "high":
-                if (
-                    self._last_high_block_ts > 0.0
-                    and now - self._last_high_block_ts < cfg.block_cooldown_sec
-                ):
-                    reason = "high_band_cooldown"
-                    self._update_decision_stall_locked(
-                        active_tasks=active_tasks,
-                        admitted=False,
-                        reason=reason,
-                        now=now,
+                    # AIMD: strong multiplicative decrease on emergency
+                    self._update_target_parallel_locked(
+                        used_frac=used_frac,
+                        precritical=False,
+                        high_swap=swap_frac >= cfg.swap_block_frac,
+                        mem_trouble=True,
                     )
-                    return False, reason
 
-                self._last_high_block_ts = now
-                reason = "high_band"
-                logger.info(
-                    "[AdaptiveScheduling] high band - admission denied "
-                    "(active=%d, avg_cpu=%.3f, avg_mem=%.3f)",
-                    active_tasks,
-                    avg_cpu,
-                    avg_mem,
-                )
-                self._update_decision_stall_locked(
-                    active_tasks=active_tasks,
-                    admitted=False,
-                    reason=reason,
-                    now=now,
-                )
-                return False, reason
+                    if num_active <= 0:
+                        # Nothing to cancel but memory is critical; recommend restart.
+                        if not self._restart_recommended:
+                            self._restart_recommended = True
+                            logger.error(
+                                "[AdaptiveScheduling] memory critical (used_frac=%.3f swap_frac=%.3f) "
+                                "with zero active companies; restart recommended.",
+                                used_frac,
+                                swap_frac,
+                            )
+                        continue
 
-            # From here, band is either "low" or "cautious".
-            # First, respect the global admission cooldown.
-            if (
-                self._last_admission_ts > 0.0
-                and now - self._last_admission_ts < cfg.admission_cooldown_sec
-            ):
-                reason = "admission_cooldown"
-                self._update_decision_stall_locked(
-                    active_tasks=active_tasks,
-                    admitted=False,
-                    reason=reason,
-                    now=now,
-                )
-                return False, reason
+                    # Determine how many companies we need to cancel to get
+                    # down to mem_crit_low_frac.
+                    target_used_bytes = int(cfg.mem_crit_low_frac * float(total))
+                    excess_bytes = max(0, used - target_used_bytes)
 
-            if band == "low":
-                # Low band: only global admission cooldown applied.
-                self._last_admission_ts = now
-                reason = "low_band"
-                logger.info(
-                    "[AdaptiveScheduling] low band admission granted "
-                    "(active=%d, avg_cpu=%.3f, avg_mem=%.3f)",
-                    active_tasks,
-                    avg_cpu,
-                    avg_mem,
-                )
-                self._update_decision_stall_locked(
-                    active_tasks=active_tasks,
-                    admitted=True,
-                    reason=reason,
-                    now=now,
-                )
-                return True, reason
+                    # Effective per-company estimate (global + per-company profiles)
+                    effective_est_mb = self._per_company_est_mb
+                    company_p95 = self._get_company_p95_est_mb_locked()
+                    if company_p95 is not None and company_p95 > effective_est_mb:
+                        effective_est_mb = company_p95
 
-            # Cautious band.
-            # Apply an extra cooldown window inside this band.
-            if (
-                self._last_cautious_admission_ts > 0.0
-                and now - self._last_cautious_admission_ts
-                < cfg.cautious_admission_cooldown_sec
-            ):
-                reason = "cautious_cooldown"
-                logger.info(
-                    "[AdaptiveScheduling] cautious band cooldown - "
-                    "admission denied (active=%d, avg_cpu=%.3f, avg_mem=%.3f)",
-                    active_tasks,
-                    avg_cpu,
-                    avg_mem,
-                )
-                self._update_decision_stall_locked(
-                    active_tasks=active_tasks,
-                    admitted=False,
-                    reason=reason,
-                    now=now,
-                )
-                return False, reason
-
-            self._last_admission_ts = now
-            self._last_cautious_admission_ts = now
-            reason = "cautious_band"
-            logger.info(
-                "[AdaptiveScheduling] cautious band admission granted "
-                "(active=%d, avg_cpu=%.3f, avg_mem=%.3f)",
-                active_tasks,
-                avg_cpu,
-                avg_mem,
-            )
-            self._update_decision_stall_locked(
-                active_tasks=active_tasks,
-                admitted=True,
-                reason=reason,
-                now=now,
-            )
-            return True, reason
-
-    def notify_admitted(
-        self,
-        company_id: Optional[str] = None,
-        reason: str = "ok",
-    ) -> None:
-        """
-        Optional helper for callers that want to log an explicit admission
-        event tied to a specific company, and let the scheduler track
-        "newest first" ordering for memory-based cancellations.
-        """
-        if company_id is None:
-            return
-
-        logger.info(
-            "[AdaptiveScheduling] company admitted company_id=%s reason=%s",
-            company_id,
-            reason,
-        )
-
-        # Track admission order for "cancel newest first" semantics.
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # If not in an event loop, update synchronously without lock.
-            if company_id not in self._admission_order:
-                self._admission_order.append(company_id)
-            return
-
-        async def _update() -> None:
-            async with self._lock:
-                if company_id not in self._admission_order:
-                    self._admission_order.append(company_id)
-
-        loop.create_task(_update())
-
-    async def notify_completed(self, company_id: str) -> None:
-        """
-        Inform the scheduler that a company finished (successfully or
-        permanently failed). Removes it from internal tracking structures.
-        """
-        async with self._lock:
-            if company_id in self._admission_order:
-                self._admission_order = [
-                    cid for cid in self._admission_order if cid != company_id
-                ]
-            if company_id in self._memory_priority_queue:
-                self._memory_priority_queue = [
-                    cid for cid in self._memory_priority_queue if cid != company_id
-                ]
-
-    # ------------------------------------------------------------------ #
-    # Public API for caller: host-level memory cancellation
-    # ------------------------------------------------------------------ #
-
-    async def maybe_select_company_to_cancel(
-        self,
-        active_company_ids: Iterable[str],
-    ) -> Optional[str]:
-        """
-        Based purely on host memory (not CPU), decide whether a running
-        company should be cancelled to avoid OOM, and if so which one.
-
-        Behavior:
-          - Only acts if mem_cancel_enabled is True and psutil is available.
-          - Only acts if last_raw_mem (or avg_mem) >= mem_critical_limit.
-          - Enforced cooldown:
-                cancel -> wait mem_cancel_cooldown_sec
-                -> require a new sample
-                -> maybe cancel another.
-          - Picks the newest active company according to admission order.
-          - After choosing a victim:
-                * increments memory_pressure_hits
-                * sets _next_mem_cancel_ts
-                * sets _blocked_until_ts for mem_post_relief_block_sec seconds.
-
-        Returns:
-          - company_id to cancel, or None if no cancellation is needed.
-        """
-        if not self.cfg.mem_cancel_enabled or not PSUTIL_AVAILABLE:
-            return None
-
-        now = time.monotonic()
-        active_set = set(active_company_ids)
-        if not active_set:
-            return None
-
-        async with self._lock:
-            # Require a new sample after the last cancellation.
-            if self._last_sample_mono <= self._last_cancel_sample_mono:
-                return None
-
-            # Enforce cooldown between cancellations.
-            if now < self._next_mem_cancel_ts:
-                return None
-
-            mem_frac = self._last_raw_mem or self._last_avg_mem
-            if mem_frac < self.cfg.mem_critical_limit:
-                return None
-
-            # Choose "newest" active company: last admitted that is still active.
-            victim: Optional[str] = None
-            for cid in reversed(self._admission_order):
-                if cid in active_set:
-                    victim = cid
-                    break
-
-            # Fallback: pick any active company (e.g. last one).
-            if victim is None:
-                victim = next(iter(active_set))
-
-            self._memory_pressure_hits += 1
-            self._last_cancel_sample_mono = self._last_sample_mono
-            self._next_mem_cancel_ts = now + float(self.cfg.mem_cancel_cooldown_sec)
-
-            # Block new admissions for a relief window (for example 3 minutes).
-            relief_until = now + float(self.cfg.mem_post_relief_block_sec)
-            self._blocked_until_ts = max(self._blocked_until_ts, relief_until)
-
-            logger.error(
-                "[AdaptiveScheduling] host memory critical (mem=%.3f >= %.3f); "
-                "selected company_id=%s for cancellation; "
-                "cooldown_until=%.1fs, blocked_until=%.1fs (monotonic zero).",
-                mem_frac,
-                self.cfg.mem_critical_limit,
-                victim,
-                self._next_mem_cancel_ts,
-                self._blocked_until_ts,
-            )
-
-            return victim
-
-    # ------------------------------------------------------------------ #
-    # Public API for caller: memory priority queue
-    # ------------------------------------------------------------------ #
-
-    async def register_memory_requeued(self, company_id: str) -> None:
-        """
-        Register that a company was cancelled due to memory and requeued.
-        The scheduler maintains a priority queue so that such companies
-        can resume as soon as admissions allow.
-
-        Caller should invoke this after:
-          - cancelling the company's Task
-          - persisting its progress
-          - marking it as NOT_DONE (for example markdown not done)
-        """
-        async with self._lock:
-            if company_id not in self._memory_priority_queue:
-                self._memory_priority_queue.append(company_id)
-                logger.info(
-                    "[AdaptiveScheduling] memory-priority requeue company_id=%s",
-                    company_id,
-                )
-
-    async def pop_priority_company(
-        self,
-        pending_company_ids: Iterable[str],
-    ) -> Optional[str]:
-        """
-        Pop the next memory-priority company that is still pending.
-
-        pending_company_ids:
-            Set/list of companies that are eligible to run (not completed).
-
-        Returns:
-            company_id to run next with priority, or None if there is no
-            matching entry.
-        """
-        pending = set(pending_company_ids)
-        async with self._lock:
-            if not self._memory_priority_queue:
-                return None
-
-            # Find first in queue that is still pending.
-            for cid in list(self._memory_priority_queue):
-                if cid in pending:
-                    self._memory_priority_queue.remove(cid)
-                    logger.info(
-                        "[AdaptiveScheduling] memory-priority pop company_id=%s",
-                        cid,
+                    per_company_bytes = max(
+                        int(effective_est_mb * 1e6),
+                        int(self.cfg.per_company_min_reservation_mb * 1e6),
                     )
-                    return cid
+                    if per_company_bytes <= 0:
+                        # Cannot estimate; cancel just one as a minimal action.
+                        needed_cancel = 1
+                    else:
+                        needed_cancel = int(
+                            (excess_bytes + per_company_bytes - 1) // per_company_bytes
+                        )
+                        needed_cancel = max(1, needed_cancel)
 
-            # Nothing in queue matches current pending set.
-            return None
+                    # Respect min_active_keep.
+                    max_cancelable = max(0, num_active - int(cfg.min_active_keep))
+                    if max_cancelable <= 0:
+                        if not self._restart_recommended:
+                            self._restart_recommended = True
+                            logger.error(
+                                "[AdaptiveScheduling] memory critical (used_frac=%.3f swap_frac=%.3f) "
+                                "but num_active=%d <= min_active_keep=%d; restart recommended.",
+                                used_frac,
+                                swap_frac,
+                                num_active,
+                                cfg.min_active_keep,
+                            )
+                        continue
 
-    # ------------------------------------------------------------------ #
-    # Public API for caller / legacy: external memory pressure
-    # ------------------------------------------------------------------ #
+                    to_cancel_count = min(needed_cancel, max_cancelable)
+                    # We assume get_active_company_ids returns an order where
+                    # younger tasks are later in the sequence; cancel from the end.
+                    to_cancel = list(active_ids)[-to_cancel_count:]
 
-    async def on_memory_pressure(self, severity: str = "hard") -> None:
-        """
-        Called when an external component detects a critical memory event.
+                    logger.error(
+                        "[AdaptiveScheduling] emergency memory pressure: "
+                        "used_frac=%.3f, swap_used_frac=%.3f, "
+                        "total_mem_mb=%.1f, used_mem_mb=%.1f, "
+                        "num_active=%d, per_company_est_mb=%.1f, "
+                        "effective_per_company_est_mb=%.1f, "
+                        "excess_bytes=%.1fMB, canceling=%d companies.",
+                        used_frac,
+                        swap_frac,
+                        float(total) / 1e6,
+                        float(used) / 1e6,
+                        num_active,
+                        self._per_company_est_mb,
+                        effective_est_mb,
+                        float(excess_bytes) / 1e6,
+                        len(to_cancel),
+                    )
 
-        This does not touch any "limit". Instead, it:
+                    # Copy ids to cancel outside the lock.
+                    cancel_ids: List[str] = list(to_cancel)
 
-          - increments a counter for diagnostics
-          - blocks all new admissions for mem_pressure_block_sec seconds
-            (for soft / hard) or mem_post_relief_block_sec for emergency.
-        """
-        async with self._lock:
-            self._memory_pressure_hits += 1
-            now = time.monotonic()
+                # Call the cancellation callback outside the lock.
+                if cancel_ids:
+                    try:
+                        self._request_cancel_companies(cancel_ids)
+                    except Exception:
+                        logger.exception(
+                            "[AdaptiveScheduling] request_cancel_companies failed"
+                        )
 
-            if severity == "emergency":
-                # More conservative block when emergency triggered from outside.
-                extra = max(
-                    float(self.cfg.mem_post_relief_block_sec),
-                    float(self.cfg.mem_pressure_block_sec),
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception(
+                    "[AdaptiveScheduling] error in emergency watchdog loop"
                 )
-            else:
-                extra = float(self.cfg.mem_pressure_block_sec)
 
-            self._blocked_until_ts = max(self._blocked_until_ts, now + extra)
-            logger.warning(
-                "[AdaptiveScheduling] external memory pressure event "
-                "(severity=%s, hits=%d); blocking new admissions until %.1fs "
-                "from monotonic zero.",
-                severity,
-                self._memory_pressure_hits,
-                self._blocked_until_ts,
-            )
+    # ------------------------------------------------------------------ #
+    # State inspection
+    # ------------------------------------------------------------------ #
 
-    async def get_state(self) -> Dict[str, Any]:
+    def get_state_snapshot(self) -> Dict[str, Any]:
         """
-        Return a snapshot of internal state for debugging / monitoring.
-
-        The snapshot includes:
-          - CPU/memory averages and last raw values
-          - current band
-          - rush mode flags
-          - memory pressure and cancellation state
-          - admission order and memory-priority queue
-          - host-level stall suspicion and supporting fields
+        Return a lightweight snapshot of the scheduler state for logging
+        or debugging.
         """
-        async with self._lock:
-            band = self._classify_band_locked() if self._samples else "unknown"
-            return {
-                "max_concurrency": self.cfg.max_concurrency,
-                "last_avg_cpu": self._last_avg_cpu,
-                "last_avg_mem": self._last_avg_mem,
-                "last_raw_cpu": self._last_raw_cpu,
-                "last_raw_mem": self._last_raw_mem,
-                "samples_count": len(self._samples),
-                "last_update_ts": self._last_update_ts,
-                "last_sample_mono": self._last_sample_mono,
-                "last_admission_ts": self._last_admission_ts,
-                "last_cautious_admission_ts": self._last_cautious_admission_ts,
-                "last_high_block_ts": self._last_high_block_ts,
-                "blocked_until_ts": self._blocked_until_ts,
-                "memory_pressure_hits": self._memory_pressure_hits,
-                "band": band,
-                "rush_active": self._rush_active,
-                "rush_start_ts": self._rush_start_ts,
-                "rush_until_ts": self._rush_until_ts,
-                "rush_start_cpu": self._rush_start_cpu,
-                "rush_start_mem": self._rush_start_mem,
-                "next_mem_cancel_ts": self._next_mem_cancel_ts,
-                "last_cancel_sample_mono": self._last_cancel_sample_mono,
-                "admission_order": list(self._admission_order),
-                "memory_priority_queue": list(self._memory_priority_queue),
-                "host_stall_enabled": self.cfg.host_stall_enabled,
-                "host_stall_suspected": self._host_stall_suspected,
-                "host_stall_since_mono": self._host_stall_since_mono,
-                "host_stall_reason": self._host_stall_reason,
-                "host_stall_last_denial_reason": self._host_stall_last_denial_reason,
-                "host_stall_last_denial_ts": self._host_stall_last_denial_ts,
-            }
+        total = self._total_mem_bytes or 0
+        used = self._last_used_bytes
+        used_frac = self._last_used_frac
+
+        return {
+            "total_mem_mb": float(total) / 1e6 if total > 0 else 0.0,
+            "used_mem_mb": float(used) / 1e6 if used > 0 else 0.0,
+            "used_frac": used_frac,
+            "swap_used_frac": self._last_swap_used_frac,
+            "per_company_est_mb": self._per_company_est_mb,
+            "peak_history_len": len(self._peak_history_mb),
+            "trend_slope_mb_s": self._last_trend_slope_mb_s,
+            "target_parallel": self._target_parallel,
+            "near_oom_events": self._near_oom_events,
+            "psutil_available": self._psutil_available,
+            "restart_recommended": self._restart_recommended,
+            "mem_cap_frac": self.cfg.mem_cap_frac,
+            "mem_high_frac": self.cfg.mem_high_frac,
+        }
 
     # ------------------------------------------------------------------ #
     # Internal helpers
     # ------------------------------------------------------------------ #
 
-    def _read_usage(self) -> Tuple[float, float]:
-        if not PSUTIL_AVAILABLE:
-            return 0.0, 0.0
+    def _read_cgroup_memory_bytes(self) -> Tuple[int, int]:
+        """
+        Try to read cgroup v2 memory limits (memory.max, memory.current).
 
-        cpu_frac = 0.0
-        mem_frac = 0.0
-
+        Returns (limit, used) or (0, 0) if not available.
+        """
         try:
-            cpu_pct = psutil.cpu_percent(interval=None)  # type: ignore[union-attr]
-            cpu_frac = max(0.0, min(1.0, float(cpu_pct) / 100.0))
+            base = Path("/sys/fs/cgroup")
+            max_path = base / "memory.max"
+            cur_path = base / "memory.current"
+            if not max_path.exists() or not cur_path.exists():
+                return 0, 0
+
+            max_raw = max_path.read_text(encoding="utf-8").strip()
+            cur_raw = cur_path.read_text(encoding="utf-8").strip()
+            if not cur_raw:
+                return 0, 0
+
+            used = int(cur_raw)
+            if not max_raw or max_raw == "max":
+                # No explicit cgroup limit; caller should fall back to host.
+                return 0, used
+
+            limit = int(max_raw)
+            return limit, used
         except Exception:
-            pass
+            return 0, 0
+
+    def _read_memory_usage_bytes(self) -> Tuple[int, int]:
+        """
+        Read total and used memory in bytes.
+
+        Preference order:
+          - cgroup v2 memory limits (memory.max / memory.current), if enabled.
+          - host-level memory from psutil.virtual_memory().
+
+        Uses host level memory from psutil.virtual_memory():
+
+            total = vm.total
+            used  = vm.total - vm.available
+
+        Returns (0, 0) if psutil is not available.
+        """
+        if not self._psutil_available or psutil is None:
+            return 0, 0
+
+        # cgroup-aware path
+        if self.cfg.prefer_cgroup_limits:
+            limit, used = self._read_cgroup_memory_bytes()
+            if limit > 0:
+                if self._total_mem_bytes is None:
+                    self._total_mem_bytes = limit
+                return limit, used
 
         try:
             vm = psutil.virtual_memory()  # type: ignore[union-attr]
-            mem_frac = max(0.0, min(1.0, float(vm.percent) / 100.0))
+            total = int(vm.total)
+            used = int(vm.total - vm.available)
+            # Cache total if not set yet.
+            if self._total_mem_bytes is None and total > 0:
+                self._total_mem_bytes = total
+            return total, used
         except Exception:
-            pass
-
-        return cpu_frac, mem_frac
-
-    async def _sample_once(self) -> None:
-        """
-        Sample CPU and memory once and update smoothed averages.
-        Also updates rush mode based on plateau detection and keeps
-        a separate, longer window for host-level stall plateau detection.
-        """
-        if not PSUTIL_AVAILABLE:
-            # When psutil is missing, keep existing averages and simply
-            # log once that we do not have usage metrics.
-            async with self._lock:
-                if self._last_update_ts == 0.0:
-                    self._last_update_ts = time.time()
-                    logger.warning(
-                        "[AdaptiveScheduling] psutil not available; "
-                        "admissions will not be based on real CPU/memory.",
-                    )
-            return
-
-        raw_cpu, raw_mem = self._read_usage()
-        now_mono = time.monotonic()
-        wall_ts = time.time()
-        cfg = self.cfg
-
-        window = (
-            float(cfg.smoothing_window_sec) if cfg.smoothing_window_sec > 0.0 else 0.0
-        )
-
-        async with self._lock:
-            # Short window for admission decisions / rush.
-            self._update_samples_locked(now_mono=now_mono, cpu=raw_cpu, mem=raw_mem)
-            avg_cpu = self._last_avg_cpu
-            avg_mem = self._last_avg_mem
-            self._last_raw_cpu = raw_cpu
-            self._last_raw_mem = raw_mem
-            self._last_update_ts = wall_ts
-            self._last_sample_mono = now_mono
-
-            # Rush mode plateau detection.
-            self._update_rush_mode_locked(now_mono=now_mono)
-
-            # Longer window for host-level stall plateau detection.
-            self._update_stall_plateau_locked(
-                now_mono=now_mono, cpu=raw_cpu, mem=raw_mem
+            logger.debug(
+                "[AdaptiveScheduling] failed to read memory usage via psutil",
+                exc_info=True,
             )
+            return 0, 0
 
-            state_snapshot = {
-                "ts": wall_ts,
-                "monotonic": now_mono,
-                "avg_cpu": avg_cpu,
-                "avg_mem": avg_mem,
-                "raw_cpu": raw_cpu,
-                "raw_mem": raw_mem,
-                "samples_window_sec": window,
-                "samples_count": len(self._samples),
-                "memory_pressure_hits": self._memory_pressure_hits,
-                "rush_active": self._rush_active,
-                "host_stall_suspected": self._host_stall_suspected,
-                "host_stall_reason": self._host_stall_reason,
-            }
-
-        self._maybe_log_state(state_snapshot)
-
-    def _update_samples_locked(self, now_mono: float, cpu: float, mem: float) -> None:
+    def _read_swap_used_frac(self) -> float:
         """
-        Update sliding window and averages for admission / rush logic.
+        Return swap_used / swap_total or 0.0 if not available.
+        """
+        if not self._psutil_available or psutil is None:
+            return 0.0
+        try:
+            sm = psutil.swap_memory()  # type: ignore[union-attr]
+            if sm.total <= 0:
+                return 0.0
+            return float(sm.used) / float(sm.total)
+        except Exception:
+            return 0.0
+
+    def _record_memory_sample_locked(self, *, ts: float, used_bytes: int) -> None:
+        """
+        Update rolling window of memory samples and recompute slope
+        (MB/s) over the window.
         Caller must hold _lock.
         """
-        window = float(self.cfg.smoothing_window_sec)
-        self._samples.append((now_mono, cpu, mem))
+        window = max(1.0, float(self.cfg.mem_trend_window_sec))
+        self._mem_samples.append((ts, used_bytes))
+        cutoff = ts - window
+        # Prune old samples
+        self._mem_samples = [(t, u) for (t, u) in self._mem_samples if t >= cutoff]
 
-        if window > 0.0:
-            cutoff = now_mono - window
-            self._samples = [(t, c, m) for (t, c, m) in self._samples if t >= cutoff]
+        if len(self._mem_samples) >= 2:
+            t0, u0 = self._mem_samples[0]
+            t1, u1 = self._mem_samples[-1]
+            dt = t1 - t0
+            if dt > 0:
+                self._last_trend_slope_mb_s = (float(u1) - float(u0)) / dt / 1e6
+            else:
+                self._last_trend_slope_mb_s = 0.0
         else:
-            # Only keep the latest sample when smoothing is disabled.
-            self._samples = self._samples[-1:]
+            self._last_trend_slope_mb_s = 0.0
 
-        if not self._samples:
-            self._last_avg_cpu = cpu
-            self._last_avg_mem = mem
-            return
-
-        sum_cpu = 0.0
-        sum_mem = 0.0
-        for _, c, m in self._samples:
-            sum_cpu += c
-            sum_mem += m
-        count = len(self._samples)
-        self._last_avg_cpu = sum_cpu / count
-        self._last_avg_mem = sum_mem / count
-
-    def _classify_band_locked(self) -> str:
+    def _get_company_p95_est_mb_locked(self) -> Optional[float]:
         """
-        Classify current load into 'low', 'cautious', or 'high'.
+        Compute 95th percentile of per-company peak estimates, if any.
         Caller must hold _lock.
         """
-        if not self._samples:
-            return "low"
+        if not self._company_peak_mb:
+            return None
+        vals = sorted(self._company_peak_mb.values())
+        idx = max(0, int(0.95 * len(vals)) - 1)
+        return vals[idx]
 
-        cfg = self.cfg
-        use_cpu = cfg.use_cpu
-        use_mem = cfg.use_mem
-        cpu = self._last_avg_cpu
-        mem = self._last_avg_mem
-
-        # High band: any metric at or above its high threshold.
-        high = False
-        if use_cpu and cpu >= cfg.target_cpu_high:
-            high = True
-        if use_mem and mem >= cfg.target_mem_high:
-            high = True
-        if high:
-            return "high"
-
-        # Low band: both metrics at or below low thresholds (if enabled).
-        low_cpu_ok = (not use_cpu) or cpu <= cfg.target_cpu_low
-        low_mem_ok = (not use_mem) or mem <= cfg.target_mem_low
-        if low_cpu_ok and low_mem_ok:
-            return "low"
-
-        # Otherwise we are in the cautious band.
-        return "cautious"
-
-    def _update_rush_mode_locked(self, now_mono: float) -> None:
-        """
-        Update rush mode state based on plateau detection and duration.
-
-        Rush mode is entered when CPU and memory are below configured
-        thresholds and fluctuate inside a ±rush_band_width band for
-        at least rush_min_samples samples.
-
-        When rush mode ends, log how CPU and memory changed over that
-        window.
-        """
-        cfg = self.cfg
-        if not cfg.rush_enabled:
-            return
-
-        if not self._samples:
-            return
-
-        # First, handle rush window completion.
-        if self._rush_active and now_mono >= self._rush_until_ts:
-            avg_cpu = self._last_avg_cpu
-            avg_mem = self._last_avg_mem
-            cpu_delta = avg_cpu - self._rush_start_cpu
-            mem_delta = avg_mem - self._rush_start_mem
-
-            logger.info(
-                "[AdaptiveScheduling] rush window complete: "
-                "cpu %.3f -> %.3f (delta=%.3f), "
-                "mem %.3f -> %.3f (delta=%.3f)",
-                self._rush_start_cpu,
-                avg_cpu,
-                cpu_delta,
-                self._rush_start_mem,
-                avg_mem,
-                mem_delta,
-            )
-
-            self._rush_active = False
-            self._rush_start_ts = 0.0
-            self._rush_until_ts = 0.0
-            return
-
-        # If already in rush and not finished, do not try to restart.
-        if self._rush_active:
-            return
-
-        # Not in rush: check for underutilized plateau.
-        if len(self._samples) < max(1, cfg.rush_min_samples):
-            return
-
-        cpus = [c for (_, c, _) in self._samples]
-        mems = [m for (_, _, m) in self._samples]
-
-        min_cpu = min(cpus)
-        max_cpu = max(cpus)
-        min_mem = min(mems)
-        max_mem = max(mems)
-
-        avg_cpu = self._last_avg_cpu
-        avg_mem = self._last_avg_mem
-
-        cpu_range = max_cpu - min_cpu
-        mem_range = max_mem - min_mem
-
-        plateau_cpu = (
-            avg_cpu < cfg.rush_cpu_threshold and cpu_range <= cfg.rush_band_width
-        )
-        plateau_mem = (
-            avg_mem < cfg.rush_mem_threshold and mem_range <= cfg.rush_band_width
-        )
-
-        if plateau_cpu and plateau_mem:
-            # Enter rush mode.
-            self._rush_active = True
-            self._rush_start_ts = now_mono
-            self._rush_until_ts = now_mono + float(cfg.rush_duration_sec)
-            self._rush_start_cpu = avg_cpu
-            self._rush_start_mem = avg_mem
-
-            logger.info(
-                "[AdaptiveScheduling] entering rush mode "
-                "(avg_cpu=%.3f range=%.3f, avg_mem=%.3f range=%.3f, "
-                "duration=%.1fs)",
-                avg_cpu,
-                cpu_range,
-                avg_mem,
-                mem_range,
-                cfg.rush_duration_sec,
-            )
-
-    def _update_stall_plateau_locked(
-        self, now_mono: float, cpu: float, mem: float
-    ) -> None:
-        """
-        Maintain a longer sliding window for host-level stall plateau detection.
-
-        Definition:
-          - We look at the last host_stall_window_sec seconds of raw
-            CPU and memory samples (0..1 fractions).
-          - If both CPU and memory stay within a narrow band
-            (<= host_stall_band_width) AND there have been no admissions
-            for at least host_stall_min_duration_sec, we mark a stall
-            due to plateau, regardless of absolute usage (0..100 percent).
-
-        This does not raise; it only updates internal flags that appear
-        in get_state().
-        """
-        cfg = self.cfg
-        if not cfg.host_stall_enabled:
-            return
-
-        window = float(cfg.host_stall_window_sec)
-        if window <= 0.0:
-            return
-
-        self._stall_samples.append((now_mono, cpu, mem))
-        cutoff = now_mono - window
-        self._stall_samples = [
-            (t, c, m) for (t, c, m) in self._stall_samples if t >= cutoff
-        ]
-
-        if len(self._stall_samples) < 2:
-            return
-
-        cpus = [c for (_, c, _) in self._stall_samples]
-        mems = [m for (_, _, m) in self._stall_samples]
-
-        min_cpu = min(cpus)
-        max_cpu = max(cpus)
-        min_mem = min(mems)
-        max_mem = max(mems)
-
-        cpu_range = max_cpu - min_cpu
-        mem_range = max_mem - min_mem
-
-        band = float(cfg.host_stall_band_width)
-        if band <= 0.0:
-            return
-
-        # Total span of the stall window we currently hold.
-        span = self._stall_samples[-1][0] - self._stall_samples[0][0]
-        min_duration = float(cfg.host_stall_min_duration_sec)
-
-        if span >= min_duration and cpu_range <= band and mem_range <= band:
-            # Additional guard: do not mark plateau stall if we have
-            # been admitting new companies recently; use last_admission_ts
-            # as a crude proxy for "progress".
-            no_recent_admissions = (
-                self._last_admission_ts > 0.0
-                and (now_mono - self._last_admission_ts) >= min_duration
-            )
-            if no_recent_admissions and not self._host_stall_suspected:
-                self._host_stall_suspected = True
-                self._host_stall_since_mono = self._stall_samples[0][0]
-                if not self._host_stall_reason:
-                    self._host_stall_reason = "cpu_mem_plateau"
-                logger.error(
-                    "[AdaptiveScheduling] host stall suspected due to CPU/memory plateau: "
-                    "cpu_range=%.3f mem_range=%.3f span=%.1fs (band<=%.3f, min_duration=%.1fs)",
-                    cpu_range,
-                    mem_range,
-                    span,
-                    band,
-                    min_duration,
-                )
-
-    def _update_decision_stall_locked(
+    def _update_per_company_estimate_locked(
         self,
         *,
-        active_tasks: int,
-        admitted: bool,
-        reason: str,
-        now: float,
+        used_bytes: int,
+        num_active: int,
     ) -> None:
         """
-        Update host-level stall detection based on admission decisions.
+        Update the global per-company memory estimate based on current host usage
+        and number of active companies.
 
-        Condition:
-          - host_stall_enabled is True
-          - active_tasks == 0
-          - we repeatedly deny admissions with the same reason
-          - this persists for at least host_stall_min_duration_sec
+        The heuristic is:
 
-        When triggered, sets host_stall_suspected=True and fills
-        host_stall_reason="no_active_tasks_with_denials:<reason>".
+            per_company_now_mb = (used_bytes / num_active) in MB
+
+        which is then collected into a history buffer. P_est is set to
+
+            safety_factor * max(q95, per_company_min_reservation_mb)
+
+        and is kept monotonically non decreasing over the lifetime of the
+        scheduler for safety.
         """
-        if not self.cfg.host_stall_enabled:
+        if used_bytes <= 0 or num_active <= 0 or self._total_mem_bytes is None:
             return
 
-        if admitted:
-            # Any successful admission resets the denial-based stall timer.
-            self._host_stall_last_denial_ts = 0.0
-            self._host_stall_last_denial_reason = ""
+        per_company_now_mb = (float(used_bytes) / float(num_active)) / 1e6
+
+        # Keep history bounded.
+        self._peak_history_mb.append(per_company_now_mb)
+        if len(self._peak_history_mb) > self.cfg.peak_history_size:
+            self._peak_history_mb.pop(0)
+
+        sorted_hist = sorted(self._peak_history_mb)
+        if not sorted_hist:
             return
 
-        # Only consider the "active=0, repeated denial" pattern described
-        # in the logs:
-        #
-        #   INFO: [Scheduler] not starting new company
-        #         (active=0, reason=high_band_cooldown, remaining=...)
-        #
-        if active_tasks != 0:
-            return
+        idx = max(0, int(0.95 * len(sorted_hist)) - 1)
+        q95 = sorted_hist[idx]
+        base = max(q95, self.cfg.per_company_min_reservation_mb)
+        new_est = self.cfg.per_company_safety_factor * base
 
-        min_duration = float(self.cfg.host_stall_min_duration_sec)
-        if min_duration <= 0.0:
-            return
+        # Monotonic non decreasing for safety.
+        if new_est > self._per_company_est_mb * 1.1:
+            logger.info(
+                "[AdaptiveScheduling] per company estimate updated: "
+                "%.1fMB -> %.1fMB (q95=%.1fMB, active=%d)",
+                self._per_company_est_mb,
+                new_est,
+                q95,
+                num_active,
+            )
+        self._per_company_est_mb = max(self._per_company_est_mb, new_est)
 
-        if self._host_stall_last_denial_ts == 0.0:
-            # First denial in a possible streak.
-            self._host_stall_last_denial_ts = now
-            self._host_stall_last_denial_reason = reason
-            return
+    def _register_near_oom_locked(
+        self,
+        used_frac: float,
+        swap_frac: float,
+    ) -> None:
+        """
+        Detect near-OOM situations and auto-tune mem_cap_frac / mem_high_frac
+        downward for the remainder of the process lifetime.
+        Caller must hold _lock.
+        """
+        cfg = self.cfg
+        is_near = (
+            used_frac >= cfg.near_oom_used_frac or swap_frac >= cfg.near_oom_swap_frac
+        )
 
-        # If the reason changed, start a new streak.
-        if reason != self._host_stall_last_denial_reason:
-            self._host_stall_last_denial_ts = now
-            self._host_stall_last_denial_reason = reason
-            return
+        if is_near and not self._last_near_oom_flag:
+            self._near_oom_events += 1
+            old_cap = cfg.mem_cap_frac
+            old_high = cfg.mem_high_frac
+            step = cfg.near_oom_mem_cap_step
 
-        elapsed = now - self._host_stall_last_denial_ts
-        if elapsed < 0.0:
-            return
+            if step > 0.0:
+                cfg.mem_cap_frac = max(cfg.mem_cap_min_frac, cfg.mem_cap_frac - step)
+                cfg.mem_high_frac = max(cfg.mem_high_min_frac, cfg.mem_high_frac - step)
 
-        if elapsed >= min_duration and not self._host_stall_suspected:
-            self._host_stall_suspected = True
-            self._host_stall_since_mono = self._host_stall_last_denial_ts
-            if not self._host_stall_reason:
-                self._host_stall_reason = f"no_active_tasks_with_denials:{reason}"
-            logger.error(
-                "[AdaptiveScheduling] host stall suspected: "
-                "active_tasks=0, repeated denial reason=%s for %.1fs "
-                "(min_duration=%.1fs)",
-                reason,
-                elapsed,
-                min_duration,
+            logger.warning(
+                "[AdaptiveScheduling] near-oom event #%d: "
+                "used_frac=%.3f swap_frac=%.3f "
+                "mem_cap_frac: %.3f -> %.3f, mem_high_frac: %.3f -> %.3f",
+                self._near_oom_events,
+                used_frac,
+                swap_frac,
+                old_cap,
+                cfg.mem_cap_frac,
+                old_high,
+                cfg.mem_high_frac,
             )
 
-    def _maybe_log_state(self, state: Dict[str, Any]) -> None:
+        self._last_near_oom_flag = is_near
+
+    def _update_target_parallel_locked(
+        self,
+        *,
+        used_frac: float,
+        precritical: bool,
+        high_swap: bool,
+        mem_trouble: bool,
+    ) -> None:
         """
-        Optional structured logging of sampling state.
+        AIMD style concurrency controller for target_parallel.
+        Caller must hold _lock.
+        """
+        cfg = self.cfg
+        old_target = self._target_parallel
+
+        if mem_trouble or high_swap or precritical:
+            # Multiplicative decrease on trouble or strong warning signs
+            new_target = int(self._target_parallel * cfg.md_factor)
+            if new_target < cfg.min_target:
+                new_target = cfg.min_target
+            if new_target < 1:
+                new_target = 1
+        else:
+            # Additive increase when comfortably below cap and trend is safe
+            margin = cfg.mem_trend_margin_frac
+            if (
+                used_frac < max(0.0, cfg.mem_cap_frac - margin)
+                and self._last_trend_slope_mb_s <= cfg.mem_trend_slope_high_mb_per_s
+            ):
+                new_target = min(cfg.max_target, self._target_parallel + cfg.ai_step)
+            else:
+                new_target = self._target_parallel
+
+        self._target_parallel = new_target
+
+        if new_target != old_target and logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "[AdaptiveScheduling] target_parallel updated: %d -> %d "
+                "(used_frac=%.3f, swap_frac=%.3f, slope=%.1fMB/s, "
+                "precritical=%s, high_swap=%s, mem_trouble=%s)",
+                old_target,
+                new_target,
+                used_frac,
+                self._last_swap_used_frac,
+                self._last_trend_slope_mb_s,
+                precritical,
+                high_swap,
+                mem_trouble,
+            )
+
+    def _maybe_log_state_locked(
+        self,
+        *,
+        reason: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Optionally write a JSON state line to log_path for offline analysis.
+
+        This is rate limited to avoid excessive disk writes.
+        Caller must hold _lock.
         """
         if self.cfg.log_path is None:
             return
 
+        now = time.time()
+        if self._last_log_ts and now - self._last_log_ts < 5.0:
+            return
+        self._last_log_ts = now
+
+        state: Dict[str, Any] = {
+            "ts": now,
+            "reason": reason,
+            "total_mem_bytes": self._total_mem_bytes,
+            "last_used_bytes": self._last_used_bytes,
+            "last_used_frac": self._last_used_frac,
+            "last_swap_used_frac": self._last_swap_used_frac,
+            "per_company_est_mb": self._per_company_est_mb,
+            "peak_history_len": len(self._peak_history_mb),
+            "trend_slope_mb_s": self._last_trend_slope_mb_s,
+            "target_parallel": self._target_parallel,
+            "near_oom_events": self._near_oom_events,
+            "restart_recommended": self._restart_recommended,
+            "mem_cap_frac": self.cfg.mem_cap_frac,
+            "mem_high_frac": self.cfg.mem_high_frac,
+        }
+        if extra:
+            state.update(extra)
+
         try:
-            self.cfg.log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.cfg.log_path.open("a", encoding="utf-8") as f:
+            path = self.cfg.log_path
+            assert path is not None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False)
                 f.write("\n")
         except Exception:
             logger.debug(
-                "[AdaptiveScheduling] failed writing log to %s",
+                "[AdaptiveScheduling] failed writing state log to %s",
                 self.cfg.log_path,
                 exc_info=True,
             )
 
 
-# ---------------------------------------------------------------------------
-# Lightweight page-level MemoryGuard (marker only)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class MemoryGuardConfig:
-    """
-    Lightweight configuration for MemoryGuard.
-
-    This variant only deals with page-level memory markers from Crawl4AI.
-
-    - marker:
-        String that Crawl4AI puts into page errors on critical pressure.
-
-    - severity_for_marker:
-        Severity to use when the marker is detected. Default: "soft".
-    """
-
-    marker: str = MEMORY_PRESSURE_MARKER
-    severity_for_marker: str = "soft"
-
-
-class MemoryGuard:
-    """
-    Lightweight memory guard used at the page level.
-
-    Responsibilities:
-      - Inspect page level `error` objects.
-      - If the configured marker is present, mark the company for memory
-        retry and raise CriticalMemoryPressure(severity="soft") to abort
-        the current company gracefully, leaving the run alive.
-
-    Host-level memory protection (when to cancel companies based on
-    overall RAM usage) is handled by AdaptiveScheduler and not by this
-    class anymore.
-    """
-
-    def __init__(self, config: Optional[MemoryGuardConfig] = None) -> None:
-        self.config = config or MemoryGuardConfig()
-
-    def check_page_error(
-        self,
-        *,
-        error: Any,
-        company_id: str,
-        url: Optional[str],
-        mark_company_memory: Callable[[str], None],
-    ) -> None:
-        """
-        Inspect a page level `error` and, if the marker is present:
-
-          - mark the company via mark_company_memory(company_id)
-          - raise CriticalMemoryPressure(severity="soft")
-
-        Host-wide memory checks are intentionally not performed here;
-        they are handled by AdaptiveScheduler via psutil.
-        """
-        if not isinstance(error, str):
-            return
-
-        if self.config.marker not in error:
-            return
-
-        logger.error(
-            "Critical memory pressure marker detected for company_id=%s url=%s; "
-            "marking for retry and signalling abort of this company.",
-            company_id,
-            url,
-        )
-
-        mark_company_memory(company_id)
-
-        raise CriticalMemoryPressure(
-            f"Critical memory pressure for company_id={company_id} url={url!r}",
-            severity=self.config.severity_for_marker,
-        )
-
-
-# ---------------------------------------------------------------------------
-# StallGuard: async company level monitor (merged from stall_guard.py)
-# ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class StallGuardConfig:
-    """
-    Configuration for StallGuard.
-
-    Purely time-based stall detection at the company level.
-
-    A company is considered stalled when no progress has been recorded for
-    longer than hard_timeout_sec = page_timeout_sec * hard_timeout_factor.
-    """
-
-    page_timeout_sec: float = 60.0
-    soft_timeout_factor: float = 1.5
-    hard_timeout_factor: float = 3.0
-    check_interval_sec: float = 30.0
-
-    @property
-    def soft_timeout_sec(self) -> float:
-        return self.page_timeout_sec * self.soft_timeout_factor
-
-    @property
-    def hard_timeout_sec(self) -> float:
-        return self.page_timeout_sec * self.hard_timeout_factor
-
-
-@dataclass(slots=True)
-class StallSnapshot:
-    """
-    Immutable snapshot of a company level stall.
-    """
-
-    detected_at: str
-    company_id: str
-    idle_seconds: float
-    last_progress_at: Optional[str]
-    last_event: Optional[str]
-    reason: str
-
-
-class StallDetectedError(RuntimeError):
-    """Raised when StallGuard detects a stall (optional use)."""
-
-
-class GlobalStallDetectedError(RuntimeError):
-    """Raised when wait_for_global_hard_stall detects a global stall."""
-
-
-@dataclass(slots=True)
-class _CompanyState:
-    company_id: str
-    last_progress_mono: Optional[float] = None
-    last_progress_wall: Optional[datetime] = None
-    last_event: Optional[str] = None
-    active: bool = True
-    stalled: bool = False
-
-
-class StallGuard:
-    """
-    Async stall monitor working at company level.
-
-    - Each company gets its own independent idle timer.
-    - Progress is recorded via:
-        * record_company_start(company_id)
-        * record_company_completed(company_id)
-        * record_heartbeat(source, company_id=...)
-    - A stall is declared for a company when the time since its last
-      progress exceeds hard_timeout_sec.
-
-    StallGuard itself does not stop the run or write to disk.
-    It only keeps snapshots in memory and optionally calls on_stall.
-    """
-
-    def __init__(
-        self,
-        config: Optional[StallGuardConfig] = None,
-        *,
-        logger_name: str = "stall_guard",
-    ) -> None:
-        self.config = config or StallGuardConfig()
-        self._log = logging.getLogger(logger_name)
-
-        # Company states keyed by company_id
-        self._companies: Dict[str, _CompanyState] = {}
-
-        # Monitoring task
-        self._monitor_task: Optional[asyncio.Task] = None
-        self._running: bool = False
-
-        # First stall snapshot (for wait_for_stall()) and event
-        self._stall_event: asyncio.Event = asyncio.Event()
-        self._first_snapshot: Optional[StallSnapshot] = None
-
-        # Optional user callback invoked on each company stall
-        # Signature: async def on_stall(snapshot: StallSnapshot) -> None
-        self.on_stall: Optional[Callable[[StallSnapshot], Awaitable[None]]] = None
-
-        # Snapshots for all companies stalled during this process
-        self._stalled_snapshots: Dict[str, StallSnapshot] = {}
-
-        # Global progress trackers (across all companies, active or not)
-        self._last_any_progress_mono: Optional[float] = None
-        self._last_any_progress_wall: Optional[datetime] = None
-
-    # ------------------------------------------------------------------ #
-    # Public API: lifecycle
-    # ------------------------------------------------------------------ #
-
-    async def start(self) -> None:
-        """
-        Start the background monitor task.
-
-        Safe to call multiple times; subsequent calls are ignored.
-        If no running event loop is available, the guard logs and does nothing.
-        """
-        if self._running:
-            self._log.debug("StallGuard.start() called but already running")
-            return
-
-        self._stall_event.clear()
-        self._running = True
-
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Called from a context without an event loop.
-            self._running = False
-            self._log.error(
-                "StallGuard.start() called without a running event loop; guard not started",
-            )
-            return
-
-        self._monitor_task = loop.create_task(
-            self._monitor_loop(),
-            name="stall-guard-monitor",
-        )
-
-        self._log.info(
-            "StallGuard started (company level): page_timeout=%.1fs soft>=%.1fs hard>=%.1fs interval=%.1fs",
-            self.config.page_timeout_sec,
-            self.config.soft_timeout_sec,
-            self.config.hard_timeout_sec,
-            self.config.check_interval_sec,
-        )
-
-    async def stop(self) -> None:
-        """
-        Stop the background monitor task.
-
-        This is best effort and will not raise if the task is already done
-        or if cancellation fails.
-        """
-        if not self._running and self._monitor_task is None:
-            return
-
-        self._running = False
-        task = self._monitor_task
-        self._monitor_task = None
-
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                self._log.debug("Error while stopping StallGuard monitor: %s", e)
-
-    async def wait_for_stall(self) -> StallSnapshot:
-        """
-        Wait until the first stall is detected and return its snapshot.
-        """
-        await self._stall_event.wait()
-        assert self._first_snapshot is not None
-        return self._first_snapshot
-
-    def is_stalled(self) -> bool:
-        """
-        True if any company has been marked as stalled.
-        """
-        return self._first_snapshot is not None
-
-    def last_progress_age(self) -> Optional[float]:
-        """
-        Return the minimum age (seconds) since last progress across all
-        active companies. None if no progress has been recorded yet.
-        """
-        now = time.monotonic()
-        ages = []
-        for st in self._companies.values():
-            if not st.active or st.last_progress_mono is None:
-                continue
-            ages.append(now - st.last_progress_mono)
-        if not ages:
-            return None
-        return min(ages)
-
-    def last_any_progress_age(self) -> Optional[float]:
-        """
-        Age in seconds since the last progress event on any company,
-        active or inactive. None if no progress has ever been recorded.
-        """
-        if self._last_any_progress_mono is None:
-            return None
-        age = time.monotonic() - self._last_any_progress_mono
-        if age < 0:
-            # Monotonic clock should not go backwards, but be defensive.
-            return 0.0
-        return age
-
-    def active_company_count(self) -> int:
-        """
-        Current number of companies marked as active.
-        """
-        return sum(1 for st in self._companies.values() if st.active)
-
-    def stalled_companies(self) -> Dict[str, StallSnapshot]:
-        """
-        Return a mapping company_id -> StallSnapshot for all companies that
-        were marked as stalled during this StallGuard's lifetime.
-        """
-        return dict(self._stalled_snapshots)
-
-    # ------------------------------------------------------------------ #
-    # Public API: progress hooks
-    # ------------------------------------------------------------------ #
-
-    def record_company_start(self, company_id: str) -> None:
-        """
-        Mark the beginning of a company pipeline.
-
-        This ensures that timeouts can trigger even if we never manage to
-        fetch a single page.
-        """
-        st = self._companies.get(company_id)
-        if st is None:
-            st = _CompanyState(company_id=company_id)
-            self._companies[company_id] = st
-        st.active = True
-        st.stalled = False
-        self._touch_progress(st, reason="company_start")
-
-    def record_company_completed(self, company_id: str) -> None:
-        """
-        Record that a company's pipeline has completed successfully.
-
-        The company will no longer be monitored for stalls.
-        """
-        st = self._companies.get(company_id)
-        if st is None:
-            st = _CompanyState(company_id=company_id)
-            self._companies[company_id] = st
-        self._touch_progress(st, reason="company_completed")
-        st.active = False
-
-    def record_heartbeat(
-        self,
-        source: str = "generic",
-        company_id: Optional[str] = None,
-    ) -> None:
-        """
-        Record a generic heartbeat.
-
-        - If company_id is provided, it is treated as company level progress.
-        - If company_id is None, it is treated as a global heartbeat and does
-        not affect stall detection.
-        """
-        if company_id is None:
-            self._log.debug(
-                "StallGuard global heartbeat (%s) - ignored for stall detection",
-                source,
-            )
-            return
-
-        st = self._companies.get(company_id)
-        if st is None:
-            st = _CompanyState(company_id=company_id)
-            self._companies[company_id] = st
-        self._touch_progress(st, reason=f"heartbeat:{source}")
-
-    # ------------------------------------------------------------------ #
-    # Internal helpers
-    # ------------------------------------------------------------------ #
-
-    def _touch_progress(self, st: _CompanyState, *, reason: str) -> None:
-        now_mono = time.monotonic()
-        now_wall = datetime.now(timezone.utc)
-
-        st.last_progress_mono = now_mono
-        st.last_progress_wall = now_wall
-        st.last_event = reason
-
-        # Global progress trackers
-        self._last_any_progress_mono = now_mono
-        self._last_any_progress_wall = now_wall
-
-        self._log.debug(
-            "StallGuard progress heartbeat (%s): company=%s",
-            reason,
-            st.company_id,
-        )
-
-    async def _monitor_loop(self) -> None:
-        try:
-            while self._running:
-                try:
-                    await asyncio.sleep(self.config.check_interval_sec)
-                except asyncio.CancelledError:
-                    # Normal shutdown path.
-                    break
-
-                try:
-                    self._check_for_stalls()
-                except Exception as e:
-                    self._log.exception("StallGuard monitor iteration failed: %s", e)
-        except asyncio.CancelledError:
-            # Defensive double catch in case cancellation lands here directly.
-            return
-
-    def _check_for_stalls(self) -> None:
-        if not self._companies:
-            self._log.debug("StallGuard: no companies registered; skipping stall check")
-            return
-
-        now = time.monotonic()
-        soft = self.config.soft_timeout_sec
-        hard = self.config.hard_timeout_sec
-
-        for company_id, st in list(self._companies.items()):
-            if not st.active or st.stalled:
-                continue
-
-            if st.last_progress_mono is None:
-                # Company started but no progress yet; wait for first heartbeat.
-                self._log.debug(
-                    "StallGuard check: company=%s has no progress timestamps yet; "
-                    "waiting for first heartbeat",
-                    company_id,
-                )
-                continue
-
-            idle = now - st.last_progress_mono
-
-            if idle < 0:
-                # Monotonic clock should not go backwards, but be defensive.
-                self._log.debug(
-                    "StallGuard check: company=%s had negative idle %.3fs, skipping",
-                    company_id,
-                    idle,
-                )
-                continue
-
-            self._log.debug(
-                "StallGuard check: company=%s idle=%.1fs soft>=%.1fs hard>=%.1fs",
-                company_id,
-                idle,
-                soft,
-                hard,
-            )
-
-            # Pure time-based stall: only condition is idle >= hard_timeout_sec
-            if idle >= hard:
-                self._declare_company_stall(st, idle_seconds=idle)
-
-    def _declare_company_stall(self, st: _CompanyState, *, idle_seconds: float) -> None:
-        if st.stalled:
-            return
-
-        st.stalled = True
-        st.active = False
-
-        detected_at = datetime.now(timezone.utc)
-        snapshot = StallSnapshot(
-            detected_at=detected_at.isoformat(),
-            company_id=st.company_id,
-            idle_seconds=float(idle_seconds),
-            last_progress_at=(
-                st.last_progress_wall.isoformat()
-                if st.last_progress_wall is not None
-                else None
-            ),
-            last_event=st.last_event,
-            reason=(
-                "company_idle_for_%.1fs_gt_hard_threshold_%.1fs"
-                % (idle_seconds, self.config.hard_timeout_sec)
-            ),
-        )
-
-        # Store the first snapshot for wait_for_stall()
-        if self._first_snapshot is None:
-            self._first_snapshot = snapshot
-            self._stall_event.set()
-
-        # Keep the snapshot available for later inspection.
-        self._stalled_snapshots[st.company_id] = snapshot
-
-        self._log.error(
-            "STALL DETECTED for company_id=%s: idle=%.1fs (see snapshot)",
-            st.company_id,
-            idle_seconds,
-        )
-
-        # Fire async callback, if any
-        if self.on_stall is not None:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                # No running loop; nothing we can do.
-                self._log.warning(
-                    "StallGuard: stall detected for %s but no running loop; "
-                    "on_stall callback not scheduled",
-                    st.company_id,
-                )
-            else:
-                loop.create_task(
-                    self._run_on_stall(snapshot),
-                    name=f"stall-guard-on-stall-{st.company_id}",
-                )
-
-    async def _run_on_stall(self, snapshot: StallSnapshot) -> None:
-        if self.on_stall is None:
-            return
-        try:
-            await self.on_stall(snapshot)
-        except Exception as e:
-            self._log.exception("StallGuard on_stall callback failed: %s", e)
-
-
-# ---------------------------------------------------------------------------
-# Global hard stall helper (merged from stall_guard.py)
-# ---------------------------------------------------------------------------
-
-
-async def wait_for_global_hard_stall(
-    stall_guard: StallGuard,
-    *,
-    page_timeout_sec: float,
-    factor: float = 4.5,
-    check_interval_sec: float = 30.0,
-    raise_on_stall: bool = False,
-) -> float:
-    """
-    Wait until the whole run appears globally stalled.
-
-    Definition here:
-      - StallGuard.last_progress_age() returns the minimum idle time across
-        all active companies.
-      - If that age is greater than or equal to page_timeout_sec * factor,
-        we consider the system globally stalled.
-
-    In addition, this helper also detects a "zombie" condition where:
-
-      * there are active companies but no per company timestamps at all, or
-      * there are zero active companies but no progress anywhere for a long
-        time.
-
-    In both cases it falls back to the age since the last progress on any
-    company and returns once that exceeds the same hard threshold.
-
-    If raise_on_stall is True, the helper raises GlobalStallDetectedError
-    instead of just returning the age. This is useful if you want to abort
-    the whole run on a global stall and let an outer retry wrapper restart
-    the process.
-    """
-
-    if factor <= 0:
-        factor = 4.5
-    if check_interval_sec <= 0:
-        check_interval_sec = page_timeout_sec
-
-    hard = page_timeout_sec * factor
-
-    logger.info(
-        "Global StallGuard watchdog started: page_timeout=%.1fs factor=%.1f hard>=%.1fs check_interval=%.1fs",
-        page_timeout_sec,
-        factor,
-        hard,
-        check_interval_sec,
-    )
-
-    # Track how long we have been waiting when there is no progress at all.
-    start_mono = time.monotonic()
-
-    while True:
-        await asyncio.sleep(check_interval_sec)
-
-        age_active = stall_guard.last_progress_age()
-        age_any = stall_guard.last_any_progress_age()
-        active_count = stall_guard.active_company_count()
-
-        # New: handle the "no progress at all yet" zombie case
-        if age_active is None and age_any is None:
-            elapsed = time.monotonic() - start_mono
-
-            if active_count > 0:
-                logger.warning(
-                    "Global StallGuard: %d active companies but no progress "
-                    "recorded yet; elapsed=%.1fs (hard>=%.1fs)",
-                    active_count,
-                    elapsed,
-                    hard,
-                )
-            else:
-                logger.debug(
-                    "Global StallGuard: no progress recorded yet; "
-                    "elapsed=%.1fs (hard>=%.1fs)",
-                    elapsed,
-                    hard,
-                )
-
-            if elapsed >= hard:
-                msg = (
-                    "Global StallGuard: zombie stall detected before first "
-                    "heartbeat; no progress for %.1fs >= %.1fs" % (elapsed, hard)
-                )
-                logger.error(msg)
-                if raise_on_stall:
-                    raise GlobalStallDetectedError(msg)
-                return elapsed
-
-            continue
-
-        # Normal global hard stall: at least one active company with a known
-        # progress timestamp and that idle time exceeds the threshold.
-        if age_active is not None:
-            logger.debug(
-                "Global StallGuard: min idle across ACTIVE companies = %.1fs (hard>=%.1fs)",
-                age_active,
-                hard,
-            )
-            if age_active >= hard:
-                msg = (
-                    "Global StallGuard: hard stall detected, "
-                    "min idle (active) = %.1fs >= %.1fs" % (age_active, hard)
-                )
-                logger.error(msg)
-                if raise_on_stall:
-                    raise GlobalStallDetectedError(msg)
-                return age_active
-
-        # Zombie branch 1: active companies but last_progress_age() could not
-        # compute anything, fall back to global last progress age.
-        if active_count > 0 and age_active is None and age_any is not None:
-            logger.warning(
-                "Global StallGuard: %d active companies but no per company "
-                "progress timestamps; using last_any_progress_age=%.1fs "
-                "(hard>=%.1fs) for stall detection",
-                active_count,
-                age_any,
-                hard,
-            )
-            if age_any >= hard:
-                msg = (
-                    "Global StallGuard: zombie stall detected "
-                    "(active companies, no progress for %.1fs >= %.1fs)"
-                    % (age_any, hard)
-                )
-                logger.error(msg)
-                if raise_on_stall:
-                    raise GlobalStallDetectedError(msg)
-                return age_any
-
-        # Zombie branch 2: no active companies, but there has been no progress
-        # anywhere for a long time. This can happen if the outer logic is stuck.
-        if active_count == 0 and age_any is not None:
-            logger.debug(
-                "Global StallGuard: zero active companies, "
-                "last_any_progress_age=%.1fs (hard>=%.1fs)",
-                age_any,
-                hard,
-            )
-            if age_any >= hard:
-                msg = (
-                    "Global StallGuard: zombie stall detected with zero active "
-                    "companies; no progress for %.1fs >= %.1fs" % (age_any, hard)
-                )
-                logger.error(msg)
-                if raise_on_stall:
-                    raise GlobalStallDetectedError(msg)
-                return age_any
-
-        # Otherwise we are either making progress or not yet past the
-        # threshold; keep waiting.
-
-
-async def global_stall_watchdog(
-    *,
-    stall_guard: StallGuard,
-    stall_cfg: StallGuardConfig,
-    company_tasks: Dict[str, asyncio.Task[Any]],
-    mark_company_stalled: Callable[[str], None],
-    on_global_stall: Optional[Callable] = None,
-) -> None:
-    """
-    Background task that waits for a global hard stall and then:
-
-      - optionally notifies the caller via `on_global_stall(idle_seconds)`
-      - marks all active companies as stalled via `mark_company_stalled`
-      - cancels their running asyncio tasks
-
-    This is the lifted version of the old `_global_stall_watchdog()` from run.py.
-
-    Parameters
-    ----------
-    stall_guard:
-        The StallGuard instance monitoring per company progress.
-    stall_cfg:
-        Its StallGuardConfig, used to pick page_timeout and check interval.
-    company_tasks:
-        Mapping company_id -> asyncio.Task for active company pipelines.
-    mark_company_stalled:
-        Callback that records stalled companies in the retry tracker or logs.
-    on_global_stall:
-        Optional callback that is invoked once with the detected idle duration
-        (in seconds) before cancelling tasks. You can use this to set an
-        `abort_run` flag in the caller.
-    """
-    try:
-        idle = await wait_for_global_hard_stall(
-            stall_guard,
-            page_timeout_sec=stall_cfg.page_timeout_sec,
-            check_interval_sec=stall_cfg.check_interval_sec,
-        )
-    except asyncio.CancelledError:
-        return
-    except GlobalStallDetectedError:
-        # Already handled inside wait_for_global_hard_stall when raise_on_stall=True.
-        return
-    except Exception as e:
-        logger.exception(
-            "Global StallGuard watchdog encountered an unexpected error: %s",
-            e,
-        )
-        return
-
-    # Let the caller flip any outer flags before we touch tasks.
-    if on_global_stall is not None:
-        try:
-            on_global_stall(idle)
-        except Exception as e:
-            logger.exception("Global stall callback failed: %s", e)
-
-    logger.error(
-        "Global StallGuard: no company level progress for %.1fs, treating this run "
-        "as globally stalled and marking active companies for retry.",
-        idle,
-    )
-
-    active_company_ids: List[str] = []
-    for cid, task in list(company_tasks.items()):
-        if not task.done():
-            active_company_ids.append(cid)
-
-    if not active_company_ids:
-        logger.error(
-            "Global StallGuard: no active company tasks found at stall detection time.",
-        )
-
-    for cid in active_company_ids:
-        mark_company_stalled(cid)
-
-    for cid in active_company_ids:
-        task = company_tasks.get(cid)
-        if task is not None and not task.done():
-            logger.error(
-                "Global StallGuard: cancelling company task company_id=%s",
-                cid,
-            )
-            task.cancel()
-
-
 __all__ = [
     "AdaptiveSchedulingConfig",
     "AdaptiveScheduler",
-    "MemoryGuardConfig",
-    "MemoryGuard",
     "CriticalMemoryPressure",
     "MEMORY_PRESSURE_MARKER",
-    "StallGuardConfig",
-    "StallSnapshot",
-    "StallGuard",
-    "StallDetectedError",
-    "GlobalStallDetectedError",
-    "wait_for_global_hard_stall",
-    "global_stall_watchdog",
 ]

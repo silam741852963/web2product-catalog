@@ -7,7 +7,7 @@ from extensions.connectivity_guard import ConnectivityGuard
 from extensions import md_gating
 from extensions.output_paths import save_stage_output
 from extensions.crawl_state import upsert_url_index_entry
-from extensions.adaptive_scheduling import MemoryGuard, StallGuard
+from extensions.adaptive_scheduling import MEMORY_PRESSURE_MARKER
 
 logger = logging.getLogger("page_pipeline")
 
@@ -19,8 +19,6 @@ async def process_page_result(
     guard: Optional[ConnectivityGuard],
     gating_cfg: md_gating.MarkdownGatingConfig,
     timeout_error_marker: str,
-    stall_guard: Optional[StallGuard] = None,
-    memory_guard: Optional[MemoryGuard] = None,
     mark_company_timeout_cb: Optional[Callable[[str], None]] = None,
     mark_company_memory_cb: Optional[Callable[[str], None]] = None,
 ) -> None:
@@ -30,8 +28,8 @@ async def process_page_result(
     - Saves HTML and markdown.
     - Applies markdown gating.
     - Updates url_index via upsert_url_index_entry.
-    - Notifies ConnectivityGuard, StallGuard, and MemoryGuard.
-    - Optionally calls retry callbacks when provided.
+    - Notifies ConnectivityGuard.
+    - Optionally calls timeout / memory callbacks when provided.
 
     Parameters
     ----------
@@ -45,10 +43,6 @@ async def process_page_result(
         Markdown gating configuration (extensions.md_gating).
     timeout_error_marker
         String marker used in error messages to detect per page timeouts.
-    stall_guard
-        Optional StallGuard for heartbeat updates.
-    memory_guard
-        Optional MemoryGuard for memory marker detection at page level.
     mark_company_timeout_cb
         Optional callback mark_company_timeout(company_id: str).
     mark_company_memory_cb
@@ -83,23 +77,17 @@ async def process_page_result(
         None,
     )
 
-    # Page level memory guard (marker only). Host level is handled by AdaptiveScheduler.
-    if memory_guard is not None:
+    # Error classification
+    error_str = error if isinstance(error, str) else ""
+    timeout_exceeded = bool(error_str and timeout_error_marker in error_str)
+    memory_pressure = bool(error_str and MEMORY_PRESSURE_MARKER in error_str)
 
-        def _mark_mem(cid: str) -> None:
-            if mark_company_memory_cb is not None:
-                mark_company_memory_cb(cid)
-
-        memory_guard.check_page_error(
-            error=error,
-            company_id=company_id,
-            url=url,
-            mark_company_memory=_mark_mem,
-        )
-
-    timeout_exceeded = isinstance(error, str) and timeout_error_marker in error
+    # Company-level markers
     if timeout_exceeded and mark_company_timeout_cb is not None:
         mark_company_timeout_cb(company_id)
+
+    if memory_pressure and mark_company_memory_cb is not None:
+        mark_company_memory_cb(company_id)
 
     html = _getattr(page_result, "html", None) or _getattr(
         page_result, "final_html", None
@@ -169,8 +157,12 @@ async def process_page_result(
     else:
         md_status = "markdown_suppressed"
 
+    # Override status for timeout / memory pressure
     if timeout_exceeded:
         md_status = "timeout_page_exceeded"
+    if memory_pressure:
+        # Memory pressure takes precedence over timeout in the status label
+        md_status = "memory_pressure"
 
     entry: Dict[str, Any] = {
         "url": url,
@@ -187,8 +179,13 @@ async def process_page_result(
         "status": md_status,
     }
 
+    # Page-level flags for retry logic / analysis
     if timeout_exceeded:
         entry["timeout_page_exceeded"] = True
+        entry["scheduled_retry"] = True
+
+    if memory_pressure:
+        entry["memory_pressure"] = True
         entry["scheduled_retry"] = True
 
     if md_path is not None:
@@ -197,6 +194,3 @@ async def process_page_result(
         entry["html_path"] = html_path
 
     upsert_url_index_entry(company_id, url, entry)
-
-    if stall_guard is not None:
-        stall_guard.record_heartbeat("page", company_id=company_id)

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
+from collections import deque
 
 from crawl4ai import AsyncWebCrawler, CacheMode
 from crawl4ai.deep_crawling.filters import FilterChain
@@ -71,18 +72,13 @@ from extensions.retry_tracker import (
     set_retry_tracker,
     record_company_attempt,
     mark_company_timeout,
-    mark_company_stalled,
     mark_company_memory_pressure,
     mark_company_completed,
 )
 from extensions.adaptive_scheduling import (
     AdaptiveSchedulingConfig,
     AdaptiveScheduler,
-    MemoryGuard,
     CriticalMemoryPressure,
-    StallGuard,
-    StallGuardConfig,
-    global_stall_watchdog,
 )
 from extensions.page_pipeline import process_page_result
 from extensions.llm_passes import (
@@ -179,13 +175,11 @@ async def crawl_company(
     guard: Optional[ConnectivityGuard],
     gating_cfg: md_gating.MarkdownGatingConfig,
     timeout_error_marker: str,
-    stall_guard: Optional[StallGuard] = None,
     root_urls: Optional[List[str]] = None,
     crawler_base_cfg: Any = None,
     page_policy: PageInteractionPolicy,
     page_interaction_factory: PageInteractionFactory,
     page_timeout_ms: Optional[int] = None,
-    memory_guard: Optional[MemoryGuard] = None,
 ) -> None:
     """
     Run a deep crawl for a single company.
@@ -276,8 +270,6 @@ async def crawl_company(
                             guard=guard,
                             gating_cfg=gating_cfg,
                             timeout_error_marker=timeout_error_marker,
-                            stall_guard=stall_guard,
-                            memory_guard=memory_guard,
                             mark_company_timeout_cb=mark_company_timeout,
                             mark_company_memory_cb=mark_company_memory_pressure,
                         )
@@ -297,7 +289,7 @@ async def crawl_company(
                         # Continue with next page.
                         continue
             except asyncio.CancelledError as e:
-                # Task-level cancellation (scheduler or stall).
+                # Task-level cancellation (scheduler).
                 logger.warning(
                     "crawl_company cancelled for company_id=%s root=%s; closing stream.",
                     company.company_id,
@@ -305,6 +297,7 @@ async def crawl_company(
                 )
                 pending_exc = e
             finally:
+                # Always close the generator so Playwright resources are freed.
                 aclose = getattr(agen, "aclose", None)
                 if aclose is not None:
                     try:
@@ -334,8 +327,6 @@ async def crawl_company(
                         guard=guard,
                         gating_cfg=gating_cfg,
                         timeout_error_marker=timeout_error_marker,
-                        stall_guard=stall_guard,
-                        memory_guard=memory_guard,
                         mark_company_timeout_cb=mark_company_timeout,
                         mark_company_memory_cb=mark_company_memory_pressure,
                     )
@@ -405,8 +396,6 @@ async def run_company_pipeline(
     run_id: Optional[str],
     presence_llm: Any,
     full_llm: Any,
-    stall_guard: Optional[StallGuard],
-    memory_guard: Optional[MemoryGuard],
     dfs_factory: Optional[DeepCrawlStrategyFactory],
     crawler_base_cfg: Any,
     page_policy: PageInteractionPolicy,
@@ -486,9 +475,6 @@ async def run_company_pipeline(
 
             record_company_attempt(company.company_id)
 
-            if stall_guard is not None:
-                stall_guard.record_company_start(company.company_id)
-
             token = logging_ext.set_company_context(company.company_id)
             company_logger = logging_ext.get_company_logger(company.company_id)
 
@@ -532,14 +518,13 @@ async def run_company_pipeline(
                     guard=guard,
                     gating_cfg=gating_cfg,
                     timeout_error_marker=timeout_error_marker,
-                    stall_guard=stall_guard,
                     root_urls=resume_roots,
                     crawler_base_cfg=crawler_base_cfg,
                     page_policy=page_policy,
                     page_interaction_factory=page_interaction_factory,
                     page_timeout_ms=page_timeout_ms,
-                    memory_guard=memory_guard,
                 )
+                # After the crawl, recompute company-level state from the index.
                 await state.recompute_company_from_index(
                     company.company_id,
                     name=None,
@@ -550,13 +535,11 @@ async def run_company_pipeline(
                 await run_presence_pass_for_company(
                     company,
                     presence_strategy=presence_llm,
-                    stall_guard=stall_guard,
                 )
             elif args.llm_mode == "full" and full_llm is not None:
                 await run_full_pass_for_company(
                     company,
                     full_strategy=full_llm,
-                    stall_guard=stall_guard,
                 )
 
             completed_ok = True
@@ -566,8 +549,7 @@ async def run_company_pipeline(
                 "Company pipeline cancelled for company_id=%s",
                 company.company_id,
             )
-            # Propagate so outer scheduler can handle it; we do not perform
-            # any further async work in this function after this point.
+            # Do not do further async work here to keep cancellation responsive.
             raise
 
         except CriticalMemoryPressure:
@@ -588,6 +570,9 @@ async def run_company_pipeline(
         try:
             snap_meta = await state.get_company_snapshot(company.company_id)
             _write_crawl_meta(company, snap_meta)
+        except asyncio.CancelledError:
+            # If we are being cancelled, just propagate.
+            raise
         except Exception:
             logger.exception(
                 "Failed to write crawl_meta for company_id=%s",
@@ -598,6 +583,8 @@ async def run_company_pipeline(
             if run_id is not None and completed_ok:
                 await state.mark_company_completed(run_id, company.company_id)
                 await state.recompute_global_state()
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception(
                 "Failed to update run/global state for company_id=%s",
@@ -607,13 +594,17 @@ async def run_company_pipeline(
         if completed_ok:
             mark_company_completed(company.company_id)
 
-        if stall_guard is not None and completed_ok:
-            stall_guard.record_company_completed(company.company_id)
-
     finally:
+        # Always release logging resources for this company.
         if token is not None:
-            logging_ext.reset_company_context(token)
-            logging_ext.close_company(company.company_id)
+            try:
+                logging_ext.reset_company_context(token)
+                logging_ext.close_company(company.company_id)
+            except Exception:
+                logger.exception(
+                    "Failed to close logging context for company_id=%s",
+                    company.company_id,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -711,7 +702,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=8,
         help=(
             "Maximum number of companies to process concurrently. "
-            "Acts as a hard upper bound for adaptive scheduling."
+            "Acts as a hard upper bound on top of adaptive scheduling."
         ),
     )
     parser.add_argument(
@@ -732,20 +723,13 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--resource-monitor-interval",
-        type=float,
-        default=2.0,
-        help="Sampling interval in seconds for the resource monitor (default: 2.0).",
-    )
-    parser.add_argument(
         "--page-timeout-ms",
         type=int,
         default=60000,
         help=(
             "Per page timeout in milliseconds for Playwright and Crawl4AI. "
             "This value is applied to CrawlerRunConfig.page_timeout, "
-            "PageInteractionPolicy.wait_timeout_ms, StallGuardConfig.page_timeout_sec "
-            "and timeout error detection."
+            "PageInteractionPolicy.wait_timeout_ms, and timeout error detection."
         ),
     )
     parser.add_argument(
@@ -758,32 +742,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
             "'all' = ignore it and consider all eligible companies; "
             "'skip-retry' = skip companies listed in retry_companies.json; "
             "'only-retry' = process only companies listed there."
-        ),
-    )
-    parser.add_argument(
-        "--enable-hard-memory-guard",
-        action="store_true",
-        help=(
-            "Enable host level memory based cancellation in the adaptive scheduler. "
-            "Page level memory markers are always active."
-        ),
-    )
-    parser.add_argument(
-        "--adaptive-disable-cpu",
-        action="store_true",
-        help=(
-            "Disable CPU based adaptive scheduling decisions. "
-            "When set, only memory (if enabled) will influence scaling."
-        ),
-    )
-    parser.add_argument(
-        "--adaptive-disable-mem",
-        action="store_true",
-        help=(
-            "Disable memory based adaptive scheduling decisions. "
-            "When set, only CPU (if enabled) will influence scaling. "
-            "If both CPU and memory are disabled, concurrency will rise "
-            "to --company-concurrency and stay there."
         ),
     )
     parser.add_argument(
@@ -919,65 +877,33 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     page_interaction_factory = default_page_interaction_factory
 
-    stall_cfg = StallGuardConfig(
-        page_timeout_sec=page_timeout_ms / 1000.0,
-    )
-    stall_guard = StallGuard(config=stall_cfg)
-
-    # Page level memory guard (marker only). Host level handled by AdaptiveScheduler.
-    memory_guard: Optional[MemoryGuard] = MemoryGuard()
-
-    company_tasks: Dict[str, asyncio.Task] = {}
-
-    logger.info(
-        "Page level MemoryGuard enabled (marker based). "
-        "Host level memory protection is handled by AdaptiveScheduler."
-    )
-
-    async def _handle_stall(snapshot: Any) -> None:
-        company_id = getattr(snapshot, "company_id", None)
-        idle_seconds = getattr(snapshot, "idle_seconds", None)
-
-        if not company_id:
-            logger.error(
-                "StallGuard on_stall called without company_id in snapshot: %r",
-                snapshot,
-            )
-            return
-
-        mark_company_stalled(company_id)
-
-        task = company_tasks.get(company_id)
-        if task is None:
-            logger.debug(
-                "StallGuard: stall detected for company_id=%s but no active "
-                "task found to cancel (likely already finished).",
-                company_id,
-            )
-            return
-
-        if task.done():
-            logger.info(
-                "StallGuard: stall detected for company_id=%s but task already finished",
-                company_id,
-            )
-            return
-
-        logger.error(
-            "StallGuard: cancelling stalled company task company_id=%s idle=%.1fs",
-            company_id,
-            idle_seconds if idle_seconds is not None else -1.0,
-        )
-        task.cancel()
-
-    if hasattr(stall_guard, "on_stall"):
-        stall_guard.on_stall = _handle_stall  # type: ignore[attr-defined]
-    await stall_guard.start()
-
     state = get_crawl_state()
 
+    # Mapping from company id to its asyncio.Task (for AdaptiveScheduler callbacks).
+    company_tasks: Dict[str, asyncio.Task] = {}
+
+    def _get_active_company_ids() -> List[str]:
+        # Only report truly active tasks so scheduler cancellations are accurate.
+        return [cid for cid, t in company_tasks.items() if not t.done()]
+
+    def _request_cancel_companies(ids: Iterable[str]) -> None:
+        # Synchronous callback from AdaptiveScheduler emergency watchdog.
+        # We only cancel tasks here; per-company cleanup happens in
+        # crawl_company (generator aclose) and in run_company_pipeline finally.
+        for cid in ids:
+            task = company_tasks.get(cid)
+            if task is None or task.done():
+                continue
+            logger.error(
+                "[AdaptiveScheduling] cancelling company_id=%s due to emergency memory pressure",
+                cid,
+            )
+            # Mark for retry as memory-pressure victim.
+            mark_company_memory_pressure(cid)
+            task.cancel()
+
     scheduler: Optional[AdaptiveScheduler] = None
-    global_stall_task: Optional[asyncio.Task] = None
+    abort_run = False
 
     try:
         # Load companies
@@ -1098,15 +1024,6 @@ async def main_async(args: argparse.Namespace) -> None:
 
         max_companies = max(1, int(args.company_concurrency))
 
-        sched_cfg = AdaptiveSchedulingConfig(
-            max_concurrency=max_companies,
-            use_cpu=not getattr(args, "adaptive_disable_cpu", False),
-            use_mem=not getattr(args, "adaptive_disable_mem", False),
-            mem_cancel_enabled=bool(getattr(args, "enable_hard_memory_guard", False)),
-        )
-        scheduler = AdaptiveScheduler(cfg=sched_cfg)
-        await scheduler.start()
-
         # DFS factory only needed when selected.
         dfs_factory: Optional[DeepCrawlStrategyFactory] = None
         if args.strategy == "dfs":
@@ -1125,89 +1042,63 @@ async def main_async(args: argparse.Namespace) -> None:
             headless=True,
         )
 
-        abort_run = False
+        # Initialize adaptive scheduler with extended configuration.
+        scheduler_log_path = out_dir / "adaptive_scheduling_state.jsonl"
+        scheduler_cfg = AdaptiveSchedulingConfig(
+            log_path=scheduler_log_path,
+        )
+        scheduler = AdaptiveScheduler(
+            cfg=scheduler_cfg,
+            get_active_company_ids=_get_active_company_ids,
+            request_cancel_companies=_request_cancel_companies,
+        )
+        await scheduler.start()
+        logger.info(
+            "[AdaptiveScheduling] initialized (psutil_available=%s, log_path=%s)",
+            scheduler.psutil_available,
+            scheduler_log_path,
+        )
 
-        def _on_global_stall() -> None:
-            nonlocal abort_run
-            abort_run = True
-
-        total_companies = len(companies)
         companies_by_id: Dict[str, Company] = {c.company_id: c for c in companies}
-        ready_queue: List[str] = [c.company_id for c in companies]
+        ready_queue: deque[str] = deque(c.company_id for c in companies)
 
         async with AsyncWebCrawler(config=browser_cfg) as crawler:
-            global_stall_task = asyncio.create_task(
-                global_stall_watchdog(
-                    stall_guard=stall_guard,
-                    stall_cfg=stall_cfg,
-                    company_tasks=company_tasks,
-                    mark_company_stalled=mark_company_stalled,
-                    on_global_stall=_on_global_stall,
-                ),
-                name="global-stall-watchdog",
-            )
-
             inflight: set[asyncio.Task] = set()
             launched_counter = 0
+            total_companies = len(companies)
 
             while not abort_run and (ready_queue or inflight):
+                # If scheduler indicates that a controlled restart is recommended,
+                # stop launching new work and move towards a clean shutdown.
+                if scheduler.restart_recommended:
+                    abort_run = True
+                    logger.error(
+                        "[AdaptiveScheduling] restart recommended by scheduler; "
+                        "stopping new launches and cancelling remaining tasks.",
+                    )
+                    break
+
                 active_tasks = len(inflight)
+                num_waiting = len(ready_queue)
 
-                # Host level memory check: select a company to cancel if needed.
-                if scheduler is not None and company_tasks:
-                    victim_id = await scheduler.maybe_select_company_to_cancel(
-                        active_company_ids=company_tasks.keys()
+                # Decide how many new companies to start, respecting both memory and
+                # hard concurrency cap.
+                slots_mem = 0
+                if num_waiting > 0:
+                    slots_mem = await scheduler.admissible_slots(
+                        num_waiting=num_waiting
                     )
-                    if victim_id is not None:
-                        victim_task = company_tasks.get(victim_id)
-                        if victim_task is not None and not victim_task.done():
-                            logger.error(
-                                "[Scheduler] host memory critical, cancelling company_id=%s",
-                                victim_id,
-                            )
-                            mark_company_memory_pressure(victim_id)
-                            victim_task.cancel()
-                            # Requeue with priority for later restart.
-                            if scheduler is not None:
-                                await scheduler.register_memory_requeued(victim_id)
-                            if victim_id not in ready_queue:
-                                ready_queue.append(victim_id)
 
-                started = False
-                reason = "no_scheduler"
+                available_concurrency = max(0, max_companies - active_tasks)
+                slots_to_start = max(
+                    0,
+                    min(slots_mem, available_concurrency, num_waiting),
+                )
 
-                if scheduler is not None:
-                    can_start, reason = await scheduler.can_start_new_company(
-                        active_tasks=active_tasks
-                    )
-                else:
-                    can_start = active_tasks < max_companies
-
-                if can_start and ready_queue and not abort_run:
-                    # Priority: check if scheduler has a memory priority company.
-                    next_company_id: Optional[str]
-                    if scheduler is not None:
-                        priority_id = await scheduler.pop_priority_company(ready_queue)
-                        if priority_id is not None and priority_id in ready_queue:
-                            next_company_id = priority_id
-                        else:
-                            next_company_id = ready_queue[0]
-                    else:
-                        next_company_id = ready_queue[0]
-
-                    # Remove selected company from ready queue.
-                    if next_company_id is not None:
-                        try:
-                            ready_queue.remove(next_company_id)
-                        except ValueError:
-                            logger.warning(
-                                "[Scheduler] selected company_id=%s not in ready_queue, skipping.",
-                                next_company_id,
-                            )
-                            next_company_id = None
-
-                    if next_company_id is not None:
-                        company = companies_by_id[next_company_id]
+                if slots_to_start > 0:
+                    for _ in range(slots_to_start):
+                        cid = ready_queue.popleft()
+                        company = companies_by_id[cid]
                         launched_counter += 1
                         idx_for_log = launched_counter
 
@@ -1232,8 +1123,6 @@ async def main_async(args: argparse.Namespace) -> None:
                                 run_id=run_id,
                                 presence_llm=presence_llm,
                                 full_llm=full_llm,
-                                stall_guard=stall_guard,
-                                memory_guard=memory_guard,
                                 dfs_factory=dfs_factory,
                                 crawler_base_cfg=crawler_base_cfg,
                                 page_policy=page_policy,
@@ -1242,12 +1131,14 @@ async def main_async(args: argparse.Namespace) -> None:
                             )
 
                         logger.info(
-                            "[Scheduler] starting company company_id=%s (idx=%d/%d, active_before=%d, reason=%s)",
+                            "[Scheduler] starting company company_id=%s (idx=%d/%d, active_before=%d, "
+                            "slots_mem=%d, available_concurrency=%d)",
                             company.company_id,
                             idx_for_log,
                             total_companies,
                             active_tasks,
-                            reason,
+                            slots_mem,
+                            available_concurrency,
                         )
 
                         task = asyncio.create_task(
@@ -1256,160 +1147,136 @@ async def main_async(args: argparse.Namespace) -> None:
                         )
                         company_tasks[company.company_id] = task
                         inflight.add(task)
-                        if scheduler is not None:
-                            scheduler.notify_admitted(
-                                company_id=company.company_id,
-                                reason=reason,
-                            )
-                        started = True
                 else:
-                    if not started and not abort_run and ready_queue:
+                    if ready_queue and not abort_run:
                         logger.info(
-                            "[Scheduler] not starting new company (active=%d, reason=%s, remaining=%d)",
+                            "[Scheduler] cannot start new company yet (active=%d, waiting=%d, "
+                            "slots_mem=%d, cap=%d)",
                             active_tasks,
-                            reason,
-                            len(ready_queue),
+                            num_waiting,
+                            slots_mem,
+                            max_companies,
                         )
 
-                if not inflight and not ready_queue:
+                if abort_run:
                     break
 
-                if inflight:
-                    timeout = (
-                        scheduler.sample_interval_sec if scheduler is not None else None
-                    )
+                if not inflight:
+                    if ready_queue and slots_to_start == 0:
+                        # Nothing running but cannot start new work due to memory;
+                        # give the system a moment before rechecking.
+                        await asyncio.sleep(1.0)
+                        continue
+                    # No work left.
+                    break
 
-                    done, pending = await asyncio.wait(
-                        inflight,
-                        return_when=asyncio.FIRST_COMPLETED,
-                        timeout=timeout,
-                    )
-                    inflight = pending
+                # Wait for at least one company to finish.
+                done, pending = await asyncio.wait(
+                    inflight,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                inflight = pending
 
-                    for t in done:
-                        resolved_cid: Optional[str] = None
-                        for cid, ct in list(company_tasks.items()):
-                            if ct is t:
-                                resolved_cid = cid
-                                company_tasks.pop(cid, None)
-                                break
+                for t in done:
+                    resolved_cid: Optional[str] = None
+                    for cid, ct in list(company_tasks.items()):
+                        if ct is t:
+                            resolved_cid = cid
+                            company_tasks.pop(cid, None)
+                            break
 
-                        if resolved_cid is not None and scheduler is not None:
-                            await scheduler.notify_completed(resolved_cid)
+                    if t.cancelled():
+                        logger.info(
+                            "Company task cancelled for company_id=%s",
+                            resolved_cid,
+                        )
+                        # For cancelled tasks, resources are cleaned up in the
+                        # company pipeline and crawl-company generator close.
+                        continue
 
-                        if t.cancelled():
-                            logger.info(
-                                "Company task cancelled for company_id=%s",
-                                resolved_cid,
-                            )
-                            continue
+                    try:
+                        exc = t.exception()
+                    except asyncio.CancelledError:
+                        # We are shutting down; nothing more to do.
+                        continue
 
-                        try:
-                            exc = t.exception()
-                        except asyncio.CancelledError:
-                            continue
-
+                    if exc is not None:
                         if isinstance(exc, CriticalMemoryPressure):
-                            severity = getattr(exc, "severity", "emergency")
-                            cid_for_log = resolved_cid or "unknown"
-
-                            logger.warning(
-                                "Company %s terminated due to CriticalMemoryPressure severity=%s",
-                                cid_for_log,
-                                severity,
-                            )
-                            mark_company_memory_pressure(cid_for_log)
-
-                            if severity == "soft":
-                                # Page level marker: requeue with priority.
-                                if scheduler is not None and resolved_cid is not None:
-                                    await scheduler.register_memory_requeued(
-                                        resolved_cid
-                                    )
-                                if (
-                                    resolved_cid is not None
-                                    and resolved_cid not in ready_queue
-                                ):
-                                    ready_queue.append(resolved_cid)
-                                continue
-
-                            # Hard or emergency severity: notify scheduler and possibly abort.
-                            if scheduler is not None:
-                                await scheduler.on_memory_pressure(severity=severity)
-
-                            if severity == "emergency":
-                                logger.error(
-                                    "Emergency memory pressure reported; aborting run so wrapper can restart.",
-                                )
-                                abort_run = True
-                                break
-                            else:
-                                # Hard severity: continue run with more conservative scheduling.
-                                continue
-
-                        if exc is not None:
                             logger.error(
-                                "Company task failed with error: %s",
+                                "Company task for company_id=%s ended with CriticalMemoryPressure: %s",
+                                resolved_cid,
+                                exc,
+                            )
+                            if resolved_cid:
+                                mark_company_memory_pressure(resolved_cid)
+                        else:
+                            logger.error(
+                                "Company task for company_id=%s failed with error: %s",
+                                resolved_cid,
                                 exc,
                             )
 
-                    if abort_run:
-                        break
-                else:
-                    if scheduler is not None:
-                        await asyncio.sleep(scheduler.sample_interval_sec)
-
-            if abort_run:
+            # If we are aborting (scheduler restart) or an outer condition,
+            # cancel all remaining inflight tasks and wait for them to release
+            # their resources (Playwright pages, loggers, etc).
+            if abort_run and inflight:
+                logger.error(
+                    "Aborting run with %d inflight company tasks; cancelling them now.",
+                    len(inflight),
+                )
                 for t in inflight:
                     if not t.done():
                         t.cancel()
-                # Give cancelled tasks a brief chance to run their cleanup
-                # (including closing any Playwright contexts) before we
-                # tear down the shared AsyncWebCrawler.
-                if inflight:
-                    try:
-                        await asyncio.gather(*inflight, return_exceptions=True)
-                    except Exception:
-                        logger.exception("Error while waiting for cancelled tasks")
+                try:
+                    await asyncio.gather(*inflight, return_exceptions=True)
+                except Exception:
+                    logger.exception("Error while waiting for cancelled tasks")
                 inflight.clear()
 
-            if global_stall_task is not None:
-                global_stall_task.cancel()
-                try:
-                    await global_stall_task
-                except asyncio.CancelledError:
-                    pass
-                global_stall_task = None
+        # At the end of main loop, recompute global state once more so that
+        # a controlled restart has an up-to-date view of what was completed.
+        try:
+            await state.recompute_global_state()
+        except Exception:
+            logger.exception("Failed to recompute global crawl state at shutdown")
+
+        # If scheduler recommended a restart, write a final snapshot for debugging.
+        if scheduler is not None and scheduler.restart_recommended:
+            try:
+                snapshot = scheduler.get_state_snapshot()
+                final_path = out_dir / "adaptive_scheduling_final.json"
+                with final_path.open("w", encoding="utf-8") as f:
+                    json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                logger.info(
+                    "[AdaptiveScheduling] final snapshot written to %s",
+                    final_path,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to write final AdaptiveScheduling snapshot",
+                )
 
     finally:
-        if global_stall_task is not None:
-            global_stall_task.cancel()
-            try:
-                await global_stall_task
-            except asyncio.CancelledError:
-                pass
-
+        # Stop guard first to avoid new network attempts during teardown.
         try:
             await guard.stop()
         except Exception:
             logger.exception("Error while stopping ConnectivityGuard")
 
-        try:
-            await stall_guard.stop()
-        except Exception:
-            logger.exception("Error while stopping StallGuard")
-
+        # Close logging extension so per-company handlers are released.
         try:
             logging_ext.close()
         except Exception:
             logger.exception("Error while closing LoggingExtension")
 
+        # Stop resource monitor, flushing any pending samples.
         if resource_monitor is not None:
             try:
                 resource_monitor.stop()
             except Exception:
                 logger.exception("Error while stopping ResourceMonitor")
 
+        # Stop adaptive scheduler and its emergency watchdog.
         if scheduler is not None:
             try:
                 await scheduler.stop()

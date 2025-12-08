@@ -766,10 +766,11 @@ class HTMLContentFilter(URLFilter):
     Only keep URLs likely to be HTML over HTTP(S).
 
     Strategy:
-      - If scheme is non-HTTP(S) (mailto, tel, javascript, etc.) → DROP.
-      - If no extension → assume HTML → KEEP.
-      - If extension in known non-HTML list → DROP.
-      - Otherwise → KEEP (php/asp/jsp/etc).
+      - If scheme is non-HTTP(S) (mailto, tel, javascript, etc.) -> DROP.
+      - If path encodes a mailto: or tel: link even under http(s) -> DROP.
+      - If no extension -> assume HTML -> KEEP.
+      - If extension in known non-HTML list -> DROP.
+      - Otherwise -> KEEP (php/asp/jsp/etc).
     """
 
     __slots__ = ("_reject_exts",)
@@ -861,7 +862,6 @@ class HTMLContentFilter(URLFilter):
         return ext
 
     def apply(self, url: str) -> bool:
-        # First, drop non-HTTP(S) schemes like mailto:, tel:, javascript:, data:, etc.
         try:
             parsed = urlparse(url)
             scheme = (parsed.scheme or "").lower()
@@ -870,8 +870,34 @@ class HTMLContentFilter(URLFilter):
             scheme = ""
             path = url or ""
 
+        # Explicitly drop mailto: and tel: schemes
+        if scheme in ("mailto", "tel"):
+            result = False
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[HTMLContentFilter.apply] url=%s scheme=%s -> DROP (mailto/tel scheme)",
+                    url,
+                    scheme,
+                )
+            self._update_stats(result)
+            return result
+
+        # Also drop encoded tel/mailto links that have been wrapped in http(s)
+        # for example: https://example.com/tel:+123456 or /mailto:info@example.com
+        lowered_path = path.lstrip("/").lower()
+        if lowered_path.startswith("mailto:") or lowered_path.startswith("tel:"):
+            result = False
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(
+                    "[HTMLContentFilter.apply] url=%s path=%s -> DROP (mailto/tel path)",
+                    url,
+                    path,
+                )
+            self._update_stats(result)
+            return result
+
+        # Drop other non-http(s) schemes
         if scheme and scheme not in ("http", "https"):
-            # Explicitly DROP mailto:/tel:/javascript:/data:/...
             result = False
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(
@@ -982,16 +1008,18 @@ class LanguageAwareURLFilter(URLFilter):
             else spec_deny_tld.get(self._lang_code, [])
         )
 
-        self._allowed_tlds: Set[str] = {t.lower().lstrip(".") for t in (allow_src or [])}
+        self._allowed_tlds: Set[str] = {
+            t.lower().lstrip(".") for t in (allow_src or [])
+        }
         self._blocked_tlds: Set[str] = {t.lower().lstrip(".") for t in (deny_src or [])}
 
         # Host suffix rules are likewise language → {suffixes}
-        spec_allow_host: Dict[str, Iterable[str]] = spec.get(
-            "LANG_HOST_ALLOW_SUFFIXES", {}
-        ) or {}
-        spec_block_host: Dict[str, Iterable[str]] = spec.get(
-            "LANG_HOST_BLOCK_SUFFIXES", {}
-        ) or {}
+        spec_allow_host: Dict[str, Iterable[str]] = (
+            spec.get("LANG_HOST_ALLOW_SUFFIXES", {}) or {}
+        )
+        spec_block_host: Dict[str, Iterable[str]] = (
+            spec.get("LANG_HOST_BLOCK_SUFFIXES", {}) or {}
+        )
 
         allow_host_src = (
             allowed_host_suffixes
@@ -1012,7 +1040,9 @@ class LanguageAwareURLFilter(URLFilter):
         }
 
         # Path language tokens from language config (global mapping)
-        raw_path_tokens: Dict[str, Iterable[str]] = spec.get("PATH_LANG_TOKENS", {}) or {}
+        raw_path_tokens: Dict[str, Iterable[str]] = (
+            spec.get("PATH_LANG_TOKENS", {}) or {}
+        )
         self._path_lang_tokens: Dict[str, Set[str]] = {
             code.lower(): {str(v).lower() for v in vals}
             for code, vals in raw_path_tokens.items()
@@ -1175,3 +1205,4 @@ class LanguageAwareURLFilter(URLFilter):
             )
         self._update_stats(result)
         return result
+

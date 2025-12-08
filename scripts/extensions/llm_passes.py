@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from configs.llm import parse_extracted_payload, parse_presence_result
 from extensions.crawl_state import (
@@ -13,7 +13,6 @@ from extensions.crawl_state import (
     upsert_url_index_entry,
 )
 from extensions.output_paths import save_stage_output
-from extensions.adaptive_scheduling import StallGuard
 
 logger = logging.getLogger("llm_passes")
 
@@ -27,7 +26,6 @@ async def run_presence_pass_for_company(
     company: Any,
     *,
     presence_strategy: Any,
-    stall_guard: Optional[StallGuard] = None,
 ) -> None:
     """
     LLM presence pass for a single company.
@@ -61,10 +59,6 @@ async def run_presence_pass_for_company(
     index = load_url_index(company.company_id) or {}
     updated = 0
 
-    def _heartbeat() -> None:
-        if stall_guard is not None:
-            stall_guard.record_heartbeat("llm_presence", company_id=company.company_id)
-
     def _update(url: str, patch: Dict[str, Any], reason: str) -> None:
         nonlocal updated
         patch_full = {
@@ -76,7 +70,6 @@ async def run_presence_pass_for_company(
         patch_full.update(patch)
         upsert_url_index_entry(company.company_id, url, patch_full)
         updated += 1
-        _heartbeat()
 
     for url in pending_urls:
         ent = index.get(url) or {}
@@ -136,7 +129,6 @@ async def run_presence_pass_for_company(
 
         upsert_url_index_entry(company.company_id, url, patch)
         updated += 1
-        _heartbeat()
 
     logger.info(
         "LLM presence: updated %d URLs for company_id=%s",
@@ -160,7 +152,6 @@ async def run_full_pass_for_company(
     company: Any,
     *,
     full_strategy: Any,
-    stall_guard: Optional[StallGuard] = None,
 ) -> None:
     """
     LLM full extraction pass for a single company.
@@ -182,10 +173,6 @@ async def run_full_pass_for_company(
         return
 
     updated = 0
-
-    def _heartbeat() -> None:
-        if stall_guard is not None:
-            stall_guard.record_heartbeat("llm_full", company_id=company.company_id)
 
     for url, ent in index.items():
         if not isinstance(ent, dict):
@@ -209,7 +196,6 @@ async def run_full_pass_for_company(
                 url,
                 {"extracted": 0, "status": "llm_full_markdown_read_error"},
             )
-            _heartbeat()
             continue
 
         if not text.strip():
@@ -223,7 +209,6 @@ async def run_full_pass_for_company(
                     "status": "llm_full_empty_markdown",
                 },
             )
-            _heartbeat()
             continue
 
         try:
@@ -240,7 +225,6 @@ async def run_full_pass_for_company(
                 url,
                 {"extracted": 0, "status": f"llm_full_error:{type(e).__name__}"},
             )
-            _heartbeat()
             continue
 
         payload = parse_extracted_payload(raw_result)
@@ -265,7 +249,6 @@ async def run_full_pass_for_company(
                 url,
                 {"extracted": 0, "status": "llm_full_write_error"},
             )
-            _heartbeat()
             continue
 
         presence_flag = 1 if payload.offerings else 0
@@ -280,7 +263,6 @@ async def run_full_pass_for_company(
 
         upsert_url_index_entry(company.company_id, url, patch)
         updated += 1
-        _heartbeat()
 
     logger.info(
         "LLM full: wrote product JSON for %d URLs (company_id=%s)",
