@@ -56,108 +56,6 @@ class AdaptiveSchedulingConfig:
 
     All thresholds are expressed as fractions of the effective memory limit
     (host or cgroup).
-
-    mem_cap_frac:
-        Safe usable cap. The scheduler tries to keep estimated future memory
-        usage (current usage plus reservations for new companies) at or below
-        this value.
-
-    mem_high_frac:
-        Above this fraction, no new companies are admitted, but the scheduler
-        does not request cancellations yet.
-
-    mem_crit_high_frac:
-        Emergency cancellation starts once used memory fraction is at or
-        above this threshold.
-
-    mem_crit_low_frac:
-        Emergency cancellation stops once used memory fraction drops back
-        to or below this threshold. This introduces hysteresis so we do not
-        keep cancelling on every small fluctuation.
-
-    min_active_keep:
-        Minimum number of active companies the scheduler tries to preserve
-        even during emergency cancellation. If memory is still critical and
-        we cannot cancel without going below this, the scheduler marks that
-        a controlled restart is recommended.
-
-    peak_history_size:
-        Number of recent per company estimates kept in the history buffer.
-
-    per_company_safety_factor:
-        Multiplicative safety factor applied to the 95th percentile of the
-        history, to give a conservative reservation per company.
-
-    per_company_min_reservation_mb:
-        Minimum reservation per company when little history is available.
-
-    emergency_check_interval_sec:
-        Period for the background emergency watchdog loop.
-
-    log_path:
-        Optional path where the scheduler writes structured JSON snapshots
-        for debugging. Disabled by default.
-
-    use_psutil:
-        If False or psutil is not available, the scheduler falls back to a
-        very conservative mode that always returns at most 1 slot and does
-        not start the emergency watchdog.
-
-    prefer_cgroup_limits:
-        If True, the scheduler prefers cgroup v2 memory limits (memory.max /
-        memory.current) over host-wide memory when available.
-
-    swap_block_frac:
-        If swap_used / swap_total is at or above this fraction AND RAM usage
-        is already above mem_high_frac, new admissions are blocked.
-
-    swap_emergency_frac:
-        If swap_used / swap_total is at or above this fraction AND RAM usage
-        is already above mem_crit_low_frac, the watchdog treats the situation
-        as emergency even if RAM usage is below mem_crit_high_frac.
-
-    mem_trend_window_sec:
-        Window length for memory usage trend estimation.
-
-    mem_trend_slope_high_mb_per_s:
-        If the estimated slope of used memory is at or above this value
-        (MB/s), the scheduler treats it as “precritical” when near mem_cap.
-
-    mem_trend_margin_frac:
-        Margin below mem_cap_frac within which a high positive slope is
-        considered precritical.
-
-    ai_step:
-        Additive increase step for the concurrency target (companies).
-
-    md_factor:
-        Multiplicative decrease factor applied to the concurrency target when
-        memory trouble is detected.
-
-    min_target:
-        Minimum concurrency target (companies).
-
-    max_target:
-        Maximum concurrency target (companies).
-
-    near_oom_used_frac:
-        Used memory fraction threshold for near-OOM detection.
-
-    near_oom_swap_frac:
-        Swap usage fraction threshold for near-OOM detection.
-
-    near_oom_mem_cap_step:
-        Amount by which mem_cap_frac and mem_high_frac are reduced on each
-        new near-OOM event (process lifetime only).
-
-    mem_cap_min_frac:
-        Lower bound for mem_cap_frac during auto-tuning.
-
-    mem_high_min_frac:
-        Lower bound for mem_high_frac during auto-tuning.
-
-    company_profile_max_size:
-        Maximum number of per-company memory profiles kept in memory.
     """
 
     mem_cap_frac: float = 0.85
@@ -191,6 +89,14 @@ class AdaptiveSchedulingConfig:
     md_factor: float = 0.6
     min_target: int = 1
     max_target: int = 512
+
+    # Faster ramp-up at the start of the run
+    # initial_target: starting target_parallel
+    # warmup_updates: number of AIMD updates to treat as "warmup"
+    # warmup_ai_step: additive step during warmup (on top of initial_target)
+    initial_target: int = 2
+    warmup_updates: int = 8
+    warmup_ai_step: int = 4
 
     # (5) Safety margin auto-tuning
     near_oom_used_frac: float = 0.97
@@ -268,7 +174,13 @@ class AdaptiveScheduler:
         self._last_trend_slope_mb_s: float = 0.0
 
         # AIMD concurrency target (companies)
-        self._target_parallel: int = max(self.cfg.min_target, 1)
+        # Start higher than 1 to allow faster ramp at beginning.
+        self._target_parallel: int = min(
+            max(self.cfg.min_target, self.cfg.initial_target), self.cfg.max_target
+        )
+
+        # Count how many times we've updated target_parallel (for warmup)
+        self._update_calls: int = 0
 
         # Near-OOM bookkeeping for safety margin auto-tuning
         self._near_oom_events: int = 0
@@ -325,8 +237,10 @@ class AdaptiveScheduler:
             self._last_used_frac = (float(used) / total) if total > 0 else 0.0
 
             logger.info(
-                "[AdaptiveScheduling] started (total_mem_mb=%.1f, psutil=True)",
+                "[AdaptiveScheduling] started (total_mem_mb=%.1f, psutil=True, "
+                "initial_target_parallel=%d)",
                 (float(total) / 1e6) if total > 0 else -1.0,
+                self._target_parallel,
             )
 
             interval = max(0.5, float(self.cfg.emergency_check_interval_sec))
@@ -869,19 +783,29 @@ class AdaptiveScheduler:
         cfg = self.cfg
         old_target = self._target_parallel
 
+        # Count updates so we know if we are in warm-up phase
+        self._update_calls += 1
+
         if mem_trouble or high_swap or precritical:
+            # Multiplicative decrease on trouble or strong warning signs
             new_target = int(self._target_parallel * cfg.md_factor)
             if new_target < cfg.min_target:
                 new_target = cfg.min_target
             if new_target < 1:
                 new_target = 1
         else:
+            # Additive increase when comfortably below cap and trend is safe
             margin = cfg.mem_trend_margin_frac
             if (
                 used_frac < max(0.0, cfg.mem_cap_frac - margin)
                 and self._last_trend_slope_mb_s <= cfg.mem_trend_slope_high_mb_per_s
             ):
-                new_target = min(cfg.max_target, self._target_parallel + cfg.ai_step)
+                # During warm-up, use a larger step to ramp up faster
+                if self._update_calls <= cfg.warmup_updates:
+                    step = max(cfg.ai_step, cfg.warmup_ai_step)
+                else:
+                    step = cfg.ai_step
+                new_target = min(cfg.max_target, self._target_parallel + step)
             else:
                 new_target = self._target_parallel
 
@@ -891,7 +815,8 @@ class AdaptiveScheduler:
             logger.info(
                 "[AdaptiveScheduling] target_parallel updated: %d -> %d "
                 "(used_frac=%.3f, swap_frac=%.3f, slope=%.1fMB/s, "
-                "precritical=%s, high_swap=%s, mem_trouble=%s)",
+                "precritical=%s, high_swap=%s, mem_trouble=%s, "
+                "update_calls=%d)",
                 old_target,
                 new_target,
                 used_frac,
@@ -900,6 +825,7 @@ class AdaptiveScheduler:
                 precritical,
                 high_swap,
                 mem_trouble,
+                self._update_calls,
             )
 
     def _maybe_log_state_locked(
