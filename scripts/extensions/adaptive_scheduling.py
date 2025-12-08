@@ -108,13 +108,13 @@ class AdaptiveSchedulingConfig:
         memory.current) over host-wide memory when available.
 
     swap_block_frac:
-        If swap_used / swap_total is at or above this fraction, new admissions
-        are blocked even if RAM usage is below mem_high_frac.
+        If swap_used / swap_total is at or above this fraction AND RAM usage
+        is already above mem_high_frac, new admissions are blocked.
 
     swap_emergency_frac:
-        If swap_used / swap_total is at or above this fraction, the watchdog
-        treats the situation as emergency even if RAM usage is below
-        mem_crit_high_frac.
+        If swap_used / swap_total is at or above this fraction AND RAM usage
+        is already above mem_crit_low_frac, the watchdog treats the situation
+        as emergency even if RAM usage is below mem_crit_high_frac.
 
     mem_trend_window_sec:
         Window length for memory usage trend estimation.
@@ -217,16 +217,6 @@ class AdaptiveScheduler:
       - Optional per-company heaviness profiles
       - AIMD-style concurrency target
       - Safety margin auto-tuning
-
-    The scheduler itself does not manage asyncio.Task objects or any crawl
-    logic. Callers provide two callbacks:
-
-      get_active_company_ids()
-          Returns the list of company ids currently running.
-
-      request_cancel_companies(company_ids)
-          Called by the scheduler when it wants some companies to be
-          cancelled due to emergency memory pressure.
     """
 
     def __init__(
@@ -304,9 +294,6 @@ class AdaptiveScheduler:
         """
         Optional hint from the caller: record a per-company peak memory estimate
         (in MB). This is used to tighten the global estimate for future runs.
-
-        This method is intentionally lightweight and not locked; minor races are
-        acceptable since the data is only used for conservative estimation.
         """
         if not company_id or peak_mb <= 0:
             return
@@ -330,13 +317,8 @@ class AdaptiveScheduler:
     async def start(self) -> None:
         """
         Initialize memory information and start the emergency watchdog loop.
-
-        If psutil is not available, this logs a warning and skips starting
-        the watchdog. In that case admissible_slots will behave in a very
-        conservative way.
         """
         if self._psutil_available:
-            # Initialize total memory once
             total, used = self._read_memory_usage_bytes()
             self._total_mem_bytes = total or None
             self._last_used_bytes = used
@@ -386,29 +368,6 @@ class AdaptiveScheduler:
     async def admissible_slots(self, num_waiting: int) -> int:
         """
         Decide how many new companies can be started right now.
-
-        Parameters
-        ----------
-        num_waiting:
-            Number of companies currently in the waiting queue.
-
-        Returns
-        -------
-        int
-            Number of companies that can be safely started now.
-            Always greater than or equal to zero and less than or equal
-            to num_waiting.
-
-        Behavior
-        --------
-        - If psutil is unavailable, returns at most 1 slot (very conservative).
-        - Uses effective memory limit (host or cgroup), host memory usage,
-          swap usage, and the current per company estimate to compute a safe
-          number of new companies:
-
-              M_used + P_est * slots <= M_cap
-
-          where M_cap = mem_cap_frac * total_mem_bytes.
         """
         if num_waiting <= 0:
             return 0
@@ -442,7 +401,11 @@ class AdaptiveScheduler:
                 used_frac >= max(0.0, cfg.mem_cap_frac - cfg.mem_trend_margin_frac)
                 and self._last_trend_slope_mb_s >= cfg.mem_trend_slope_high_mb_per_s
             )
-            high_swap_block = swap_frac >= cfg.swap_block_frac
+
+            # Swap alone should not block admissions when RAM is low.
+            high_swap_block = (
+                swap_frac >= cfg.swap_block_frac and used_frac >= cfg.mem_high_frac
+            )
             mem_trouble = used_frac >= cfg.mem_high_frac or high_swap_block
 
             # AIMD target update
@@ -453,7 +416,7 @@ class AdaptiveScheduler:
                 mem_trouble=mem_trouble,
             )
 
-            # Above high watermark or critical swap: do not admit new work.
+            # Above high watermark or critical swap with high RAM: do not admit.
             if mem_trouble:
                 reason = (
                     "swap_block"
@@ -576,24 +539,27 @@ class AdaptiveScheduler:
                         used_bytes=used, num_active=num_active
                     )
 
-                    # Emergency condition: high RAM or very high swap
-                    in_emergency = (
-                        used_frac >= cfg.mem_crit_high_frac
-                        or swap_frac >= cfg.swap_emergency_frac
+                    # Emergency condition: high RAM or very high swap while RAM is already high
+                    in_emergency = used_frac >= cfg.mem_crit_high_frac or (
+                        swap_frac >= cfg.swap_emergency_frac
+                        and used_frac >= cfg.mem_crit_low_frac
                     )
                     if not in_emergency:
                         continue
 
                     # AIMD: strong multiplicative decrease on emergency
+                    high_swap = (
+                        swap_frac >= cfg.swap_block_frac
+                        and used_frac >= cfg.mem_high_frac
+                    )
                     self._update_target_parallel_locked(
                         used_frac=used_frac,
                         precritical=False,
-                        high_swap=swap_frac >= cfg.swap_block_frac,
+                        high_swap=high_swap,
                         mem_trouble=True,
                     )
 
                     if num_active <= 0:
-                        # Nothing to cancel but memory is critical; recommend restart.
                         if not self._restart_recommended:
                             self._restart_recommended = True
                             logger.error(
@@ -620,7 +586,6 @@ class AdaptiveScheduler:
                         int(self.cfg.per_company_min_reservation_mb * 1e6),
                     )
                     if per_company_bytes <= 0:
-                        # Cannot estimate; cancel just one as a minimal action.
                         needed_cancel = 1
                     else:
                         needed_cancel = int(
@@ -644,8 +609,6 @@ class AdaptiveScheduler:
                         continue
 
                     to_cancel_count = min(needed_cancel, max_cancelable)
-                    # We assume get_active_company_ids returns an order where
-                    # younger tasks are later in the sequence; cancel from the end.
                     to_cancel = list(active_ids)[-to_cancel_count:]
 
                     logger.error(
@@ -666,10 +629,8 @@ class AdaptiveScheduler:
                         len(to_cancel),
                     )
 
-                    # Copy ids to cancel outside the lock.
                     cancel_ids: List[str] = list(to_cancel)
 
-                # Call the cancellation callback outside the lock.
                 if cancel_ids:
                     try:
                         self._request_cancel_companies(cancel_ids)
@@ -738,7 +699,6 @@ class AdaptiveScheduler:
 
             used = int(cur_raw)
             if not max_raw or max_raw == "max":
-                # No explicit cgroup limit; caller should fall back to host.
                 return 0, used
 
             limit = int(max_raw)
@@ -749,22 +709,10 @@ class AdaptiveScheduler:
     def _read_memory_usage_bytes(self) -> Tuple[int, int]:
         """
         Read total and used memory in bytes.
-
-        Preference order:
-          - cgroup v2 memory limits (memory.max / memory.current), if enabled.
-          - host-level memory from psutil.virtual_memory().
-
-        Uses host level memory from psutil.virtual_memory():
-
-            total = vm.total
-            used  = vm.total - vm.available
-
-        Returns (0, 0) if psutil is not available.
         """
         if not self._psutil_available or psutil is None:
             return 0, 0
 
-        # cgroup-aware path
         if self.cfg.prefer_cgroup_limits:
             limit, used = self._read_cgroup_memory_bytes()
             if limit > 0:
@@ -776,7 +724,6 @@ class AdaptiveScheduler:
             vm = psutil.virtual_memory()  # type: ignore[union-attr]
             total = int(vm.total)
             used = int(vm.total - vm.available)
-            # Cache total if not set yet.
             if self._total_mem_bytes is None and total > 0:
                 self._total_mem_bytes = total
             return total, used
@@ -803,14 +750,11 @@ class AdaptiveScheduler:
 
     def _record_memory_sample_locked(self, *, ts: float, used_bytes: int) -> None:
         """
-        Update rolling window of memory samples and recompute slope
-        (MB/s) over the window.
-        Caller must hold _lock.
+        Update rolling window of memory samples and recompute slope (MB/s).
         """
         window = max(1.0, float(self.cfg.mem_trend_window_sec))
         self._mem_samples.append((ts, used_bytes))
         cutoff = ts - window
-        # Prune old samples
         self._mem_samples = [(t, u) for (t, u) in self._mem_samples if t >= cutoff]
 
         if len(self._mem_samples) >= 2:
@@ -827,7 +771,6 @@ class AdaptiveScheduler:
     def _get_company_p95_est_mb_locked(self) -> Optional[float]:
         """
         Compute 95th percentile of per-company peak estimates, if any.
-        Caller must hold _lock.
         """
         if not self._company_peak_mb:
             return None
@@ -842,26 +785,13 @@ class AdaptiveScheduler:
         num_active: int,
     ) -> None:
         """
-        Update the global per-company memory estimate based on current host usage
-        and number of active companies.
-
-        The heuristic is:
-
-            per_company_now_mb = (used_bytes / num_active) in MB
-
-        which is then collected into a history buffer. P_est is set to
-
-            safety_factor * max(q95, per_company_min_reservation_mb)
-
-        and is kept monotonically non decreasing over the lifetime of the
-        scheduler for safety.
+        Update the global per-company memory estimate.
         """
         if used_bytes <= 0 or num_active <= 0 or self._total_mem_bytes is None:
             return
 
         per_company_now_mb = (float(used_bytes) / float(num_active)) / 1e6
 
-        # Keep history bounded.
         self._peak_history_mb.append(per_company_now_mb)
         if len(self._peak_history_mb) > self.cfg.peak_history_size:
             self._peak_history_mb.pop(0)
@@ -875,7 +805,6 @@ class AdaptiveScheduler:
         base = max(q95, self.cfg.per_company_min_reservation_mb)
         new_est = self.cfg.per_company_safety_factor * base
 
-        # Monotonic non decreasing for safety.
         if new_est > self._per_company_est_mb * 1.1:
             logger.info(
                 "[AdaptiveScheduling] per company estimate updated: "
@@ -895,11 +824,10 @@ class AdaptiveScheduler:
         """
         Detect near-OOM situations and auto-tune mem_cap_frac / mem_high_frac
         downward for the remainder of the process lifetime.
-        Caller must hold _lock.
         """
         cfg = self.cfg
-        is_near = (
-            used_frac >= cfg.near_oom_used_frac or swap_frac >= cfg.near_oom_swap_frac
+        is_near = used_frac >= cfg.near_oom_used_frac or (
+            swap_frac >= cfg.near_oom_swap_frac and used_frac >= cfg.mem_crit_low_frac
         )
 
         if is_near and not self._last_near_oom_flag:
@@ -937,20 +865,17 @@ class AdaptiveScheduler:
     ) -> None:
         """
         AIMD style concurrency controller for target_parallel.
-        Caller must hold _lock.
         """
         cfg = self.cfg
         old_target = self._target_parallel
 
         if mem_trouble or high_swap or precritical:
-            # Multiplicative decrease on trouble or strong warning signs
             new_target = int(self._target_parallel * cfg.md_factor)
             if new_target < cfg.min_target:
                 new_target = cfg.min_target
             if new_target < 1:
                 new_target = 1
         else:
-            # Additive increase when comfortably below cap and trend is safe
             margin = cfg.mem_trend_margin_frac
             if (
                 used_frac < max(0.0, cfg.mem_cap_frac - margin)
@@ -985,9 +910,6 @@ class AdaptiveScheduler:
     ) -> None:
         """
         Optionally write a JSON state line to log_path for offline analysis.
-
-        This is rate limited to avoid excessive disk writes.
-        Caller must hold _lock.
         """
         if self.cfg.log_path is None:
             return
