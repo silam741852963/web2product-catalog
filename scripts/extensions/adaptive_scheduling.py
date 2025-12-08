@@ -91,9 +91,6 @@ class AdaptiveSchedulingConfig:
     max_target: int = 512
 
     # Faster ramp-up at the start of the run
-    # initial_target: starting target_parallel
-    # warmup_updates: number of AIMD updates to treat as "warmup"
-    # warmup_ai_step: additive step during warmup (on top of initial_target)
     initial_target: int = 4
     warmup_updates: int = 10
     warmup_ai_step: int = 8
@@ -107,6 +104,12 @@ class AdaptiveSchedulingConfig:
 
     # (3) Per-company profiles
     company_profile_max_size: int = 2000
+
+    # Unstall heuristics
+    # If slots_by_mem == 0 but used_frac is clearly below this, we relax estimates.
+    unstall_low_frac: float = 0.70
+    # Cooldown between automatic resets in seconds
+    unstall_cooldown_sec: float = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +177,6 @@ class AdaptiveScheduler:
         self._last_trend_slope_mb_s: float = 0.0
 
         # AIMD concurrency target (companies)
-        # Start higher than 1 to allow faster ramp at beginning.
         self._target_parallel: int = min(
             max(self.cfg.min_target, self.cfg.initial_target), self.cfg.max_target
         )
@@ -185,6 +187,9 @@ class AdaptiveScheduler:
         # Near-OOM bookkeeping for safety margin auto-tuning
         self._near_oom_events: int = 0
         self._last_near_oom_flag: bool = False
+
+        # Unstall bookkeeping
+        self._last_unstall_ts: float = 0.0
 
     # ------------------------------------------------------------------ #
     # Public properties
@@ -368,7 +373,7 @@ class AdaptiveScheduler:
             active_ids = list(self._get_active_company_ids())
             num_active = len(active_ids)
             self._update_per_company_estimate_locked(
-                used_bytes=used, num_active=num_active
+                used_bytes=used, num_active=num_active, used_frac=used_frac
             )
 
             # Effective per-company estimate (global + per-company profiles)
@@ -392,12 +397,48 @@ class AdaptiveScheduler:
 
             slots_by_mem = int(headroom_bytes // per_company_bytes)
 
-            # Key anti-stall: if nothing is active, always allow at least one
+            # Key anti-stall 1: if nothing is active, always allow at least one
             # company to start (below mem_high_frac), even if the model says 0.
-            if num_active == 0 and slots_by_mem <= 0:
+            if num_active == 0 and slots_by_mem <= 0 and used_frac < cfg.mem_high_frac:
                 slots_by_mem = 1
 
+            # Key anti-stall 2: estimator has become over-conservative.
+            # Condition: we are below mem_cap_frac, not in mem_trouble,
+            # there is headroom, num_active > 0, num_waiting > 0,
+            # but slots_by_mem == 0.
+            if (
+                slots_by_mem <= 0
+                and not mem_trouble
+                and headroom_bytes > 0
+                and num_active > 0
+                and num_waiting > 0
+                and used_frac < cfg.mem_cap_frac
+            ):
+                self._maybe_unstall_locked(
+                    total=total,
+                    used=used,
+                    headroom_bytes=headroom_bytes,
+                    used_frac=used_frac,
+                )
+                # recompute effective_est_mb and slots_by_mem after reset
+                effective_est_mb = self._per_company_est_mb
+                company_p95 = self._get_company_p95_est_mb_locked()
+                if company_p95 is not None and company_p95 > effective_est_mb:
+                    effective_est_mb = company_p95
+
+                max_safe_mb = (cfg.mem_cap_frac * float(total)) / 1e6
+                if max_safe_mb > 0.0 and effective_est_mb > max_safe_mb:
+                    effective_est_mb = max_safe_mb
+
+                per_company_bytes = max(
+                    int(effective_est_mb * 1e6),
+                    int(self.cfg.per_company_min_reservation_mb * 1e6),
+                )
+                if per_company_bytes > 0:
+                    slots_by_mem = int(headroom_bytes // per_company_bytes)
+
             if slots_by_mem <= 0:
+                # Still no safe slot.
                 return 0
 
             # Apply AIMD target cap
@@ -422,10 +463,69 @@ class AdaptiveScheduler:
                     "swap_used_frac": swap_frac,
                     "trend_slope_mb_s": self._last_trend_slope_mb_s,
                     "target_parallel": self._target_parallel,
+                    "slots_by_mem": slots_by_mem,
                 },
             )
 
             return slots
+
+    def _maybe_unstall_locked(
+        self,
+        *,
+        total: int,
+        used: int,
+        headroom_bytes: int,
+        used_frac: float,
+    ) -> None:
+        """
+        Detect and fix stalls caused by an over-conservative per-company
+        estimate.
+
+        Strategy:
+          - Only trigger when memory usage is clearly below mem_cap_frac
+            and below a "low" unstall threshold.
+          - Clear history and per-company profiles.
+          - Reset the global per-company estimate to something compatible
+            with current headroom (but not below per_company_min_reservation_mb).
+        """
+        now = time.time()
+        cfg = self.cfg
+
+        if used_frac >= cfg.unstall_low_frac:
+            return
+
+        if now - self._last_unstall_ts < cfg.unstall_cooldown_sec:
+            return
+
+        headroom_mb = float(headroom_bytes) / 1e6
+        if headroom_mb <= cfg.per_company_min_reservation_mb:
+            # Not enough room even for one min-sized company; nothing to do.
+            return
+
+        old_est = self._per_company_est_mb
+
+        # Reset global estimate to allow at least one company in headroom,
+        # but keep at or above the configured minimum.
+        new_est = min(old_est, headroom_mb)
+        new_est = max(cfg.per_company_min_reservation_mb, new_est)
+
+        # Clear history and per-company profiles so we don't immediately
+        # re-apply old heavy tails.
+        self._peak_history_mb.clear()
+        self._company_peak_mb.clear()
+        self._company_order.clear()
+
+        self._per_company_est_mb = new_est
+        self._last_unstall_ts = now
+
+        logger.warning(
+            "[AdaptiveScheduling] unstall reset: per_company_est_mb %.1fMB -> %.1fMB "
+            "(used_frac=%.3f, headroom_mb=%.1f)",
+            old_est,
+            new_est,
+            used_frac,
+            headroom_mb,
+        )
 
     # ------------------------------------------------------------------ #
     # Emergency watchdog
@@ -465,7 +565,7 @@ class AdaptiveScheduler:
                     active_ids = list(self._get_active_company_ids())
                     num_active = len(active_ids)
                     self._update_per_company_estimate_locked(
-                        used_bytes=used, num_active=num_active
+                        used_bytes=used, num_active=num_active, used_frac=used_frac
                     )
 
                     # Emergency condition: high RAM or very high swap while RAM is already high
@@ -510,7 +610,6 @@ class AdaptiveScheduler:
                     if company_p95 is not None and company_p95 > effective_est_mb:
                         effective_est_mb = company_p95
 
-                    # Bound effective estimate by safe cap here as well
                     max_safe_mb = (cfg.mem_cap_frac * float(total)) / 1e6
                     if max_safe_mb > 0.0 and effective_est_mb > max_safe_mb:
                         effective_est_mb = max_safe_mb
@@ -717,52 +816,73 @@ class AdaptiveScheduler:
         *,
         used_bytes: int,
         num_active: int,
+        used_frac: float,
     ) -> None:
         """
         Update the global per-company memory estimate.
 
-        We only learn from situations where at least 2 companies are active.
-        With a single active company, "used / 1" is too noisy and tends to
-        overestimate because it includes process overhead.
+        We want:
+          - Robust upward learning when several companies are active.
+          - Slow, controlled downward adjustment when memory is clearly safe,
+            even if only 1 company is active, to avoid stalls at the tail.
         """
-        if used_bytes <= 0 or num_active <= 1 or self._total_mem_bytes is None:
+        if used_bytes <= 0 or self._total_mem_bytes is None:
             return
 
-        per_company_now_mb = (float(used_bytes) / float(num_active)) / 1e6
+        cfg = self.cfg
+        total = float(self._total_mem_bytes)
+        used = float(used_bytes)
 
-        self._peak_history_mb.append(per_company_now_mb)
-        if len(self._peak_history_mb) > self.cfg.peak_history_size:
-            self._peak_history_mb.pop(0)
+        if num_active <= 0:
+            return
 
+        per_company_now_mb = (used / float(num_active)) / 1e6
+
+        # Only add to peak history when we have at least 2 actives.
+        if num_active >= 2:
+            self._peak_history_mb.append(per_company_now_mb)
+            if len(self._peak_history_mb) > cfg.peak_history_size:
+                self._peak_history_mb.pop(0)
+
+        # Upward estimate from history (q95 * safety_factor)
         sorted_hist = sorted(self._peak_history_mb)
-        if not sorted_hist:
-            return
+        if sorted_hist:
+            idx = max(0, int(0.95 * len(sorted_hist)) - 1)
+            q95 = sorted_hist[idx]
+            base = max(q95, cfg.per_company_min_reservation_mb)
+            upward_est = cfg.per_company_safety_factor * base
+        else:
+            upward_est = self._per_company_est_mb
 
-        idx = max(0, int(0.95 * len(sorted_hist)) - 1)
-        q95 = sorted_hist[idx]
-        base = max(q95, self.cfg.per_company_min_reservation_mb)
-        new_est = self.cfg.per_company_safety_factor * base
-
-        # Bound estimate so it cannot exceed the safe cap.
-        max_safe_mb = (self.cfg.mem_cap_frac * float(self._total_mem_bytes)) / 1e6
-        if max_safe_mb > 0.0 and new_est > max_safe_mb:
-            new_est = max_safe_mb
+        # Bound upward estimate by safe cap.
+        max_safe_mb = (cfg.mem_cap_frac * total) / 1e6
+        if max_safe_mb > 0.0 and upward_est > max_safe_mb:
+            upward_est = max_safe_mb
 
         old_est = self._per_company_est_mb
-        # Allow both growth and shrink, but never below the minimum reservation.
-        self._per_company_est_mb = max(
-            self.cfg.per_company_min_reservation_mb,
-            new_est,
-        )
+        new_est = max(cfg.per_company_min_reservation_mb, upward_est)
+
+        # Controlled downward adjustment:
+        # If memory usage is clearly in a safe region, and the naive
+        # per-company_now_mb is significantly smaller than our current
+        # estimate, gently move the estimate downwards.
+        if used_frac < cfg.unstall_low_frac and per_company_now_mb * 1.5 < old_est:
+            # Move 10% of the way towards the current observation (smoothed)
+            target = max(cfg.per_company_min_reservation_mb, per_company_now_mb)
+            lowered = old_est * 0.9 + target * 0.1
+            if lowered < new_est:
+                new_est = lowered
+
+        self._per_company_est_mb = new_est
 
         if self._per_company_est_mb > old_est * 1.1:
             logger.info(
                 "[AdaptiveScheduling] per company estimate updated: "
-                "%.1fMB -> %.1fMB (q95=%.1fMB, active=%d)",
+                "%.1fMB -> %.1fMB (active=%d, used_frac=%.3f)",
                 old_est,
                 self._per_company_est_mb,
-                q95,
                 num_active,
+                used_frac,
             )
 
     def _register_near_oom_locked(

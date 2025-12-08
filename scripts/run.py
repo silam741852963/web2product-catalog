@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import gc
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +75,7 @@ from extensions.retry_tracker import (
     mark_company_timeout,
     mark_company_memory_pressure,
     mark_company_completed,
+    mark_company_stalled,
 )
 from extensions.adaptive_scheduling import (
     AdaptiveSchedulingConfig,
@@ -260,7 +262,6 @@ async def crawl_company(
                             company.company_id,
                             e,
                         )
-                        # Stop consuming this stream; cleanup in finally via aclose.
                         break
 
                     try:
@@ -274,8 +275,6 @@ async def crawl_company(
                             mark_company_memory_cb=mark_company_memory_pressure,
                         )
                     except CriticalMemoryPressure as e:
-                        # Stop streaming but remember the exception so it can be
-                        # re-raised after we close the generator.
                         pending_exc = e
                         break
                     except Exception as e:
@@ -286,10 +285,8 @@ async def crawl_company(
                             company.company_id,
                             e,
                         )
-                        # Continue with next page.
                         continue
             except asyncio.CancelledError as e:
-                # Task-level cancellation (scheduler).
                 logger.warning(
                     "crawl_company cancelled for company_id=%s root=%s; closing stream.",
                     company.company_id,
@@ -297,7 +294,6 @@ async def crawl_company(
                 )
                 pending_exc = e
             finally:
-                # Always close the generator so Playwright resources are freed.
                 aclose = getattr(agen, "aclose", None)
                 if aclose is not None:
                     try:
@@ -310,12 +306,10 @@ async def crawl_company(
                         )
 
             if pending_exc is not None:
-                # Propagate cancellation or memory pressure to the caller.
                 if isinstance(pending_exc, asyncio.CancelledError):
                     raise pending_exc
                 if isinstance(pending_exc, CriticalMemoryPressure):
                     raise pending_exc
-                # Other exceptions were already logged; do not abort the whole company.
 
         # Non streaming list result
         else:
@@ -496,7 +490,6 @@ async def run_company_pipeline(
                 bm25_filter=bm25_filter,
             )
 
-            # Wire --max-pages into the deep crawl strategy itself.
             max_pages_for_strategy: Optional[int] = None
             if getattr(args, "max_pages", None) is not None and args.max_pages > 0:
                 max_pages_for_strategy = int(args.max_pages)
@@ -524,7 +517,6 @@ async def run_company_pipeline(
                     page_interaction_factory=page_interaction_factory,
                     page_timeout_ms=page_timeout_ms,
                 )
-                # After the crawl, recompute company-level state from the index.
                 await state.recompute_company_from_index(
                     company.company_id,
                     name=None,
@@ -549,7 +541,6 @@ async def run_company_pipeline(
                 "Company pipeline cancelled for company_id=%s",
                 company.company_id,
             )
-            # Do not do further async work here to keep cancellation responsive.
             raise
 
         except CriticalMemoryPressure:
@@ -566,12 +557,10 @@ async def run_company_pipeline(
                 e,
             )
 
-        # Only executed if we were not cancelled or aborted by CriticalMemoryPressure.
         try:
             snap_meta = await state.get_company_snapshot(company.company_id)
             _write_crawl_meta(company, snap_meta)
         except asyncio.CancelledError:
-            # If we are being cancelled, just propagate.
             raise
         except Exception:
             logger.exception(
@@ -595,7 +584,6 @@ async def run_company_pipeline(
             mark_company_completed(company.company_id)
 
     finally:
-        # Always release logging resources for this company.
         if token is not None:
             try:
                 logging_ext.reset_company_context(token)
@@ -764,7 +752,6 @@ async def main_async(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     output_paths.OUTPUT_ROOT = out_dir  # type: ignore[attr-defined]
 
-    # Retry tracker
     retry_cfg = RetryTrackerConfig(out_dir=out_dir)
     retry_tracker = RetryTracker(retry_cfg)
     _retry_tracker_instance = retry_tracker
@@ -879,17 +866,12 @@ async def main_async(args: argparse.Namespace) -> None:
 
     state = get_crawl_state()
 
-    # Mapping from company id to its asyncio.Task (for AdaptiveScheduler callbacks).
     company_tasks: Dict[str, asyncio.Task] = {}
 
     def _get_active_company_ids() -> List[str]:
-        # Only report truly active tasks so scheduler cancellations are accurate.
         return [cid for cid, t in company_tasks.items() if not t.done()]
 
     def _request_cancel_companies(ids: Iterable[str]) -> None:
-        # Synchronous callback from AdaptiveScheduler emergency watchdog.
-        # We only cancel tasks here; per-company cleanup happens in
-        # crawl_company (generator aclose) and in run_company_pipeline finally.
         for cid in ids:
             task = company_tasks.get(cid)
             if task is None or task.done():
@@ -898,7 +880,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 "[AdaptiveScheduling] cancelling company_id=%s due to emergency memory pressure",
                 cid,
             )
-            # Mark for retry as memory-pressure victim.
             mark_company_memory_pressure(cid)
             task.cancel()
 
@@ -906,7 +887,6 @@ async def main_async(args: argparse.Namespace) -> None:
     abort_run = False
 
     try:
-        # Load companies
         if args.company_file:
             companies: List[Company] = _companies_from_source(Path(args.company_file))
         else:
@@ -920,7 +900,6 @@ async def main_async(args: argparse.Namespace) -> None:
 
         total_input = len(companies)
 
-        # Apply retry filter
         if retry_company_mode == "skip-retry" and prev_retry_ids:
             before = len(companies)
             companies = [c for c in companies if c.company_id not in prev_retry_ids]
@@ -964,7 +943,6 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception:
             logger.exception("Failed to recompute global crawl state at startup")
 
-        # Pre check statuses and skip already completed companies.
         companies_to_run: List[Company] = []
         skipped_companies: List[Company] = []
 
@@ -1024,7 +1002,6 @@ async def main_async(args: argparse.Namespace) -> None:
 
         max_companies = max(1, int(args.company_concurrency))
 
-        # DFS factory only needed when selected.
         dfs_factory: Optional[DeepCrawlStrategyFactory] = None
         if args.strategy == "dfs":
             dfs_factory = DeepCrawlStrategyFactory(
@@ -1042,7 +1019,6 @@ async def main_async(args: argparse.Namespace) -> None:
             headless=True,
         )
 
-        # Initialize adaptive scheduler with extended configuration.
         scheduler_log_path = out_dir / "adaptive_scheduling_state.jsonl"
         scheduler_cfg = AdaptiveSchedulingConfig(
             log_path=scheduler_log_path,
@@ -1068,8 +1044,6 @@ async def main_async(args: argparse.Namespace) -> None:
             total_companies = len(companies)
 
             while not abort_run and (ready_queue or inflight):
-                # If scheduler indicates that a controlled restart is recommended,
-                # stop launching new work and move towards a clean shutdown.
                 if scheduler.restart_recommended:
                     abort_run = True
                     logger.error(
@@ -1081,8 +1055,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 active_tasks = len(inflight)
                 num_waiting = len(ready_queue)
 
-                # Decide how many new companies to start, respecting both memory and
-                # hard concurrency cap.
                 slots_mem = 0
                 if num_waiting > 0:
                     slots_mem = await scheduler.admissible_slots(
@@ -1094,6 +1066,45 @@ async def main_async(args: argparse.Namespace) -> None:
                     0,
                     min(slots_mem, available_concurrency, num_waiting),
                 )
+
+                # Soft stall recovery:
+                # If scheduler refuses new slots while memory usage is clearly
+                # below its cap and we still have waiting work plus at least
+                # one active company, treat the active company as a stalled
+                # memory holder, cancel it to free resources, and continue
+                # within the same run.
+                if (
+                    scheduler is not None
+                    and slots_to_start == 0
+                    and num_waiting > 0
+                    and active_tasks > 0
+                ):
+                    snap = scheduler.get_state_snapshot()
+                    used_frac = float(snap.get("used_frac", 0.0))
+                    mem_cap_frac = float(snap.get("mem_cap_frac", 0.0))
+                    if mem_cap_frac > 0.0 and used_frac < mem_cap_frac * 0.80:
+                        stalled_ids = _get_active_company_ids()
+                        if stalled_ids:
+                            stalled_cid = stalled_ids[0]
+                            stalled_task = company_tasks.get(stalled_cid)
+                            if stalled_task is not None and not stalled_task.done():
+                                logger.warning(
+                                    "[Scheduler] detected low-memory stall "
+                                    "(used_frac=%.3f < 0.8*mem_cap_frac=%.3f, "
+                                    "active=%d, waiting=%d); cancelling stalled "
+                                    "company_id=%s to free resources and continue "
+                                    "within the same run.",
+                                    used_frac,
+                                    mem_cap_frac,
+                                    active_tasks,
+                                    num_waiting,
+                                    stalled_cid,
+                                )
+                                stalled_task.cancel()
+                                gc.collect()
+                                await asyncio.sleep(1.0)
+                                continue
+                            mark_company_stalled(stalled_cid)
 
                 if slots_to_start > 0:
                     for _ in range(slots_to_start):
@@ -1163,14 +1174,10 @@ async def main_async(args: argparse.Namespace) -> None:
 
                 if not inflight:
                     if ready_queue and slots_to_start == 0:
-                        # Nothing running but cannot start new work due to memory;
-                        # give the system a moment before rechecking.
                         await asyncio.sleep(1.0)
                         continue
-                    # No work left.
                     break
 
-                # Wait for at least one company to finish.
                 done, pending = await asyncio.wait(
                     inflight,
                     return_when=asyncio.FIRST_COMPLETED,
@@ -1190,14 +1197,11 @@ async def main_async(args: argparse.Namespace) -> None:
                             "Company task cancelled for company_id=%s",
                             resolved_cid,
                         )
-                        # For cancelled tasks, resources are cleaned up in the
-                        # company pipeline and crawl-company generator close.
                         continue
 
                     try:
                         exc = t.exception()
                     except asyncio.CancelledError:
-                        # We are shutting down; nothing more to do.
                         continue
 
                     if exc is not None:
@@ -1216,9 +1220,6 @@ async def main_async(args: argparse.Namespace) -> None:
                                 exc,
                             )
 
-            # If we are aborting (scheduler restart) or an outer condition,
-            # cancel all remaining inflight tasks and wait for them to release
-            # their resources (Playwright pages, loggers, etc).
             if abort_run and inflight:
                 logger.error(
                     "Aborting run with %d inflight company tasks; cancelling them now.",
@@ -1233,14 +1234,11 @@ async def main_async(args: argparse.Namespace) -> None:
                     logger.exception("Error while waiting for cancelled tasks")
                 inflight.clear()
 
-        # At the end of main loop, recompute global state once more so that
-        # a controlled restart has an up-to-date view of what was completed.
         try:
             await state.recompute_global_state()
         except Exception:
             logger.exception("Failed to recompute global crawl state at shutdown")
 
-        # If scheduler recommended a restart, write a final snapshot for debugging.
         if scheduler is not None and scheduler.restart_recommended:
             try:
                 snapshot = scheduler.get_state_snapshot()
@@ -1257,26 +1255,22 @@ async def main_async(args: argparse.Namespace) -> None:
                 )
 
     finally:
-        # Stop guard first to avoid new network attempts during teardown.
         try:
             await guard.stop()
         except Exception:
             logger.exception("Error while stopping ConnectivityGuard")
 
-        # Close logging extension so per-company handlers are released.
         try:
             logging_ext.close()
         except Exception:
             logger.exception("Error while closing LoggingExtension")
 
-        # Stop resource monitor, flushing any pending samples.
         if resource_monitor is not None:
             try:
                 resource_monitor.stop()
             except Exception:
                 logger.exception("Error while stopping ResourceMonitor")
 
-        # Stop adaptive scheduler and its emergency watchdog.
         if scheduler is not None:
             try:
                 await scheduler.stop()
