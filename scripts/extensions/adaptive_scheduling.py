@@ -63,7 +63,7 @@ class AdaptiveSchedulingConfig:
     mem_crit_high_frac: float = 0.95
     mem_crit_low_frac: float = 0.90
 
-    min_active_keep: int = 1
+    min_active_keep: int = 0
 
     peak_history_size: int = 100
     per_company_safety_factor: float = 1.3
@@ -629,6 +629,7 @@ class AdaptiveScheduler:
                     # Respect min_active_keep.
                     max_cancelable = max(0, num_active - int(cfg.min_active_keep))
                     if max_cancelable <= 0:
+                        max_cancelable = num_active
                         if not self._restart_recommended:
                             self._restart_recommended = True
                             logger.error(
