@@ -85,6 +85,9 @@ class AdaptiveSchedulingConfig:
     mem_trend_slope_high_mb_per_s: float = 100.0
     mem_trend_margin_frac: float = 0.03
 
+    # Extra trend threshold for emergency preemption
+    mem_trend_emergency_slope_mb_per_s: float = 200.0
+
     # (4) AIMD concurrency controller
     ai_step: int = 2
     md_factor: float = 0.6
@@ -102,21 +105,49 @@ class AdaptiveSchedulingConfig:
     near_oom_mem_cap_step: float = 0.01
     mem_cap_min_frac: float = 0.70
     mem_high_min_frac: float = 0.80
+    mem_crit_min_frac: float = 0.90
 
     # (3) Per-company profiles
     company_profile_max_size: int = 2000
 
     # Unstall heuristics
-    # If slots_by_mem == 0 but used_frac is clearly below this, we relax estimates.
+    # If slots_by_mem is too low but used_frac is clearly below this, we relax estimates.
     unstall_low_frac: float = 0.70
     # Cooldown between automatic resets in seconds
     unstall_cooldown_sec: float = 60.0
+    # Treat stalls also when slots_by_mem is small but not zero
+    unstall_slots_threshold: int = 1
+    # Margin from mem_cap_frac to still consider as "safe" for unstall
+    unstall_margin_frac: float = 0.05
 
     # Emergency cancellation behavior
     # Minimum time between two emergency cancellations
     emergency_cancel_cooldown_sec: float = 3.0
-    # Time to wait after canceling a company to allow memory to drop
+    # Time to wait after canceling companies to allow memory to drop
     emergency_post_cancel_delay_sec: float = 1.5
+    # Max number of companies to cancel in one super critical step
+    max_emergency_cancel_per_step: int = 3
+    # Number of emergency rounds after which we recommend restart
+    emergency_persistent_rounds_threshold: int = 3
+
+    # Peak history: time horizon for considering samples (seconds)
+    peak_history_horizon_sec: float = 1800.0  # 30 minutes
+
+    # Plateau rescue heuristics
+    plateau_detect_sec: float = 1800.0  # 30 minutes of "stuck" behavior
+    plateau_min_num_waiting: int = 100
+    plateau_slots_threshold: int = 1
+    plateau_used_margin_frac: float = 0.05
+    plateau_shrink_factor: float = 0.7
+
+    # Full estimator reset when we have not been in a healthy regime for a long time
+    estimator_reset_interval_sec: float = 3600.0  # 1 hour
+    estimator_reset_parallel_threshold: int = 16
+    estimator_reset_used_frac_threshold: float = 0.80
+    estimator_reset_factor: float = 1.5
+
+    # Global hard cap for per-company estimate (in MB)
+    per_company_max_reservation_mb: float = 1024.0
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +164,7 @@ class AdaptiveScheduler:
       - Optional per-company heaviness profiles
       - AIMD-style concurrency target
       - Safety margin auto-tuning
+      - Stall / plateau rescue to avoid poisoned estimates
     """
 
     def __init__(
@@ -152,8 +184,8 @@ class AdaptiveScheduler:
         # Effective total memory limit (host or cgroup) in bytes
         self._total_mem_bytes: Optional[int] = None
 
-        # History of approximate per company usage in MB
-        self._peak_history_mb: List[float] = []
+        # History of approximate per company usage in MB: list of (timestamp, value)
+        self._peak_history_mb: List[Tuple[float, float]] = []
 
         # Estimated per company peak memory in MB (global)
         self._per_company_est_mb: float = cfg.per_company_min_reservation_mb
@@ -200,6 +232,17 @@ class AdaptiveScheduler:
 
         # Emergency cancellation bookkeeping
         self._last_emergency_cancel_ts: float = 0.0
+        self._emergency_rounds: int = 0
+
+        # Base RSS estimate (memory used when no companies are active)
+        self._base_rss_bytes: float = 0.0
+        self._base_rss_samples: int = 0
+
+        # Plateau detection window: list of (ts, num_active, slots_by_mem, used_frac, near_oom_events)
+        self._plateau_window: List[Tuple[float, int, int, float, int]] = []
+
+        # Last time we observed a "healthy" period (for full estimator reset)
+        self._last_healthy_ts: float = time.time()
 
     # ------------------------------------------------------------------ #
     # Public properties
@@ -338,6 +381,11 @@ class AdaptiveScheduler:
             )
             mem_trouble = used_frac >= cfg.mem_high_frac or high_swap_block
 
+            # Update base RSS estimate before per-company estimate
+            active_ids = list(self._get_active_company_ids())
+            num_active = len(active_ids)
+            self._update_base_rss_locked(used_bytes=used, num_active=num_active)
+
             # AIMD target update
             self._update_target_parallel_locked(
                 used_frac=used_frac,
@@ -362,6 +410,13 @@ class AdaptiveScheduler:
                         "swap_used_frac": swap_frac,
                     },
                 )
+                # Still record plateau patterns even when blocked
+                self._record_plateau_sample_locked(
+                    ts=now,
+                    num_active=num_active,
+                    slots_by_mem=0,
+                    used_frac=used_frac,
+                )
                 return 0
 
             # Headroom with respect to the safe cap.
@@ -377,11 +432,15 @@ class AdaptiveScheduler:
                         "swap_used_frac": swap_frac,
                     },
                 )
+                self._record_plateau_sample_locked(
+                    ts=now,
+                    num_active=num_active,
+                    slots_by_mem=0,
+                    used_frac=used_frac,
+                )
                 return 0
 
-            # Active companies for estimation and target cap
-            active_ids = list(self._get_active_company_ids())
-            num_active = len(active_ids)
+            # Update per-company estimate
             self._update_per_company_estimate_locked(
                 used_bytes=used, num_active=num_active, used_frac=used_frac
             )
@@ -392,17 +451,26 @@ class AdaptiveScheduler:
             if company_p95 is not None and company_p95 > effective_est_mb:
                 effective_est_mb = company_p95
 
-            # Bound effective estimate so one bad episode cannot permanently
-            # exceed the safe cap.
-            max_safe_mb = (cfg.mem_cap_frac * float(total)) / 1e6
+            # Bound effective estimate by safe cap and global hard cap.
+            total_mb = float(total) / 1e6
+            max_safe_mb = cfg.mem_cap_frac * total_mb
             if max_safe_mb > 0.0 and effective_est_mb > max_safe_mb:
                 effective_est_mb = max_safe_mb
+
+            if effective_est_mb > cfg.per_company_max_reservation_mb:
+                effective_est_mb = cfg.per_company_max_reservation_mb
 
             per_company_bytes = max(
                 int(effective_est_mb * 1e6),
                 int(self.cfg.per_company_min_reservation_mb * 1e6),
             )
             if per_company_bytes <= 0:
+                self._record_plateau_sample_locked(
+                    ts=now,
+                    num_active=num_active,
+                    slots_by_mem=0,
+                    used_frac=used_frac,
+                )
                 return 0
 
             slots_by_mem = int(headroom_bytes // per_company_bytes)
@@ -412,17 +480,13 @@ class AdaptiveScheduler:
             if num_active == 0 and slots_by_mem <= 0 and used_frac < cfg.mem_high_frac:
                 slots_by_mem = 1
 
-            # Key anti-stall 2: estimator has become over-conservative.
-            # Condition: we are below mem_cap_frac, not in mem_trouble,
-            # there is headroom, num_active > 0, num_waiting > 0,
-            # but slots_by_mem == 0.
+            # Extended unstall detection: if slots_by_mem is too low
             if (
-                slots_by_mem <= 0
+                slots_by_mem <= cfg.unstall_slots_threshold
                 and not mem_trouble
                 and headroom_bytes > 0
-                and num_active > 0
-                and num_waiting > 0
-                and used_frac < cfg.mem_cap_frac
+                and num_waiting >= cfg.plateau_min_num_waiting
+                and used_frac < max(0.0, cfg.mem_cap_frac - cfg.unstall_margin_frac)
             ):
                 self._maybe_unstall_locked(
                     total=total,
@@ -430,15 +494,19 @@ class AdaptiveScheduler:
                     headroom_bytes=headroom_bytes,
                     used_frac=used_frac,
                 )
-                # Recompute effective_est_mb and slots_by_mem after reset
+                # Recompute effective_est_mb and slots_by_mem after unstall
                 effective_est_mb = self._per_company_est_mb
                 company_p95 = self._get_company_p95_est_mb_locked()
                 if company_p95 is not None and company_p95 > effective_est_mb:
                     effective_est_mb = company_p95
 
-                max_safe_mb = (cfg.mem_cap_frac * float(total)) / 1e6
+                total_mb = float(total) / 1e6
+                max_safe_mb = cfg.mem_cap_frac * total_mb
                 if max_safe_mb > 0.0 and effective_est_mb > max_safe_mb:
                     effective_est_mb = max_safe_mb
+
+                if effective_est_mb > cfg.per_company_max_reservation_mb:
+                    effective_est_mb = cfg.per_company_max_reservation_mb
 
                 per_company_bytes = max(
                     int(effective_est_mb * 1e6),
@@ -446,6 +514,18 @@ class AdaptiveScheduler:
                 )
                 if per_company_bytes > 0:
                     slots_by_mem = int(headroom_bytes // per_company_bytes)
+
+            # Plateau rescue (pattern-based stall detection)
+            self._record_plateau_sample_locked(
+                ts=now,
+                num_active=num_active,
+                slots_by_mem=slots_by_mem,
+                used_frac=used_frac,
+            )
+            self._maybe_plateau_rescue_locked(
+                num_waiting=num_waiting,
+                used_frac=used_frac,
+            )
 
             if slots_by_mem <= 0:
                 # Still no safe slot.
@@ -459,6 +539,21 @@ class AdaptiveScheduler:
             if precritical and slots > 1:
                 slots = 1
 
+            # Mark healthy periods for possible future full reset avoidance
+            if (
+                not mem_trouble
+                and num_active >= cfg.estimator_reset_parallel_threshold
+                and used_frac < cfg.estimator_reset_used_frac_threshold
+            ):
+                self._last_healthy_ts = now
+
+            # Full estimator reset if we have not seen a healthy period for a long time
+            self._maybe_full_estimator_reset_locked(
+                now=now,
+                used_frac=used_frac,
+                mem_trouble=mem_trouble,
+            )
+
             self._maybe_log_state_locked(
                 reason="admission",
                 extra={
@@ -467,13 +562,14 @@ class AdaptiveScheduler:
                     "num_active": num_active,
                     "per_company_est_mb": self._per_company_est_mb,
                     "effective_per_company_est_mb": effective_est_mb,
-                    "total_mem_mb": float(total) / 1e6,
+                    "total_mem_mb": total_mb,
                     "used_mem_mb": float(used) / 1e6,
                     "used_frac": used_frac,
                     "swap_used_frac": swap_frac,
                     "trend_slope_mb_s": self._last_trend_slope_mb_s,
                     "target_parallel": self._target_parallel,
                     "slots_by_mem": slots_by_mem,
+                    "base_rss_mb": self._base_rss_bytes / 1e6,
                 },
             )
 
@@ -519,6 +615,10 @@ class AdaptiveScheduler:
         new_est = min(old_est, headroom_mb)
         new_est = max(cfg.per_company_min_reservation_mb, new_est)
 
+        # Apply global hard cap
+        if new_est > cfg.per_company_max_reservation_mb:
+            new_est = cfg.per_company_max_reservation_mb
+
         # Clear history and per-company profiles so we do not immediately
         # re-apply old heavy tails.
         self._peak_history_mb.clear()
@@ -535,6 +635,141 @@ class AdaptiveScheduler:
             new_est,
             used_frac,
             headroom_mb,
+        )
+
+    def _record_plateau_sample_locked(
+        self,
+        *,
+        ts: float,
+        num_active: int,
+        slots_by_mem: int,
+        used_frac: float,
+    ) -> None:
+        """
+        Record a coarse-grained sample for plateau detection.
+        """
+        self._plateau_window.append(
+            (ts, num_active, slots_by_mem, used_frac, self._near_oom_events)
+        )
+        horizon = float(self.cfg.plateau_detect_sec)
+        cutoff = ts - horizon
+        self._plateau_window = [s for s in self._plateau_window if s[0] >= cutoff]
+
+    def _maybe_plateau_rescue_locked(
+        self,
+        *,
+        num_waiting: int,
+        used_frac: float,
+    ) -> None:
+        """
+        Treat a long-lived plateau with low slots_by_mem and low parallelism
+        as a signal to shrink the per-company estimate.
+        """
+        cfg = self.cfg
+        if num_waiting < cfg.plateau_min_num_waiting:
+            return
+
+        if not self._plateau_window:
+            return
+
+        now = time.time()
+        earliest_ts = self._plateau_window[0][0]
+        duration = now - earliest_ts
+        if duration < cfg.plateau_detect_sec:
+            return
+
+        # If we have near-oom events in the window, do not treat as benign plateau
+        window_near_oom_events = {s[4] for s in self._plateau_window}
+        if len(window_near_oom_events) > 1:
+            # near_oom_events changed during this window
+            return
+
+        # Check that we have been mostly in the "stuck" regime
+        stuck_samples = 0
+        for _, num_active, slots_by_mem, u_frac, _ in self._plateau_window:
+            if (
+                slots_by_mem <= cfg.plateau_slots_threshold
+                and num_active <= cfg.estimator_reset_parallel_threshold
+                and u_frac < max(0.0, cfg.mem_cap_frac - cfg.plateau_used_margin_frac)
+            ):
+                stuck_samples += 1
+
+        if not self._plateau_window:
+            return
+
+        fraction_stuck = float(stuck_samples) / float(len(self._plateau_window))
+        if fraction_stuck < 0.8:
+            # Not clearly a plateau
+            return
+
+        old_est = self._per_company_est_mb
+        new_est = max(
+            cfg.per_company_min_reservation_mb,
+            old_est * cfg.plateau_shrink_factor,
+        )
+        if new_est > cfg.per_company_max_reservation_mb:
+            new_est = cfg.per_company_max_reservation_mb
+
+        # Clear detailed history to avoid re-inflation from stale peaks
+        self._peak_history_mb.clear()
+        self._company_peak_mb.clear()
+        self._company_order.clear()
+
+        self._per_company_est_mb = new_est
+        self._last_unstall_ts = now  # share cooldown with unstall
+
+        logger.warning(
+            "[AdaptiveScheduling] plateau rescue: per_company_est_mb %.1fMB -> %.1fMB "
+            "(duration=%.1fs, used_frac=%.3f, num_waiting=%d)",
+            old_est,
+            new_est,
+            duration,
+            used_frac,
+            num_waiting,
+        )
+
+    def _maybe_full_estimator_reset_locked(
+        self,
+        *,
+        now: float,
+        used_frac: float,
+        mem_trouble: bool,
+    ) -> None:
+        """
+        Nuclear option: if we have not seen a "healthy" period (many actives,
+        comfortable memory) for a long time, reset the estimator towards
+        a small multiple of the minimum.
+        """
+        cfg = self.cfg
+        if mem_trouble:
+            return
+
+        if now - self._last_healthy_ts < cfg.estimator_reset_interval_sec:
+            return
+
+        # Do not reset if we are near OOM; that is handled elsewhere
+        if used_frac >= cfg.mem_high_frac:
+            return
+
+        old_est = self._per_company_est_mb
+        target = cfg.per_company_min_reservation_mb * cfg.estimator_reset_factor
+        new_est = max(cfg.per_company_min_reservation_mb, target)
+        if new_est > cfg.per_company_max_reservation_mb:
+            new_est = cfg.per_company_max_reservation_mb
+
+        self._peak_history_mb.clear()
+        self._company_peak_mb.clear()
+        self._company_order.clear()
+
+        self._per_company_est_mb = new_est
+        self._last_healthy_ts = now
+
+        logger.warning(
+            "[AdaptiveScheduling] full estimator reset after long unhealthy period: "
+            "per_company_est_mb %.1fMB -> %.1fMB (used_frac=%.3f)",
+            old_est,
+            new_est,
+            used_frac,
         )
 
     # ------------------------------------------------------------------ #
@@ -571,17 +806,33 @@ class AdaptiveScheduler:
                     # Safety margin auto-tuning (near-OOM events)
                     self._register_near_oom_locked(used_frac, swap_frac)
 
-                    # Update per company estimate based on current usage and active count
+                    # Update base RSS estimate
                     active_ids = list(self._get_active_company_ids())
                     num_active = len(active_ids)
+                    self._update_base_rss_locked(used_bytes=used, num_active=num_active)
+
+                    # Update per company estimate based on current usage and active count
                     self._update_per_company_estimate_locked(
                         used_bytes=used, num_active=num_active, used_frac=used_frac
                     )
 
+                    # Effective emergency thresholds
+                    eff_mem_crit_high = self._effective_mem_crit_high_frac(
+                        total_bytes=total
+                    )
+
                     # Emergency condition: high RAM or very high swap while RAM is already high
-                    in_emergency = used_frac >= cfg.mem_crit_high_frac or (
-                        swap_frac >= cfg.swap_emergency_frac
-                        and used_frac >= cfg.mem_crit_low_frac
+                    in_emergency = (
+                        used_frac >= eff_mem_crit_high
+                        or (
+                            swap_frac >= cfg.swap_emergency_frac
+                            and used_frac >= cfg.mem_crit_low_frac
+                        )
+                        or (
+                            used_frac >= cfg.mem_cap_frac
+                            and self._last_trend_slope_mb_s
+                            >= cfg.mem_trend_emergency_slope_mb_per_s
+                        )
                     )
                     if not in_emergency:
                         continue
@@ -642,14 +893,66 @@ class AdaptiveScheduler:
                             )
                         continue
 
-                    # Choose exactly one company to cancel, preferring the heaviest known one.
-                    to_cancel_id = self._select_heaviest_company_locked(active_ids)
-                    if to_cancel_id is None:
-                        # Fallback to last active company (should be rare)
-                        to_cancel_id = active_ids[-1]
+                    # Determine how many companies we ideally need to cancel to reach mem_crit_low_frac
+                    total_mb = float(total) / 1e6
+                    mem_crit_low_bytes = int(cfg.mem_crit_low_frac * float(total))
+                    excess_bytes = max(0, used - mem_crit_low_bytes)
 
-                    cancel_ids = [to_cancel_id]
+                    # Effective per-company estimate (global + per-company profiles)
+                    effective_est_mb = self._per_company_est_mb
+                    company_p95 = self._get_company_p95_est_mb_locked()
+                    if company_p95 is not None and company_p95 > effective_est_mb:
+                        effective_est_mb = company_p95
+
+                    max_safe_mb = cfg.mem_cap_frac * total_mb
+                    if max_safe_mb > 0.0 and effective_est_mb > max_safe_mb:
+                        effective_est_mb = max_safe_mb
+
+                    if effective_est_mb > cfg.per_company_max_reservation_mb:
+                        effective_est_mb = cfg.per_company_max_reservation_mb
+
+                    per_company_bytes = max(
+                        int(effective_est_mb * 1e6),
+                        int(self.cfg.per_company_min_reservation_mb * 1e6),
+                    )
+                    if per_company_bytes <= 0:
+                        needed_cancel = 1
+                    else:
+                        needed_cancel = int(
+                            (excess_bytes + per_company_bytes - 1) // per_company_bytes
+                        )
+                        needed_cancel = max(1, needed_cancel)
+
+                    # Decide how many to cancel in this round
+                    super_critical = used_frac >= 0.98 or (
+                        used_frac >= cfg.mem_cap_frac
+                        and self._last_trend_slope_mb_s
+                        >= cfg.mem_trend_emergency_slope_mb_per_s
+                    )
+                    if super_critical:
+                        to_cancel_count = min(
+                            needed_cancel,
+                            cfg.max_emergency_cancel_per_step,
+                            max_cancelable,
+                        )
+                    else:
+                        to_cancel_count = min(1, max_cancelable)
+
+                    if to_cancel_count <= 0:
+                        continue
+
+                    # Choose companies to cancel, preferring the heaviest known ones.
+                    to_cancel = self._select_heaviest_companies_locked(
+                        active_ids, count=to_cancel_count
+                    )
+
+                    if not to_cancel:
+                        # Fallback: cancel last N active companies
+                        to_cancel = list(active_ids)[-to_cancel_count:]
+
+                    cancel_ids = list(to_cancel)
                     self._last_emergency_cancel_ts = now
+                    self._emergency_rounds += 1
 
                     # Log emergency cancellation
                     logger.error(
@@ -657,15 +960,34 @@ class AdaptiveScheduler:
                         "used_frac=%.3f, swap_used_frac=%.3f, "
                         "total_mem_mb=%.1f, used_mem_mb=%.1f, "
                         "num_active=%d, per_company_est_mb=%.1f, "
-                        "canceling_company_id=%s",
+                        "effective_per_company_est_mb=%.1f, "
+                        "excess_bytes=%.1fMB, canceling=%d companies: %s",
                         used_frac,
                         swap_frac,
-                        float(total) / 1e6,
+                        total_mb,
                         float(used) / 1e6,
                         num_active,
                         self._per_company_est_mb,
-                        to_cancel_id,
+                        effective_est_mb,
+                        float(excess_bytes) / 1e6,
+                        len(cancel_ids),
+                        cancel_ids,
                     )
+
+                    # If emergency persists for many rounds, recommend restart
+                    if (
+                        self._emergency_rounds
+                        >= cfg.emergency_persistent_rounds_threshold
+                        and used_frac >= cfg.mem_crit_low_frac
+                        and not self._restart_recommended
+                    ):
+                        self._restart_recommended = True
+                        logger.error(
+                            "[AdaptiveScheduling] repeated emergency rounds (%d) "
+                            "with used_frac=%.3f; restart recommended.",
+                            self._emergency_rounds,
+                            used_frac,
+                        )
 
                 if cancel_ids:
                     try:
@@ -730,6 +1052,8 @@ class AdaptiveScheduler:
             "restart_recommended": self._restart_recommended,
             "mem_cap_frac": self.cfg.mem_cap_frac,
             "mem_high_frac": self.cfg.mem_high_frac,
+            "mem_crit_high_frac": self.cfg.mem_crit_high_frac,
+            "base_rss_mb": self._base_rss_bytes / 1e6,
         }
 
     # ------------------------------------------------------------------ #
@@ -835,6 +1159,26 @@ class AdaptiveScheduler:
         idx = max(0, int(0.95 * len(vals)) - 1)
         return vals[idx]
 
+    def _update_base_rss_locked(self, *, used_bytes: int, num_active: int) -> None:
+        """
+        Update our best guess of base RSS (memory used with zero active companies).
+        """
+        if used_bytes <= 0:
+            return
+        if num_active != 0:
+            return
+
+        # Simple exponential moving average with mild smoothing
+        alpha = 0.1
+        if self._base_rss_samples == 0:
+            self._base_rss_bytes = float(used_bytes)
+            self._base_rss_samples = 1
+        else:
+            self._base_rss_bytes = (1.0 - alpha) * self._base_rss_bytes + alpha * float(
+                used_bytes
+            )
+            self._base_rss_samples += 1
+
     def _update_per_company_estimate_locked(
         self,
         *,
@@ -849,6 +1193,7 @@ class AdaptiveScheduler:
           - Robust upward learning when several companies are active.
           - Slow, controlled downward adjustment when memory is clearly safe,
             even if only 1 company is active, to avoid stalls at the tail.
+          - Estimates that exclude baseline RSS where possible.
         """
         if used_bytes <= 0 or self._total_mem_bytes is None:
             return
@@ -860,17 +1205,34 @@ class AdaptiveScheduler:
         if num_active <= 0:
             return
 
-        per_company_now_mb = (used / float(num_active)) / 1e6
+        # Separate base RSS from per-company usage
+        effective_used = used - self._base_rss_bytes
+        if effective_used < 0:
+            effective_used = 0.0
+
+        if num_active > 0:
+            per_company_now_mb = (effective_used / float(num_active)) / 1e6
+        else:
+            per_company_now_mb = 0.0
 
         # Only add to peak history when we have at least 2 actives.
-        if num_active >= 2:
-            self._peak_history_mb.append(per_company_now_mb)
+        now = time.time()
+        if num_active >= 2 and per_company_now_mb > 0.0:
+            self._peak_history_mb.append((now, per_company_now_mb))
+            # Trim by size
             if len(self._peak_history_mb) > cfg.peak_history_size:
-                self._peak_history_mb.pop(0)
+                self._peak_history_mb = self._peak_history_mb[-cfg.peak_history_size :]
+            # And by time horizon
+            horizon = float(cfg.peak_history_horizon_sec)
+            cutoff = now - horizon
+            self._peak_history_mb = [
+                (t, v) for (t, v) in self._peak_history_mb if t >= cutoff
+            ]
 
         # Upward estimate from history (q95 * safety_factor)
-        sorted_hist = sorted(self._peak_history_mb)
-        if sorted_hist:
+        if self._peak_history_mb:
+            values = [v for (_, v) in self._peak_history_mb]
+            sorted_hist = sorted(values)
             idx = max(0, int(0.95 * len(sorted_hist)) - 1)
             q95 = sorted_hist[idx]
             base = max(q95, cfg.per_company_min_reservation_mb)
@@ -878,24 +1240,30 @@ class AdaptiveScheduler:
         else:
             upward_est = self._per_company_est_mb
 
-        # Bound upward estimate by safe cap.
+        # Bound upward estimate by safe cap and hard cap.
         max_safe_mb = (cfg.mem_cap_frac * total) / 1e6
         if max_safe_mb > 0.0 and upward_est > max_safe_mb:
             upward_est = max_safe_mb
+
+        if upward_est > cfg.per_company_max_reservation_mb:
+            upward_est = cfg.per_company_max_reservation_mb
 
         old_est = self._per_company_est_mb
         new_est = max(cfg.per_company_min_reservation_mb, upward_est)
 
         # Controlled downward adjustment:
         # If memory usage is clearly in a safe region, and the naive
-        # per-company_now_mb is significantly smaller than our current
+        # per_company_now_mb is significantly smaller than our current
         # estimate, gently move the estimate downwards.
         if used_frac < cfg.unstall_low_frac and per_company_now_mb * 1.5 < old_est:
-            # Move 10% of the way towards the current observation (smoothed)
+            # Move 10 percent of the way towards the current observation (smoothed)
             target = max(cfg.per_company_min_reservation_mb, per_company_now_mb)
             lowered = old_est * 0.9 + target * 0.1
             if lowered < new_est:
                 new_est = lowered
+
+        if new_est > cfg.per_company_max_reservation_mb:
+            new_est = cfg.per_company_max_reservation_mb
 
         self._per_company_est_mb = new_est
 
@@ -915,8 +1283,8 @@ class AdaptiveScheduler:
         swap_frac: float,
     ) -> None:
         """
-        Detect near-OOM situations and auto-tune mem_cap_frac / mem_high_frac
-        downward for the remainder of the process lifetime.
+        Detect near-OOM situations and auto-tune mem_cap_frac / mem_high_frac /
+        mem_crit_high_frac downward for the remainder of the process lifetime.
         """
         cfg = self.cfg
         is_near = used_frac >= cfg.near_oom_used_frac or (
@@ -927,16 +1295,21 @@ class AdaptiveScheduler:
             self._near_oom_events += 1
             old_cap = cfg.mem_cap_frac
             old_high = cfg.mem_high_frac
+            old_crit = cfg.mem_crit_high_frac
             step = cfg.near_oom_mem_cap_step
 
             if step > 0.0:
                 cfg.mem_cap_frac = max(cfg.mem_cap_min_frac, cfg.mem_cap_frac - step)
                 cfg.mem_high_frac = max(cfg.mem_high_min_frac, cfg.mem_high_frac - step)
+                cfg.mem_crit_high_frac = max(
+                    cfg.mem_crit_min_frac, cfg.mem_crit_high_frac - step
+                )
 
             logger.warning(
                 "[AdaptiveScheduling] near-oom event #%d: "
                 "used_frac=%.3f swap_frac=%.3f "
-                "mem_cap_frac: %.3f -> %.3f, mem_high_frac: %.3f -> %.3f",
+                "mem_cap_frac: %.3f -> %.3f, mem_high_frac: %.3f -> %.3f, "
+                "mem_crit_high_frac: %.3f -> %.3f",
                 self._near_oom_events,
                 used_frac,
                 swap_frac,
@@ -944,9 +1317,27 @@ class AdaptiveScheduler:
                 cfg.mem_cap_frac,
                 old_high,
                 cfg.mem_high_frac,
+                old_crit,
+                cfg.mem_crit_high_frac,
             )
 
         self._last_near_oom_flag = is_near
+
+    def _effective_mem_crit_high_frac(self, *, total_bytes: int) -> float:
+        """
+        Adjust mem_crit_high_frac based on total memory size to react earlier
+        on small hosts.
+        """
+        cfg = self.cfg
+        eff = cfg.mem_crit_high_frac
+        if total_bytes <= 0:
+            return eff
+
+        total_gb = float(total_bytes) / (1024.0**3)
+        if total_gb <= 16.0:
+            # For small hosts be a bit more conservative
+            eff = min(eff, 0.92)
+        return max(cfg.mem_crit_low_frac, eff)
 
     def _update_target_parallel_locked(
         self,
@@ -1039,6 +1430,8 @@ class AdaptiveScheduler:
             "restart_recommended": self._restart_recommended,
             "mem_cap_frac": self.cfg.mem_cap_frac,
             "mem_high_frac": self.cfg.mem_high_frac,
+            "mem_crit_high_frac": self.cfg.mem_crit_high_frac,
+            "base_rss_mb": self._base_rss_bytes / 1e6,
         }
         if extra:
             state.update(extra)
@@ -1057,32 +1450,34 @@ class AdaptiveScheduler:
                 exc_info=True,
             )
 
-    def _select_heaviest_company_locked(
-        self, active_ids: Sequence[str]
-    ) -> Optional[str]:
+    def _select_heaviest_companies_locked(
+        self,
+        active_ids: Sequence[str],
+        count: int,
+    ) -> List[str]:
         """
-        Select the "heaviest" active company based on recorded peak memory.
+        Select up to `count` "heaviest" active companies based on recorded peaks.
 
-        If no peak info is available for any active company, fall back
-        to the last active id in the list.
+        If no peak info is available for any active company, returns [] and the
+        caller should fall back to a simple policy.
         """
-        if not active_ids:
-            return None
+        if not active_ids or count <= 0:
+            return []
 
-        heaviest_id: Optional[str] = None
-        heaviest_mb: float = -1.0
-
+        # Gather (id, peak_mb) for those with known peaks
+        weighted: List[Tuple[str, float]] = []
         for cid in active_ids:
             mb = self._company_peak_mb.get(cid)
-            if mb is not None and mb > heaviest_mb:
-                heaviest_mb = mb
-                heaviest_id = cid
+            if mb is not None:
+                weighted.append((cid, mb))
 
-        if heaviest_id is not None:
-            return heaviest_id
+        if not weighted:
+            return []
 
-        # No peak info for any active company, fallback strategy
-        return active_ids[-1]
+        # Sort by peak_mb descending and pick top count
+        weighted.sort(key=lambda x: x[1], reverse=True)
+        selected = [cid for (cid, _) in weighted[:count]]
+        return selected
 
 
 __all__ = [
