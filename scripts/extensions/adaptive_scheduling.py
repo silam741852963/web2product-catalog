@@ -61,7 +61,7 @@ class AdaptiveSchedulingConfig:
 
     mem_cap_frac: float = 0.85
     mem_high_frac: float = 0.90
-    mem_crit_high_frac: float = 0.95
+    mem_crit_high_frac: float = 0.94
     mem_crit_low_frac: float = 0.90
 
     min_active_keep: int = 0
@@ -86,23 +86,23 @@ class AdaptiveSchedulingConfig:
     mem_trend_margin_frac: float = 0.03
 
     # Extra trend threshold for emergency preemption
-    mem_trend_emergency_slope_mb_per_s: float = 200.0
+    mem_trend_emergency_slope_mb_per_s: float = 40.0
 
     # (4) AIMD concurrency controller
-    ai_step: int = 2
-    md_factor: float = 0.6
+    ai_step: int = 1
+    md_factor: float = 0.5
     min_target: int = 1
     max_target: int = 512
 
     # Faster ramp-up at the start of the run
     initial_target: int = 4
     warmup_updates: int = 10
-    warmup_ai_step: int = 8
+    warmup_ai_step: int = 6
 
     # (5) Safety margin auto-tuning
-    near_oom_used_frac: float = 0.97
+    near_oom_used_frac: float = 0.93
     near_oom_swap_frac: float = 0.50
-    near_oom_mem_cap_step: float = 0.01
+    near_oom_mem_cap_step: float = 0.02
     mem_cap_min_frac: float = 0.70
     mem_high_min_frac: float = 0.80
     mem_crit_min_frac: float = 0.90
@@ -408,6 +408,10 @@ class AdaptiveScheduler:
                         "used_mem_mb": float(used) / 1e6,
                         "used_frac": used_frac,
                         "swap_used_frac": swap_frac,
+                        "num_active": num_active,
+                        "slots_by_mem": 0,
+                        "trend_slope_mb_s": self._last_trend_slope_mb_s,
+                        "target_parallel": self._target_parallel,
                     },
                 )
                 # Still record plateau patterns even when blocked
@@ -430,6 +434,10 @@ class AdaptiveScheduler:
                         "used_mem_mb": float(used) / 1e6,
                         "used_frac": used_frac,
                         "swap_used_frac": swap_frac,
+                        "num_active": num_active,
+                        "slots_by_mem": 0,
+                        "trend_slope_mb_s": self._last_trend_slope_mb_s,
+                        "target_parallel": self._target_parallel,
                     },
                 )
                 self._record_plateau_sample_locked(
@@ -821,6 +829,8 @@ class AdaptiveScheduler:
                         total_bytes=total
                     )
 
+                    slope = self._last_trend_slope_mb_s
+
                     # Emergency condition: high RAM or very high swap while RAM is already high
                     in_emergency = (
                         used_frac >= eff_mem_crit_high
@@ -830,8 +840,11 @@ class AdaptiveScheduler:
                         )
                         or (
                             used_frac >= cfg.mem_cap_frac
-                            and self._last_trend_slope_mb_s
-                            >= cfg.mem_trend_emergency_slope_mb_per_s
+                            and slope >= cfg.mem_trend_emergency_slope_mb_per_s
+                        )
+                        or (
+                            used_frac >= cfg.mem_high_frac
+                            and slope >= cfg.mem_trend_emergency_slope_mb_per_s
                         )
                     )
                     if not in_emergency:
@@ -850,6 +863,7 @@ class AdaptiveScheduler:
                                 "used_frac": used_frac,
                                 "swap_used_frac": swap_frac,
                                 "num_active": num_active,
+                                "trend_slope_mb_s": slope,
                             },
                         )
                         continue
@@ -926,15 +940,25 @@ class AdaptiveScheduler:
                     # Decide how many to cancel in this round
                     super_critical = used_frac >= 0.98 or (
                         used_frac >= cfg.mem_cap_frac
-                        and self._last_trend_slope_mb_s
-                        >= cfg.mem_trend_emergency_slope_mb_per_s
+                        and slope >= cfg.mem_trend_emergency_slope_mb_per_s
                     )
+
+                    mid_emergency = (
+                        used_frac >= cfg.mem_high_frac
+                        and slope >= cfg.mem_trend_slope_high_mb_per_s
+                    ) or (
+                        used_frac >= 0.92
+                        and slope >= cfg.mem_trend_emergency_slope_mb_per_s
+                    )
+
                     if super_critical:
                         to_cancel_count = min(
                             needed_cancel,
                             cfg.max_emergency_cancel_per_step,
                             max_cancelable,
                         )
+                    elif mid_emergency:
+                        to_cancel_count = min(2, needed_cancel, max_cancelable)
                     else:
                         to_cancel_count = min(1, max_cancelable)
 
@@ -961,7 +985,8 @@ class AdaptiveScheduler:
                         "total_mem_mb=%.1f, used_mem_mb=%.1f, "
                         "num_active=%d, per_company_est_mb=%.1f, "
                         "effective_per_company_est_mb=%.1f, "
-                        "excess_bytes=%.1fMB, canceling=%d companies: %s",
+                        "excess_bytes=%.1fMB, canceling=%d companies: %s, "
+                        "trend_slope_mb_s=%.1f",
                         used_frac,
                         swap_frac,
                         total_mb,
@@ -972,6 +997,7 @@ class AdaptiveScheduler:
                         float(excess_bytes) / 1e6,
                         len(cancel_ids),
                         cancel_ids,
+                        slope,
                     )
 
                     # If emergency persists for many rounds, recommend restart
@@ -1287,8 +1313,20 @@ class AdaptiveScheduler:
         mem_crit_high_frac downward for the remainder of the process lifetime.
         """
         cfg = self.cfg
-        is_near = used_frac >= cfg.near_oom_used_frac or (
-            swap_frac >= cfg.near_oom_swap_frac and used_frac >= cfg.mem_crit_low_frac
+
+        # Soft near-OOM when already high and ramping fast
+        soft_high_and_fast = (
+            used_frac >= cfg.mem_high_frac
+            and self._last_trend_slope_mb_s >= cfg.mem_trend_slope_high_mb_per_s
+        )
+
+        is_near = (
+            used_frac >= cfg.near_oom_used_frac
+            or (
+                swap_frac >= cfg.near_oom_swap_frac
+                and used_frac >= cfg.mem_crit_low_frac
+            )
+            or soft_high_and_fast
         )
 
         if is_near and not self._last_near_oom_flag:
@@ -1307,12 +1345,13 @@ class AdaptiveScheduler:
 
             logger.warning(
                 "[AdaptiveScheduling] near-oom event #%d: "
-                "used_frac=%.3f swap_frac=%.3f "
+                "used_frac=%.3f swap_frac=%.3f slope=%.1fMB/s "
                 "mem_cap_frac: %.3f -> %.3f, mem_high_frac: %.3f -> %.3f, "
                 "mem_crit_high_frac: %.3f -> %.3f",
                 self._near_oom_events,
                 used_frac,
                 swap_frac,
+                self._last_trend_slope_mb_s,
                 old_cap,
                 cfg.mem_cap_frac,
                 old_high,
@@ -1336,7 +1375,7 @@ class AdaptiveScheduler:
         total_gb = float(total_bytes) / (1024.0**3)
         if total_gb <= 16.0:
             # For small hosts be a bit more conservative
-            eff = min(eff, 0.92)
+            eff = min(eff, 0.91)
         return max(cfg.mem_crit_low_frac, eff)
 
     def _update_target_parallel_locked(
