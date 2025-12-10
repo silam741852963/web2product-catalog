@@ -56,7 +56,7 @@ class AdaptiveSchedulingConfig:
     Memory-based adaptive scheduling configuration.
 
     All thresholds are expressed as fractions of the effective memory limit
-    (host or cgroup).
+    (host or cgroup), except where otherwise noted.
     """
 
     mem_cap_frac: float = 0.85
@@ -149,6 +149,36 @@ class AdaptiveSchedulingConfig:
     # Global hard cap for per-company estimate (in MB)
     per_company_max_reservation_mb: float = 1024.0
 
+    # ------------------------------------------------------------------
+    # Progress-based stall detection (CPU / network / disk / completions)
+    # ------------------------------------------------------------------
+
+    # Rolling window for progress samples (seconds)
+    progress_window_sec: float = 900.0  # 15 minutes
+    # Minimum duration within the window to consider a stall (seconds)
+    stall_min_duration_sec: float = 900.0  # 15 minutes
+    # Cooldown between stall rescue actions (seconds)
+    stall_cooldown_sec: float = 600.0  # 10 minutes
+
+    # CPU considered "flat" when max-min <= stall_cpu_band and mean below stall_cpu_max_mean
+    # Values are fractions in [0, 1], not percentages.
+    stall_cpu_band: float = 0.03  # 3% band
+    stall_cpu_max_mean: float = 0.80  # 80% mean
+
+    # Network and disk thresholds in KB/s (mean over window)
+    stall_net_threshold_kb_s: float = 200.0
+    stall_disk_threshold_kb_s: float = 300.0
+
+    # Minimum completed companies per minute to consider "making progress"
+    stall_min_completed_per_min: float = 1.0
+
+    # Stall rescue actions
+    stall_per_company_shrink_factor: float = 0.6
+    stall_target_parallel_boost: int = 4
+    stall_max_history_shrink_frac: float = 0.3
+    # Step to reduce mem_cap_frac / mem_high_frac on stall (fraction)
+    stall_mem_cap_step: float = 0.02
+
 
 # ---------------------------------------------------------------------------
 # Scheduler
@@ -165,6 +195,7 @@ class AdaptiveScheduler:
       - AIMD-style concurrency target
       - Safety margin auto-tuning
       - Stall / plateau rescue to avoid poisoned estimates
+      - Progress-based stall rescue (CPU / network / disk / completions)
     """
 
     def __init__(
@@ -244,6 +275,19 @@ class AdaptiveScheduler:
         # Last time we observed a "healthy" period (for full estimator reset)
         self._last_healthy_ts: float = time.time()
 
+        # ------------------------------------------------------------------
+        # Progress-based stall detection state
+        # ------------------------------------------------------------------
+        # Progress samples: (ts, cpu_frac, net_bytes_per_s, disk_bytes_per_s, completed_counter)
+        self._progress_samples: List[Tuple[float, float, float, float, int]] = []
+        self._last_progress_raw_ts: float = 0.0
+        self._last_net_bytes: Optional[int] = None
+        self._last_disk_write_bytes: Optional[int] = None
+        self._last_progress_stall_ts: float = 0.0
+
+        # Run-level completed companies counter (to be bumped by the caller)
+        self._completed_counter: int = 0
+
     # ------------------------------------------------------------------ #
     # Public properties
     # ------------------------------------------------------------------ #
@@ -257,7 +301,7 @@ class AdaptiveScheduler:
         return self._restart_recommended
 
     # ------------------------------------------------------------------ #
-    # Public API for per-company profiles
+    # Public API for per-company profiles / progress
     # ------------------------------------------------------------------ #
 
     def record_company_peak(self, company_id: str, peak_mb: float) -> None:
@@ -279,6 +323,13 @@ class AdaptiveScheduler:
         if len(self._company_order) > max_size:
             oldest = self._company_order.pop(0)
             self._company_peak_mb.pop(oldest, None)
+
+    def register_company_completed(self) -> None:
+        """
+        Optional: caller can invoke this whenever a company finishes successfully.
+        Used only for low-progress stall detection; safe to ignore if unused.
+        """
+        self._completed_counter += 1
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -392,6 +443,16 @@ class AdaptiveScheduler:
                 precritical=precritical,
                 high_swap=high_swap_block,
                 mem_trouble=mem_trouble,
+            )
+
+            # Progress-based stall detection and rescue (does not kill tasks)
+            # Runs before the hard memory-based blocks so that it can relax
+            # estimates and boost target_parallel in low-progress regimes.
+            self._record_progress_sample_locked(ts=now)
+            self._maybe_progress_stall_rescue_locked(
+                num_waiting=num_waiting,
+                num_active=num_active,
+                used_frac=used_frac,
             )
 
             # Above high watermark or critical swap with high RAM: do not admit.
@@ -1080,6 +1141,8 @@ class AdaptiveScheduler:
             "mem_high_frac": self.cfg.mem_high_frac,
             "mem_crit_high_frac": self.cfg.mem_crit_high_frac,
             "base_rss_mb": self._base_rss_bytes / 1e6,
+            "completed_counter": self._completed_counter,
+            "progress_samples_len": len(self._progress_samples),
         }
 
     # ------------------------------------------------------------------ #
@@ -1174,6 +1237,57 @@ class AdaptiveScheduler:
                 self._last_trend_slope_mb_s = 0.0
         else:
             self._last_trend_slope_mb_s = 0.0
+
+    def _record_progress_sample_locked(self, *, ts: float) -> None:
+        """
+        Record CPU / network / disk progress sample for stall detection.
+
+        Stores:
+          (ts, cpu_frac, net_bytes_per_s, disk_bytes_per_s, completed_counter)
+        """
+        if not self._psutil_available or psutil is None:
+            return
+
+        try:
+            # CPU percent since last call, normalized to [0, 1].
+            cpu_percent = psutil.cpu_percent(interval=None)  # type: ignore[union-attr]
+            cpu_frac = float(cpu_percent) / 100.0
+
+            net = psutil.net_io_counters()  # type: ignore[union-attr]
+            disk = psutil.disk_io_counters()  # type: ignore[union-attr]
+        except Exception:
+            return
+
+        net_bytes = int(net.bytes_sent + net.bytes_recv)
+        disk_bytes = int(disk.write_bytes)  # type: ignore
+
+        if (
+            self._last_net_bytes is None
+            or self._last_disk_write_bytes is None
+            or self._last_progress_raw_ts <= 0.0
+        ):
+            net_rate = 0.0
+            disk_rate = 0.0
+        else:
+            dt = ts - self._last_progress_raw_ts
+            if dt <= 0:
+                net_rate = 0.0
+                disk_rate = 0.0
+            else:
+                net_rate = float(net_bytes - self._last_net_bytes) / dt
+                disk_rate = float(disk_bytes - self._last_disk_write_bytes) / dt
+
+        self._last_progress_raw_ts = ts
+        self._last_net_bytes = net_bytes
+        self._last_disk_write_bytes = disk_bytes
+
+        self._progress_samples.append(
+            (ts, cpu_frac, net_rate, disk_rate, self._completed_counter)
+        )
+
+        window = max(1.0, float(self.cfg.progress_window_sec))
+        cutoff = ts - window
+        self._progress_samples = [s for s in self._progress_samples if s[0] >= cutoff]
 
     def _get_company_p95_est_mb_locked(self) -> Optional[float]:
         """
@@ -1302,6 +1416,132 @@ class AdaptiveScheduler:
                 num_active,
                 used_frac,
             )
+
+    def _maybe_progress_stall_rescue_locked(
+        self,
+        *,
+        num_waiting: int,
+        num_active: int,
+        used_frac: float,
+    ) -> None:
+        """
+        Detect a long-lived low-progress plateau using CPU / network / disk / completions
+        and gently relax the estimator and target_parallel WITHOUT canceling tasks.
+
+        Intended to wake up droplets where CPU and RAM are flat, but network, disk
+        and completions are near zero.
+        """
+        cfg = self.cfg
+
+        if num_waiting <= 0 or num_active <= 0:
+            return
+
+        if not self._progress_samples:
+            return
+
+        now = time.time()
+        if now - self._last_progress_stall_ts < float(cfg.stall_cooldown_sec):
+            return
+
+        # Require a minimum duration inside the progress window.
+        ts0 = self._progress_samples[0][0]
+        ts1 = self._progress_samples[-1][0]
+        duration = ts1 - ts0
+        if duration <= 0 or duration < float(cfg.stall_min_duration_sec):
+            return
+
+        cpu_vals = [s[1] for s in self._progress_samples]
+        net_rates = [s[2] for s in self._progress_samples]
+        disk_rates = [s[3] for s in self._progress_samples]
+        completed0 = self._progress_samples[0][4]
+        completed1 = self._progress_samples[-1][4]
+
+        if not cpu_vals:
+            return
+
+        cpu_min = min(cpu_vals)
+        cpu_max = max(cpu_vals)
+        cpu_mean = sum(cpu_vals) / float(len(cpu_vals))
+        cpu_band = cpu_max - cpu_min
+
+        mean_net = sum(net_rates) / float(len(net_rates)) if net_rates else 0.0
+        mean_disk = sum(disk_rates) / float(len(disk_rates)) if disk_rates else 0.0
+
+        total_completed = max(0, completed1 - completed0)
+        completed_per_min = (
+            float(total_completed) / (duration / 60.0) if duration > 0 else float("inf")
+        )
+
+        stalled_cpu = (
+            cpu_band <= cfg.stall_cpu_band and cpu_mean <= cfg.stall_cpu_max_mean
+        )
+        stalled_net = mean_net <= cfg.stall_net_threshold_kb_s * 1024.0
+        stalled_disk = mean_disk <= cfg.stall_disk_threshold_kb_s * 1024.0
+        stalled_completion = completed_per_min <= cfg.stall_min_completed_per_min
+
+        if not (stalled_cpu and stalled_net and stalled_disk and stalled_completion):
+            return
+
+        # Do not trigger this when already near the memory cap; that is handled elsewhere.
+        if used_frac >= cfg.mem_cap_frac:
+            return
+
+        self._last_progress_stall_ts = now
+
+        # Shrink per-company estimate
+        old_est = self._per_company_est_mb
+        new_est = max(
+            cfg.per_company_min_reservation_mb,
+            old_est * cfg.stall_per_company_shrink_factor,
+        )
+        if new_est > cfg.per_company_max_reservation_mb:
+            new_est = cfg.per_company_max_reservation_mb
+
+        self._per_company_est_mb = new_est
+
+        # Boost target_parallel to force more companies to start
+        old_target = self._target_parallel
+        self._target_parallel = min(
+            cfg.max_target, self._target_parallel + cfg.stall_target_parallel_boost
+        )
+
+        # Shrink peak history to forget a chunk of heavy tails
+        hist_len = len(self._peak_history_mb)
+        if hist_len > 0 and cfg.stall_max_history_shrink_frac > 0.0:
+            drop = int(hist_len * cfg.stall_max_history_shrink_frac)
+            if drop > 0:
+                self._peak_history_mb = self._peak_history_mb[drop:]
+
+        # Gently reduce mem_cap_frac and mem_high_frac to keep some headroom
+        old_cap = cfg.mem_cap_frac
+        old_high = cfg.mem_high_frac
+        step = max(0.0, float(cfg.stall_mem_cap_step))
+        if step > 0.0:
+            cfg.mem_cap_frac = max(cfg.mem_cap_min_frac, cfg.mem_cap_frac - step)
+            cfg.mem_high_frac = max(cfg.mem_high_min_frac, cfg.mem_high_frac - step)
+
+        logger.warning(
+            "[AdaptiveScheduling] progress stall detected: cpu_mean=%.3f cpu_band=%.3f, "
+            "net_kb_s=%.1f, disk_kb_s=%.1f, completed_per_min=%.2f, "
+            "num_active=%d, num_waiting=%d; "
+            "per_company_est_mb %.1f -> %.1f, target_parallel %d -> %d, "
+            "mem_cap_frac %.3f -> %.3f, mem_high_frac %.3f -> %.3f",
+            cpu_mean,
+            cpu_band,
+            mean_net / 1024.0,
+            mean_disk / 1024.0,
+            completed_per_min,
+            num_active,
+            num_waiting,
+            old_est,
+            self._per_company_est_mb,
+            old_target,
+            self._target_parallel,
+            old_cap,
+            cfg.mem_cap_frac,
+            old_high,
+            cfg.mem_high_frac,
+        )
 
     def _register_near_oom_locked(
         self,
@@ -1471,6 +1711,7 @@ class AdaptiveScheduler:
             "mem_high_frac": self.cfg.mem_high_frac,
             "mem_crit_high_frac": self.cfg.mem_crit_high_frac,
             "base_rss_mb": self._base_rss_bytes / 1e6,
+            "completed_counter": self._completed_counter,
         }
         if extra:
             state.update(extra)
