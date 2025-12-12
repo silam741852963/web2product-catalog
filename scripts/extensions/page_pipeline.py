@@ -7,9 +7,10 @@ from extensions.connectivity_guard import ConnectivityGuard
 from extensions import md_gating
 from extensions.output_paths import save_stage_output
 from extensions.crawl_state import upsert_url_index_entry
-from extensions.adaptive_scheduling import MEMORY_PRESSURE_MARKER
 
 logger = logging.getLogger("page_pipeline")
+
+MEMORY_PRESSURE_MARKER = "Requeued due to critical memory pressure"
 
 
 async def process_page_result(

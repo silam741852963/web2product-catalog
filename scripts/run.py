@@ -80,7 +80,6 @@ from extensions.retry_tracker import (
 from extensions.adaptive_scheduling import (
     AdaptiveSchedulingConfig,
     AdaptiveScheduler,
-    CriticalMemoryPressure,
 )
 from extensions.page_pipeline import process_page_result
 from extensions.llm_passes import (
@@ -103,6 +102,20 @@ RETRY_EXIT_CODE = 17
 
 # Keep a reference to the tracker for exit code handling.
 _retry_tracker_instance: Optional[RetryTracker] = None
+
+
+class CriticalMemoryPressure(RuntimeError):
+    """
+    Raised by external components when memory pressure is high enough that
+    the current company task should be aborted.
+
+    This module no longer uses it internally but keeps the type so that
+    other parts of the codebase can continue to import it.
+    """
+
+    def __init__(self, message: str, severity: str = "emergency") -> None:
+        super().__init__(message)
+        self.severity = severity
 
 
 # ---------------------------------------------------------------------------

@@ -25,27 +25,6 @@ except Exception:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
-# Optional marker and exception kept for compatibility with callers
-# ---------------------------------------------------------------------------
-
-MEMORY_PRESSURE_MARKER = "Requeued due to critical memory pressure"
-
-
-class CriticalMemoryPressure(RuntimeError):
-    """
-    Raised by external components when memory pressure is high enough that
-    the current company task should be aborted.
-
-    This module no longer uses it internally but keeps the type so that
-    other parts of the codebase can continue to import it.
-    """
-
-    def __init__(self, message: str, severity: str = "emergency") -> None:
-        super().__init__(message)
-        self.severity = severity
-
-
-# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -59,10 +38,11 @@ class AdaptiveSchedulingConfig:
     (host or cgroup), except where otherwise noted.
     """
 
-    mem_cap_frac: float = 0.85
-    mem_high_frac: float = 0.90
-    mem_crit_high_frac: float = 0.94
-    mem_crit_low_frac: float = 0.90
+    # Conservative defaults tuned for headless-chrome workloads (not too aggressive)
+    mem_cap_frac: float = 0.78
+    mem_high_frac: float = 0.83
+    mem_crit_high_frac: float = 0.90
+    mem_crit_low_frac: float = 0.88
 
     min_active_keep: int = 0
 
@@ -97,7 +77,7 @@ class AdaptiveSchedulingConfig:
     # Faster ramp-up at the start of the run
     initial_target: int = 4
     warmup_updates: int = 10
-    warmup_ai_step: int = 6
+    warmup_ai_step: int = 3
 
     # (5) Safety margin auto-tuning
     near_oom_used_frac: float = 0.93
@@ -124,7 +104,7 @@ class AdaptiveSchedulingConfig:
     # Minimum time between two emergency cancellations
     emergency_cancel_cooldown_sec: float = 3.0
     # Time to wait after canceling companies to allow memory to drop
-    emergency_post_cancel_delay_sec: float = 1.5
+    emergency_post_cancel_delay_sec: float = 3.0
     # Max number of companies to cancel in one super critical step
     max_emergency_cancel_per_step: int = 3
     # Number of emergency rounds after which we recommend restart
@@ -179,6 +159,22 @@ class AdaptiveSchedulingConfig:
     # Step to reduce mem_cap_frac / mem_high_frac on stall (fraction)
     stall_mem_cap_step: float = 0.02
 
+    # ------------------------------------------------------------------
+    # Per-task RSS monitoring (early detection of runaway browser children)
+    # ------------------------------------------------------------------
+
+    # If a single company's process tree exceeds this RSS (MB) for
+    # per_task_rss_duration_sec seconds, immediately request cancel.
+    per_task_rss_limit_mb: float = 500.0
+    per_task_rss_duration_sec: float = 2.0
+    # Do per-task checks inside emergency loop (same interval as emergency_check_interval_sec).
+    per_task_monitor_enabled: bool = True
+
+    # Slope-based early pre-oom cancellation
+    preoom_used_frac: float = 0.83
+    preoom_slope_mb_s: float = 20.0
+    preoom_cancel_count: int = 1  # 1-2 (conservative by default)
+
 
 # ---------------------------------------------------------------------------
 # Scheduler
@@ -196,6 +192,7 @@ class AdaptiveScheduler:
       - Safety margin auto-tuning
       - Stall / plateau rescue to avoid poisoned estimates
       - Progress-based stall rescue (CPU / network / disk / completions)
+      - Per-task RSS monitoring to catch runaway browser children early
     """
 
     def __init__(
@@ -203,6 +200,8 @@ class AdaptiveScheduler:
         cfg: AdaptiveSchedulingConfig,
         get_active_company_ids: Callable[[], Sequence[str]],
         request_cancel_companies: Callable[[Sequence[str]], None],
+        # Optional callback: given a company_id -> Sequence[int] of PIDs (root processes)
+        get_company_pids: Optional[Callable[[str], Sequence[int]]] = None,
     ) -> None:
         self.cfg = cfg
 
@@ -211,6 +210,7 @@ class AdaptiveScheduler:
         # Callbacks into the caller
         self._get_active_company_ids = get_active_company_ids
         self._request_cancel_companies = request_cancel_companies
+        self._get_company_pids = get_company_pids
 
         # Effective total memory limit (host or cgroup) in bytes
         self._total_mem_bytes: Optional[int] = None
@@ -287,6 +287,14 @@ class AdaptiveScheduler:
 
         # Run-level completed companies counter (to be bumped by the caller)
         self._completed_counter: int = 0
+
+        # ------------------------------------------------------------------
+        # Per-task RSS monitoring state
+        # ------------------------------------------------------------------
+        # Map company_id -> first timestamp when per-task RSS exceeded threshold
+        self._per_task_over_thresh_ts: Dict[str, float] = {}
+        # Map company_id -> last observed rss (bytes)
+        self._per_task_last_rss_bytes: Dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Public properties
@@ -885,12 +893,115 @@ class AdaptiveScheduler:
                         used_bytes=used, num_active=num_active, used_frac=used_frac
                     )
 
+                    # -------------------------
+                    # Per-task RSS monitoring
+                    # -------------------------
+                    # Conservative, non-aggressive early-cancel for runaway tasks.
+                    if (
+                        cfg.per_task_monitor_enabled
+                        and self._get_company_pids is not None
+                        and active_ids
+                    ):
+                        per_task_limit_bytes = int(cfg.per_task_rss_limit_mb * 1e6)
+                        for cid in active_ids:
+                            try:
+                                pids = list(self._get_company_pids(cid) or [])
+                            except Exception:
+                                # If callback fails, skip per-task check for this company.
+                                pids = []
+
+                            if not pids:
+                                # nothing to check
+                                self._per_task_over_thresh_ts.pop(cid, None)
+                                self._per_task_last_rss_bytes.pop(cid, None)
+                                continue
+
+                            # compute process-tree RSS for these root pids
+                            rss_total = 0
+                            for pid in pids:
+                                try:
+                                    proc = psutil.Process(pid)  # type: ignore
+                                    # include rss of proc and its children
+                                    try:
+                                        rss_total += proc.memory_info().rss
+                                    except Exception:
+                                        # if memory_info fails, skip
+                                        pass
+                                    # children
+                                    try:
+                                        for ch in proc.children(recursive=True):
+                                            try:
+                                                rss_total += ch.memory_info().rss
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        # some processes may restrict child inspection
+                                        pass
+                                except Exception:
+                                    # process may have died
+                                    pass
+
+                            # store last rss (helpful for logs / diagnostics)
+                            self._per_task_last_rss_bytes[cid] = int(rss_total)
+
+                            if rss_total >= per_task_limit_bytes:
+                                first_ts = self._per_task_over_thresh_ts.get(cid)
+                                if first_ts is None:
+                                    self._per_task_over_thresh_ts[cid] = now
+                                else:
+                                    if now - first_ts >= float(
+                                        cfg.per_task_rss_duration_sec
+                                    ):
+                                        # sustained exceed -> request cancel
+                                        logger.warning(
+                                            "[AdaptiveScheduling] per-task RSS exceeded for company %s: "
+                                            "rss=%.1fMB limit=%.1fMB sustained=%.1fs; canceling",
+                                            cid,
+                                            float(rss_total) / 1e6,
+                                            float(cfg.per_task_rss_limit_mb),
+                                            now - first_ts,
+                                        )
+                                        cancel_ids.append(cid)
+                                        # reset timer for this company
+                                        self._per_task_over_thresh_ts.pop(cid, None)
+                                        self._per_task_last_rss_bytes.pop(cid, None)
+                            else:
+                                # below threshold -> clear any pending timestamp
+                                self._per_task_over_thresh_ts.pop(cid, None)
+
                     # Effective emergency thresholds
                     eff_mem_crit_high = self._effective_mem_crit_high_frac(
                         total_bytes=total
                     )
 
                     slope = self._last_trend_slope_mb_s
+
+                    # Pre-OOM slope-based early cancel (conservative)
+                    if (
+                        used_frac >= cfg.preoom_used_frac
+                        and slope >= cfg.preoom_slope_mb_s
+                    ):
+                        # cancel 1..preoom_cancel_count heaviest companies (conservative)
+                        to_cancel_count = min(
+                            max(1, int(cfg.preoom_cancel_count)),
+                            max(0, num_active - int(cfg.min_active_keep)),
+                        )
+                        if to_cancel_count > 0:
+                            selected = self._select_heaviest_companies_locked(
+                                active_ids, count=to_cancel_count
+                            )
+                            if not selected:
+                                selected = list(active_ids)[-to_cancel_count:]
+                            logger.warning(
+                                "[AdaptiveScheduling] pre-oom slope trigger: used_frac=%.3f slope=%.1fMB/s canceling=%d companies: %s",
+                                used_frac,
+                                slope,
+                                len(selected),
+                                selected,
+                            )
+                            cancel_ids.extend(selected)
+                            self._last_emergency_cancel_ts = now
+                            self._emergency_rounds += 1
 
                     # Emergency condition: high RAM or very high swap while RAM is already high
                     in_emergency = (
@@ -908,14 +1019,16 @@ class AdaptiveScheduler:
                             and slope >= cfg.mem_trend_emergency_slope_mb_per_s
                         )
                     )
-                    if not in_emergency:
+
+                    if not in_emergency and not cancel_ids:
+                        # Nothing more to do this round
                         continue
 
                     # Respect emergency cancellation cooldown to avoid rapid-fire cancels
                     if (
                         now - self._last_emergency_cancel_ts
                         < cfg.emergency_cancel_cooldown_sec
-                    ):
+                    ) and not cancel_ids:
                         self._maybe_log_state_locked(
                             reason="emergency_cooldown",
                             extra={
@@ -929,7 +1042,8 @@ class AdaptiveScheduler:
                         )
                         continue
 
-                    # AIMD: strong multiplicative decrease on emergency
+                    # If we already decided to cancel due to per-task RSS or pre-oom slope,
+                    # we still run the AIMD decrease and other bookkeeping below.
                     high_swap = (
                         swap_frac >= cfg.swap_block_frac
                         and used_frac >= cfg.mem_high_frac
@@ -968,74 +1082,81 @@ class AdaptiveScheduler:
                             )
                         continue
 
-                    # Determine how many companies we ideally need to cancel to reach mem_crit_low_frac
-                    total_mb = float(total) / 1e6
-                    mem_crit_low_bytes = int(cfg.mem_crit_low_frac * float(total))
-                    excess_bytes = max(0, used - mem_crit_low_bytes)
-
-                    # Effective per-company estimate (global + per-company profiles)
-                    effective_est_mb = self._per_company_est_mb
-                    company_p95 = self._get_company_p95_est_mb_locked()
-                    if company_p95 is not None and company_p95 > effective_est_mb:
-                        effective_est_mb = company_p95
-
-                    max_safe_mb = cfg.mem_cap_frac * total_mb
-                    if max_safe_mb > 0.0 and effective_est_mb > max_safe_mb:
-                        effective_est_mb = max_safe_mb
-
-                    if effective_est_mb > cfg.per_company_max_reservation_mb:
-                        effective_est_mb = cfg.per_company_max_reservation_mb
-
-                    per_company_bytes = max(
-                        int(effective_est_mb * 1e6),
-                        int(self.cfg.per_company_min_reservation_mb * 1e6),
-                    )
-                    if per_company_bytes <= 0:
-                        needed_cancel = 1
+                    # If cancel_ids already collected (from per-task or pre-oom), respect max_cancelable
+                    if cancel_ids:
+                        cancel_ids = cancel_ids[:max_cancelable]
                     else:
-                        needed_cancel = int(
-                            (excess_bytes + per_company_bytes - 1) // per_company_bytes
+                        # Determine how many companies we ideally need to cancel to reach mem_crit_low_frac
+                        total_mb = float(total) / 1e6
+                        mem_crit_low_bytes = int(cfg.mem_crit_low_frac * float(total))
+                        excess_bytes = max(0, used - mem_crit_low_bytes)
+
+                        # Effective per-company estimate (global + per-company profiles)
+                        effective_est_mb = self._per_company_est_mb
+                        company_p95 = self._get_company_p95_est_mb_locked()
+                        if company_p95 is not None and company_p95 > effective_est_mb:
+                            effective_est_mb = company_p95
+
+                        max_safe_mb = cfg.mem_cap_frac * total_mb
+                        if max_safe_mb > 0.0 and effective_est_mb > max_safe_mb:
+                            effective_est_mb = max_safe_mb
+
+                        if effective_est_mb > cfg.per_company_max_reservation_mb:
+                            effective_est_mb = cfg.per_company_max_reservation_mb
+
+                        per_company_bytes = max(
+                            int(effective_est_mb * 1e6),
+                            int(self.cfg.per_company_min_reservation_mb * 1e6),
                         )
-                        needed_cancel = max(1, needed_cancel)
+                        if per_company_bytes <= 0:
+                            needed_cancel = 1
+                        else:
+                            needed_cancel = int(
+                                (excess_bytes + per_company_bytes - 1)
+                                // per_company_bytes
+                            )
+                            needed_cancel = max(1, needed_cancel)
 
-                    # Decide how many to cancel in this round
-                    super_critical = used_frac >= 0.98 or (
-                        used_frac >= cfg.mem_cap_frac
-                        and slope >= cfg.mem_trend_emergency_slope_mb_per_s
-                    )
-
-                    mid_emergency = (
-                        used_frac >= cfg.mem_high_frac
-                        and slope >= cfg.mem_trend_slope_high_mb_per_s
-                    ) or (
-                        used_frac >= 0.92
-                        and slope >= cfg.mem_trend_emergency_slope_mb_per_s
-                    )
-
-                    if super_critical:
-                        to_cancel_count = min(
-                            needed_cancel,
-                            cfg.max_emergency_cancel_per_step,
-                            max_cancelable,
+                        # Decide how many to cancel in this round
+                        super_critical = used_frac >= 0.98 or (
+                            used_frac >= cfg.mem_cap_frac
+                            and slope >= cfg.mem_trend_emergency_slope_mb_per_s
                         )
-                    elif mid_emergency:
-                        to_cancel_count = min(2, needed_cancel, max_cancelable)
-                    else:
-                        to_cancel_count = min(1, max_cancelable)
 
-                    if to_cancel_count <= 0:
-                        continue
+                        mid_emergency = (
+                            used_frac >= cfg.mem_high_frac
+                            and slope >= cfg.mem_trend_slope_high_mb_per_s
+                        ) or (
+                            used_frac >= 0.92
+                            and slope >= cfg.mem_trend_emergency_slope_mb_per_s
+                        )
 
-                    # Choose companies to cancel, preferring the heaviest known ones.
-                    to_cancel = self._select_heaviest_companies_locked(
-                        active_ids, count=to_cancel_count
-                    )
+                        if super_critical:
+                            to_cancel_count = min(
+                                needed_cancel,
+                                cfg.max_emergency_cancel_per_step,
+                                max_cancelable,
+                            )
+                        elif mid_emergency:
+                            to_cancel_count = min(2, needed_cancel, max_cancelable)
+                        else:
+                            to_cancel_count = min(1, max_cancelable)
 
-                    if not to_cancel:
-                        # Fallback: cancel last N active companies
-                        to_cancel = list(active_ids)[-to_cancel_count:]
+                        if to_cancel_count <= 0:
+                            # nothing to cancel
+                            continue
 
-                    cancel_ids = list(to_cancel)
+                        to_cancel = self._select_heaviest_companies_locked(
+                            active_ids, count=to_cancel_count
+                        )
+
+                        if not to_cancel:
+                            # Fallback: cancel last N active companies
+                            to_cancel = list(active_ids)[-to_cancel_count:]
+
+                        cancel_ids = list(to_cancel)
+
+                    # Update emergency bookkeeping
                     self._last_emergency_cancel_ts = now
                     self._emergency_rounds += 1
 
@@ -1046,16 +1167,17 @@ class AdaptiveScheduler:
                         "total_mem_mb=%.1f, used_mem_mb=%.1f, "
                         "num_active=%d, per_company_est_mb=%.1f, "
                         "effective_per_company_est_mb=%.1f, "
-                        "excess_bytes=%.1fMB, canceling=%d companies: %s, "
+                        "canceling=%d companies: %s, "
                         "trend_slope_mb_s=%.1f",
                         used_frac,
                         swap_frac,
-                        total_mb,
+                        float(total) / 1e6,
                         float(used) / 1e6,
                         num_active,
                         self._per_company_est_mb,
-                        effective_est_mb,
-                        float(excess_bytes) / 1e6,
+                        effective_est_mb
+                        if "effective_est_mb" in locals()
+                        else self._per_company_est_mb,
                         len(cancel_ids),
                         cancel_ids,
                         slope,
@@ -1076,6 +1198,7 @@ class AdaptiveScheduler:
                             used_frac,
                         )
 
+                # release lock before calling external cancellation (but keep consistent state)
                 if cancel_ids:
                     try:
                         self._request_cancel_companies(cancel_ids)
@@ -1125,6 +1248,11 @@ class AdaptiveScheduler:
         used = self._last_used_bytes
         used_frac = self._last_used_frac
 
+        # per-task rss samples (convert to MB) - include few entries
+        per_task_rss_mb = {
+            cid: (bytes_ / 1e6) for cid, bytes_ in self._per_task_last_rss_bytes.items()
+        }
+
         return {
             "total_mem_mb": float(total) / 1e6 if total > 0 else 0.0,
             "used_mem_mb": float(used) / 1e6 if used > 0 else 0.0,
@@ -1143,6 +1271,7 @@ class AdaptiveScheduler:
             "base_rss_mb": self._base_rss_bytes / 1e6,
             "completed_counter": self._completed_counter,
             "progress_samples_len": len(self._progress_samples),
+            "per_task_rss_mb_sample": per_task_rss_mb,
         }
 
     # ------------------------------------------------------------------ #
@@ -1763,6 +1892,4 @@ class AdaptiveScheduler:
 __all__ = [
     "AdaptiveSchedulingConfig",
     "AdaptiveScheduler",
-    "CriticalMemoryPressure",
-    "MEMORY_PRESSURE_MARKER",
 ]
