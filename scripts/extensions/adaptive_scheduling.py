@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.addHandler(logging.NullHandler())
 
-# psutil is optional; degrade gracefully if missing
 try:
     import psutil  # type: ignore
 
@@ -23,23 +22,11 @@ except Exception:  # pragma: no cover
     psutil = None  # type: ignore
     PSUTIL_AVAILABLE = False
 
-_MB = 1_000_000  # keep consistent with your codebase (you used 1e6 everywhere)
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+_MB = 1_000_000
 
 
 @dataclass
 class AdaptiveSchedulingConfig:
-    """
-    Memory-based adaptive scheduling configuration.
-
-    All thresholds are expressed as fractions of the effective memory limit
-    (host or cgroup), except where otherwise noted.
-    """
-
     # -----------------------------
     # Core watermarks
     # -----------------------------
@@ -52,7 +39,7 @@ class AdaptiveSchedulingConfig:
     # Estimation (per-company)
     # -----------------------------
     peak_history_size: int = 100
-    peak_history_horizon_sec: float = 1800.0  # 30 minutes
+    peak_history_horizon_sec: float = 1800.0
 
     per_company_safety_factor: float = 1.3
     per_company_min_reservation_mb: float = 256.0
@@ -62,8 +49,8 @@ class AdaptiveSchedulingConfig:
     # Sampling / overhead controls
     # -----------------------------
     emergency_check_interval_sec: float = 1.0
-    min_admission_sample_interval_sec: float = 0.35  # avoid over-sampling on fast loops
-    swap_sample_interval_sec: float = 2.0  # NEW: reduce psutil.swap_memory calls
+    min_admission_sample_interval_sec: float = 0.35
+    swap_sample_interval_sec: float = 2.0
 
     log_path: Optional[Path] = None
     use_psutil: bool = True
@@ -119,14 +106,11 @@ class AdaptiveSchedulingConfig:
     low_mem_stall_relax_shrink: float = 0.75
 
     # -----------------------------
-    # SAFE BURST (NEW)
+    # SAFE BURST
     # -----------------------------
-    # If we're clearly safe (low used_frac + tame slope), don't let target_parallel cap slots.
     safe_burst_used_frac: float = 0.72
     safe_burst_slope_mb_s: float = 60.0
     safe_burst_swap_frac: float = 0.30
-
-    # When safe, align target_parallel quickly to headroom (fast ramp).
     safe_target_align: bool = True
 
     # -----------------------------
@@ -139,7 +123,7 @@ class AdaptiveSchedulingConfig:
     emergency_persistent_rounds_threshold: int = 3
 
     # -----------------------------
-    # Per-task RSS monitoring (optional; needs PID callback)
+    # Per-task RSS monitoring (optional)
     # -----------------------------
     per_task_rss_limit_mb: float = 500.0
     per_task_rss_duration_sec: float = 2.0
@@ -152,22 +136,25 @@ class AdaptiveSchedulingConfig:
     preoom_slope_mb_s: float = 20.0
     preoom_cancel_count: int = 1
 
-
-# ---------------------------------------------------------------------------
-# Scheduler
-# ---------------------------------------------------------------------------
+    # -----------------------------
+    # NEW: Progress-stall detector
+    # -----------------------------
+    # If we have active companies but **no completions** for a while and memory
+    # keeps rising (linear leak / spin), proactively cancel a few tasks to break
+    # the stall. If it persists, recommend restart.
+    progress_stall_window_sec: float = 180.0
+    progress_stall_used_frac: float = 0.70
+    progress_stall_slope_mb_s: float = 15.0
+    progress_stall_min_active: int = 2
+    progress_stall_cancel_count: int = 1
+    progress_stall_cancel_cooldown_sec: float = 30.0
+    progress_stall_max_rounds_before_restart: int = 3
+    progress_stall_restart_multiplier: float = (
+        2.0  # restart if idle_for >= window * multiplier
+    )
 
 
 class AdaptiveScheduler:
-    """
-    Memory-based adaptive scheduler.
-
-    Hot path: admissible_slots()
-      - cache + throttle psutil sampling
-      - minimal work under lock
-      - avoid target_parallel artificially capping admissions when clearly safe
-    """
-
     def __init__(
         self,
         cfg: AdaptiveSchedulingConfig,
@@ -184,72 +171,60 @@ class AdaptiveScheduler:
 
         self._total_mem_bytes: Optional[int] = None
 
-        # Histories
         self._peak_history_mb: collections.deque[Tuple[float, float]] = (
             collections.deque()
         )
         self._mem_samples: collections.deque[Tuple[float, int]] = collections.deque()
 
-        # Estimator state
         self._per_company_est_mb: float = cfg.per_company_min_reservation_mb
 
-        # Per-company LRU peak cache
         self._company_peak_mb: "collections.OrderedDict[str, float]" = (
             collections.OrderedDict()
         )
         self._company_p95_cache_mb: Optional[float] = None
         self._company_p95_cache_ts: float = 0.0
 
-        # Watchdog / sync
         self._emergency_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
 
         self._restart_recommended: bool = False
         self._last_log_ts: float = 0.0
 
-        # Cached samples (hot path uses these)
         self._last_used_bytes: int = 0
         self._last_used_frac: float = 0.0
         self._last_swap_used_frac: float = 0.0
         self._last_sample_ts: float = 0.0
         self._last_swap_sample_ts: float = 0.0
 
-        # Trend estimation
         self._last_trend_slope_mb_s: float = 0.0
 
-        # AIMD target
         self._target_parallel: int = min(
             max(self.cfg.min_target, self.cfg.initial_target), self.cfg.max_target
         )
         self._update_calls: int = 0
 
-        # Near-OOM tuning
         self._near_oom_events: int = 0
         self._last_near_oom_flag: bool = False
 
-        # Unstall bookkeeping
         self._last_low_mem_relax_ts: float = 0.0
 
-        # Emergency bookkeeping
         self._last_emergency_cancel_ts: float = 0.0
         self._emergency_rounds: int = 0
 
-        # Base RSS estimate
         self._base_rss_bytes: float = 0.0
         self._base_rss_samples: int = 0
 
-        # Per-task RSS monitoring
         self._per_task_over_thresh_ts: Dict[str, float] = {}
         self._per_task_last_rss_bytes: Dict[str, int] = {}
         self._last_per_task_check_ts: float = 0.0
 
-        # Progress counters
         self._completed_counter: int = 0
         self._last_num_waiting: int = 0
 
-    # ------------------------------------------------------------------ #
-    # Public API
-    # ------------------------------------------------------------------ #
+        # NEW: stall tracking
+        self._last_progress_ts: float = time.time()
+        self._stall_rounds: int = 0
+        self._last_stall_cancel_ts: float = 0.0
 
     @property
     def psutil_available(self) -> bool:
@@ -261,6 +236,8 @@ class AdaptiveScheduler:
 
     def register_company_completed(self) -> None:
         self._completed_counter += 1
+        self._last_progress_ts = time.time()
+        self._stall_rounds = 0  # reset stall counter on progress
 
     def record_company_peak(self, company_id: str, peak_mb: float) -> None:
         if not company_id or peak_mb <= 0:
@@ -273,7 +250,6 @@ class AdaptiveScheduler:
         max_size = max(1, int(self.cfg.company_profile_max_size))
         while len(self._company_peak_mb) > max_size:
             self._company_peak_mb.popitem(last=False)
-
         self._company_p95_cache_mb = None
 
     async def start(self) -> None:
@@ -288,10 +264,12 @@ class AdaptiveScheduler:
         self._last_used_bytes = used
         self._last_used_frac = (float(used) / float(total)) if total > 0 else 0.0
 
-        # sample swap once at boot
         self._last_swap_used_frac = self._read_swap_used_frac()
-        self._last_swap_sample_ts = time.time()
-        self._last_sample_ts = time.time()
+        now = time.time()
+        self._last_swap_sample_ts = now
+        self._last_sample_ts = now
+
+        self._last_progress_ts = now
 
         logger.info(
             "[AdaptiveScheduling] started (total_mem_mb=%.1f, psutil=True, initial_target_parallel=%d)",
@@ -321,26 +299,17 @@ class AdaptiveScheduler:
             )
 
     async def admissible_slots(self, num_waiting: int) -> int:
-        """
-        Decide how many new companies can be started right now.
-
-        Refactor goals:
-          - minimize psutil calls (cached sampling + swap throttling)
-          - keep lock region small
-          - avoid target_parallel artificially limiting slots when clearly safe
-        """
         if num_waiting <= 0:
             return 0
         self._last_num_waiting = num_waiting
 
         if not self._psutil_available:
-            return 1  # conservative fallback
+            return 1
 
         now = time.time()
         cfg = self.cfg
 
         async with self._lock:
-            # 1) Sample memory only if needed
             if (now - self._last_sample_ts) >= cfg.min_admission_sample_interval_sec:
                 total, used = self._read_memory_usage_bytes()
                 if total <= 0:
@@ -353,7 +322,6 @@ class AdaptiveScheduler:
 
                 self._record_memory_sample_locked(ts=now, used_bytes=used)
 
-                # swap sampling throttled
                 if (now - self._last_swap_sample_ts) >= cfg.swap_sample_interval_sec:
                     self._last_swap_used_frac = self._read_swap_used_frac()
                     self._last_swap_sample_ts = now
@@ -374,10 +342,8 @@ class AdaptiveScheduler:
             active_ids = self._get_active_company_ids()
             num_active = len(active_ids)
 
-            # base RSS estimate only in idle
             self._update_base_rss_locked(used_bytes=used, num_active=num_active)
 
-            # 2) Update AIMD target (cheap)
             precritical = (
                 used_frac >= max(0.0, cfg.mem_cap_frac - cfg.mem_trend_margin_frac)
                 and slope >= cfg.mem_trend_slope_high_mb_per_s
@@ -407,7 +373,6 @@ class AdaptiveScheduler:
                 )
                 return 0
 
-            # 3) Compute headroom and mem-limited slots
             mem_cap_bytes = int(cfg.mem_cap_frac * float(total))
             headroom_bytes = mem_cap_bytes - used
             if headroom_bytes <= 0:
@@ -423,7 +388,6 @@ class AdaptiveScheduler:
                 )
                 return 0
 
-            # 4) Update per-company estimator (keep it cheap; peak_history is small)
             self._update_per_company_estimate_locked(
                 used_bytes=used,
                 num_active=num_active,
@@ -440,7 +404,6 @@ class AdaptiveScheduler:
 
             slots_by_mem = int(headroom_bytes // per_company_bytes)
 
-            # Poisoned estimator rescue (low-mem stall relax)
             if slots_by_mem <= 0:
                 self._maybe_low_mem_stall_relax_locked(
                     total=total,
@@ -462,7 +425,6 @@ class AdaptiveScheduler:
             if slots_by_mem <= 0:
                 return 0
 
-            # 5) Soft target cap, but allow SAFE BURST when clearly safe
             max_by_target = max(0, self._target_parallel - num_active)
 
             safe_burst = (
@@ -472,7 +434,6 @@ class AdaptiveScheduler:
             )
 
             if cfg.safe_target_align and safe_burst:
-                # Fast ramp: align target to what headroom allows (prevents “stuck at 7”)
                 desired = min(
                     cfg.max_target, max(cfg.min_target, num_active + slots_by_mem)
                 )
@@ -480,7 +441,6 @@ class AdaptiveScheduler:
                     self._target_parallel = desired
 
             if safe_burst:
-                # don't cap by low target_parallel; still respect max_target hard bound
                 hard_cap = max(0, cfg.max_target - num_active)
                 slots = min(slots_by_mem, num_waiting, hard_cap)
             else:
@@ -536,12 +496,12 @@ class AdaptiveScheduler:
             "mem_crit_high_frac": self.cfg.mem_crit_high_frac,
             "base_rss_mb": self._base_rss_bytes / _MB,
             "completed_counter": self._completed_counter,
+            "last_progress_age_sec": max(0.0, time.time() - self._last_progress_ts),
+            "stall_rounds": self._stall_rounds,
             "per_task_rss_mb_sample": per_task_rss_mb,
         }
 
-    # ------------------------------------------------------------------ #
-    # Internal helpers
-    # ------------------------------------------------------------------ #
+    # ---------------- internal ----------------
 
     def _read_cgroup_memory_bytes(self) -> Tuple[int, int]:
         try:
@@ -669,11 +629,7 @@ class AdaptiveScheduler:
         return p95
 
     def _update_per_company_estimate_locked(
-        self,
-        *,
-        used_bytes: int,
-        num_active: int,
-        used_frac: float,
+        self, *, used_bytes: int, num_active: int, used_frac: float
     ) -> None:
         if used_bytes <= 0 or self._total_mem_bytes is None or num_active <= 0:
             return
@@ -697,7 +653,6 @@ class AdaptiveScheduler:
                 self._peak_history_mb.popleft()
 
         if self._peak_history_mb:
-            # peak_history_size is small (<=100), sorting is cheap enough and stable
             values = [v for (_, v) in self._peak_history_mb]
             values.sort()
             idx = max(0, int(0.95 * len(values)) - 1)
@@ -716,7 +671,6 @@ class AdaptiveScheduler:
         old_est = self._per_company_est_mb
         new_est = max(cfg.per_company_min_reservation_mb, upward_est)
 
-        # gentle downward nudge in safe regime
         if used_frac < cfg.unstall_low_frac and (per_company_now_mb * 1.5) < old_est:
             target = max(cfg.per_company_min_reservation_mb, per_company_now_mb)
             lowered = old_est * 0.9 + target * 0.1
@@ -738,12 +692,7 @@ class AdaptiveScheduler:
             )
 
     def _maybe_low_mem_stall_relax_locked(
-        self,
-        *,
-        total: int,
-        used: int,
-        headroom_bytes: int,
-        used_frac: float,
+        self, *, total: int, used: int, headroom_bytes: int, used_frac: float
     ) -> None:
         cfg = self.cfg
         now = time.time()
@@ -763,7 +712,6 @@ class AdaptiveScheduler:
             new_est = cfg.per_company_max_reservation_mb
 
         self._peak_history_mb.clear()
-
         self._per_company_est_mb = new_est
         self._last_low_mem_relax_ts = now
 
@@ -823,12 +771,7 @@ class AdaptiveScheduler:
         self._last_near_oom_flag = is_near
 
     def _update_target_parallel_locked(
-        self,
-        *,
-        used_frac: float,
-        precritical: bool,
-        high_swap: bool,
-        mem_trouble: bool,
+        self, *, used_frac: float, precritical: bool, high_swap: bool, mem_trouble: bool
     ) -> None:
         cfg = self.cfg
         old_target = self._target_parallel
@@ -893,6 +836,8 @@ class AdaptiveScheduler:
             "mem_crit_high_frac": self.cfg.mem_crit_high_frac,
             "base_rss_mb": self._base_rss_bytes / _MB,
             "completed_counter": self._completed_counter,
+            "last_progress_age_sec": max(0.0, time.time() - self._last_progress_ts),
+            "stall_rounds": self._stall_rounds,
         }
         if extra:
             state.update(extra)
@@ -922,9 +867,115 @@ class AdaptiveScheduler:
         weighted.sort(key=lambda x: x[1], reverse=True)
         return [cid for (cid, _) in weighted[:count]]
 
-    # ------------------------------------------------------------------ #
-    # Emergency watchdog
-    # ------------------------------------------------------------------ #
+    def _maybe_progress_stall_actions_locked(
+        self,
+        *,
+        now: float,
+        used_frac: float,
+        swap_frac: float,
+        slope: float,
+        active_ids: Sequence[str],
+    ) -> List[str]:
+        """
+        Detect the stall pattern you described:
+          - RAM rising steadily (positive slope)
+          - CPU high but no useful progress (we approximate by: no completions)
+          - active companies exist
+        Action:
+          - cancel a small number of companies to break the stall
+          - if repeated, recommend restart
+        """
+        cfg = self.cfg
+        num_active = len(active_ids)
+        if num_active < int(cfg.progress_stall_min_active):
+            return []
+
+        idle_for = now - self._last_progress_ts
+        if idle_for < float(cfg.progress_stall_window_sec):
+            return []
+
+        if used_frac < float(cfg.progress_stall_used_frac):
+            return []
+
+        if slope < float(cfg.progress_stall_slope_mb_s):
+            return []
+
+        if (now - self._last_stall_cancel_ts) < float(
+            cfg.progress_stall_cancel_cooldown_sec
+        ):
+            return []
+
+        max_cancelable = max(0, num_active - int(cfg.min_active_keep))
+        if max_cancelable <= 0:
+            # cannot cancel: recommend restart if the stall is strong
+            self._restart_recommended = True
+            self._maybe_log_state_locked(
+                reason="progress_stall_restart_nocancel",
+                extra={
+                    "idle_for_sec": idle_for,
+                    "used_frac": used_frac,
+                    "swap_used_frac": swap_frac,
+                    "trend_slope_mb_s": slope,
+                    "num_active": num_active,
+                },
+            )
+            return []
+
+        to_cancel = min(max_cancelable, max(1, int(cfg.progress_stall_cancel_count)))
+        cancel_ids = self._select_heaviest_companies_locked(active_ids, count=to_cancel)
+        if not cancel_ids:
+            cancel_ids = list(active_ids)[-to_cancel:]
+
+        self._last_stall_cancel_ts = now
+        self._stall_rounds += 1
+
+        logger.error(
+            "[AdaptiveScheduling] progress-stall detected: idle_for=%.1fs used_frac=%.3f slope=%.1fMB/s active=%d -> cancel=%s (stall_rounds=%d)",
+            idle_for,
+            used_frac,
+            slope,
+            num_active,
+            cancel_ids,
+            self._stall_rounds,
+        )
+
+        self._maybe_log_state_locked(
+            reason="progress_stall_cancel",
+            extra={
+                "idle_for_sec": idle_for,
+                "used_frac": used_frac,
+                "swap_used_frac": swap_frac,
+                "trend_slope_mb_s": slope,
+                "num_active": num_active,
+                "cancel_ids": cancel_ids,
+                "stall_rounds": self._stall_rounds,
+            },
+        )
+
+        # Escalate to restart if it persists
+        if self._stall_rounds >= int(cfg.progress_stall_max_rounds_before_restart):
+            if idle_for >= float(cfg.progress_stall_window_sec) * float(
+                cfg.progress_stall_restart_multiplier
+            ):
+                self._restart_recommended = True
+                logger.error(
+                    "[AdaptiveScheduling] progress-stall persists (%d rounds, idle_for=%.1fs); restart recommended.",
+                    self._stall_rounds,
+                    idle_for,
+                )
+                self._maybe_log_state_locked(
+                    reason="progress_stall_restart",
+                    extra={
+                        "idle_for_sec": idle_for,
+                        "used_frac": used_frac,
+                        "swap_used_frac": swap_frac,
+                        "trend_slope_mb_s": slope,
+                        "num_active": num_active,
+                        "stall_rounds": self._stall_rounds,
+                    },
+                )
+
+        return cancel_ids
 
     async def _emergency_loop(self, interval: float) -> None:
         cfg = self.cfg
@@ -950,7 +1001,6 @@ class AdaptiveScheduler:
                     self._last_used_frac = used_frac
                     self._record_memory_sample_locked(ts=now, used_bytes=used)
 
-                    # swap sampling throttled even in watchdog
                     if (
                         now - self._last_swap_sample_ts
                     ) >= cfg.swap_sample_interval_sec:
@@ -968,7 +1018,18 @@ class AdaptiveScheduler:
                         used_bytes=used, num_active=num_active, used_frac=used_frac
                     )
 
-                    # Per-task RSS monitoring (optional)
+                    # --- NEW: progress-stall actions (runs even if not "near-oom") ---
+                    slope = self._last_trend_slope_mb_s
+                    stall_cancels = self._maybe_progress_stall_actions_locked(
+                        now=now,
+                        used_frac=used_frac,
+                        swap_frac=swap_frac,
+                        slope=slope,
+                        active_ids=active_ids,
+                    )
+                    cancel_ids.extend(stall_cancels)
+
+                    # Per-task RSS monitoring
                     if (
                         cfg.per_task_monitor_enabled
                         and self._get_company_pids is not None
@@ -1037,8 +1098,6 @@ class AdaptiveScheduler:
                                 else:
                                     self._per_task_over_thresh_ts.pop(cid, None)
 
-                    slope = self._last_trend_slope_mb_s
-
                     # Pre-oom slope trigger
                     if (
                         used_frac >= cfg.preoom_used_frac
@@ -1106,8 +1165,17 @@ class AdaptiveScheduler:
                         )
                         continue
 
+                    # Dedup + cap cancel list
                     if cancel_ids:
-                        cancel_ids = cancel_ids[:max_cancelable]
+                        # preserve order, dedup
+                        seen = set()
+                        uniq: List[str] = []
+                        for cid in cancel_ids:
+                            if cid in seen:
+                                continue
+                            seen.add(cid)
+                            uniq.append(cid)
+                        cancel_ids = uniq[:max_cancelable]
                     else:
                         effective_est_mb = self._effective_per_company_est_mb_locked()
                         per_company_bytes = max(
