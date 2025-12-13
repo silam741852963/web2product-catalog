@@ -606,7 +606,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-pages", type=int, default=100)
     parser.add_argument("--enable-resource-monitor", action="store_true")
-    parser.add_argument("--page-timeout-ms", type=int, default=60000)
+    parser.add_argument("--page-timeout-ms", type=int, default=30000)
 
     parser.add_argument(
         "--retry-mode",
