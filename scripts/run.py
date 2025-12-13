@@ -169,6 +169,36 @@ def _write_crawl_meta(company: Company, snapshot: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Global state helpers
+# ---------------------------------------------------------------------------
+
+
+def _read_in_progress_companies(out_dir: Path) -> List[str]:
+    """
+    Reads out_dir/crawl_global_state.json and returns in_progress_companies.
+    If missing or invalid, returns [].
+    """
+    p = out_dir / "crawl_global_state.json"
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Failed to parse crawl_global_state.json at %s", p)
+        return []
+    ids = data.get("in_progress_companies") or []
+    # normalize to strings
+    out: List[str] = []
+    for x in ids:
+        if x is None:
+            continue
+        s = str(x).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Company level crawl
 # ---------------------------------------------------------------------------
 
@@ -252,7 +282,6 @@ async def crawl_company(
 
             results_or_gen = await crawler.arun(start_url, config=config)
 
-            # Streaming generator
             if not isinstance(results_or_gen, list):
                 agen = results_or_gen
                 pending_exc: Optional[BaseException] = None
@@ -346,6 +375,11 @@ async def run_company_pipeline(
     completed_ok = False
     token: Optional[Any] = None
 
+    # Special finalize mode: force-mark markdown completed even if errors
+    finalize_in_progress_md: bool = bool(
+        getattr(args, "finalize_in_progress_md", False)
+    )
+
     try:
         try:
             snap = await state.get_company_snapshot(company.company_id)
@@ -375,6 +409,10 @@ async def run_company_pipeline(
         will_run_llm_presence = args.llm_mode == "presence" and presence_llm is not None
         will_run_llm_full = args.llm_mode == "full" and full_llm is not None
         will_run_llm = will_run_llm_presence or will_run_llm_full
+
+        # In finalize mode, we *never* run LLM (wrapper also passes --llm-mode none)
+        if finalize_in_progress_md:
+            will_run_llm = False
 
         if not do_crawl and not will_run_llm:
             return True
@@ -441,10 +479,13 @@ async def run_company_pipeline(
                 root_url=company.domain_url,
             )
 
-        if args.llm_mode == "presence" and presence_llm is not None:
-            await run_presence_pass_for_company(company, presence_strategy=presence_llm)
-        elif args.llm_mode == "full" and full_llm is not None:
-            await run_full_pass_for_company(company, full_strategy=full_llm)
+        if not finalize_in_progress_md:
+            if args.llm_mode == "presence" and presence_llm is not None:
+                await run_presence_pass_for_company(
+                    company, presence_strategy=presence_llm
+                )
+            elif args.llm_mode == "full" and full_llm is not None:
+                await run_full_pass_for_company(company, full_strategy=full_llm)
 
         completed_ok = True
         return True
@@ -479,8 +520,18 @@ async def run_company_pipeline(
                 "Failed to update run state for company_id=%s", company.company_id
             )
 
-        if completed_ok:
-            mark_company_completed(company.company_id)
+        # IMPORTANT: new behavior
+        # - normal runs: mark_company_completed only if completed_ok
+        # - finalize-in-progress-md: force mark_company_completed regardless of errors
+        try:
+            if finalize_in_progress_md:
+                mark_company_completed(company.company_id)
+            elif completed_ok:
+                mark_company_completed(company.company_id)
+        except Exception:
+            logger.exception(
+                "Failed to mark_company_completed for company_id=%s", company.company_id
+            )
 
         if token is not None:
             try:
@@ -555,7 +606,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-pages", type=int, default=100)
     parser.add_argument("--enable-resource-monitor", action="store_true")
-    parser.add_argument("--page-timeout-ms", type=int, default=30000)
+    parser.add_argument("--page-timeout-ms", type=int, default=60000)
 
     parser.add_argument(
         "--retry-mode",
@@ -564,6 +615,13 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="all",
     )
     parser.add_argument("--enable-session-log", action="store_true")
+
+    # NEW: finalize mode (used by wrapper after clean exit)
+    parser.add_argument(
+        "--finalize-in-progress-md",
+        action="store_true",
+        help="Special mode: read crawl_global_state.json and force-mark markdown completion for in_progress companies (no LLM).",
+    )
 
     # page pipeline knobs
     parser.add_argument("--page-result-concurrency", type=int, default=32)
@@ -592,6 +650,15 @@ async def main_async(args: argparse.Namespace) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
     )
     logger.setLevel(log_level)
+
+    # If we are in finalize mode, force no-LLM (markdown only)
+    if getattr(args, "finalize_in_progress_md", False):
+        if args.llm_mode != "none":
+            logger.warning(
+                "--finalize-in-progress-md enabled; forcing --llm-mode none (ignoring requested llm-mode=%s).",
+                args.llm_mode,
+            )
+        args.llm_mode = "none"
 
     retry_cfg = RetryTrackerConfig(out_dir=out_dir)
     retry_tracker = RetryTracker(retry_cfg)
@@ -684,7 +751,6 @@ async def main_async(args: argparse.Namespace) -> None:
 
     state = get_crawl_state()
 
-    # ---- minimal scheduler wiring: only ids + cancel hook ----
     inflight_by_cid: Dict[str, asyncio.Task] = {}
     cid_by_task: Dict[asyncio.Task, str] = {}
 
@@ -715,10 +781,38 @@ async def main_async(args: argparse.Namespace) -> None:
                 cid = (parsed.netloc or parsed.path or "company").replace(":", "_")
             companies = [Company(company_id=cid, domain_url=url)]
 
-        if retry_mode == "skip-retry" and prev_retry_ids:
-            companies = [c for c in companies if c.company_id not in prev_retry_ids]
-        elif retry_mode == "only-retry" and prev_retry_ids:
-            companies = [c for c in companies if c.company_id in prev_retry_ids]
+        # NEW: finalize mode filters to in_progress_companies from crawl_global_state.json
+        finalize_in_progress_md: bool = bool(
+            getattr(args, "finalize_in_progress_md", False)
+        )
+        if finalize_in_progress_md:
+            inprog = _read_in_progress_companies(out_dir)
+            if not inprog:
+                logger.info(
+                    "--finalize-in-progress-md: no in_progress_companies; exiting."
+                )
+                return
+            inprog_set = set(inprog)
+            before = len(companies)
+            companies = [c for c in companies if c.company_id in inprog_set]
+            logger.info(
+                "--finalize-in-progress-md: filtered companies %d -> %d (in_progress=%d).",
+                before,
+                len(companies),
+                len(inprog_set),
+            )
+            if not companies:
+                logger.info(
+                    "--finalize-in-progress-md: none of the in_progress IDs exist in input; exiting."
+                )
+                return
+
+        # Retry-mode filters (normal flow)
+        if not finalize_in_progress_md:
+            if retry_mode == "skip-retry" and prev_retry_ids:
+                companies = [c for c in companies if c.company_id not in prev_retry_ids]
+            elif retry_mode == "only-retry" and prev_retry_ids:
+                companies = [c for c in companies if c.company_id in prev_retry_ids]
 
         run_id = await state.start_run(
             pipeline="deep_crawl", version=None, args_hash=None
@@ -733,19 +827,22 @@ async def main_async(args: argparse.Namespace) -> None:
             logger.exception("Failed to recompute global crawl state at startup")
 
         # ---- pre-skip ----
-        companies_to_run: List[Company] = []
-        for c in companies:
-            try:
-                snap = await state.get_company_snapshot(c.company_id)
-                status = getattr(snap, "status", None) or COMPANY_STATUS_PENDING
-            except Exception:
+        # IMPORTANT: disable pre-skip in finalize mode (we need to force-mark completion even if status looks done)
+        if not finalize_in_progress_md:
+            companies_to_run: List[Company] = []
+            for c in companies:
+                try:
+                    snap = await state.get_company_snapshot(c.company_id)
+                    status = getattr(snap, "status", None) or COMPANY_STATUS_PENDING
+                except Exception:
+                    companies_to_run.append(c)
+                    continue
+                if _should_skip_company(status, args.llm_mode):
+                    continue
                 companies_to_run.append(c)
-                continue
-            if _should_skip_company(status, args.llm_mode):
-                continue
-            companies_to_run.append(c)
 
-        companies = companies_to_run
+            companies = companies_to_run
+
         if not companies:
             logger.info(
                 "No companies require work for llm_mode=%s; exiting.", args.llm_mode
@@ -782,7 +879,6 @@ async def main_async(args: argparse.Namespace) -> None:
             headless=True,
         )
 
-        # ---- adaptive scheduler (logic stays inside the scheduler module) ----
         scheduler_log_path = out_dir / "adaptive_scheduling_state.jsonl"
         scheduler_cfg = AdaptiveSchedulingConfig(log_path=scheduler_log_path)
         scheduler = AdaptiveScheduler(
@@ -798,7 +894,6 @@ async def main_async(args: argparse.Namespace) -> None:
         launched = 0
         total = len(companies)
 
-        # cheap periodic global recompute (optional but useful)
         last_global_recompute_ts = 0.0
         global_recompute_interval_sec = 120.0
 

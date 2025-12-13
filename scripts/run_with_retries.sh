@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-set -uo pipefail   # no -e because we handle non-zero exits manually
+set -uo pipefail   # no -e (we handle non-zero exits manually)
 
 args=("$@")
 
-# Retry exit code: prefer RETRY_EXIT_CODE, then DEEP_CRAWL_RETRY_EXIT_CODE, else 17
+# Retry exit code: prefer RETRY_EXIT_CODE, then DEEP_CRAWL_RETRY_EXIT_CODE, then default 17
 : "${RETRY_EXIT_CODE:=}"
 if [[ -z "$RETRY_EXIT_CODE" && -n "${DEEP_CRAWL_RETRY_EXIT_CODE:-}" ]]; then
   RETRY_EXIT_CODE="${DEEP_CRAWL_RETRY_EXIT_CODE}"
@@ -14,7 +14,7 @@ fi
 export RETRY_EXIT_CODE
 export DEEP_CRAWL_RETRY_EXIT_CODE="$RETRY_EXIT_CODE"
 
-# OUT_DIR from env or --out-dir
+# Derive OUT_DIR from env or --out-dir argument
 if [[ -n "${OUT_DIR:-}" ]]; then
   OUT_DIR="${OUT_DIR}"
 else
@@ -29,38 +29,86 @@ fi
 export OUT_DIR
 
 RETRY_FILE="${OUT_DIR}/retry_companies.json"
+GLOBAL_STATE_FILE="${OUT_DIR}/crawl_global_state.json"
 
-# Strict retry controls (retry phase only)
-STRICT_MIN_RETRY_SUCCESS_RATE="${STRICT_MIN_RETRY_SUCCESS_RATE:-0.1}"  # 10%
-STRICT_MAX_RETRY_ITER="${STRICT_MAX_RETRY_ITER:-10}"
+# Expected improvement + retry caps (new names, with backward-compat)
+EXPECTED_MIN_IMPROVEMENT_RATE="${EXPECTED_MIN_IMPROVEMENT_RATE:-${STRICT_MIN_RETRY_SUCCESS_RATE:-0.10}}"  # 10%
+MAX_RETRY_ITER="${MAX_RETRY_ITER:-${STRICT_MAX_RETRY_ITER:-10}}"
 
-# OOM auto restart controls
+# OOM auto restart config
 OOM_RESTART_LIMIT="${OOM_RESTART_LIMIT:-100}"
 OOM_RESTART_DELAY="${OOM_RESTART_DELAY:-10}"
 OOM_RESTART_COUNT=0
 
-# Persistent history file (JSONL)
+# Persistent retry history file (JSONL)
 RETRY_HISTORY_FILE="${RETRY_HISTORY_FILE:-${OUT_DIR}/retry_history.jsonl}"
 mkdir -p "$(dirname "$RETRY_HISTORY_FILE")"
 
 log_history() {
   local iter="$1"
   local exit_code="$2"
-  local current_retry_count="$3"
-  local prev_retry_count="$4"
-  local reason="$5"
+  local retry_mode="$3"
+  local phase="$4"
+  local current_retry_count="$5"
+  local prev_retry_count="$6"
+  local total_companies="$7"
+  local attempted_total="$8"
+  local reason="$9"
 
   local ts
   ts="$(date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')"
 
   printf '{"timestamp":"%s","iteration":%s,"exit_code":%s,' \
     "$ts" "$iter" "$exit_code" >> "$RETRY_HISTORY_FILE"
+  printf '"retry_mode":"%s","phase":"%s",' \
+    "$retry_mode" "$phase" >> "$RETRY_HISTORY_FILE"
   printf '"current_retry_count":%s,"prev_retry_count":%s,' \
     "$current_retry_count" "$prev_retry_count" >> "$RETRY_HISTORY_FILE"
+  printf '"total_companies":%s,"attempted_total":%s,' \
+    "$total_companies" "$attempted_total" >> "$RETRY_HISTORY_FILE"
   printf '"reason":"%s"}\n' "$reason" >> "$RETRY_HISTORY_FILE"
 }
 
-# Detect user supplied --retry-mode once; if present, wrapper does NOT override it.
+read_retry_info() {
+  # Prints: retry_count total_companies attempted_total
+  if [[ ! -f "$RETRY_FILE" ]]; then
+    echo "0 0 0"
+    return 0
+  fi
+  python3 - "$RETRY_FILE" << 'PYEOF'
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+except Exception:
+    print("0 0 0")
+    raise SystemExit
+rc = data.get("retry_companies") or []
+total = int(data.get("total_companies") or 0)
+attempted = int(data.get("attempted_total") or 0)
+print(len(rc), total, attempted)
+PYEOF
+}
+
+read_in_progress_count() {
+  if [[ ! -f "$GLOBAL_STATE_FILE" ]]; then
+    echo "0"
+    return 0
+  fi
+  python3 - "$GLOBAL_STATE_FILE" << 'PYEOF'
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+except Exception:
+    print(0)
+    raise SystemExit
+lst = data.get("in_progress_companies") or []
+print(len(lst))
+PYEOF
+}
+
+# Detect user supplied --retry-mode once (wrapper will not override)
 USER_RETRY_MODE=0
 USER_RETRY_MODE_VALUE=""
 for ((i=0; i<${#args[@]}; i++)); do
@@ -76,200 +124,181 @@ if [[ "$USER_RETRY_MODE" -eq 1 ]]; then
   echo "[retry-wrapper] user-specified --retry-mode=${USER_RETRY_MODE_VALUE} (wrapper will not override retry-mode)."
 fi
 
-# Helper: read retry_companies count + totals
-read_retry_fields() {
-  # outputs: retry_count total_companies attempted_total all_attempted_flag
-  python3 - "$RETRY_FILE" << 'PYEOF'
-import json, sys, pathlib
-p = pathlib.Path(sys.argv[1])
-try:
-    data = json.loads(p.read_text(encoding="utf-8"))
-except Exception:
-    print("0 0 0 false")
-    raise SystemExit(0)
-
-retry_companies = data.get("retry_companies") or []
-total_companies = int(data.get("total_companies") or 0)
-attempted_total = int(data.get("attempted_total") or 0)
-all_attempted = bool(data.get("all_attempted") or False)
-print(len(retry_companies), total_companies, attempted_total, "true" if all_attempted else "false")
-PYEOF
-}
-
-PREV_RETRY_COUNT=0
 ITER=1
-PHASE="primary"       # primary => skip-retry (after first iteration); retry => only-retry
-STRICT_RETRY_COUNT=0
+PHASE="primary"  # primary -> retry
+RETRY_ITER=0
+PREV_RETRY_COUNT=0
 
 while :; do
-  echo "[retry-wrapper] iteration ${ITER} (phase=${PHASE})"
-
-  # Decide retry-mode for this iteration (only if wrapper controls it)
-  if [[ "$USER_RETRY_MODE" -eq 0 ]]; then
-    RETRY_COMPANY_MODE="skip-retry"
-
-    if [[ "$PHASE" == "retry" ]]; then
-      RETRY_COMPANY_MODE="only-retry"
-    else
-      # PHASE == primary
-      if [[ "$ITER" -eq 1 ]]; then
-        # First run: use "all" only if retry file missing OR retry_companies empty
-        if [[ ! -f "$RETRY_FILE" ]]; then
-          RETRY_COMPANY_MODE="all"
-        else
-          read -r _rc _tc _at _aa <<<"$(read_retry_fields)"
-          if [[ "$_rc" -eq 0 ]]; then
-            RETRY_COMPANY_MODE="all"
-          else
-            RETRY_COMPANY_MODE="skip-retry"
-          fi
-        fi
-      else
-        # Later runs: always skip-retry in primary phase
-        RETRY_COMPANY_MODE="skip-retry"
-      fi
-    fi
-
-    echo "[retry-wrapper] RETRY_COMPANY_MODE=${RETRY_COMPANY_MODE}"
+  # Decide retry-mode for this iteration
+  RETRY_MODE_TO_USE=""
+  if [[ "$USER_RETRY_MODE" -eq 1 ]]; then
+    RETRY_MODE_TO_USE="(user:${USER_RETRY_MODE_VALUE})"
   else
-    echo "[retry-wrapper] using user-specified --retry-mode=${USER_RETRY_MODE_VALUE}"
+    read -r retry_count total_companies attempted_total <<< "$(read_retry_info)"
+    if [[ "$PHASE" == "primary" ]]; then
+      # first run uses --retry-mode all ONLY when retry file missing OR retry_companies is empty
+      if [[ "$retry_count" -eq 0 ]]; then
+        RETRY_MODE_TO_USE="all"
+      else
+        RETRY_MODE_TO_USE="skip-retry"
+      fi
+    else
+      RETRY_MODE_TO_USE="only-retry"
+    fi
   fi
 
-  # Run
+  echo "[retry-wrapper] iteration ${ITER} phase=${PHASE} retry_mode=${RETRY_MODE_TO_USE}"
+
+  # Run crawler
   if [[ "$USER_RETRY_MODE" -eq 1 ]]; then
     python3 scripts/run.py "${args[@]}"
   else
-    python3 scripts/run.py --retry-mode "$RETRY_COMPANY_MODE" "${args[@]}"
+    python3 scripts/run.py --retry-mode "$RETRY_MODE_TO_USE" "${args[@]}"
   fi
   EXIT_CODE=$?
 
-  # ---------------- Clean exit ----------------
+  # --- Clean exit path ---------------------------------------------------
   if [[ "$EXIT_CODE" -eq 0 ]]; then
-    CURRENT_RETRY_COUNT=0
-    TOTAL_COMPANIES=0
-    ATTEMPTED_TOTAL=0
-    ALL_ATTEMPTED_FLAG="false"
+    read -r retry_count total_companies attempted_total <<< "$(read_retry_info)"
+    log_history "$ITER" "$EXIT_CODE" "$RETRY_MODE_TO_USE" "$PHASE" \
+      "$retry_count" "$PREV_RETRY_COUNT" "$total_companies" "$attempted_total" "clean_exit"
 
-    if [[ -f "$RETRY_FILE" ]]; then
-      read -r CURRENT_RETRY_COUNT TOTAL_COMPANIES ATTEMPTED_TOTAL ALL_ATTEMPTED_FLAG <<<"$(read_retry_fields)"
+    # Final “in_progress” cleanup pass:
+    inprog="$(read_in_progress_count)"
+    if [[ "$inprog" -gt 0 ]]; then
+      echo "[retry-wrapper] clean exit but crawl_global_state.json has in_progress_companies=${inprog}"
+      echo "[retry-wrapper] running finalize pass: force-mark markdown completed for those companies (no LLM)."
+
+      # IMPORTANT: we intentionally do NOT override --retry-mode here; finalize flag filters by in_progress list.
+      # We do force llm-mode none as requested, and finalize-in-progress-md.
+      python3 scripts/run.py "${args[@]}" --finalize-in-progress-md --llm-mode none
+      FINALIZE_EXIT=$?
+
+      if [[ "$FINALIZE_EXIT" -ne 0 ]]; then
+        echo "[retry-wrapper] finalize pass failed with exit_code=${FINALIZE_EXIT}; stopping."
+        log_history "$ITER" "$FINALIZE_EXIT" "finalize" "finalize" \
+          "-1" "$PREV_RETRY_COUNT" "$total_companies" "$attempted_total" "finalize_failed"
+        exit "$FINALIZE_EXIT"
+      fi
+
+      echo "[retry-wrapper] finalize pass completed."
     fi
 
-    log_history "$ITER" "$EXIT_CODE" "0" "$PREV_RETRY_COUNT" "clean_exit"
-
-    # Defensive: if exit=0 but retry list exists, enter retry phase once.
-    if [[ "$PHASE" == "primary" && "$CURRENT_RETRY_COUNT" -gt 0 ]]; then
-      echo "[retry-wrapper] run exited cleanly but retry_companies.json has ${CURRENT_RETRY_COUNT}; switching to retry phase."
-      PHASE="retry"
-      PREV_RETRY_COUNT="$CURRENT_RETRY_COUNT"
-      ITER=$((ITER + 1))
-      continue
-    fi
-
-    echo "[retry-wrapper] run finished cleanly; stopping."
-    break
+    echo "[retry-wrapper] finished."
+    exit 0
   fi
 
-  # ---------------- Non-retry exit (handle OOM signal 9 / 137 first) ----------------
+  # --- Non-retry exit code path (handle OOM first) ------------------------
   if [[ "$EXIT_CODE" -ne "$RETRY_EXIT_CODE" ]]; then
+    # Signal-kill -> 128 + signal
     if (( EXIT_CODE >= 128 )); then
       SIGNAL=$((EXIT_CODE - 128))
       if (( SIGNAL == 9 )); then
+        # Likely OOM killer or kill -9
         if (( OOM_RESTART_COUNT < OOM_RESTART_LIMIT )); then
           OOM_RESTART_COUNT=$((OOM_RESTART_COUNT + 1))
-          echo "[retry-wrapper] terminated by SIGKILL (likely OOM); restart ${OOM_RESTART_COUNT}/${OOM_RESTART_LIMIT} after ${OOM_RESTART_DELAY}s."
-          log_history "$ITER" "$EXIT_CODE" "-1" "$PREV_RETRY_COUNT" "oom_signal_restart"
+          echo "[retry-wrapper] killed by signal 9 (likely OOM); restart ${OOM_RESTART_COUNT}/${OOM_RESTART_LIMIT} after ${OOM_RESTART_DELAY}s."
+          read -r retry_count total_companies attempted_total <<< "$(read_retry_info)"
+          log_history "$ITER" "$EXIT_CODE" "$RETRY_MODE_TO_USE" "$PHASE" \
+            "$retry_count" "$PREV_RETRY_COUNT" "$total_companies" "$attempted_total" "oom_signal_restart"
           sleep "$OOM_RESTART_DELAY"
           ITER=$((ITER + 1))
           continue
         else
-          echo "[retry-wrapper] reached OOM_RESTART_LIMIT=${OOM_RESTART_LIMIT}; stopping."
-          log_history "$ITER" "$EXIT_CODE" "-1" "$PREV_RETRY_COUNT" "oom_signal_stop"
+          echo "[retry-wrapper] repeated OOM; reached OOM_RESTART_LIMIT=${OOM_RESTART_LIMIT}; stopping."
+          read -r retry_count total_companies attempted_total <<< "$(read_retry_info)"
+          log_history "$ITER" "$EXIT_CODE" "$RETRY_MODE_TO_USE" "$PHASE" \
+            "$retry_count" "$PREV_RETRY_COUNT" "$total_companies" "$attempted_total" "oom_signal_stop"
           exit "$EXIT_CODE"
         fi
       fi
     fi
 
     echo "[retry-wrapper] run exited with non-retry code ${EXIT_CODE}; stopping."
-    log_history "$ITER" "$EXIT_CODE" "-1" "$PREV_RETRY_COUNT" "non_retry_exit"
+    read -r retry_count total_companies attempted_total <<< "$(read_retry_info)"
+    log_history "$ITER" "$EXIT_CODE" "$RETRY_MODE_TO_USE" "$PHASE" \
+      "$retry_count" "$PREV_RETRY_COUNT" "$total_companies" "$attempted_total" "non_retry_exit"
     exit "$EXIT_CODE"
   fi
 
-  # ---------------- RETRY_EXIT_CODE path ----------------
+  # --- RETRY_EXIT_CODE path ----------------------------------------------
   if [[ ! -f "$RETRY_FILE" ]]; then
     echo "[retry-wrapper] retry exit code but ${RETRY_FILE} not found; stopping."
-    log_history "$ITER" "$EXIT_CODE" "-1" "$PREV_RETRY_COUNT" "retry_exit_missing_retry_file"
+    log_history "$ITER" "$EXIT_CODE" "$RETRY_MODE_TO_USE" "$PHASE" \
+      "-1" "$PREV_RETRY_COUNT" "0" "0" "retry_exit_missing_retry_file"
     exit 1
   fi
 
-  read -r CURRENT_RETRY_COUNT TOTAL_COMPANIES ATTEMPTED_TOTAL ALL_ATTEMPTED_FLAG <<<"$(read_retry_fields)"
-  echo "[retry-wrapper] retry_count=${CURRENT_RETRY_COUNT} total_companies=${TOTAL_COMPANIES} attempted_total=${ATTEMPTED_TOTAL} all_attempted=${ALL_ATTEMPTED_FLAG}"
+  read -r CURRENT_RETRY_COUNT TOTAL_COMPANIES ATTEMPTED_TOTAL <<< "$(read_retry_info)"
+  echo "[retry-wrapper] retry_companies=${CURRENT_RETRY_COUNT} total_companies=${TOTAL_COMPANIES} attempted_total=${ATTEMPTED_TOTAL}"
 
-  reason="retry_exit_continue"
+  REASON="retry_exit_continue"
 
-  # ---- Primary phase: keep doing skip-retry until everything attempted at least once ----
   if [[ "$PHASE" == "primary" ]]; then
-    # Switch condition: attempted_total >= total_companies (or all_attempted true)
-    if [[ "$ALL_ATTEMPTED_FLAG" == "true" ]] || (( ATTEMPTED_TOTAL >= TOTAL_COMPANIES && TOTAL_COMPANIES > 0 )); then
-      echo "[retry-wrapper] all primary companies attempted at least once; switching to retry phase (only-retry)."
+    # Switch to retry phase once this run’s population has all been attempted
+    # (ATTEMPTED_TOTAL >= TOTAL_COMPANIES) and there is something to retry.
+    if (( TOTAL_COMPANIES > 0 )) && (( ATTEMPTED_TOTAL >= TOTAL_COMPANIES )) && (( CURRENT_RETRY_COUNT > 0 )); then
+      echo "[retry-wrapper] attempted_total>=total_companies; switching to retry phase (only-retry)."
       PHASE="retry"
-      STRICT_RETRY_COUNT=0
+      RETRY_ITER=0
       PREV_RETRY_COUNT="$CURRENT_RETRY_COUNT"
     else
-      echo "[retry-wrapper] primary not finished yet (${ATTEMPTED_TOTAL}/${TOTAL_COMPANIES}); staying in primary phase."
-      PREV_RETRY_COUNT="$CURRENT_RETRY_COUNT"
+      echo "[retry-wrapper] staying in primary phase (skip-retry on subsequent runs)."
     fi
 
-    log_history "$ITER" "$EXIT_CODE" "$CURRENT_RETRY_COUNT" "$PREV_RETRY_COUNT" "$reason"
+    log_history "$ITER" "$EXIT_CODE" "$RETRY_MODE_TO_USE" "$PHASE" \
+      "$CURRENT_RETRY_COUNT" "$PREV_RETRY_COUNT" "$TOTAL_COMPANIES" "$ATTEMPTED_TOTAL" "$REASON"
+    PREV_RETRY_COUNT="$CURRENT_RETRY_COUNT"
     ITER=$((ITER + 1))
     continue
   fi
 
-  # ---- Retry phase: enforce improvement + max iterations ----
+  # PHASE=retry: enforce expected improvement + max retry iterations
   if (( PREV_RETRY_COUNT == 0 )); then
     PREV_RETRY_COUNT="$CURRENT_RETRY_COUNT"
   fi
 
   if (( PREV_RETRY_COUNT > 0 )); then
-    python3 - "$PREV_RETRY_COUNT" "$CURRENT_RETRY_COUNT" "$STRICT_MIN_RETRY_SUCCESS_RATE" << 'PYEOF'
+    python3 - "$PREV_RETRY_COUNT" "$CURRENT_RETRY_COUNT" "$EXPECTED_MIN_IMPROVEMENT_RATE" << 'PYEOF'
 import sys
 prev = int(sys.argv[1])
 cur = int(sys.argv[2])
 thr = float(sys.argv[3])
 succ = prev - cur
 rate = (succ / prev) if prev else 0.0
-print(f"[retry-wrapper] improvement: {succ}/{prev} ({rate:.1%})")
-# exit 1 => stop
+print(f"[retry-wrapper] retry improvement: {succ}/{prev} ({rate:.1%})")
 if cur == 0:
-    sys.exit(1)
+    sys.exit(2)  # done
 if rate < thr:
-    sys.exit(1)
+    sys.exit(1)  # insufficient progress
+sys.exit(0)
 PYEOF
-    SHOULD_CONTINUE=$?
-    if [[ "$SHOULD_CONTINUE" -ne 0 ]]; then
-      if (( CURRENT_RETRY_COUNT == 0 )); then
-        reason="retry_exit_stop_empty"
-        echo "[retry-wrapper] no companies left to retry; stopping."
-      else
-        reason="retry_exit_stop_progress"
-        echo "[retry-wrapper] improvement below STRICT_MIN_RETRY_SUCCESS_RATE=${STRICT_MIN_RETRY_SUCCESS_RATE}; stopping."
-      fi
+    IMPROVE_STATUS=$?
+    if [[ "$IMPROVE_STATUS" -eq 2 ]]; then
+      echo "[retry-wrapper] retry set is empty; stopping."
+      REASON="retry_exit_stop_empty"
+    elif [[ "$IMPROVE_STATUS" -ne 0 ]]; then
+      echo "[retry-wrapper] progress below EXPECTED_MIN_IMPROVEMENT_RATE=${EXPECTED_MIN_IMPROVEMENT_RATE}; stopping."
+      REASON="retry_exit_stop_progress"
     fi
   fi
 
-  if [[ "$reason" == "retry_exit_continue" ]]; then
-    if (( STRICT_RETRY_COUNT >= STRICT_MAX_RETRY_ITER )); then
-      reason="retry_exit_stop_max_iter"
-      echo "[retry-wrapper] reached STRICT_MAX_RETRY_ITER=${STRICT_MAX_RETRY_ITER}; stopping."
+  if [[ "$REASON" == "retry_exit_continue" ]]; then
+    if (( RETRY_ITER >= MAX_RETRY_ITER )); then
+      echo "[retry-wrapper] reached MAX_RETRY_ITER=${MAX_RETRY_ITER}; stopping."
+      REASON="retry_exit_stop_max_iter"
     fi
   fi
 
-  log_history "$ITER" "$EXIT_CODE" "$CURRENT_RETRY_COUNT" "$PREV_RETRY_COUNT" "$reason"
+  log_history "$ITER" "$EXIT_CODE" "$RETRY_MODE_TO_USE" "$PHASE" \
+    "$CURRENT_RETRY_COUNT" "$PREV_RETRY_COUNT" "$TOTAL_COMPANIES" "$ATTEMPTED_TOTAL" "$REASON"
 
-  if [[ "$reason" != "retry_exit_continue" ]]; then
-    break
+  if [[ "$REASON" != "retry_exit_continue" ]]; then
+    exit 0
   fi
 
   PREV_RETRY_COUNT="$CURRENT_RETRY_COUNT"
-  STRICT_RETRY_COUNT=$((STRICT_RETRY_COUNT + 1))
+  RETRY_ITER=$((RETRY_ITER + 1))
   ITER=$((ITER + 1))
 done
