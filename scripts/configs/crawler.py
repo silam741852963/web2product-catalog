@@ -1,21 +1,7 @@
 from __future__ import annotations
 
-"""
-Centralized Crawl4AI CrawlerRunConfig strategies.
-
-New architecture:
-- Configuration-as-Strategy:
-    * CrawlerRunStrategy defines how to build a CrawlerRunConfig.
-    * DefaultCrawlerRunStrategy implements the common project baseline.
-- Factory:
-    * CrawlerRunConfigFactory builds configs from a given strategy.
-- DI:
-    * High-level orchestration code injects the strategy/factory it needs.
-"""
-
 from dataclasses import dataclass
 from typing import Optional, Protocol
-
 from crawl4ai import CrawlerRunConfig
 
 
@@ -199,3 +185,4 @@ __all__ = [
     "default_crawler_strategy",
     "default_crawler_factory",
 ]
+

@@ -7,6 +7,8 @@ import os
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,33 +16,65 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from extensions.output_paths import (
     OUTPUT_ROOT as OUTPUTS_DIR,
-    sanitize_bvdid,
     ensure_company_dirs,
+    sanitize_bvdid,
 )
 
 # ---------------------------------------------------------------------------
-# Atomic file I/O + small JSON cache (shared for meta + url_index + global)
+# Atomic file I/O + bounded JSON cache + per-path locks
 # ---------------------------------------------------------------------------
 
-_JSON_CACHE: Dict[Path, Tuple[float, Any]] = {}
+_JSON_CACHE_LOCK = threading.Lock()
+_FILE_LOCKS_LOCK = threading.Lock()
+_DIR_CACHE_LOCK = threading.Lock()
+
+# Bounded caches (avoid unbounded growth when crawling tens of thousands of companies)
+_JSON_CACHE_MAX = int(os.getenv("CRAWLSTATE_JSON_CACHE_SIZE", "2048"))
+_DIR_CACHE_MAX = int(os.getenv("CRAWLSTATE_DIR_CACHE_SIZE", "4096"))
+
+# Path -> (mtime_ns, obj) as LRU
+_JSON_CACHE: "OrderedDict[Path, Tuple[int, Any]]" = OrderedDict()
+# bvdid -> metadata_dir as LRU
+_DIR_CACHE: "OrderedDict[str, Path]" = OrderedDict()
+# Path -> Lock (for read-modify-write JSON files like url_index.json)
+_FILE_LOCKS: Dict[Path, threading.Lock] = {}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _retry_emfile(fn, attempts: int = 6, base_delay: float = 0.15):
+    """
+    Retry helper for transient file-descriptor exhaustion.
+    """
     for i in range(attempts):
         try:
             return fn()
         except OSError as e:
-            if e.errno == errno.EMFILE or "Too many open files" in str(e):
-                time.sleep(base_delay * (2 ** i))
+            if e.errno in (errno.EMFILE, errno.ENFILE) or "Too many open files" in str(
+                e
+            ):
+                time.sleep(base_delay * (2**i))
                 continue
             raise
 
 
+def _get_file_lock(path: Path) -> threading.Lock:
+    # Per-file lock prevents lost updates for read-modify-write JSON patterns.
+    with _FILE_LOCKS_LOCK:
+        lk = _FILE_LOCKS.get(path)
+        if lk is None:
+            lk = threading.Lock()
+            _FILE_LOCKS[path] = lk
+        return lk
+
+
 def _atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
     """
-    Robust atomic write that:
+    Robust atomic write:
       * Writes to a unique temp file in the same dir
-      * fsyncs it (if available)
+      * fsyncs it (best-effort)
       * Replaces the target
     """
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,60 +82,93 @@ def _atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
     tmp = Path(f"{str(path)}.tmp.{stamp}")
 
     def _write() -> None:
-        with open(tmp, "w", encoding=encoding, newline="") as f:
-            f.write(data)
-            try:
-                f.flush()
-                os.fsync(f.fileno())
-            except Exception:
-                # fsync not always available; best-effort
-                pass
-        os.replace(tmp, path)
+        try:
+            with open(tmp, "w", encoding=encoding, newline="") as f:
+                f.write(data)
+                try:
+                    f.flush()
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp, path)
+        finally:
+            # If something failed before replace, avoid leaving temp files behind.
+            with suppress(Exception):
+                if tmp.exists() and tmp != path:
+                    tmp.unlink()
 
     _retry_emfile(_write)
 
 
-def _atomic_write_json(path: Path, obj: Any) -> None:
-    payload = json.dumps(obj, ensure_ascii=False, indent=2)
-    _atomic_write_text(path, payload, "utf-8")
-    _json_update_cache(path, obj)
+def _json_dumps(obj: Any, *, pretty: bool) -> str:
+    if pretty:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+    # Compact is significantly faster/smaller for huge dicts (e.g., url_index.json)
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
-def _atomic_write_json_nocache(path: Path, obj: Any) -> None:
-    """
-    Atomic JSON write that does NOT update _JSON_CACHE.
-    Use for large, frequently-updated files such as url_index.json.
-    """
-    payload = json.dumps(obj, ensure_ascii=False, indent=2)
+def _json_cache_get(path: Path, mtime_ns: int) -> Optional[Any]:
+    with _JSON_CACHE_LOCK:
+        entry = _JSON_CACHE.get(path)
+        if entry is None:
+            return None
+        cached_mtime_ns, obj = entry
+        if cached_mtime_ns != mtime_ns:
+            return None
+        # refresh LRU
+        _JSON_CACHE.move_to_end(path, last=True)
+        return obj
+
+
+def _json_cache_put(path: Path, mtime_ns: int, obj: Any) -> None:
+    with _JSON_CACHE_LOCK:
+        _JSON_CACHE[path] = (mtime_ns, obj)
+        _JSON_CACHE.move_to_end(path, last=True)
+        while len(_JSON_CACHE) > _JSON_CACHE_MAX:
+            _JSON_CACHE.popitem(last=False)
+
+
+def _atomic_write_json(
+    path: Path, obj: Any, *, cache: bool = True, pretty: bool = True
+) -> None:
+    payload = _json_dumps(obj, pretty=pretty)
     _atomic_write_text(path, payload, "utf-8")
-    # intentionally do NOT call _json_update_cache
+    if cache:
+        with suppress(OSError):
+            mtime_ns = path.stat().st_mtime_ns
+            _json_cache_put(path, mtime_ns, obj)
 
 
 def _json_load_cached(path: Path) -> Any:
+    """
+    Load JSON with a bounded LRU cache keyed by path+mtime_ns.
+    Intended for small files (e.g., crawl_meta.json). Do NOT use for url_index.json.
+    """
     try:
-        mtime = path.stat().st_mtime
+        st = path.stat()
+        mtime_ns = st.st_mtime_ns
     except OSError:
         return {}
 
-    cached = _JSON_CACHE.get(path)
+    cached = _json_cache_get(path, mtime_ns)
     if cached is not None:
-        cached_mtime, obj = cached
-        if cached_mtime == mtime:
-            return obj
+        return cached
 
-    try:
-        raw = path.read_text(encoding="utf-8")
-        obj = json.loads(raw)
-    except Exception:
-        obj = {}
+    def _read() -> Any:
+        try:
+            raw = path.read_text(encoding="utf-8")
+            return json.loads(raw)
+        except Exception:
+            return {}
 
-    _JSON_CACHE[path] = (mtime, obj)
+    obj = _retry_emfile(_read)
+    _json_cache_put(path, mtime_ns, obj)
     return obj
 
 
 def _json_load_nocache(path: Path) -> Any:
     """
-    Load JSON from disk without touching the global _JSON_CACHE.
+    Load JSON without touching the global cache.
     Intended for large per-company manifests like url_index.json.
     """
 
@@ -113,14 +180,6 @@ def _json_load_nocache(path: Path) -> Any:
             return {}
 
     return _retry_emfile(_read)
-
-
-def _json_update_cache(path: Path, obj: Any) -> None:
-    try:
-        mtime = path.stat().st_mtime
-    except OSError:
-        return
-    _JSON_CACHE[path] = (mtime, obj)
 
 
 # ---------------------------------------------------------------------------
@@ -159,13 +218,31 @@ def _company_metadata_dir(bvdid: str) -> Path:
     """
     Returns the company-level metadata directory (outputs/{safe}/metadata).
     Uses ensure_company_dirs so it cooperates with the rest of the system.
+    Uses a bounded LRU to reduce repeated fs ops within a run.
     """
+    with _DIR_CACHE_LOCK:
+        cached = _DIR_CACHE.get(bvdid)
+        if cached is not None:
+            _DIR_CACHE.move_to_end(bvdid, last=True)
+            return cached
+
+    # Prefer existing project conventions
     dirs = ensure_company_dirs(bvdid)
     meta = dirs.get("metadata") or dirs.get("checkpoints")
     if meta is None:
         safe = sanitize_bvdid(bvdid)
         meta = OUTPUTS_DIR / safe / "metadata"
         meta.mkdir(parents=True, exist_ok=True)
+    else:
+        meta = Path(meta)
+        meta.mkdir(parents=True, exist_ok=True)
+
+    with _DIR_CACHE_LOCK:
+        _DIR_CACHE[bvdid] = meta
+        _DIR_CACHE.move_to_end(bvdid, last=True)
+        while len(_DIR_CACHE) > _DIR_CACHE_MAX:
+            _DIR_CACHE.popitem(last=False)
+
     return meta
 
 
@@ -186,7 +263,7 @@ def _global_state_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class CompanySnapshot:
     bvdid: str
     name: Optional[str] = None
@@ -200,7 +277,7 @@ class CompanySnapshot:
     updated_at: Optional[str] = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class RunSnapshot:
     run_id: str
     pipeline: Optional[str]
@@ -212,10 +289,38 @@ class RunSnapshot:
     last_updated: Optional[str]
 
 
-@dataclass
+@dataclass(frozen=True)
 class _Stmt:
     sql: str
     args: Tuple[Any, ...] = tuple()
+
+
+def _row_to_company_snapshot(row: sqlite3.Row) -> CompanySnapshot:
+    return CompanySnapshot(
+        bvdid=row["bvdid"],
+        name=row["name"],
+        root_url=row["root_url"],
+        status=(row["status"] or COMPANY_STATUS_PENDING),
+        urls_total=int(row["urls_total"] or 0),
+        urls_markdown_done=int(row["urls_markdown_done"] or 0),
+        urls_llm_done=int(row["urls_llm_done"] or 0),
+        last_error=row["last_error"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_run_snapshot(row: sqlite3.Row) -> RunSnapshot:
+    return RunSnapshot(
+        run_id=row["run_id"],
+        pipeline=row["pipeline"],
+        version=row["version"],
+        started_at=row["started_at"],
+        total_companies=int(row["total_companies"] or 0),
+        completed_companies=int(row["completed_companies"] or 0),
+        last_company_bvdid=row["last_company_bvdid"],
+        last_updated=row["last_updated"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -241,31 +346,27 @@ def upsert_url_index_entry(bvdid: str, url: str, patch: Dict[str, Any]) -> None:
 
     - Merges `patch` into the per-URL entry.
     - Creates url_index.json or the URL entry if missing.
-    - Intended to be used by:
-        * page processing (HTML/markdown)
-        * LLM passes
-        * filters/scorers (BM25, etc.)
+    - Uses a per-file lock to avoid lost updates under concurrency.
+    - Writes compact JSON (faster/smaller) and avoids caching the full dict.
     """
     idx_path = _url_index_path_for(bvdid)
+    lk = _get_file_lock(idx_path)
 
     def _update() -> None:
-        existing: Dict[str, Any] = {}
-        if idx_path.exists():
-            try:
-                # NOTE: do NOT use _json_load_cached here;
-                # url_index.json may be huge and we don't want it in _JSON_CACHE.
-                existing = _json_load_nocache(idx_path)
-            except Exception:
-                existing = {}
-        if not isinstance(existing, dict):
-            existing = {}
+        with lk:
+            existing: Dict[str, Any] = {}
+            if idx_path.exists():
+                loaded = _json_load_nocache(idx_path)
+                if isinstance(loaded, dict):
+                    existing = loaded
 
-        ent = dict(existing.get(url, {}))
-        ent.update(patch)
-        existing[url] = ent
+            ent = existing.get(url)
+            ent_dict = dict(ent) if isinstance(ent, dict) else {}
+            ent_dict.update(patch)
+            existing[url] = ent_dict
 
-        # Use the no-cache writer to avoid pinning this large dict in memory
-        _atomic_write_json_nocache(idx_path, existing)
+            # compact + no cache
+            _atomic_write_json(idx_path, existing, cache=False, pretty=False)
 
     _update()
 
@@ -285,13 +386,13 @@ def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
     presence_checked = bool(ent.get("presence_checked"))
 
     markdown_done = has_md_path or status in _MARKDOWN_COMPLETE_STATUSES
-    # We treat either full LLM extraction or presence-only as LLM stage completion.
+    # Treat either full LLM extraction or presence-only as LLM stage completion.
     llm_done = has_llm_artifact or status in _LLM_COMPLETE_STATUSES or presence_checked
     return markdown_done, llm_done
 
 
 def _compute_company_stage_from_index(
-    index: Dict[str, Any]
+    index: Dict[str, Any],
 ) -> Tuple[CompanyStatus, int, int, int]:
     """
     Given the full url_index dict for a company, compute:
@@ -307,17 +408,14 @@ def _compute_company_stage_from_index(
     md_done = 0
     llm_done = 0
 
-    for _, raw_ent in index.items():
-        if not isinstance(raw_ent, dict):
-            # tolerate legacy / unexpected shapes
-            urls_total += 1
-            continue
+    for raw_ent in index.values():
         urls_total += 1
-        m_done, l_done = _classify_url_entry(raw_ent)
-        if m_done:
-            md_done += 1
-        if l_done:
-            llm_done += 1
+        if isinstance(raw_ent, dict):
+            m_done, l_done = _classify_url_entry(raw_ent)
+            if m_done:
+                md_done += 1
+            if l_done:
+                llm_done += 1
 
     if urls_total == 0:
         return COMPANY_STATUS_PENDING, 0, 0, 0
@@ -333,11 +431,8 @@ def _compute_company_stage_from_index(
         status = COMPANY_STATUS_LLM_NOT_DONE
     elif md_done == urls_total:
         status = COMPANY_STATUS_MD_DONE
-    elif md_done > 0 or urls_total > 0:
-        # URLs discovered but markdown pipeline not fully completed
-        status = COMPANY_STATUS_MD_NOT_DONE
     else:
-        status = COMPANY_STATUS_PENDING
+        status = COMPANY_STATUS_MD_NOT_DONE
 
     return status, urls_total, md_done, llm_done
 
@@ -353,14 +448,12 @@ def _pending_urls_for_stage(
     """
     pending: List[str] = []
     for url, raw_ent in index.items():
-        if not isinstance(raw_ent, dict):
-            raw_ent = {}
-        md_done, llm_done = _classify_url_entry(raw_ent)
+        ent = raw_ent if isinstance(raw_ent, dict) else {}
+        md_done, llm_done = _classify_url_entry(ent)
         if stage == "markdown":
             if not md_done:
                 pending.append(url)
         else:
-            # For LLM we only consider URLs that are already markdown-complete
             if md_done and not llm_done:
                 pending.append(url)
     return pending
@@ -386,17 +479,34 @@ class CrawlState:
     def __init__(self, db_path: Path = DEFAULT_DB) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
         self._conn = sqlite3.connect(
-            self.db_path, check_same_thread=False, isolation_level=None
+            self.db_path,
+            check_same_thread=False,
+            isolation_level=None,  # autocommit
+            timeout=5.0,
         )
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         self._init_schema()
 
+    def close(self) -> None:
+        with suppress(Exception):
+            with self._lock:
+                self._conn.close()
+
     # ---------- schema ----------
 
     def _init_schema(self) -> None:
         with self._lock:
+            # Pragmas first for better behavior under load
+            with suppress(Exception):
+                self._conn.execute("PRAGMA journal_mode=WAL")
+            with suppress(Exception):
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+            with suppress(Exception):
+                self._conn.execute("PRAGMA busy_timeout=5000")
+
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS companies (
@@ -428,9 +538,6 @@ class CrawlState:
                 )
                 """
             )
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA busy_timeout=5000")
 
     # ---------- tiny async executors ----------
 
@@ -444,18 +551,16 @@ class CrawlState:
     async def _query_one(
         self, sql: str, args: Tuple[Any, ...]
     ) -> Optional[sqlite3.Row]:
-        def _run():
+        def _run() -> Optional[sqlite3.Row]:
             with self._lock:
-                cur = self._conn.execute(sql, args)
-                return cur.fetchone()
+                return self._conn.execute(sql, args).fetchone()
 
         return await asyncio.to_thread(_run)
 
     async def _query_all(self, sql: str, args: Tuple[Any, ...]) -> List[sqlite3.Row]:
-        def _run():
+        def _run() -> List[sqlite3.Row]:
             with self._lock:
-                cur = self._conn.execute(sql, args)
-                return cur.fetchall()
+                return self._conn.execute(sql, args).fetchall()
 
         return await asyncio.to_thread(_run)
 
@@ -473,7 +578,7 @@ class CrawlState:
         Create (or re-init) a run row. Returns the run_id.
         """
         rid = run_id or f"run-{int(time.time())}-{os.getpid()}"
-        now = datetime.now(timezone.utc).isoformat()
+        now = _now_iso()
         await self._exec(
             _Stmt(
                 """
@@ -503,9 +608,10 @@ class CrawlState:
         completed_companies: Optional[int] = None,
         last_company_bvdid: Optional[str] = None,
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = _now_iso()
         sets = ["last_updated=?"]
         args: List[Any] = [now]
+
         if total_companies is not None:
             sets.append("total_companies=?")
             args.append(int(total_companies))
@@ -515,6 +621,7 @@ class CrawlState:
         if last_company_bvdid is not None:
             sets.append("last_company_bvdid=?")
             args.append(last_company_bvdid)
+
         args.append(run_id)
         sql = f"UPDATE runs SET {', '.join(sets)} WHERE run_id=?"
         await self._exec(_Stmt(sql, tuple(args)))
@@ -522,47 +629,30 @@ class CrawlState:
     async def mark_company_completed(self, run_id: str, bvdid: str) -> None:
         """
         Convenience: increment completed_companies and set last_company_bvdid.
+        Implemented as a single atomic UPDATE (no pre-read).
         """
-        now = datetime.now(timezone.utc).isoformat()
-
-        def _run() -> None:
-            with self._lock:
-                cur = self._conn.execute(
-                    "SELECT completed_companies FROM runs WHERE run_id=?", (run_id,)
-                )
-                row = cur.fetchone()
-                completed = int(row["completed_companies"] or 0) + 1 if row else 1
-                self._conn.execute(
-                    """
-                    UPDATE runs
-                       SET completed_companies=?,
-                           last_company_bvdid=?,
-                           last_updated=?,
-                           total_companies = CASE
-                               WHEN total_companies < ? THEN ?
-                               ELSE total_companies
-                           END
-                     WHERE run_id=?
-                    """,
-                    (completed, bvdid, now, completed, completed, run_id),
-                )
-
-        await asyncio.to_thread(_run)
+        now = _now_iso()
+        await self._exec(
+            _Stmt(
+                """
+                UPDATE runs
+                   SET completed_companies = COALESCE(completed_companies, 0) + 1,
+                       last_company_bvdid = ?,
+                       last_updated = ?,
+                       total_companies = CASE
+                           WHEN total_companies < (COALESCE(completed_companies, 0) + 1)
+                               THEN (COALESCE(completed_companies, 0) + 1)
+                           ELSE total_companies
+                       END
+                 WHERE run_id = ?
+                """,
+                (bvdid, now, run_id),
+            )
+        )
 
     async def get_run_snapshot(self, run_id: str) -> Optional[RunSnapshot]:
         row = await self._query_one("SELECT * FROM runs WHERE run_id=?", (run_id,))
-        if not row:
-            return None
-        return RunSnapshot(
-            run_id=row["run_id"],
-            pipeline=row["pipeline"],
-            version=row["version"],
-            started_at=row["started_at"],
-            total_companies=int(row["total_companies"] or 0),
-            completed_companies=int(row["completed_companies"] or 0),
-            last_company_bvdid=row["last_company_bvdid"],
-            last_updated=row["last_updated"],
-        )
+        return _row_to_run_snapshot(row) if row else None
 
     # ---------- company-level API ----------
 
@@ -580,13 +670,31 @@ class CrawlState:
     ) -> None:
         """
         Lightweight upsert that updates only provided fields.
-        Use `recompute_company_from_index` when you want the status derived
-        from url_index.json instead of setting it manually.
+
+        Optimization vs old version:
+          - Avoids SELECT existence check by doing INSERT OR IGNORE first.
+          - Then runs a single UPDATE with only provided fields.
         """
-        now = datetime.now(timezone.utc).isoformat()
-        # Build dynamic update
+        now = _now_iso()
+
+        # Ensure a row exists (no read needed)
+        await self._exec(
+            _Stmt(
+                """
+                INSERT OR IGNORE INTO companies (
+                    bvdid, name, root_url, status,
+                    urls_total, urls_markdown_done, urls_llm_done,
+                    last_error, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, 0, 0, 0, NULL, ?, ?)
+                """,
+                (bvdid, name, root_url, status or COMPANY_STATUS_PENDING, now, now),
+            )
+        )
+
         sets = ["updated_at=?"]
         args: List[Any] = [now]
+
         if name is not None:
             sets.append("name=?")
             args.append(name)
@@ -609,40 +717,9 @@ class CrawlState:
             sets.append("last_error=?")
             args.append(last_error)
 
-        sets_clause = ", ".join(sets)
-
-        async def _ensure_row() -> None:
-            # Ensure row exists first
-            existing = await self._query_one(
-                "SELECT bvdid FROM companies WHERE bvdid=?", (bvdid,)
-            )
-            if not existing:
-                created_at = now
-                await self._exec(
-                    _Stmt(
-                        """
-                        INSERT INTO companies (
-                            bvdid, name, root_url, status,
-                            urls_total, urls_markdown_done, urls_llm_done,
-                            last_error, created_at, updated_at
-                        )
-                        VALUES (?, ?, ?, ?, 0, 0, 0, NULL, ?, ?)
-                        """,
-                        (
-                            bvdid,
-                            name,
-                            root_url,
-                            status or COMPANY_STATUS_PENDING,
-                            created_at,
-                            now,
-                        ),
-                    )
-                )
-
-        await _ensure_row()
         args.append(bvdid)
         await self._exec(
-            _Stmt(f"UPDATE companies SET {sets_clause} WHERE bvdid=?", tuple(args))
+            _Stmt(f"UPDATE companies SET {', '.join(sets)} WHERE bvdid=?", tuple(args))
         )
 
     async def recompute_company_from_index(
@@ -658,7 +735,7 @@ class CrawlState:
         """
         index = await asyncio.to_thread(load_url_index, bvdid)
         status, urls_total, md_done, llm_done = _compute_company_stage_from_index(index)
-        now = datetime.now(timezone.utc).isoformat()
+        now = _now_iso()
 
         await self._exec(
             _Stmt(
@@ -670,8 +747,8 @@ class CrawlState:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
                 ON CONFLICT(bvdid) DO UPDATE SET
-                    name      = COALESCE(?, companies.name),
-                    root_url  = COALESCE(?, companies.root_url),
+                    name      = COALESCE(excluded.name, companies.name),
+                    root_url  = COALESCE(excluded.root_url, companies.root_url),
                     status    = excluded.status,
                     urls_total = excluded.urls_total,
                     urls_markdown_done = excluded.urls_markdown_done,
@@ -688,42 +765,34 @@ class CrawlState:
                     llm_done,
                     now,
                     now,
-                    # DO UPDATE COALESCE params
-                    name,
-                    root_url,
                 ),
             )
         )
-        snap = await self.get_company_snapshot(bvdid, recompute=False)
-        # get_company_snapshot always returns non-None for an existing row
-        return snap  # type: ignore[return-value]
+        # Return authoritative row
+        return await self.get_company_snapshot(bvdid, recompute=False)
 
     async def set_company_error(self, bvdid: str, reason: str) -> None:
         await self.upsert_company(bvdid, last_error=reason)
 
     async def get_company_snapshot(
-        self,
-        bvdid: str,
-        *,
-        recompute: bool = True,
+        self, bvdid: str, *, recompute: bool = True
     ) -> CompanySnapshot:
         """
         Get an immutable snapshot of company state.
 
-        If no DB row exists and recompute=True, we compute status from url_index.json.
-        If still nothing, we create a minimal 'pending' row.
+        If no DB row exists and recompute=True, compute status from url_index.json.
+        If still nothing, create a minimal 'pending' row.
         """
         row = await self._query_one("SELECT * FROM companies WHERE bvdid=?", (bvdid,))
         if row is None and recompute:
-            # This also ensures a row exists afterwards
             return await self.recompute_company_from_index(bvdid)
 
         if row is None:
-            now = datetime.now(timezone.utc).isoformat()
+            now = _now_iso()
             await self._exec(
                 _Stmt(
                     """
-                    INSERT INTO companies (
+                    INSERT OR IGNORE INTO companies (
                         bvdid, status, urls_total, urls_markdown_done,
                         urls_llm_done, created_at, updated_at
                     )
@@ -736,18 +805,8 @@ class CrawlState:
                 "SELECT * FROM companies WHERE bvdid=?", (bvdid,)
             )
 
-        return CompanySnapshot(
-            bvdid=row["bvdid"],
-            name=row["name"],
-            root_url=row["root_url"],
-            status=(row["status"] or COMPANY_STATUS_PENDING),
-            urls_total=int(row["urls_total"] or 0),
-            urls_markdown_done=int(row["urls_markdown_done"] or 0),
-            urls_llm_done=int(row["urls_llm_done"] or 0),
-            last_error=row["last_error"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-        )
+        # row must exist now
+        return _row_to_company_snapshot(row)  # type: ignore[arg-type]
 
     async def list_companies(self) -> List[CompanySnapshot]:
         """
@@ -756,29 +815,12 @@ class CrawlState:
         rows = await self._query_all(
             "SELECT * FROM companies ORDER BY created_at, bvdid", tuple()
         )
-        out: List[CompanySnapshot] = []
-        for row in rows:
-            out.append(
-                CompanySnapshot(
-                    bvdid=row["bvdid"],
-                    name=row["name"],
-                    root_url=row["root_url"],
-                    status=(row["status"] or COMPANY_STATUS_PENDING),
-                    urls_total=int(row["urls_total"] or 0),
-                    urls_markdown_done=int(row["urls_markdown_done"] or 0),
-                    urls_llm_done=int(row["urls_llm_done"] or 0),
-                    last_error=row["last_error"],
-                    created_at=row["created_at"],
-                    updated_at=row["updated_at"],
-                )
-            )
-        return out
-    
+        return [_row_to_company_snapshot(r) for r in rows]
+
     async def get_companies_by_ids(self, bvdids: List[str]) -> List[CompanySnapshot]:
         """
         Convenience helper: return snapshots for a specific subset of companies.
-        Useful for retry wrappers that want to inspect the state of previously
-        stalled / timeout companies after a new run.
+        Preserves the input order for easier downstream handling.
         """
         if not bvdids:
             return []
@@ -788,55 +830,22 @@ class CrawlState:
             f"SELECT * FROM companies WHERE bvdid IN ({placeholders})",
             tuple(bvdids),
         )
-
-        out: List[CompanySnapshot] = []
-        for row in rows:
-            out.append(
-                CompanySnapshot(
-                    bvdid=row["bvdid"],
-                    name=row["name"],
-                    root_url=row["root_url"],
-                    status=(row["status"] or COMPANY_STATUS_PENDING),
-                    urls_total=int(row["urls_total"] or 0),
-                    urls_markdown_done=int(row["urls_markdown_done"] or 0),
-                    urls_llm_done=int(row["urls_llm_done"] or 0),
-                    last_error=row["last_error"],
-                    created_at=row["created_at"],
-                    updated_at=row["updated_at"],
-                )
-            )
-        return out
+        by_id = {r["bvdid"]: _row_to_company_snapshot(r) for r in rows}
+        return [by_id[b] for b in bvdids if b in by_id]
 
     async def recompute_global_state(self) -> Dict[str, Any]:
         """
         Recompute and persist a global JSON overview of crawl progress.
 
         Output file: OUTPUT_ROOT / 'crawl_global_state.json'
-
-        Includes:
-          - total_companies
-          - crawled_companies (status != pending)
-          - completed_companies (markdown_done or llm_done)
-          - percentage_completed
-          - per-status counts
-          - lists of pending / in-progress / done bvdid
-          - latest run summary (from runs table, if any)
-
-        NOTE: This is always a snapshot of the *current* DB state.
-        It overwrites the JSON file each time, but does NOT reset any DB state,
-        so progress from previous runs is preserved.
         """
-
         path = _global_state_path()
 
         def _compute_and_write() -> Dict[str, Any]:
             with self._lock:
-                cur = self._conn.execute(
-                    "SELECT bvdid, status, urls_total, "
-                    "urls_markdown_done, urls_llm_done "
-                    "FROM companies"
-                )
-                rows = cur.fetchall()
+                rows = self._conn.execute(
+                    "SELECT bvdid, status, urls_total, urls_markdown_done, urls_llm_done FROM companies"
+                ).fetchall()
                 run_row = self._conn.execute(
                     "SELECT * FROM runs ORDER BY started_at DESC LIMIT 1"
                 ).fetchone()
@@ -855,18 +864,15 @@ class CrawlState:
             done: List[str] = []
 
             for r in rows:
-                st = (r["status"] or COMPANY_STATUS_PENDING)
+                st = r["status"] or COMPANY_STATUS_PENDING
                 b = r["bvdid"]
-                if st not in by_status:
-                    by_status[st] = by_status.get(st, 0) + 1
-                else:
-                    by_status[st] += 1
+                by_status[st] = by_status.get(st, 0) + 1
 
                 if st == COMPANY_STATUS_PENDING:
                     pending.append(b)
                 elif st in (COMPANY_STATUS_MD_NOT_DONE, COMPANY_STATUS_LLM_NOT_DONE):
                     in_progress.append(b)
-                elif st in (COMPANY_STATUS_MD_DONE, COMPANY_STATUS_LLM_DONE):
+                else:
                     done.append(b)
 
             crawled = total - len(pending)
@@ -887,7 +893,7 @@ class CrawlState:
                 }
 
             payload: Dict[str, Any] = {
-                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "generated_at": _now_iso(),
                 "total_companies": total,
                 "crawled_companies": crawled,
                 "completed_companies": completed,
@@ -899,7 +905,8 @@ class CrawlState:
                 "latest_run": latest_run,
             }
 
-            _atomic_write_json(path, payload)
+            # This can be huge (lists of bvdid) => do not cache, keep pretty for readability.
+            _atomic_write_json(path, payload, cache=False, pretty=True)
             return payload
 
         return await asyncio.to_thread(_compute_and_write)
@@ -911,9 +918,11 @@ class CrawlState:
         URLs that still need Markdown (markdown_not_done).
         """
         index = await asyncio.to_thread(load_url_index, bvdid)
-        if not isinstance(index, dict):
-            return []
-        return _pending_urls_for_stage(index, "markdown")
+        return (
+            _pending_urls_for_stage(index, "markdown")
+            if isinstance(index, dict)
+            else []
+        )
 
     async def get_pending_urls_for_llm(self, bvdid: str) -> List[str]:
         """
@@ -922,22 +931,19 @@ class CrawlState:
           - LLM/presence not yet considered done
         """
         index = await asyncio.to_thread(load_url_index, bvdid)
-        if not isinstance(index, dict):
-            return []
-        return _pending_urls_for_stage(index, "llm")
+        return _pending_urls_for_stage(index, "llm") if isinstance(index, dict) else []
 
     async def mark_url_failed(self, bvdid: str, url: str, reason: str) -> None:
         """
         Best-effort helper to mirror a failure into url_index.json.
-        Does *not* modify the main status field; it only adds dedicated failure
-        metadata so you can inspect or filter later.
+        Does *not* modify the main status field; it only adds dedicated failure metadata.
         """
 
         def _update() -> None:
             patch: Dict[str, Any] = {
                 "failed": True,
                 "failed_reason": reason,
-                "failed_at": datetime.now(timezone.utc).isoformat(),
+                "failed_at": _now_iso(),
             }
             upsert_url_index_entry(bvdid, url, patch)
 
@@ -984,7 +990,7 @@ class CrawlState:
                         payload = existing
                 except Exception:
                     pass
-            _atomic_write_json(meta_p, payload)
+            _atomic_write_json(meta_p, payload, cache=True, pretty=True)
 
         await asyncio.to_thread(_write)
 

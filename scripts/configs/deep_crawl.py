@@ -4,14 +4,55 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
-from crawl4ai.deep_crawling import (
-    BFSDeepCrawlStrategy,
-    DFSDeepCrawlStrategy,
-    BestFirstCrawlingStrategy,
-)
 from crawl4ai.deep_crawling.filters import FilterChain
 
+from crawl4ai.deep_crawling import (
+    BFSDeepCrawlStrategy as _BFSDeepCrawlStrategy,
+    DFSDeepCrawlStrategy as _DFSDeepCrawlStrategy,
+    BestFirstCrawlingStrategy as _BestFirstCrawlingStrategy,
+)
+
+
 logger = logging.getLogger(__name__)
+
+_UNBOUNDED_MAX_PAGES = 999_999
+
+
+def _coerce_max_pages(requested: Optional[int], default: Optional[int]) -> int:
+    raw = default if requested is None else requested
+    if raw is None:
+        return _UNBOUNDED_MAX_PAGES
+    try:
+        v = int(raw)
+    except Exception:
+        return _UNBOUNDED_MAX_PAGES
+    if v <= 0:
+        return _UNBOUNDED_MAX_PAGES
+    return v
+
+
+def _coerce_int(value: Optional[int], default: int) -> int:
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _coerce_bool(value: Optional[bool], default: bool) -> bool:
+    if value is None:
+        return bool(default)
+    return bool(value)
+
+
+def _coerce_float(value: Optional[float], default: Optional[float]) -> Optional[float]:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except Exception:
+        return default
 
 
 # --------------------------------------------------------------------------- #
@@ -20,18 +61,6 @@ logger = logging.getLogger(__name__)
 
 
 class DeepCrawlStrategyProvider(Protocol):
-    """
-    Strategy interface for constructing a Crawl4AI deep crawl strategy.
-
-    Implementations encapsulate:
-      - BFS / DFS / BestFirst choice
-      - Default max_depth / include_external / max_pages / score_threshold
-      - Optional defaults for filter_chain / url_scorer
-
-    Higher-level code should depend on this interface instead of concrete
-    Crawl4AI classes, and wire instances via DI.
-    """
-
     def build(
         self,
         *,
@@ -41,8 +70,8 @@ class DeepCrawlStrategyProvider(Protocol):
         score_threshold: Optional[float] = None,
         filter_chain: Optional[FilterChain] = None,
         url_scorer: Optional[Any] = None,
-    ) -> Any:  # return type is a Crawl4AI deep crawl strategy instance
-        ...  # pragma: no cover - interface
+    ) -> Any:  # pragma: no cover
+        ...
 
 
 # --------------------------------------------------------------------------- #
@@ -50,18 +79,8 @@ class DeepCrawlStrategyProvider(Protocol):
 # --------------------------------------------------------------------------- #
 
 
-@dataclass
+@dataclass(slots=True)
 class BFSDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
-    """
-    Breadth-first deep crawl configuration.
-
-    Typical use:
-      - Comprehensive but bounded exploration (site maps, product trees).
-      - Good default for "full but controlled" coverage.
-
-    Defaults are overridable on .build().
-    """
-
     default_max_depth: int = 3
     default_include_external: bool = False
     default_max_pages: Optional[int] = 200
@@ -78,22 +97,28 @@ class BFSDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
         score_threshold: Optional[float] = None,
         filter_chain: Optional[FilterChain] = None,
         url_scorer: Optional[Any] = None,
-    ) -> BFSDeepCrawlStrategy:
-        used_max_depth = self.default_max_depth if max_depth is None else int(max_depth)
-        used_include_external = (
-            self.default_include_external if include_external is None else bool(include_external)
+    ) -> Any:
+        if _BFSDeepCrawlStrategy is None:  # pragma: no cover
+            raise ImportError("Crawl4AI BFSDeepCrawlStrategy is not available.")
+
+        used_max_depth = _coerce_int(max_depth, self.default_max_depth)
+        used_include_external = _coerce_bool(
+            include_external, self.default_include_external
         )
-        raw_max = self.default_max_pages if max_pages is None else max_pages
-        used_max_pages = int(raw_max) if raw_max is not None else 999999        
-        used_score_threshold = (
-            self.default_score_threshold if score_threshold is None else float(score_threshold)
+        used_max_pages = _coerce_max_pages(max_pages, self.default_max_pages)
+        used_score_threshold = _coerce_float(
+            score_threshold, self.default_score_threshold
         )
-        used_filter_chain = filter_chain if filter_chain is not None else self.default_filter_chain
-        used_url_scorer = url_scorer if url_scorer is not None else self.default_url_scorer
+        used_filter_chain = (
+            filter_chain if filter_chain is not None else self.default_filter_chain
+        )
+        used_url_scorer = (
+            url_scorer if url_scorer is not None else self.default_url_scorer
+        )
 
         logger.info(
-            "[deep_crawl] BFS provider build max_depth=%s include_external=%s "
-            "max_pages=%s score_threshold=%s has_filter_chain=%s has_url_scorer=%s",
+            "[deep_crawl] BFS build max_depth=%s include_external=%s max_pages=%s "
+            "score_threshold=%s has_filter_chain=%s has_url_scorer=%s",
             used_max_depth,
             used_include_external,
             used_max_pages,
@@ -102,7 +127,7 @@ class BFSDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
             used_url_scorer is not None,
         )
 
-        return BFSDeepCrawlStrategy(
+        return _BFSDeepCrawlStrategy(
             max_depth=used_max_depth,
             include_external=used_include_external,
             max_pages=used_max_pages,
@@ -112,16 +137,8 @@ class BFSDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class DFSDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
-    """
-    Depth-first deep crawl configuration.
-
-    Typical use:
-      - Deep exploration of a branch (e.g., documentation chains).
-      - When you want to reach far from a starting point before spreading.
-    """
-
     default_max_depth: int = 3
     default_include_external: bool = False
     default_max_pages: Optional[int] = None
@@ -138,22 +155,28 @@ class DFSDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
         score_threshold: Optional[float] = None,
         filter_chain: Optional[FilterChain] = None,
         url_scorer: Optional[Any] = None,
-    ) -> DFSDeepCrawlStrategy:
-        used_max_depth = self.default_max_depth if max_depth is None else int(max_depth)
-        used_include_external = (
-            self.default_include_external if include_external is None else bool(include_external)
+    ) -> Any:
+        if _DFSDeepCrawlStrategy is None:  # pragma: no cover
+            raise ImportError("Crawl4AI DFSDeepCrawlStrategy is not available.")
+
+        used_max_depth = _coerce_int(max_depth, self.default_max_depth)
+        used_include_external = _coerce_bool(
+            include_external, self.default_include_external
         )
-        raw_max = self.default_max_pages if max_pages is None else max_pages
-        used_max_pages = int(raw_max) if raw_max is not None else 999999
-        used_score_threshold = (
-            self.default_score_threshold if score_threshold is None else float(score_threshold)
+        used_max_pages = _coerce_max_pages(max_pages, self.default_max_pages)
+        used_score_threshold = _coerce_float(
+            score_threshold, self.default_score_threshold
         )
-        used_filter_chain = filter_chain if filter_chain is not None else self.default_filter_chain
-        used_url_scorer = url_scorer if url_scorer is not None else self.default_url_scorer
+        used_filter_chain = (
+            filter_chain if filter_chain is not None else self.default_filter_chain
+        )
+        used_url_scorer = (
+            url_scorer if url_scorer is not None else self.default_url_scorer
+        )
 
         logger.info(
-            "[deep_crawl] DFS provider build max_depth=%s include_external=%s "
-            "max_pages=%s score_threshold=%s has_filter_chain=%s has_url_scorer=%s",
+            "[deep_crawl] DFS build max_depth=%s include_external=%s max_pages=%s "
+            "score_threshold=%s has_filter_chain=%s has_url_scorer=%s",
             used_max_depth,
             used_include_external,
             used_max_pages,
@@ -162,7 +185,7 @@ class DFSDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
             used_url_scorer is not None,
         )
 
-        return DFSDeepCrawlStrategy(
+        return _DFSDeepCrawlStrategy(
             max_depth=used_max_depth,
             include_external=used_include_external,
             max_pages=used_max_pages,
@@ -172,26 +195,14 @@ class DFSDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class BestFirstDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
-    """
-    Best-first deep crawl configuration (recommended).
-
-    Typical use:
-      - Relevance-prioritized crawling using scorers (e.g., KeywordRelevanceScorer).
-      - Focusing compute on high-value pages first.
-
-    Note:
-      - `score_threshold` is generally not needed for BestFirstCrawlingStrategy
-        but is accepted for convenience; pass-through if provided.
-    """
-
     default_max_depth: int = 3
     default_include_external: bool = False
     default_max_pages: Optional[int] = None
     default_filter_chain: Optional[FilterChain] = None
     default_url_scorer: Optional[Any] = None
-    default_score_threshold: Optional[float] = None  # optional, rarely used
+    default_score_threshold: Optional[float] = None
 
     def build(
         self,
@@ -202,22 +213,28 @@ class BestFirstDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
         score_threshold: Optional[float] = None,
         filter_chain: Optional[FilterChain] = None,
         url_scorer: Optional[Any] = None,
-    ) -> BestFirstCrawlingStrategy:
-        used_max_depth = self.default_max_depth if max_depth is None else int(max_depth)
-        used_include_external = (
-            self.default_include_external if include_external is None else bool(include_external)
+    ) -> Any:
+        if _BestFirstCrawlingStrategy is None:  # pragma: no cover
+            raise ImportError("Crawl4AI BestFirstCrawlingStrategy is not available.")
+
+        used_max_depth = _coerce_int(max_depth, self.default_max_depth)
+        used_include_external = _coerce_bool(
+            include_external, self.default_include_external
         )
-        raw_max = self.default_max_pages if max_pages is None else max_pages
-        used_max_pages = int(raw_max) if raw_max is not None else 999999        
-        used_filter_chain = filter_chain if filter_chain is not None else self.default_filter_chain
-        used_url_scorer = url_scorer if url_scorer is not None else self.default_url_scorer
-        used_score_threshold = (
-            self.default_score_threshold if score_threshold is None else float(score_threshold)
+        used_max_pages = _coerce_max_pages(max_pages, self.default_max_pages)
+        used_filter_chain = (
+            filter_chain if filter_chain is not None else self.default_filter_chain
+        )
+        used_url_scorer = (
+            url_scorer if url_scorer is not None else self.default_url_scorer
+        )
+        used_score_threshold = _coerce_float(
+            score_threshold, self.default_score_threshold
         )
 
         logger.info(
-            "[deep_crawl] BestFirst provider build max_depth=%s include_external=%s "
-            "max_pages=%s has_filter_chain=%s has_url_scorer=%s score_threshold=%s",
+            "[deep_crawl] BestFirst build max_depth=%s include_external=%s max_pages=%s "
+            "has_filter_chain=%s has_url_scorer=%s score_threshold=%s",
             used_max_depth,
             used_include_external,
             used_max_pages,
@@ -226,22 +243,23 @@ class BestFirstDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
             used_score_threshold,
         )
 
-        # BestFirstCrawlingStrategy does not *require* score_threshold;
-        # if the underlying implementation does not accept it, you can
-        # remove it from the call site and keep it only for logging.
-        kwargs: dict = {
+        kwargs: dict[str, Any] = {
             "max_depth": used_max_depth,
             "include_external": used_include_external,
             "max_pages": used_max_pages,
             "filter_chain": used_filter_chain,
             "url_scorer": used_url_scorer,
         }
-        # Only pass score_threshold if the project chooses to use it
-        # and the Crawl4AI version supports it.
         if used_score_threshold is not None:
-            kwargs["score_threshold"] = used_score_threshold  # type: ignore[assignment]
+            kwargs["score_threshold"] = used_score_threshold
 
-        return BestFirstCrawlingStrategy(**kwargs)
+        try:
+            return _BestFirstCrawlingStrategy(**kwargs)
+        except TypeError as e:  # pragma: no cover
+            if "score_threshold" in kwargs and "score_threshold" in str(e):
+                kwargs.pop("score_threshold", None)
+                return _BestFirstCrawlingStrategy(**kwargs)
+            raise
 
 
 # --------------------------------------------------------------------------- #
@@ -249,30 +267,8 @@ class BestFirstDeepCrawlStrategyProvider(DeepCrawlStrategyProvider):
 # --------------------------------------------------------------------------- #
 
 
-@dataclass
+@dataclass(slots=True)
 class DeepCrawlStrategyFactory:
-    """
-    Factory that uses a DeepCrawlStrategyProvider.
-
-    Higher-level orchestration (run scripts, services) should depend on this
-    instead of directly instantiating Crawl4AI strategies.
-
-    Example:
-
-        from configs.deep_crawl_strategy import (
-            default_bfs_internal_factory,
-        )
-        from crawl4ai import CrawlerRunConfig
-
-        factory = default_bfs_internal_factory
-        deep_strategy = factory.create(max_depth=2)
-
-        config = CrawlerRunConfig(
-            deep_crawl_strategy=deep_strategy,
-            # ...
-        )
-    """
-
     provider: DeepCrawlStrategyProvider
 
     def create(
@@ -299,10 +295,6 @@ class DeepCrawlStrategyFactory:
 # Default, injectable instances
 # --------------------------------------------------------------------------- #
 
-#: Default BFS provider tuned for internal-domain product-ish crawling.
-#: - No external domains
-#: - Conservative depth
-#: - max_pages can be set at call site; here we keep it None (unbounded).
 default_bfs_internal_provider = BFSDeepCrawlStrategyProvider(
     default_max_depth=3,
     default_include_external=False,
@@ -310,9 +302,6 @@ default_bfs_internal_provider = BFSDeepCrawlStrategyProvider(
     default_score_threshold=None,
 )
 
-#: Default BestFirst provider (recommended) with no scorer pre-wired.
-#: - Caller must inject a url_scorer (e.g., KeywordRelevanceScorer)
-#:   when calling the factory, or set default_url_scorer on the provider.
 default_bestfirst_provider = BestFirstDeepCrawlStrategyProvider(
     default_max_depth=3,
     default_include_external=True,
@@ -322,14 +311,13 @@ default_bestfirst_provider = BestFirstDeepCrawlStrategyProvider(
     default_score_threshold=None,
 )
 
-#: Simple defaults: import and call `.create(...)` where needed.
 default_bfs_internal_factory = DeepCrawlStrategyFactory(
     provider=default_bfs_internal_provider
 )
-
 default_bestfirst_factory = DeepCrawlStrategyFactory(
     provider=default_bestfirst_provider
 )
+
 
 def build_deep_strategy(
     strategy: str,
@@ -340,27 +328,10 @@ def build_deep_strategy(
     max_pages: Optional[int],
 ) -> Any:
     """
-    Convenience helper to construct a deep crawl strategy from a simple string.
-
-    This moves the old run.py `_build_deep_strategy` logic into the configs
-    layer and decouples it from argparse.
-
-    Parameters
-    ----------
-    strategy:
-        One of "bestfirst", "bfs_internal", "dfs".
-    filter_chain:
-        FilterChain instance to use for all URLs.
-    url_scorer:
-        Optional scorer, only used for "bestfirst" by default.
-    dfs_factory:
-        DeepCrawlStrategyFactory for DFS, required when strategy == "dfs".
-    max_pages:
-        Per company page limit. None means "no explicit limit" and will be
-        converted to the provider default.
+    Convenience helper used by run.py.
+    strategy: "bestfirst" | "bfs_internal" | "dfs"
     """
     if strategy == "bestfirst":
-        # BestFirst uses the BM25 scorer.
         return default_bestfirst_factory.create(
             filter_chain=filter_chain,
             url_scorer=url_scorer,
@@ -368,7 +339,6 @@ def build_deep_strategy(
         )
 
     if strategy == "bfs_internal":
-        # BFS internal does not use a scorer by default.
         return default_bfs_internal_factory.create(
             filter_chain=filter_chain,
             url_scorer=None,
@@ -379,8 +349,7 @@ def build_deep_strategy(
         if dfs_factory is None:
             raise ValueError(
                 "DFS strategy requested but `dfs_factory` is None. "
-                "Construct a DeepCrawlStrategyFactory with DFSDeepCrawlStrategyProvider "
-                "and pass it in."
+                "Construct a DeepCrawlStrategyFactory with DFSDeepCrawlStrategyProvider and pass it in."
             )
         return dfs_factory.create(
             filter_chain=filter_chain,
