@@ -1,4 +1,3 @@
-# adaptive_scheduling.py
 from __future__ import annotations
 
 import asyncio
@@ -78,7 +77,7 @@ class AdaptiveSchedulingConfig:
     mem_trend_window_sec: float = 10.0
     mem_trend_slope_high_mb_per_s: float = 100.0
     mem_trend_margin_frac: float = 0.03
-    mem_trend_emergency_slope_mb_s: float = 40.0
+    mem_trend_emergency_slope_mb_per_s: float = 40.0
 
     # -----------------------------
     # AIMD concurrency controller
@@ -151,28 +150,20 @@ class AdaptiveSchedulingConfig:
     preoom_cancel_count: int = 1
 
     # -----------------------------
-    # SYSTEM STALL detector (CPU plateau + low disk/net)
+    # System-stall detector (CPU plateau + low disk/net only)
     # -----------------------------
-    # IMPORTANT CHANGE (fix for your #3/#5 stalls):
-    #   Stall detection now ALSO requires "no progress" for some time,
-    #   and it works even when num_active == 1 (single stuck company).
-    #
-    # Stall criteria (still based on CPU plateau + low IO), gated by:
-    #   - no company completion for >= stall_no_progress_sec
-    #   - samples cover >= stall_window_sec (or at least stall_min_window_sec)
-    stall_window_sec: float = 180.0
-    stall_min_window_sec: float = 45.0
-    stall_no_progress_sec: float = 300.0  # gate to avoid canceling slow-but-alive runs
+    stall_window_sec: float = 120.0
+    stall_sample_interval_sec: float = 2.0  # sampling if watchdog isn't started
+    stall_min_active: int = 1  # IMPORTANT: works even for a single stuck company
 
-    stall_min_active: int = 1  # <--- changed from 2 to handle single stuck company
-    stall_cpu_plateau_band_pct: float = 2.0
+    # CPU plateau definition
+    stall_cpu_plateau_band_pct: float = 5.0
+    stall_cpu_min_pct: float = 5.0  # avoid "idle plateau" false positives
     stall_cpu_max_pct: float = 98.0
-    stall_disk_rate_bytes_per_s: float = 32_000.0  # 32 KB/s
-    stall_net_rate_bytes_per_s: float = 16_000.0  # 16 KB/s
 
-    # Extra guard: allow SOME net activity but still "stalled" if it's tiny and flat
-    stall_net_soft_cap_bytes_per_s: float = 64_000.0  # 64KB/s
-    stall_net_soft_cap_required_plateau: bool = True
+    # low I/O thresholds (more tolerant than before)
+    stall_disk_rate_bytes_per_s: float = 256_000.0  # 256 KB/s
+    stall_net_rate_bytes_per_s: float = 128_000.0  # 128 KB/s
 
     # Stall actions
     stall_action_cooldown_sec: float = 30.0
@@ -182,25 +173,15 @@ class AdaptiveSchedulingConfig:
     stall_max_rounds_before_restart: int = 4
     stall_restart_after_sec: float = 900.0
 
-    # When stall is detected, also reduce target_parallel (helps “unstick” loops)
+    # When stall is detected, also reduce target_parallel
     stall_reduce_target: bool = True
     stall_reduce_target_factor: float = 0.7
 
     # -----------------------------
-    # NEW: "No-progress deadlock" breaker (for leaked resources after cancel)
+    # Restart gating (prevents "restart before crawling anything")
     # -----------------------------
-    # This targets the case you described: tasks get cancelled but CPU/RAM stays pinned,
-    # so admission never recovers and the run stops making progress.
-    deadlock_no_progress_sec: float = 600.0
-    deadlock_check_interval_sec: float = 5.0
-    deadlock_used_frac_floor: float = (
-        0.50  # only consider if process is meaningfully loaded
-    )
-    deadlock_slope_abs_mb_s: float = 2.0
-    deadlock_cancel_max: int = 2
-    deadlock_max_active: int = 3
-    deadlock_action_cooldown_sec: float = 60.0
-    deadlock_rounds_before_restart: int = 3
+    restart_gate_min_uptime_sec: float = 180.0
+    restart_gate_min_completed: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -210,11 +191,12 @@ class AdaptiveSchedulingConfig:
 
 class AdaptiveScheduler:
     """
-    Memory-based adaptive scheduler with:
-      - Memory headroom admission control
-      - Emergency near-OOM canceller
-      - System-stall breaker (CPU plateau + low disk/net) gated by "no progress"
-      - Deadlock breaker for "cancelled-but-resources-still-pinned" situations
+    Memory-based adaptive scheduler with a robust system-stall breaker.
+
+    Stall detection uses ONLY:
+      - CPU plateau within band, and within [cpu_min, cpu_max]
+      - low disk I/O rate
+      - low network rate
     """
 
     def __init__(
@@ -295,10 +277,8 @@ class AdaptiveScheduler:
         # Progress counters
         self._completed_counter: int = 0
         self._last_num_waiting: int = 0
-        self._last_progress_ts: float = time.time()
-        self._last_completed_counter_seen: int = 0
 
-        # Stall tracking (CPU plateau + low I/O)
+        # Stall tracking
         # samples: (ts, cpu_pct, disk_bytes_total, net_bytes_total)
         self._stall_samples: collections.deque[Tuple[float, float, int, int]] = (
             collections.deque()
@@ -306,15 +286,14 @@ class AdaptiveScheduler:
         self._stall_rounds: int = 0
         self._stall_first_detect_ts: Optional[float] = None
         self._last_stall_action_ts: float = 0.0
+        self._last_stall_sample_ts: float = 0.0
 
         self._last_cpu_pct: float = 0.0
         self._last_disk_rate_bps: float = 0.0
         self._last_net_rate_bps: float = 0.0
 
-        # Deadlock tracking
-        self._deadlock_rounds: int = 0
-        self._last_deadlock_action_ts: float = 0.0
-        self._last_deadlock_check_ts: float = 0.0
+        # restart gating clock
+        self._started_ts: float = time.time()
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -330,7 +309,6 @@ class AdaptiveScheduler:
 
     def register_company_completed(self) -> None:
         self._completed_counter += 1
-        self._last_progress_ts = time.time()
 
     def record_company_peak(self, company_id: str, peak_mb: float) -> None:
         if not company_id or peak_mb <= 0:
@@ -358,9 +336,11 @@ class AdaptiveScheduler:
         self._last_used_bytes = used
         self._last_used_frac = (float(used) / float(total)) if total > 0 else 0.0
 
+        now = time.time()
+        self._started_ts = now
+
         # sample swap once at boot
         self._last_swap_used_frac = self._read_swap_used_frac()
-        now = time.time()
         self._last_swap_sample_ts = now
         self._last_sample_ts = now
 
@@ -371,11 +351,12 @@ class AdaptiveScheduler:
         except Exception:
             pass
 
-        # prime stall samples with disk/net baselines
+        # prime stall sample
         try:
             cpu_pct, disk_b, net_b = self._read_cpu_disk_net_sample()
             self._stall_samples.clear()
             self._stall_samples.append((now, cpu_pct, disk_b, net_b))
+            self._last_stall_sample_ts = now
             self._last_cpu_pct = cpu_pct
         except Exception:
             pass
@@ -410,10 +391,6 @@ class AdaptiveScheduler:
     async def admissible_slots(self, num_waiting: int) -> int:
         """
         Decide how many new companies can be started right now.
-
-        Hot-path goals:
-          - minimize psutil calls (cached sampling + swap throttling)
-          - keep lock region small
         """
         if num_waiting <= 0:
             return 0
@@ -424,6 +401,8 @@ class AdaptiveScheduler:
 
         now = time.time()
         cfg = self.cfg
+
+        cancel_ids_local: List[str] = []
 
         async with self._lock:
             # 1) Sample memory only if needed
@@ -462,6 +441,24 @@ class AdaptiveScheduler:
 
             # base RSS estimate only in idle
             self._update_base_rss_locked(used_bytes=used, num_active=num_active)
+
+            # 1.5) If watchdog isn't running, still sample stall + possibly act.
+            # This avoids "stall never handled" when start() wasn't called.
+            if self._emergency_task is None and self._psutil_available:
+                if (now - self._last_stall_sample_ts) >= float(
+                    cfg.stall_sample_interval_sec
+                ):
+                    try:
+                        self._record_stall_sample_locked(now=now)
+                        self._last_stall_sample_ts = now
+                        cancel_ids_local = self._maybe_stall_actions_locked(
+                            now=now, active_ids=active_ids
+                        )
+                    except Exception:
+                        logger.debug(
+                            "[AdaptiveScheduling] stall sampling failed (admissible)",
+                            exc_info=True,
+                        )
 
             # 2) Update AIMD target (cheap)
             precritical = (
@@ -593,6 +590,21 @@ class AdaptiveScheduler:
 
             return slots
 
+        # If we had to cancel (only happens if watchdog isn't running), do it outside lock.
+        if cancel_ids_local:
+            try:
+                self._request_cancel_companies(cancel_ids_local)
+            except Exception:
+                logger.exception(
+                    "[AdaptiveScheduling] request_cancel_companies failed (admissible)"
+                )
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
+        return 0
+
     def get_state_snapshot(self) -> Dict[str, Any]:
         total = self._total_mem_bytes or 0
         used = self._last_used_bytes
@@ -605,8 +617,6 @@ class AdaptiveScheduler:
         stall_age = 0.0
         if self._stall_first_detect_ts is not None:
             stall_age = max(0.0, time.time() - self._stall_first_detect_ts)
-
-        no_progress_age = max(0.0, time.time() - self._last_progress_ts)
 
         return {
             "total_mem_mb": float(total) / _MB if total > 0 else 0.0,
@@ -624,13 +634,11 @@ class AdaptiveScheduler:
             "mem_crit_high_frac": self.cfg.mem_crit_high_frac,
             "base_rss_mb": self._base_rss_bytes / _MB,
             "completed_counter": self._completed_counter,
-            "no_progress_age_sec": no_progress_age,
             "stall_rounds": self._stall_rounds,
             "stall_age_sec": stall_age,
             "stall_last_cpu_pct": self._last_cpu_pct,
             "stall_last_disk_rate_bps": self._last_disk_rate_bps,
             "stall_last_net_rate_bps": self._last_net_rate_bps,
-            "deadlock_rounds": self._deadlock_rounds,
             "per_task_rss_mb_sample": per_task_rss_mb,
         }
 
@@ -873,7 +881,7 @@ class AdaptiveScheduler:
         cfg = self.cfg
         soft_high_and_fast = (
             used_frac >= cfg.mem_high_frac
-            and self._last_trend_slope_mb_s >= cfg.mem_trend_slope_high_mb_s
+            and self._last_trend_slope_mb_s >= cfg.mem_trend_slope_high_mb_per_s
         )
 
         is_near = (
@@ -935,7 +943,7 @@ class AdaptiveScheduler:
             margin = cfg.mem_trend_margin_frac
             if (
                 used_frac < max(0.0, cfg.mem_cap_frac - margin)
-                and self._last_trend_slope_mb_s <= cfg.mem_trend_slope_high_mb_s
+                and self._last_trend_slope_mb_s <= cfg.mem_trend_slope_high_mb_per_s
             ):
                 step = (
                     cfg.warmup_ai_step
@@ -974,8 +982,6 @@ class AdaptiveScheduler:
         if self._stall_first_detect_ts is not None:
             stall_age = max(0.0, now - self._stall_first_detect_ts)
 
-        no_progress_age = max(0.0, now - self._last_progress_ts)
-
         state: Dict[str, Any] = {
             "ts": now,
             "reason": reason,
@@ -993,13 +999,11 @@ class AdaptiveScheduler:
             "mem_crit_high_frac": self.cfg.mem_crit_high_frac,
             "base_rss_mb": self._base_rss_bytes / _MB,
             "completed_counter": self._completed_counter,
-            "no_progress_age_sec": no_progress_age,
             "stall_rounds": self._stall_rounds,
             "stall_age_sec": stall_age,
             "stall_last_cpu_pct": self._last_cpu_pct,
             "stall_last_disk_rate_bps": self._last_disk_rate_bps,
             "stall_last_net_rate_bps": self._last_net_rate_bps,
-            "deadlock_rounds": self._deadlock_rounds,
         }
         if extra:
             state.update(extra)
@@ -1030,16 +1034,10 @@ class AdaptiveScheduler:
         return [cid for (cid, _) in weighted[:count]]
 
     # ------------------------------------------------------------------ #
-    # Stall sampling
+    # Stall detection (CPU plateau + low disk/net only)
     # ------------------------------------------------------------------ #
 
     def _read_cpu_disk_net_sample(self) -> Tuple[float, int, int]:
-        """
-        Returns:
-          cpu_pct: float (0..100)
-          disk_bytes_total: read_bytes + write_bytes (cumulative)
-          net_bytes_total: bytes_sent + bytes_recv (cumulative)
-        """
         if not self._psutil_available or psutil is None:
             return 0.0, 0, 0
 
@@ -1075,31 +1073,12 @@ class AdaptiveScheduler:
         cpu_pct, disk_b, net_b = self._read_cpu_disk_net_sample()
         self._stall_samples.append((now, cpu_pct, disk_b, net_b))
 
-        # update "last" telemetry (for logs/snapshots) using last delta
-        if len(self._stall_samples) >= 2:
-            t0, _, d0, n0 = self._stall_samples[-2]
-            t1, c1, d1, n1 = self._stall_samples[-1]
-            dt = max(1e-6, t1 - t0)
-            self._last_cpu_pct = float(c1)
-            self._last_disk_rate_bps = float(max(0, d1 - d0)) / dt
-            self._last_net_rate_bps = float(max(0, n1 - n0)) / dt
-        else:
-            self._last_cpu_pct = float(cpu_pct)
-            self._last_disk_rate_bps = 0.0
-            self._last_net_rate_bps = 0.0
-
         cutoff = now - float(cfg.stall_window_sec)
         while self._stall_samples and self._stall_samples[0][0] < cutoff:
             self._stall_samples.popleft()
 
     def _compute_stall_metrics_locked(self) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Stall criteria (CPU plateau + low IO), gated by:
-          - samples cover enough time
-          - no progress for cfg.stall_no_progress_sec
-        """
         cfg = self.cfg
-
         if len(self._stall_samples) < 2:
             return False, {}
 
@@ -1108,20 +1087,6 @@ class AdaptiveScheduler:
         dt = t1 - t0
         if dt <= 0.0:
             return False, {}
-
-        # require minimum window coverage
-        if dt < float(cfg.stall_min_window_sec):
-            return False, {"stall_dt_sec": dt, "window_ok": False}
-
-        # "no progress" gate
-        no_progress_age = max(0.0, t1 - self._last_progress_ts)
-        if no_progress_age < float(cfg.stall_no_progress_sec):
-            return False, {
-                "stall_dt_sec": dt,
-                "window_ok": True,
-                "no_progress_age_sec": no_progress_age,
-                "no_progress_ok": False,
-            }
 
         cpus = [c for (_, c, _, _) in self._stall_samples]
         cpu_min = min(cpus) if cpus else 0.0
@@ -1133,22 +1098,16 @@ class AdaptiveScheduler:
         net_rate = float(max(0, n1 - n0)) / dt
 
         plateau_ok = cpu_band <= float(cfg.stall_cpu_plateau_band_pct)
-        cpu_level_ok = cpu_level <= float(cfg.stall_cpu_max_pct)
+        cpu_level_ok = (cpu_level >= float(cfg.stall_cpu_min_pct)) and (
+            cpu_level <= float(cfg.stall_cpu_max_pct)
+        )
         disk_ok = disk_rate <= float(cfg.stall_disk_rate_bytes_per_s)
         net_ok = net_rate <= float(cfg.stall_net_rate_bytes_per_s)
 
-        # soft net allowance (for tiny steady traffic)
-        net_soft_ok = True
-        if cfg.stall_net_soft_cap_required_plateau:
-            net_soft_ok = net_rate <= float(cfg.stall_net_soft_cap_bytes_per_s)
-
-        stalled = bool(
-            plateau_ok and cpu_level_ok and disk_ok and (net_ok or net_soft_ok)
-        )
+        stalled = bool(plateau_ok and cpu_level_ok and disk_ok and net_ok)
 
         meta = {
             "stall_dt_sec": dt,
-            "no_progress_age_sec": no_progress_age,
             "cpu_level": cpu_level,
             "cpu_min": cpu_min,
             "cpu_max": cpu_max,
@@ -1159,9 +1118,17 @@ class AdaptiveScheduler:
             "cpu_level_ok": cpu_level_ok,
             "disk_ok": disk_ok,
             "net_ok": net_ok,
-            "net_soft_ok": net_soft_ok,
         }
         return stalled, meta
+
+    def _can_recommend_restart_locked(self, *, now: float) -> bool:
+        cfg = self.cfg
+        uptime = max(0.0, now - self._started_ts)
+        if uptime < float(cfg.restart_gate_min_uptime_sec):
+            return False
+        if self._completed_counter < int(cfg.restart_gate_min_completed):
+            return False
+        return True
 
     def _maybe_stall_actions_locked(
         self, *, now: float, active_ids: Sequence[str]
@@ -1179,10 +1146,15 @@ class AdaptiveScheduler:
             self._stall_rounds = 0
             return []
 
+        # update snapshot metrics
+        self._last_cpu_pct = float(meta.get("cpu_level", 0.0))
+        self._last_disk_rate_bps = float(meta.get("disk_rate_bps", 0.0))
+        self._last_net_rate_bps = float(meta.get("net_rate_bps", 0.0))
+
         if self._stall_first_detect_ts is None:
             self._stall_first_detect_ts = now
 
-        # cooldown
+        # cooldown between actions
         if (now - self._last_stall_action_ts) < float(cfg.stall_action_cooldown_sec):
             self._maybe_log_state_locked(
                 reason="stall_detected_cooldown",
@@ -1193,7 +1165,9 @@ class AdaptiveScheduler:
         max_cancelable = max(0, num_active - int(cfg.min_active_keep))
         if max_cancelable <= 0:
             stall_age = now - (self._stall_first_detect_ts or now)
-            if stall_age >= float(cfg.stall_restart_after_sec):
+            if stall_age >= float(
+                cfg.stall_restart_after_sec
+            ) and self._can_recommend_restart_locked(now=now):
                 self._restart_recommended = True
                 logger.error(
                     "[AdaptiveScheduling] stall persists %.1fs but cannot cancel (active=%d min_keep=%d); restart recommended.",
@@ -1201,16 +1175,21 @@ class AdaptiveScheduler:
                     num_active,
                     cfg.min_active_keep,
                 )
+                self._maybe_log_state_locked(
+                    reason="stall_restart_nocancel",
+                    extra={
+                        "stall": meta,
+                        "stall_age_sec": stall_age,
+                        "num_active": num_active,
+                    },
+                )
             return []
 
         base = max(1, int(cfg.stall_cancel_count))
         extra = 0
         if int(cfg.stall_escalate_every_rounds) > 0:
             extra = self._stall_rounds // int(cfg.stall_escalate_every_rounds)
-        to_cancel = min(
-            max_cancelable,
-            min(int(cfg.stall_cancel_max), base + extra),
-        )
+        to_cancel = min(max_cancelable, min(int(cfg.stall_cancel_max), base + extra))
 
         cancel_ids = self._select_heaviest_companies_locked(active_ids, count=to_cancel)
         if not cancel_ids:
@@ -1230,7 +1209,7 @@ class AdaptiveScheduler:
 
         logger.error(
             "[AdaptiveScheduling] SYSTEM STALL detected (round=%d age=%.1fs active=%d) "
-            "cpu=%.1f%% band=%.2f%% disk=%.1fB/s net=%.1fB/s no_progress=%.1fs -> cancel=%s target_parallel=%d",
+            "cpu=%.1f%% band=%.2f%% disk=%.1fB/s net=%.1fB/s -> cancel=%s target_parallel=%d",
             self._stall_rounds,
             stall_age,
             num_active,
@@ -1238,7 +1217,6 @@ class AdaptiveScheduler:
             float(meta.get("cpu_band", 0.0)),
             float(meta.get("disk_rate_bps", 0.0)),
             float(meta.get("net_rate_bps", 0.0)),
-            float(meta.get("no_progress_age_sec", 0.0)),
             cancel_ids,
             self._target_parallel,
         )
@@ -1258,131 +1236,22 @@ class AdaptiveScheduler:
         if self._stall_rounds >= int(
             cfg.stall_max_rounds_before_restart
         ) or stall_age >= float(cfg.stall_restart_after_sec):
-            self._restart_recommended = True
-            logger.error(
-                "[AdaptiveScheduling] stall persists (rounds=%d age=%.1fs); restart recommended.",
-                self._stall_rounds,
-                stall_age,
-            )
-            self._maybe_log_state_locked(
-                reason="stall_restart",
-                extra={
-                    "stall": meta,
-                    "stall_rounds": self._stall_rounds,
-                    "stall_age_sec": stall_age,
-                    "num_active": num_active,
-                },
-            )
-
-        return cancel_ids
-
-    def _maybe_deadlock_actions_locked(
-        self,
-        *,
-        now: float,
-        total: int,
-        used: int,
-        used_frac: float,
-        active_ids: Sequence[str],
-    ) -> List[str]:
-        """
-        Detect "no progress + stable memory + few actives" deadlock.
-        This is specifically aimed at: cancellations occurred, but leaked child processes / contexts
-        keep RSS pinned and progress never resumes.
-        """
-        cfg = self.cfg
-
-        if (now - self._last_deadlock_check_ts) < float(
-            cfg.deadlock_check_interval_sec
-        ):
-            return []
-        self._last_deadlock_check_ts = now
-
-        num_active = len(active_ids)
-        if num_active <= 0:
-            self._deadlock_rounds = 0
-            return []
-
-        no_progress_age = max(0.0, now - self._last_progress_ts)
-        if no_progress_age < float(cfg.deadlock_no_progress_sec):
-            self._deadlock_rounds = 0
-            return []
-
-        if num_active > int(cfg.deadlock_max_active):
-            self._deadlock_rounds = 0
-            return []
-
-        if used_frac < float(cfg.deadlock_used_frac_floor):
-            self._deadlock_rounds = 0
-            return []
-
-        # must be stable-ish (not rapidly changing)
-        if abs(float(self._last_trend_slope_mb_s)) > float(cfg.deadlock_slope_abs_mb_s):
-            self._deadlock_rounds = 0
-            return []
-
-        # cooldown between actions
-        if (now - self._last_deadlock_action_ts) < float(
-            cfg.deadlock_action_cooldown_sec
-        ):
-            return []
-
-        max_cancelable = max(0, num_active - int(cfg.min_active_keep))
-        if max_cancelable <= 0:
-            self._deadlock_rounds += 1
-            if self._deadlock_rounds >= int(cfg.deadlock_rounds_before_restart):
+            if self._can_recommend_restart_locked(now=now):
                 self._restart_recommended = True
                 logger.error(
-                    "[AdaptiveScheduling] deadlock persists but cannot cancel (active=%d min_keep=%d); restart recommended.",
-                    num_active,
-                    cfg.min_active_keep,
+                    "[AdaptiveScheduling] stall persists (rounds=%d age=%.1fs); restart recommended.",
+                    self._stall_rounds,
+                    stall_age,
                 )
-            return []
-
-        to_cancel = min(int(cfg.deadlock_cancel_max), max_cancelable)
-        cancel_ids = self._select_heaviest_companies_locked(active_ids, count=to_cancel)
-        if not cancel_ids:
-            cancel_ids = list(active_ids)[-to_cancel:]
-
-        self._deadlock_rounds += 1
-        self._last_deadlock_action_ts = now
-
-        logger.error(
-            "[AdaptiveScheduling] DEADLOCK detected (round=%d no_progress=%.1fs active=%d used=%.1f%% slope=%.2fMB/s) -> cancel=%s",
-            self._deadlock_rounds,
-            no_progress_age,
-            num_active,
-            used_frac * 100.0,
-            float(self._last_trend_slope_mb_s),
-            cancel_ids,
-        )
-        self._maybe_log_state_locked(
-            reason="deadlock_cancel",
-            extra={
-                "deadlock_rounds": self._deadlock_rounds,
-                "no_progress_age_sec": no_progress_age,
-                "num_active": num_active,
-                "used_frac": used_frac,
-                "trend_slope_mb_s": self._last_trend_slope_mb_s,
-                "cancel_ids": cancel_ids,
-            },
-        )
-
-        if self._deadlock_rounds >= int(cfg.deadlock_rounds_before_restart):
-            self._restart_recommended = True
-            logger.error(
-                "[AdaptiveScheduling] deadlock persists (rounds=%d); restart recommended.",
-                self._deadlock_rounds,
-            )
-            self._maybe_log_state_locked(
-                reason="deadlock_restart",
-                extra={
-                    "deadlock_rounds": self._deadlock_rounds,
-                    "no_progress_age_sec": no_progress_age,
-                    "num_active": num_active,
-                    "used_frac": used_frac,
-                },
-            )
+                self._maybe_log_state_locked(
+                    reason="stall_restart",
+                    extra={
+                        "stall": meta,
+                        "stall_rounds": self._stall_rounds,
+                        "stall_age_sec": stall_age,
+                        "num_active": num_active,
+                    },
+                )
 
         return cancel_ids
 
@@ -1414,7 +1283,6 @@ class AdaptiveScheduler:
                     self._last_used_frac = used_frac
                     self._record_memory_sample_locked(ts=now, used_bytes=used)
 
-                    # swap sampling throttled even in watchdog
                     if (
                         now - self._last_swap_sample_ts
                     ) >= cfg.swap_sample_interval_sec:
@@ -1434,49 +1302,20 @@ class AdaptiveScheduler:
 
                     slope = self._last_trend_slope_mb_s
 
-                    # Progress bookkeeping safety (if someone increments completed_counter externally)
-                    if self._completed_counter != self._last_completed_counter_seen:
-                        self._last_completed_counter_seen = self._completed_counter
-                        self._last_progress_ts = now
-
-                    # Record stall sample every watchdog tick; update last_cpu/disk/net telemetry.
+                    # Stall sampling + actions
                     try:
                         self._record_stall_sample_locked(now=now)
-                    except Exception:
-                        logger.debug(
-                            "[AdaptiveScheduling] stall sampling failed", exc_info=True
-                        )
-
-                    # 1) Stall breaker (CPU plateau + low IO) gated by no-progress
-                    try:
+                        self._last_stall_sample_ts = now
                         stall_cancels = self._maybe_stall_actions_locked(
                             now=now, active_ids=active_ids
                         )
                         cancel_ids.extend(stall_cancels)
                     except Exception:
                         logger.debug(
-                            "[AdaptiveScheduling] stall decision failed", exc_info=True
+                            "[AdaptiveScheduling] stall sampling failed", exc_info=True
                         )
 
-                    # 2) Deadlock breaker (no-progress + stable memory + few actives)
-                    try:
-                        deadlock_cancels = self._maybe_deadlock_actions_locked(
-                            now=now,
-                            total=total,
-                            used=used,
-                            used_frac=used_frac,
-                            active_ids=active_ids,
-                        )
-                        cancel_ids.extend(deadlock_cancels)
-                    except Exception:
-                        logger.debug(
-                            "[AdaptiveScheduling] deadlock decision failed",
-                            exc_info=True,
-                        )
-
-                    # -----------------------------
                     # Per-task RSS monitoring (optional)
-                    # -----------------------------
                     if (
                         cfg.per_task_monitor_enabled
                         and self._get_company_pids is not None
@@ -1488,10 +1327,10 @@ class AdaptiveScheduler:
                         ) >= cfg.per_task_monitor_interval_sec:
                             self._last_per_task_check_ts = now
                             per_task_limit_bytes = int(cfg.per_task_rss_limit_mb * _MB)
-
                             sample_ids = list(active_ids)[
                                 : cfg.per_task_monitor_max_companies
                             ]
+
                             for cid in sample_ids:
                                 try:
                                     pids = list(self._get_company_pids(cid) or [])
@@ -1545,9 +1384,7 @@ class AdaptiveScheduler:
                                 else:
                                     self._per_task_over_thresh_ts.pop(cid, None)
 
-                    # -----------------------------
                     # Pre-oom slope trigger
-                    # -----------------------------
                     if (
                         used_frac >= cfg.preoom_used_frac
                         and slope >= cfg.preoom_slope_mb_s
@@ -1571,9 +1408,7 @@ class AdaptiveScheduler:
                             )
                             cancel_ids.extend(selected)
 
-                    # -----------------------------
                     # Emergency / near-oom cancellation
-                    # -----------------------------
                     in_emergency = (
                         used_frac >= cfg.mem_crit_high_frac
                         or (
@@ -1582,11 +1417,11 @@ class AdaptiveScheduler:
                         )
                         or (
                             used_frac >= cfg.mem_cap_frac
-                            and slope >= cfg.mem_trend_emergency_slope_mb_s
+                            and slope >= cfg.mem_trend_emergency_slope_mb_per_s
                         )
                         or (
                             used_frac >= cfg.mem_high_frac
-                            and slope >= cfg.mem_trend_emergency_slope_mb_s
+                            and slope >= cfg.mem_trend_emergency_slope_mb_per_s
                         )
                     )
 
@@ -1599,22 +1434,18 @@ class AdaptiveScheduler:
                         continue
 
                     if num_active <= 0:
-                        self._restart_recommended = True
-                        logger.error(
-                            "[AdaptiveScheduling] emergency with zero active companies; restart recommended (used_frac=%.3f swap=%.3f).",
-                            used_frac,
-                            swap_frac,
-                        )
+                        # IMPORTANT: do NOT recommend restart here (this caused early restart loops before).
                         continue
 
                     max_cancelable = max(0, num_active - int(cfg.min_active_keep))
                     if max_cancelable <= 0:
-                        self._restart_recommended = True
-                        logger.error(
-                            "[AdaptiveScheduling] emergency but cannot cancel (num_active=%d min_keep=%d); restart recommended.",
-                            num_active,
-                            cfg.min_active_keep,
-                        )
+                        if self._can_recommend_restart_locked(now=now):
+                            self._restart_recommended = True
+                            logger.error(
+                                "[AdaptiveScheduling] emergency but cannot cancel (num_active=%d min_keep=%d); restart recommended.",
+                                num_active,
+                                cfg.min_active_keep,
+                            )
                         continue
 
                     # Dedup + cap cancel list
@@ -1647,7 +1478,7 @@ class AdaptiveScheduler:
 
                         super_critical = used_frac >= 0.98 or (
                             used_frac >= cfg.mem_cap_frac
-                            and slope >= cfg.mem_trend_emergency_slope_mb_s
+                            and slope >= cfg.mem_trend_emergency_slope_mb_per_s
                         )
                         if super_critical:
                             to_cancel_count = min(
@@ -1684,6 +1515,7 @@ class AdaptiveScheduler:
                         >= cfg.emergency_persistent_rounds_threshold
                         and used_frac >= cfg.mem_crit_low_frac
                         and not self._restart_recommended
+                        and self._can_recommend_restart_locked(now=now)
                     ):
                         self._restart_recommended = True
                         logger.error(
