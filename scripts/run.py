@@ -737,7 +737,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-concurrency",
         type=int,
-        default=16,
+        default=24,
         help="Hard upper bound on concurrent companies.",
     )
     parser.add_argument("--max-pages", type=int, default=100)
@@ -758,9 +758,9 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Special mode: read crawl_global_state.json and force-mark markdown completion for in_progress companies (no LLM).",
     )
 
-    parser.add_argument("--page-result-concurrency", type=int, default=32)
+    parser.add_argument("--page-result-concurrency", type=int, default=8)
     parser.add_argument("--page-queue-maxsize", type=int, default=0)
-    parser.add_argument("--url-index-flush-every", type=int, default=64)
+    parser.add_argument("--url-index-flush-every", type=int, default=32)
     parser.add_argument("--url-index-flush-interval-sec", type=float, default=1.0)
 
     return parser.parse_args(list(argv) if argv is not None else None)
