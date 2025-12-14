@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import json
 import logging
 import time
@@ -110,6 +111,75 @@ class CriticalMemoryPressure(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
+# Cancellation-safe cleanup helpers
+# ---------------------------------------------------------------------------
+
+
+def _current_task_try_uncancel() -> bool:
+    """
+    Best-effort: temporarily remove one pending cancellation from the current task
+    (Python 3.11+). Returns True if we likely uncancelled.
+    """
+    t = asyncio.current_task()
+    if t is None:
+        return False
+    uncancel = getattr(t, "uncancel", None)
+    if uncancel is None:
+        return False
+    try:
+        uncancel()
+        return True
+    except Exception:
+        return False
+
+
+def _current_task_try_recancel() -> None:
+    """
+    Best-effort: re-assert cancellation so upstream sees CancelledError semantics.
+    """
+    t = asyncio.current_task()
+    if t is None:
+        return
+    try:
+        t.cancel()
+    except Exception:
+        pass
+
+
+async def _run_cleanup_even_if_cancelled(coro: Any) -> None:
+    """
+    Run `coro` to completion even if the current task has already been cancelled.
+    Uses Task.uncancel() where available; otherwise falls back to shield().
+    """
+    # If we're cancelled and Python supports uncancel(), we can actually await cleanup.
+    uncancelled = _current_task_try_uncancel()
+    if uncancelled:
+        try:
+            await coro
+        finally:
+            # Keep cancellation semantics for callers.
+            _current_task_try_recancel()
+        return
+
+    # Fallback: shield prevents the cleanup task from being cancelled, but our await
+    # may still raise CancelledError immediately. We still want to *wait* for it.
+    # Without uncancel(), we cannot reliably block here; best-effort is to start it
+    # and let it run in background.
+    try:
+        await asyncio.shield(coro)
+    except asyncio.CancelledError:
+        # Let cleanup continue in background; avoid leaking exceptions.
+        async def _bg() -> None:
+            try:
+                await coro
+            except Exception:
+                logger.exception("Background cleanup failed")
+
+        asyncio.create_task(_bg(), name="bg-cleanup")
+        raise
+
+
+# ---------------------------------------------------------------------------
 # Models and company loading
 # ---------------------------------------------------------------------------
 
@@ -187,7 +257,6 @@ def _read_in_progress_companies(out_dir: Path) -> List[str]:
         logger.exception("Failed to parse crawl_global_state.json at %s", p)
         return []
     ids = data.get("in_progress_companies") or []
-    # normalize to strings
     out: List[str] = []
     for x in ids:
         if x is None:
@@ -247,6 +316,11 @@ async def crawl_company(
         page_queue_maxsize=int(page_queue_maxsize),
         url_index_flush_cfg=flush_cfg,
     )
+
+    # IMPORTANT: if cancellation happens, ensure processor is always stopped and its
+    # internal tasks/queues are torn down (otherwise RAM stays referenced and CPU can
+    # keep spinning in worker loops).
+    cancelled_exc: Optional[BaseException] = None
     await processor.start()
 
     try:
@@ -284,12 +358,24 @@ async def crawl_company(
 
             if not isinstance(results_or_gen, list):
                 agen = results_or_gen
-                pending_exc: Optional[BaseException] = None
                 try:
                     async for page_result in agen:
                         await processor.submit(page_result)
                 except asyncio.CancelledError as e:
-                    pending_exc = e
+                    # Mark as cancelled but still do strong cleanup below.
+                    cancelled_exc = e
+                    # Try to stop processor ASAP (best-effort).
+                    abort = getattr(processor, "abort", None)
+                    if abort is not None:
+                        try:
+                            maybe = abort()
+                            if asyncio.iscoroutine(maybe):
+                                await maybe
+                        except Exception:
+                            logger.exception(
+                                "Error aborting page processor (company_id=%s)",
+                                company.company_id,
+                            )
                 finally:
                     aclose = getattr(agen, "aclose", None)
                     if aclose is not None:
@@ -300,14 +386,50 @@ async def crawl_company(
                                 "Error closing deep crawl generator (company_id=%s)",
                                 company.company_id,
                             )
-                if pending_exc is not None:
-                    raise pending_exc
+                if cancelled_exc is not None:
+                    raise cancelled_exc
             else:
                 for page_result in results_or_gen:
                     await processor.submit(page_result)
 
+    except asyncio.CancelledError as e:
+        cancelled_exc = e
+        # Best-effort immediate abort/stop hooks if the processor offers them.
+        abort = getattr(processor, "abort", None)
+        if abort is not None:
+            try:
+                maybe = abort()
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+            except Exception:
+                logger.exception(
+                    "Error aborting page processor on cancel (company_id=%s)",
+                    company.company_id,
+                )
+        raise
     finally:
-        await processor.finish()
+        # This is the critical part: make sure processor.finish() actually runs even
+        # if this task is cancelled, so internal workers are awaited/cancelled and
+        # queues are released for GC.
+        try:
+            if cancelled_exc is not None:
+                await _run_cleanup_even_if_cancelled(processor.finish())
+            else:
+                await processor.finish()
+        except asyncio.CancelledError:
+            # If we got cancelled during cleanup, re-raise after best-effort background.
+            raise
+        except Exception:
+            logger.exception(
+                "Error while finishing processor (company_id=%s)", company.company_id
+            )
+        finally:
+            # Encourage prompt memory return (Python arena may keep RSS, but object graphs
+            # referenced by processor queues/workers should be freed).
+            try:
+                gc.collect()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +496,8 @@ async def run_company_pipeline(
 ) -> bool:
     completed_ok = False
     token: Optional[Any] = None
+    cancelled_exc: Optional[BaseException] = None
 
-    # Special finalize mode: force-mark markdown completed even if errors
     finalize_in_progress_md: bool = bool(
         getattr(args, "finalize_in_progress_md", False)
     )
@@ -404,13 +526,12 @@ async def run_company_pipeline(
         ):
             do_crawl = False
         else:
-            do_crawl = True  # unknown => crawl
+            do_crawl = True
 
         will_run_llm_presence = args.llm_mode == "presence" and presence_llm is not None
         will_run_llm_full = args.llm_mode == "full" and full_llm is not None
         will_run_llm = will_run_llm_presence or will_run_llm_full
 
-        # In finalize mode, we *never* run LLM (wrapper also passes --llm-mode none)
         if finalize_in_progress_md:
             will_run_llm = False
 
@@ -490,7 +611,9 @@ async def run_company_pipeline(
         completed_ok = True
         return True
 
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as e:
+        cancelled_exc = e
+        # Keep your current semantics: cancellation is not "completed".
         raise
     except CriticalMemoryPressure:
         raise
@@ -500,47 +623,64 @@ async def run_company_pipeline(
         )
         return False
     finally:
-        try:
-            snap_meta = await state.get_company_snapshot(company.company_id)
-            _write_crawl_meta(company, snap_meta)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "Failed to write crawl_meta for company_id=%s", company.company_id
-            )
-
-        try:
-            if run_id is not None and completed_ok:
-                await state.mark_company_completed(run_id, company.company_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "Failed to update run state for company_id=%s", company.company_id
-            )
-
-        # IMPORTANT: new behavior
-        # - normal runs: mark_company_completed only if completed_ok
-        # - finalize-in-progress-md: force mark_company_completed regardless of errors
-        try:
-            if finalize_in_progress_md:
-                mark_company_completed(company.company_id)
-            elif completed_ok:
-                mark_company_completed(company.company_id)
-        except Exception:
-            logger.exception(
-                "Failed to mark_company_completed for company_id=%s", company.company_id
-            )
-
-        if token is not None:
+        # IMPORTANT: if the task was cancelled, these awaits would normally be skipped.
+        # We run cleanup in a cancellation-safe way so that per-company log handlers,
+        # file descriptors, and state snapshots get released.
+        async def _finalize() -> None:
             try:
-                logging_ext.reset_company_context(token)
-                logging_ext.close_company(company.company_id)
+                snap_meta = await state.get_company_snapshot(company.company_id)
+                _write_crawl_meta(company, snap_meta)
             except Exception:
                 logger.exception(
-                    "Failed to close logging context for company_id=%s",
+                    "Failed to write crawl_meta for company_id=%s", company.company_id
+                )
+
+            try:
+                if run_id is not None and completed_ok:
+                    await state.mark_company_completed(run_id, company.company_id)
+            except Exception:
+                logger.exception(
+                    "Failed to update run state for company_id=%s", company.company_id
+                )
+
+            try:
+                if finalize_in_progress_md:
+                    mark_company_completed(company.company_id)
+                elif completed_ok:
+                    mark_company_completed(company.company_id)
+            except Exception:
+                logger.exception(
+                    "Failed to mark_company_completed for company_id=%s",
                     company.company_id,
+                )
+
+            if token is not None:
+                try:
+                    logging_ext.reset_company_context(token)
+                    logging_ext.close_company(company.company_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to close logging context for company_id=%s",
+                        company.company_id,
+                    )
+
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
+        if cancelled_exc is not None:
+            try:
+                await _run_cleanup_even_if_cancelled(_finalize())
+            except asyncio.CancelledError:
+                raise
+        else:
+            try:
+                await _finalize()
+            except Exception:
+                # Do not crash the whole run due to finalize issues.
+                logger.exception(
+                    "Error during finalize (company_id=%s)", company.company_id
                 )
 
 
@@ -584,11 +724,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         choices=["ollama", "api"],
         default="ollama",
     )
-    parser.add_argument(
-        "--llm-api-provider",
-        type=str,
-        default="openai/gpt-4o-mini",
-    )
+    parser.add_argument("--llm-api-provider", type=str, default="openai/gpt-4o-mini")
     parser.add_argument(
         "--log-level",
         type=str,
@@ -616,14 +752,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--enable-session-log", action="store_true")
 
-    # NEW: finalize mode (used by wrapper after clean exit)
     parser.add_argument(
         "--finalize-in-progress-md",
         action="store_true",
         help="Special mode: read crawl_global_state.json and force-mark markdown completion for in_progress companies (no LLM).",
     )
 
-    # page pipeline knobs
     parser.add_argument("--page-result-concurrency", type=int, default=32)
     parser.add_argument("--page-queue-maxsize", type=int, default=0)
     parser.add_argument("--url-index-flush-every", type=int, default=64)
@@ -651,7 +785,6 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     logger.setLevel(log_level)
 
-    # If we are in finalize mode, force no-LLM (markdown only)
     if getattr(args, "finalize_in_progress_md", False):
         if args.llm_mode != "none":
             logger.warning(
@@ -758,6 +891,8 @@ async def main_async(args: argparse.Namespace) -> None:
         return [cid for cid, t in inflight_by_cid.items() if not t.done()]
 
     def request_cancel_companies(ids: Iterable[str]) -> None:
+        # Cancellation request is cooperative. Our changes ensure per-company processor
+        # cleanup runs even under cancellation so queues/workers don't keep RAM/CPU.
         for cid in ids:
             t = inflight_by_cid.get(cid)
             if t is None or t.done():
@@ -769,7 +904,6 @@ async def main_async(args: argparse.Namespace) -> None:
     scheduler: Optional[AdaptiveScheduler] = None
 
     try:
-        # ---- load companies ----
         if args.company_file:
             companies = _companies_from_source(Path(args.company_file))
         else:
@@ -781,7 +915,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 cid = (parsed.netloc or parsed.path or "company").replace(":", "_")
             companies = [Company(company_id=cid, domain_url=url)]
 
-        # NEW: finalize mode filters to in_progress_companies from crawl_global_state.json
         finalize_in_progress_md: bool = bool(
             getattr(args, "finalize_in_progress_md", False)
         )
@@ -807,7 +940,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 )
                 return
 
-        # Retry-mode filters (normal flow)
         if not finalize_in_progress_md:
             if retry_mode == "skip-retry" and prev_retry_ids:
                 companies = [c for c in companies if c.company_id not in prev_retry_ids]
@@ -826,8 +958,6 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception:
             logger.exception("Failed to recompute global crawl state at startup")
 
-        # ---- pre-skip ----
-        # IMPORTANT: disable pre-skip in finalize mode (we need to force-mark completion even if status looks done)
         if not finalize_in_progress_md:
             companies_to_run: List[Company] = []
             for c in companies:
@@ -840,7 +970,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 if _should_skip_company(status, args.llm_mode):
                     continue
                 companies_to_run.append(c)
-
             companies = companies_to_run
 
         if not companies:
@@ -911,6 +1040,10 @@ async def main_async(args: argparse.Namespace) -> None:
                     )
                     inflight_by_cid.clear()
                     cid_by_task.clear()
+                    try:
+                        gc.collect()
+                    except Exception:
+                        pass
                     break
 
                 active = len(inflight_by_cid)
@@ -975,6 +1108,7 @@ async def main_async(args: argparse.Namespace) -> None:
                         inflight_by_cid.pop(cid, None)
 
                     if t.cancelled():
+                        # Cancelled company task should have run its own cleanup.
                         continue
 
                     ok = False
@@ -1029,6 +1163,11 @@ async def main_async(args: argparse.Namespace) -> None:
                 await scheduler.stop()
             except Exception:
                 logger.exception("Error while stopping AdaptiveScheduler")
+
+        try:
+            gc.collect()
+        except Exception:
+            pass
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
