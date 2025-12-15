@@ -83,7 +83,7 @@ class AdaptiveSchedulingConfig:
 
     # “No progress” policy
     no_progress_timeout_sec: float = 1800.0  # 30 min
-    kill_on_no_progress: bool = False
+    kill_on_no_progress: bool = True
 
     # Hard watchdog thread (survives async starvation)
     hard_watchdog_enabled: bool = True

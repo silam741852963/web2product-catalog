@@ -5,6 +5,8 @@ import asyncio
 import gc
 import json
 import logging
+import os
+import signal
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -100,6 +102,7 @@ _HTTP_LANG_MAP: Dict[str, str] = {
 
 RETRY_EXIT_CODE = 17
 _retry_tracker_instance: Optional[RetryTracker] = None
+_forced_exit_code: Optional[int] = None
 
 
 class CriticalMemoryPressure(RuntimeError):
@@ -678,7 +681,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    global _retry_tracker_instance
+    global _retry_tracker_instance, _forced_exit_code
 
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -809,6 +812,73 @@ async def main_async(args: argparse.Namespace) -> None:
 
     scheduler: Optional[AdaptiveScheduler] = None
 
+    # Stop/restart coordination (prevents hanging forever on asyncio.wait)
+    stop_event = asyncio.Event()
+    sigterm_received = False
+    restart_due_to_scheduler = False
+
+    def _on_sigterm() -> None:
+        nonlocal sigterm_received
+        sigterm_received = True
+        stop_event.set()
+        logger.error("[Signal] SIGTERM received; requesting graceful shutdown.")
+
+    def _on_sigint() -> None:
+        stop_event.set()
+        logger.warning("[Signal] SIGINT received; requesting graceful shutdown.")
+
+    try:
+        loop = asyncio.get_running_loop()
+        try:
+            loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+            loop.add_signal_handler(signal.SIGINT, _on_sigint)
+        except NotImplementedError:
+            # Fallback if add_signal_handler isn't available (unlikely on Linux)
+            signal.signal(signal.SIGTERM, lambda *_: _on_sigterm())
+            signal.signal(signal.SIGINT, lambda *_: _on_sigint())
+    except Exception:
+        # Never fail startup because of signal wiring
+        pass
+
+    async def _cancel_inflight_and_maybe_exit_hard(
+        *, reason: str, mark_timeout_like: bool, hard_exit_code: Optional[int]
+    ) -> None:
+        """
+        Best-effort cancellation of inflight tasks.
+        If tasks refuse to die, force-exit to guarantee wrapper restart.
+        """
+        if inflight_by_cid:
+            logger.error("%s (inflight=%d)", reason, len(inflight_by_cid))
+
+        # Mark inflight for retry tracking
+        if mark_timeout_like:
+            for cid in list(inflight_by_cid.keys()):
+                try:
+                    mark_company_timeout(cid)
+                except Exception:
+                    pass
+
+        # Cancel tasks
+        for t in list(inflight_by_cid.values()):
+            if not t.done():
+                t.cancel()
+
+        # Wait bounded time; if still stuck, force exit
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*inflight_by_cid.values(), return_exceptions=True),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.critical(
+                "Inflight tasks did not cancel within timeout; forcing exit."
+            )
+            if hard_exit_code is not None:
+                os._exit(int(hard_exit_code))  # noqa: S606
+        finally:
+            inflight_by_cid.clear()
+            cid_by_task.clear()
+
     try:
         # ---- Load companies
         if args.company_file:
@@ -925,6 +995,8 @@ async def main_async(args: argparse.Namespace) -> None:
                 4, max(1, int(getattr(args, "company_concurrency", 20)))
             ),
             max_target=max(1, int(getattr(args, "company_concurrency", 20))),
+            # Be explicit: you said you already set default True; this prevents config drift.
+            kill_on_no_progress=True,
         )
         scheduler = AdaptiveScheduler(
             cfg=scheduler_cfg,
@@ -947,19 +1019,28 @@ async def main_async(args: argparse.Namespace) -> None:
 
         async with AsyncWebCrawler(config=browser_cfg) as crawler:
             while ready or inflight_by_cid:
+                # Cooperative shutdown (SIGTERM/SIGINT)
+                if stop_event.is_set():
+                    # If SIGTERM came from scheduler kill_on_no_progress, restart_recommended was set first.
+                    if scheduler is not None and scheduler.restart_recommended:
+                        restart_due_to_scheduler = True
+                    await _cancel_inflight_and_maybe_exit_hard(
+                        reason="[Shutdown] stop requested; cancelling inflight.",
+                        mark_timeout_like=True,
+                        hard_exit_code=(
+                            RETRY_EXIT_CODE if restart_due_to_scheduler else None
+                        ),
+                    )
+                    break
+
                 # If scheduler says restart is needed, stop fast and let wrapper retry.
                 if scheduler is not None and scheduler.restart_recommended:
-                    logger.error(
-                        "[AdaptiveScheduling] restart recommended; cancelling inflight and exiting loop."
+                    restart_due_to_scheduler = True
+                    await _cancel_inflight_and_maybe_exit_hard(
+                        reason="[AdaptiveScheduling] restart recommended; cancelling inflight and exiting loop.",
+                        mark_timeout_like=True,
+                        hard_exit_code=RETRY_EXIT_CODE,
                     )
-                    for t in list(inflight_by_cid.values()):
-                        if not t.done():
-                            t.cancel()
-                    await asyncio.gather(
-                        *inflight_by_cid.values(), return_exceptions=True
-                    )
-                    inflight_by_cid.clear()
-                    cid_by_task.clear()
                     break
 
                 # Launch: bounded by hard_max AND scheduler admission.
@@ -1016,34 +1097,37 @@ async def main_async(args: argparse.Namespace) -> None:
                         continue
                     break
 
+                # IMPORTANT: never block forever. Wake up periodically to notice restart flags.
                 done, _ = await asyncio.wait(
                     list(inflight_by_cid.values()),
+                    timeout=1.0,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
 
-                for t in done:
-                    cid = cid_by_task.pop(t, None)
-                    if cid is not None:
-                        inflight_by_cid.pop(cid, None)
+                if done:
+                    for t in done:
+                        cid = cid_by_task.pop(t, None)
+                        if cid is not None:
+                            inflight_by_cid.pop(cid, None)
 
-                    if t.cancelled():
-                        continue
+                        if t.cancelled():
+                            continue
 
-                    ok = False
-                    try:
-                        ok = bool(t.result())
-                    except CriticalMemoryPressure:
-                        if cid:
-                            mark_company_memory_pressure(cid)
                         ok = False
-                    except Exception:
-                        logger.exception("Company task failed (company_id=%s)", cid)
-                        ok = False
+                        try:
+                            ok = bool(t.result())
+                        except CriticalMemoryPressure:
+                            if cid:
+                                mark_company_memory_pressure(cid)
+                            ok = False
+                        except Exception:
+                            logger.exception("Company task failed (company_id=%s)", cid)
+                            ok = False
 
-                    if ok and scheduler is not None:
-                        scheduler.register_company_completed()
+                        if ok and scheduler is not None:
+                            scheduler.register_company_completed()
 
-                # periodic global recompute (cheap sanity)
+                # periodic global recompute (cheap sanity) - runs even if `done` is empty
                 now = time.time()
                 if now - last_global_recompute_ts >= global_recompute_interval_sec:
                     try:
@@ -1059,6 +1143,9 @@ async def main_async(args: argparse.Namespace) -> None:
             await state.recompute_global_state()
         except Exception:
             logger.exception("Failed to recompute global crawl state at shutdown")
+
+        if restart_due_to_scheduler:
+            _forced_exit_code = RETRY_EXIT_CODE
 
     finally:
         try:
@@ -1090,6 +1177,8 @@ async def main_async(args: argparse.Namespace) -> None:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
+    global _forced_exit_code
+
     args = parse_args(argv)
     try:
         asyncio.run(main_async(args))
@@ -1100,6 +1189,11 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
             exit_code = _retry_tracker_instance.finalize_and_exit_code(RETRY_EXIT_CODE)
         else:
             exit_code = 0
+
+        # Force retry exit code when scheduler asked for restart (even if retry tracker returns 0).
+        if _forced_exit_code is not None:
+            exit_code = int(_forced_exit_code)
+
         if exit_code != 0:
             raise SystemExit(exit_code)
 
