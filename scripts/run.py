@@ -111,64 +111,33 @@ class CriticalMemoryPressure(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Cancellation-safe cleanup helpers
+# Cancellation-safe cleanup (small + reliable)
 # ---------------------------------------------------------------------------
-
-
-def _current_task_try_uncancel() -> bool:
-    """
-    Best-effort: temporarily remove one pending cancellation from the current task
-    (Python 3.11+). Returns True if we likely uncancelled.
-    """
-    t = asyncio.current_task()
-    if t is None:
-        return False
-    uncancel = getattr(t, "uncancel", None)
-    if uncancel is None:
-        return False
-    try:
-        uncancel()
-        return True
-    except Exception:
-        return False
-
-
-def _current_task_try_recancel() -> None:
-    """
-    Best-effort: re-assert cancellation so upstream sees CancelledError semantics.
-    """
-    t = asyncio.current_task()
-    if t is None:
-        return
-    try:
-        t.cancel()
-    except Exception:
-        pass
 
 
 async def _run_cleanup_even_if_cancelled(coro: Any) -> None:
     """
-    Run `coro` to completion even if the current task has already been cancelled.
-    Uses Task.uncancel() where available; otherwise falls back to shield().
+    Best-effort: ensure cleanup runs even if current task is cancelled.
+    We prefer uncancel() on Py3.11+, otherwise shield and re-raise.
     """
-    # If we're cancelled and Python supports uncancel(), we can actually await cleanup.
-    uncancelled = _current_task_try_uncancel()
-    if uncancelled:
+    t = asyncio.current_task()
+    uncancel = getattr(t, "uncancel", None) if t is not None else None
+
+    if callable(uncancel):
         try:
+            uncancel()
             await coro
         finally:
-            # Keep cancellation semantics for callers.
-            _current_task_try_recancel()
+            try:
+                t.cancel()  # preserve cancellation semantics upstream
+            except Exception:
+                pass
         return
 
-    # Fallback: shield prevents the cleanup task from being cancelled, but our await
-    # may still raise CancelledError immediately. We still want to *wait* for it.
-    # Without uncancel(), we cannot reliably block here; best-effort is to start it
-    # and let it run in background.
     try:
         await asyncio.shield(coro)
     except asyncio.CancelledError:
-        # Let cleanup continue in background; avoid leaking exceptions.
+        # If we can't reliably block, spawn it and re-raise.
         async def _bg() -> None:
             try:
                 await coro
@@ -180,7 +149,7 @@ async def _run_cleanup_even_if_cancelled(coro: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Models and company loading
+# Models + IO helpers
 # ---------------------------------------------------------------------------
 
 
@@ -197,11 +166,6 @@ def _companies_from_source(path: Path) -> List[Company]:
     ]
     logger.info("Loaded %d companies from source %s", len(companies), path)
     return companies
-
-
-# ---------------------------------------------------------------------------
-# crawl_meta helpers
-# ---------------------------------------------------------------------------
 
 
 def _crawl_meta_path(company_id: str) -> Path:
@@ -229,25 +193,11 @@ def _write_crawl_meta(company: Company, snapshot: Any) -> None:
     }
 
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-        try:
-            f.flush()
-        except Exception:
-            pass
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
 
 
-# ---------------------------------------------------------------------------
-# Global state helpers
-# ---------------------------------------------------------------------------
-
-
 def _read_in_progress_companies(out_dir: Path) -> List[str]:
-    """
-    Reads out_dir/crawl_global_state.json and returns in_progress_companies.
-    If missing or invalid, returns [].
-    """
     p = out_dir / "crawl_global_state.json"
     if not p.exists():
         return []
@@ -259,17 +209,43 @@ def _read_in_progress_companies(out_dir: Path) -> List[str]:
     ids = data.get("in_progress_companies") or []
     out: List[str] = []
     for x in ids:
-        if x is None:
-            continue
-        s = str(x).strip()
+        s = str(x).strip() if x is not None else ""
         if s:
             out.append(s)
     return out
 
 
 # ---------------------------------------------------------------------------
-# Company level crawl
+# Crawl helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_filter_chain(
+    company: Company,
+    args: argparse.Namespace,
+    dataset_externals: frozenset[str],
+    bm25_filter: Optional[DualBM25Filter],
+) -> FilterChain:
+    first_time_filter = FirstTimeURLFilter()
+    html_filter = HTMLContentFilter()
+    lang_filter = LanguageAwareURLFilter(lang_code=args.lang)
+
+    universal_filter = UniversalExternalFilter(
+        dataset_externals=sorted(dataset_externals),
+        name=f"UniversalExternalFilter[{company.company_id}]",
+    )
+    universal_filter.set_company_url(company.domain_url)
+
+    filters = [html_filter, first_time_filter, universal_filter, lang_filter]
+    if bm25_filter is not None:
+        filters.append(bm25_filter)
+    return FilterChain(filters)
+
+
+def _should_skip_company(status: str, llm_mode: str) -> bool:
+    if llm_mode == "none":
+        return status in (COMPANY_STATUS_MD_DONE, COMPANY_STATUS_LLM_DONE)
+    return status == COMPANY_STATUS_LLM_DONE
 
 
 async def crawl_company(
@@ -317,9 +293,6 @@ async def crawl_company(
         url_index_flush_cfg=flush_cfg,
     )
 
-    # IMPORTANT: if cancellation happens, ensure processor is always stopped and its
-    # internal tasks/queues are torn down (otherwise RAM stays referenced and CPU can
-    # keep spinning in worker loops).
     cancelled_exc: Optional[BaseException] = None
     await processor.start()
 
@@ -340,7 +313,6 @@ async def crawl_company(
             js_code = (
                 "\n\n".join(interaction_cfg.js_code) if interaction_cfg.js_code else ""
             )
-
             clone_kwargs.update(
                 js_code=js_code,
                 js_only=interaction_cfg.js_only,
@@ -362,11 +334,9 @@ async def crawl_company(
                     async for page_result in agen:
                         await processor.submit(page_result)
                 except asyncio.CancelledError as e:
-                    # Mark as cancelled but still do strong cleanup below.
                     cancelled_exc = e
-                    # Try to stop processor ASAP (best-effort).
                     abort = getattr(processor, "abort", None)
-                    if abort is not None:
+                    if callable(abort):
                         try:
                             maybe = abort()
                             if asyncio.iscoroutine(maybe):
@@ -378,7 +348,7 @@ async def crawl_company(
                             )
                 finally:
                     aclose = getattr(agen, "aclose", None)
-                    if aclose is not None:
+                    if callable(aclose):
                         try:
                             await aclose()
                         except Exception:
@@ -386,6 +356,7 @@ async def crawl_company(
                                 "Error closing deep crawl generator (company_id=%s)",
                                 company.company_id,
                             )
+
                 if cancelled_exc is not None:
                     raise cancelled_exc
             else:
@@ -394,9 +365,8 @@ async def crawl_company(
 
     except asyncio.CancelledError as e:
         cancelled_exc = e
-        # Best-effort immediate abort/stop hooks if the processor offers them.
         abort = getattr(processor, "abort", None)
-        if abort is not None:
+        if callable(abort):
             try:
                 maybe = abort()
                 if asyncio.iscoroutine(maybe):
@@ -408,24 +378,12 @@ async def crawl_company(
                 )
         raise
     finally:
-        # This is the critical part: make sure processor.finish() actually runs even
-        # if this task is cancelled, so internal workers are awaited/cancelled and
-        # queues are released for GC.
         try:
             if cancelled_exc is not None:
                 await _run_cleanup_even_if_cancelled(processor.finish())
             else:
                 await processor.finish()
-        except asyncio.CancelledError:
-            # If we got cancelled during cleanup, re-raise after best-effort background.
-            raise
-        except Exception:
-            logger.exception(
-                "Error while finishing processor (company_id=%s)", company.company_id
-            )
         finally:
-            # Encourage prompt memory return (Python arena may keep RSS, but object graphs
-            # referenced by processor queues/workers should be freed).
             try:
                 gc.collect()
             except Exception:
@@ -433,40 +391,7 @@ async def crawl_company(
 
 
 # ---------------------------------------------------------------------------
-# BM25 and dataset helpers
-# ---------------------------------------------------------------------------
-
-
-def _build_filter_chain(
-    company: Company,
-    args: argparse.Namespace,
-    dataset_externals: frozenset[str],
-    bm25_filter: Optional[DualBM25Filter],
-) -> FilterChain:
-    first_time_filter = FirstTimeURLFilter()
-    html_filter = HTMLContentFilter()
-    lang_filter = LanguageAwareURLFilter(lang_code=args.lang)
-
-    universal_filter = UniversalExternalFilter(
-        dataset_externals=sorted(dataset_externals),
-        name=f"UniversalExternalFilter[{company.company_id}]",
-    )
-    universal_filter.set_company_url(company.domain_url)
-
-    filters = [html_filter, first_time_filter, universal_filter, lang_filter]
-    if bm25_filter is not None:
-        filters.append(bm25_filter)
-    return FilterChain(filters)
-
-
-def _should_skip_company(status: str, llm_mode: str) -> bool:
-    if llm_mode == "none":
-        return status in (COMPANY_STATUS_MD_DONE, COMPANY_STATUS_LLM_DONE)
-    return status == COMPANY_STATUS_LLM_DONE
-
-
-# ---------------------------------------------------------------------------
-# Company pipeline runner
+# Company pipeline
 # ---------------------------------------------------------------------------
 
 
@@ -497,7 +422,6 @@ async def run_company_pipeline(
     completed_ok = False
     token: Optional[Any] = None
     cancelled_exc: Optional[BaseException] = None
-
     finalize_in_progress_md: bool = bool(
         getattr(args, "finalize_in_progress_md", False)
     )
@@ -530,10 +454,9 @@ async def run_company_pipeline(
 
         will_run_llm_presence = args.llm_mode == "presence" and presence_llm is not None
         will_run_llm_full = args.llm_mode == "full" and full_llm is not None
-        will_run_llm = will_run_llm_presence or will_run_llm_full
-
-        if finalize_in_progress_md:
-            will_run_llm = False
+        will_run_llm = (
+            will_run_llm_presence or will_run_llm_full
+        ) and not finalize_in_progress_md
 
         if not do_crawl and not will_run_llm:
             return True
@@ -542,7 +465,6 @@ async def run_company_pipeline(
 
         token = logging_ext.set_company_context(company.company_id)
         company_logger = logging_ext.get_company_logger(company.company_id)
-
         company_logger.info(
             "=== [%d/%d] Company company_id=%s url=%s ===",
             idx,
@@ -559,9 +481,8 @@ async def run_company_pipeline(
         )
 
         max_pages_for_strategy: Optional[int] = None
-        if getattr(args, "max_pages", None):
-            if args.max_pages > 0:
-                max_pages_for_strategy = int(args.max_pages)
+        if getattr(args, "max_pages", None) and args.max_pages > 0:
+            max_pages_for_strategy = int(args.max_pages)
 
         deep_strategy = build_deep_strategy(
             strategy=args.strategy,
@@ -600,12 +521,12 @@ async def run_company_pipeline(
                 root_url=company.domain_url,
             )
 
-        if not finalize_in_progress_md:
-            if args.llm_mode == "presence" and presence_llm is not None:
+        if will_run_llm:
+            if args.llm_mode == "presence":
                 await run_presence_pass_for_company(
                     company, presence_strategy=presence_llm
                 )
-            elif args.llm_mode == "full" and full_llm is not None:
+            elif args.llm_mode == "full":
                 await run_full_pass_for_company(company, full_strategy=full_llm)
 
         completed_ok = True
@@ -613,7 +534,6 @@ async def run_company_pipeline(
 
     except asyncio.CancelledError as e:
         cancelled_exc = e
-        # Keep your current semantics: cancellation is not "completed".
         raise
     except CriticalMemoryPressure:
         raise
@@ -623,9 +543,7 @@ async def run_company_pipeline(
         )
         return False
     finally:
-        # IMPORTANT: if the task was cancelled, these awaits would normally be skipped.
-        # We run cleanup in a cancellation-safe way so that per-company log handlers,
-        # file descriptors, and state snapshots get released.
+
         async def _finalize() -> None:
             try:
                 snap_meta = await state.get_company_snapshot(company.company_id)
@@ -644,9 +562,7 @@ async def run_company_pipeline(
                 )
 
             try:
-                if finalize_in_progress_md:
-                    mark_company_completed(company.company_id)
-                elif completed_ok:
+                if completed_ok:
                     mark_company_completed(company.company_id)
             except Exception:
                 logger.exception(
@@ -670,15 +586,11 @@ async def run_company_pipeline(
                 pass
 
         if cancelled_exc is not None:
-            try:
-                await _run_cleanup_even_if_cancelled(_finalize())
-            except asyncio.CancelledError:
-                raise
+            await _run_cleanup_even_if_cancelled(_finalize())
         else:
             try:
                 await _finalize()
             except Exception:
-                # Do not crash the whole run due to finalize issues.
                 logger.exception(
                     "Error during finalize (company_id=%s)", company.company_id
                 )
@@ -713,16 +625,10 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default="bestfirst",
     )
     parser.add_argument(
-        "--llm-mode",
-        type=str,
-        choices=["none", "presence", "full"],
-        default="none",
+        "--llm-mode", type=str, choices=["none", "presence", "full"], default="none"
     )
     parser.add_argument(
-        "--llm-provider",
-        type=str,
-        choices=["ollama", "api"],
-        default="ollama",
+        "--llm-provider", type=str, choices=["ollama", "api"], default="ollama"
     )
     parser.add_argument("--llm-api-provider", type=str, default="openai/gpt-4o-mini")
     parser.add_argument(
@@ -737,7 +643,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-concurrency",
         type=int,
-        default=24,
+        default=20,
         help="Hard upper bound on concurrent companies.",
     )
     parser.add_argument("--max-pages", type=int, default=100)
@@ -758,10 +664,10 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Special mode: read crawl_global_state.json and force-mark markdown completion for in_progress companies (no LLM).",
     )
 
-    parser.add_argument("--page-result-concurrency", type=int, default=8)
+    parser.add_argument("--page-result-concurrency", type=int, default=6)
     parser.add_argument("--page-queue-maxsize", type=int, default=0)
-    parser.add_argument("--url-index-flush-every", type=int, default=32)
-    parser.add_argument("--url-index-flush-interval-sec", type=float, default=1.0)
+    parser.add_argument("--url-index-flush-every", type=int, default=24)
+    parser.add_argument("--url-index-flush-interval-sec", type=float, default=0.5)
 
     return parser.parse_args(list(argv) if argv is not None else None)
 
@@ -785,14 +691,11 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     logger.setLevel(log_level)
 
-    if getattr(args, "finalize_in_progress_md", False):
-        if args.llm_mode != "none":
-            logger.warning(
-                "--finalize-in-progress-md enabled; forcing --llm-mode none (ignoring requested llm-mode=%s).",
-                args.llm_mode,
-            )
+    if getattr(args, "finalize_in_progress_md", False) and args.llm_mode != "none":
+        logger.warning("--finalize-in-progress-md enabled; forcing --llm-mode none.")
         args.llm_mode = "none"
 
+    # Retry tracker
     retry_cfg = RetryTrackerConfig(out_dir=out_dir)
     retry_tracker = RetryTracker(retry_cfg)
     _retry_tracker_instance = retry_tracker
@@ -804,6 +707,7 @@ async def main_async(args: argparse.Namespace) -> None:
     page_timeout_ms: int = int(getattr(args, "page_timeout_ms", 60000))
     timeout_error_marker = f"Timeout {page_timeout_ms}ms exceeded."
 
+    # Logging extension
     enable_session_log = getattr(args, "enable_session_log", False)
     logging_ext = LoggingExtension(
         global_level=log_level,
@@ -813,6 +717,7 @@ async def main_async(args: argparse.Namespace) -> None:
         session_log_path=(out_dir / "session.log") if enable_session_log else None,
     )
 
+    # Optional resource monitor
     resource_monitor: Optional[ResourceMonitor] = None
     if getattr(args, "enable_resource_monitor", False):
         rm_config = ResourceMonitorConfig()
@@ -822,19 +727,21 @@ async def main_async(args: argparse.Namespace) -> None:
         )
         resource_monitor.start()
 
+    # Language + LLM setup
     default_language_factory.set_language(args.lang)
 
     presence_llm = None
     full_llm = None
     if args.llm_mode != "none":
-        if args.llm_provider == "ollama":
-            provider_strategy = default_ollama_provider_strategy
-        else:
-            provider_strategy = RemoteAPIProviderStrategy(
+        provider_strategy = (
+            default_ollama_provider_strategy
+            if args.llm_provider == "ollama"
+            else RemoteAPIProviderStrategy(
                 provider=args.llm_api_provider,
                 api_token=None,
                 base_url=None,
             )
+        )
         llm_factory = LLMExtractionFactory(
             provider_strategy=provider_strategy,
             default_full_instruction=DEFAULT_FULL_INSTRUCTION,
@@ -845,9 +752,11 @@ async def main_async(args: argparse.Namespace) -> None:
         if args.llm_mode == "full":
             full_llm = llm_factory.create(mode="schema")
 
+    # Connectivity guard
     guard = ConnectivityGuard()
     await guard.start()
 
+    # Markdown gating + crawler base cfg
     gating_cfg = md_gating.build_gating_config(
         min_meaningful_words=30,
         cookie_max_fraction=0.02,
@@ -855,7 +764,6 @@ async def main_async(args: argparse.Namespace) -> None:
         interstitial_max_share=0.70,
         interstitial_min_hits=2,
     )
-
     markdown_generator = default_md_factory.create(
         min_meaningful_words=gating_cfg.min_meaningful_words,
         interstitial_max_share=gating_cfg.interstitial_max_share,
@@ -863,7 +771,6 @@ async def main_async(args: argparse.Namespace) -> None:
         cookie_max_fraction=gating_cfg.cookie_max_fraction,
         require_structure=gating_cfg.require_structure,
     )
-
     crawler_base_cfg = default_crawler_factory.create(
         markdown_generator=markdown_generator,
         page_timeout=page_timeout_ms,
@@ -884,6 +791,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
     state = get_crawl_state()
 
+    # Inflight tracking (simple, explicit)
     inflight_by_cid: Dict[str, asyncio.Task] = {}
     cid_by_task: Dict[asyncio.Task, str] = {}
 
@@ -891,8 +799,6 @@ async def main_async(args: argparse.Namespace) -> None:
         return [cid for cid, t in inflight_by_cid.items() if not t.done()]
 
     def request_cancel_companies(ids: Iterable[str]) -> None:
-        # Cancellation request is cooperative. Our changes ensure per-company processor
-        # cleanup runs even under cancellation so queues/workers don't keep RAM/CPU.
         for cid in ids:
             t = inflight_by_cid.get(cid)
             if t is None or t.done():
@@ -904,6 +810,7 @@ async def main_async(args: argparse.Namespace) -> None:
     scheduler: Optional[AdaptiveScheduler] = None
 
     try:
+        # ---- Load companies
         if args.company_file:
             companies = _companies_from_source(Path(args.company_file))
         else:
@@ -915,6 +822,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 cid = (parsed.netloc or parsed.path or "company").replace(":", "_")
             companies = [Company(company_id=cid, domain_url=url)]
 
+        # finalize-in-progress-md filter
         finalize_in_progress_md: bool = bool(
             getattr(args, "finalize_in_progress_md", False)
         )
@@ -940,16 +848,17 @@ async def main_async(args: argparse.Namespace) -> None:
                 )
                 return
 
-        if not finalize_in_progress_md:
-            if retry_mode == "skip-retry" and prev_retry_ids:
+        # retry-mode filter (only when not finalize)
+        if not finalize_in_progress_md and prev_retry_ids:
+            if retry_mode == "skip-retry":
                 companies = [c for c in companies if c.company_id not in prev_retry_ids]
-            elif retry_mode == "only-retry" and prev_retry_ids:
+            elif retry_mode == "only-retry":
                 companies = [c for c in companies if c.company_id in prev_retry_ids]
 
+        # ---- State init
         run_id = await state.start_run(
             pipeline="deep_crawl", version=None, args_hash=None
         )
-
         for c in companies:
             await state.upsert_company(c.company_id, name=None, root_url=c.domain_url)
 
@@ -958,19 +867,19 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception:
             logger.exception("Failed to recompute global crawl state at startup")
 
+        # skip already-done companies (unless finalize)
         if not finalize_in_progress_md:
-            companies_to_run: List[Company] = []
+            kept: List[Company] = []
             for c in companies:
                 try:
                     snap = await state.get_company_snapshot(c.company_id)
                     status = getattr(snap, "status", None) or COMPANY_STATUS_PENDING
                 except Exception:
-                    companies_to_run.append(c)
+                    kept.append(c)
                     continue
-                if _should_skip_company(status, args.llm_mode):
-                    continue
-                companies_to_run.append(c)
-            companies = companies_to_run
+                if not _should_skip_company(status, args.llm_mode):
+                    kept.append(c)
+            companies = kept
 
         if not companies:
             logger.info(
@@ -989,8 +898,7 @@ async def main_async(args: argparse.Namespace) -> None:
         url_scorer: Optional[DualBM25Scorer] = bm25_components["url_scorer"]
         bm25_filter: Optional[DualBM25Filter] = bm25_components["url_filter"]
 
-        max_companies = max(1, int(args.company_concurrency))
-
+        # dfs factory
         dfs_factory: Optional[DeepCrawlStrategyFactory] = None
         if args.strategy == "dfs":
             dfs_factory = DeepCrawlStrategyFactory(
@@ -1001,6 +909,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 )
             )
 
+        # Browser config
         http_lang = _HTTP_LANG_MAP.get(args.lang, f"{args.lang}-US")
         browser_cfg = default_browser_factory.create(
             lang=http_lang,
@@ -1008,8 +917,15 @@ async def main_async(args: argparse.Namespace) -> None:
             headless=True,
         )
 
-        scheduler_log_path = out_dir / "adaptive_scheduling_state.jsonl"
-        scheduler_cfg = AdaptiveSchedulingConfig(log_path=scheduler_log_path)
+        # ---- Adaptive scheduler (new simple one)
+        scheduler_cfg = AdaptiveSchedulingConfig(
+            log_path=out_dir / "adaptive_scheduling_state.jsonl",
+            heartbeat_path=out_dir / "heartbeat.json",
+            initial_target=min(
+                4, max(1, int(getattr(args, "company_concurrency", 20)))
+            ),
+            max_target=max(1, int(getattr(args, "company_concurrency", 20))),
+        )
         scheduler = AdaptiveScheduler(
             cfg=scheduler_cfg,
             get_active_company_ids=get_active_company_ids,
@@ -1017,20 +933,24 @@ async def main_async(args: argparse.Namespace) -> None:
         )
         await scheduler.start()
 
+        # ---- Work queue
         companies_by_id: Dict[str, Company] = {c.company_id: c for c in companies}
         ready: deque[str] = deque(c.company_id for c in companies)
 
         launched = 0
         total = len(companies)
+        hard_max = max(1, int(getattr(args, "company_concurrency", 20)))
 
+        # Keep global recompute, but don’t overdo it.
         last_global_recompute_ts = 0.0
         global_recompute_interval_sec = 120.0
 
         async with AsyncWebCrawler(config=browser_cfg) as crawler:
             while ready or inflight_by_cid:
+                # If scheduler says restart is needed, stop fast and let wrapper retry.
                 if scheduler is not None and scheduler.restart_recommended:
                     logger.error(
-                        "[AdaptiveScheduling] restart recommended; cancelling inflight and stopping."
+                        "[AdaptiveScheduling] restart recommended; cancelling inflight and exiting loop."
                     )
                     for t in list(inflight_by_cid.values()):
                         if not t.done():
@@ -1040,14 +960,12 @@ async def main_async(args: argparse.Namespace) -> None:
                     )
                     inflight_by_cid.clear()
                     cid_by_task.clear()
-                    try:
-                        gc.collect()
-                    except Exception:
-                        pass
                     break
 
+                # Launch: bounded by hard_max AND scheduler admission.
                 active = len(inflight_by_cid)
-                capacity = max(0, max_companies - active)
+                capacity = max(0, hard_max - active)
+
                 if capacity > 0 and ready:
                     want = len(ready)
                     slots = capacity
@@ -1062,7 +980,7 @@ async def main_async(args: argparse.Namespace) -> None:
                         company = companies_by_id[cid]
                         launched += 1
 
-                        t = asyncio.create_task(
+                        task = asyncio.create_task(
                             run_company_pipeline(
                                 company=company,
                                 idx=launched,
@@ -1088,9 +1006,10 @@ async def main_async(args: argparse.Namespace) -> None:
                             ),
                             name=f"company-{cid}",
                         )
-                        inflight_by_cid[cid] = t
-                        cid_by_task[t] = cid
+                        inflight_by_cid[cid] = task
+                        cid_by_task[task] = cid
 
+                # If nothing inflight, just wait a bit and loop (scheduler may unblock).
                 if not inflight_by_cid:
                     if ready:
                         await asyncio.sleep(0.5)
@@ -1108,7 +1027,6 @@ async def main_async(args: argparse.Namespace) -> None:
                         inflight_by_cid.pop(cid, None)
 
                     if t.cancelled():
-                        # Cancelled company task should have run its own cleanup.
                         continue
 
                     ok = False
@@ -1125,6 +1043,7 @@ async def main_async(args: argparse.Namespace) -> None:
                     if ok and scheduler is not None:
                         scheduler.register_company_completed()
 
+                # periodic global recompute (cheap sanity)
                 now = time.time()
                 if now - last_global_recompute_ts >= global_recompute_interval_sec:
                     try:
