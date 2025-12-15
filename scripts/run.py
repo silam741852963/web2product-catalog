@@ -646,7 +646,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-concurrency",
         type=int,
-        default=20,
+        default=16,
         help="Hard upper bound on concurrent companies.",
     )
     parser.add_argument("--max-pages", type=int, default=100)
