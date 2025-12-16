@@ -929,7 +929,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-concurrency",
         type=int,
-        default=12,
+        default=24,
         help="Hard upper bound on concurrent companies (tasks).",
     )
     parser.add_argument("--max-pages", type=int, default=100)
