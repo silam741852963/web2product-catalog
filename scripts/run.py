@@ -223,6 +223,10 @@ class CrawlerPool:
         self._started = False
         self._closing = False
 
+        # Forced recycle (used on memory-pressure cancels)
+        self._force_restart_budget: int = 0
+        self._force_restart_reason: str = "forced_recycle"
+
     @property
     def size(self) -> int:
         return self._size
@@ -233,6 +237,43 @@ class CrawlerPool:
             return int(self._queue.qsize())
         except Exception:
             return 0
+
+    def request_recycle(self, count: int, reason: str) -> None:
+        """
+        Ask the pool to restart `count` crawlers as they get released.
+        This is the fastest way to drop Chromium RSS after memory-pressure cancellations.
+        """
+        if count <= 0:
+            return
+        # Best-effort: budget capped to pool size
+        self._force_restart_budget = min(
+            self._size, self._force_restart_budget + int(count)
+        )
+        self._force_restart_reason = reason or "forced_recycle"
+
+    async def recycle_idle_now(self, count: int, reason: str) -> int:
+        """
+        Immediately restart up to `count` currently-idle slots.
+        Useful when memory is ramping quickly and we need relief now.
+        """
+        restarted = 0
+        n = min(self._size, max(0, int(count)))
+        for _ in range(n):
+            try:
+                slot = self._queue.get_nowait()
+            except Exception:
+                break
+            slot = await self._restart_slot(slot, reason=reason or "recycle_idle")
+            try:
+                self._queue.put_nowait(slot)
+            except Exception:
+                try:
+                    await slot.crawler.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                break
+            restarted += 1
+        return restarted
 
     async def start(self) -> None:
         if self._started:
@@ -329,6 +370,19 @@ class CrawlerPool:
         if fatal:
             slot = await self._restart_slot(slot, reason=reason)
         else:
+            # Forced recycle path (triggered by memory-pressure cancels)
+            if self._force_restart_budget > 0:
+                self._force_restart_budget -= 1
+                slot = await self._restart_slot(slot, reason=self._force_restart_reason)
+                try:
+                    self._queue.put_nowait(slot)
+                except Exception:
+                    try:
+                        await slot.crawler.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                return
+
             slot.processed_companies += 1
             if (
                 self._recycle_after > 0
@@ -570,7 +624,7 @@ async def crawl_company(
                     async for page_result in agen:
                         await processor.submit(
                             page_result
-                        )  # backpressure if queue bounded
+                        )  # bounded queue -> backpressure
                 except asyncio.CancelledError as e:
                     cancelled_exc = e
                     abort = getattr(processor, "abort", None)
@@ -967,7 +1021,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--crawler-recycle-after",
         type=int,
-        default=40,
+        default=20,
         help="Recycle a crawler instance after N companies to drop Chromium memory.",
     )
 
@@ -1107,7 +1161,23 @@ async def main_async(args: argparse.Namespace) -> None:
     def get_active_company_ids() -> List[str]:
         return [cid for cid, t in inflight_by_cid.items() if not t.done()]
 
+    crawler_pool: Optional[CrawlerPool] = None
+
     def request_cancel_companies(ids: Sequence[str]) -> None:
+        # IMPORTANT: on memory-pressure cancels, also force-recycle crawlers
+        # so Chromium high-water RSS drops quickly (helps "memory ramp up too fast").
+        if crawler_pool is not None and ids:
+            try:
+                crawler_pool.request_recycle(len(ids), reason="mem_pressure_cancel")
+                asyncio.create_task(
+                    crawler_pool.recycle_idle_now(
+                        min(len(ids), crawler_pool.size),
+                        reason="mem_pressure_idle_recycle",
+                    )
+                )
+            except Exception:
+                logger.exception("[CrawlerPool] failed to schedule forced recycle")
+
         for cid in ids:
             t = inflight_by_cid.get(cid)
             if t is None or t.done():
@@ -1132,8 +1202,6 @@ async def main_async(args: argparse.Namespace) -> None:
     def _on_sigint() -> None:
         stop_event.set()
         logger.warning("[Signal] SIGINT received; requesting graceful shutdown.")
-
-    crawler_pool: Optional[CrawlerPool] = None
 
     async def _cancel_inflight_and_maybe_exit_hard(
         *, reason: str, mark_timeout_like: bool, hard_exit_code: Optional[int]
@@ -1358,10 +1426,8 @@ async def main_async(args: argparse.Namespace) -> None:
                     )
 
                 # Optional: don’t start a ton of tasks if crawler pool is small.
-                # This avoids “many tasks waiting on pool.acquire()” looking like active work.
                 if crawler_pool is not None:
                     free_crawlers = crawler_pool.free_slots_approx()
-                    # allow some buffering, but not unbounded
                     slots = min(slots, max(1, free_crawlers * 3))
 
                 to_start = min(slots, capacity, want)
