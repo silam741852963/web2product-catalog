@@ -32,15 +32,14 @@ _MB = 1_000_000
 @dataclass
 class AdaptiveSchedulingConfig:
     """
-    Simple, effective scheduling:
-    - Uses *effective* cgroup memory when available (cgroup v2: current - inactive_file).
-      This prevents false "RAM stays high forever" stalls caused by page cache accounting.
-
-    - ALSO tracks *raw* cgroup usage (memory.current / usage_in_bytes), because cgroup OOM
-      triggers based on raw usage (page cache included). Raw is what you must avoid hitting.
-
-    - Adds "memory ramp" protection: if memory fraction increases too fast (% / sec),
-      throttle admission, and preemptively cancel tasks before hitting OOM.
+    Scheduling + safety:
+    - Uses effective cgroup memory when available (cgroup v2: current - inactive_file)
+    - ALSO tracks raw cgroup usage (OOM cares about raw)
+    - Adds memory ramp protection
+    - Adds stall detection:
+        * per-company inactivity -> cancel
+        * admission starvation (ready>0, active==0, no admission) -> restart
+        * periodic log while blocked -> no silent stall
     """
 
     # Effective memory watermarks (fractions of effective limit)
@@ -56,13 +55,12 @@ class AdaptiveSchedulingConfig:
     )
 
     # Memory ramp detection (fractions per second)
-    # Example: 0.03 == +3% / sec of total memory.
     mem_ramp_window_sec: float = 3.0
     mem_ramp_high_frac_per_sec: float = 0.020
     mem_ramp_crit_frac_per_sec: float = 0.030
     mem_ramp_kill_frac_per_sec: float = 0.050
 
-    # Estimation (based on process-tree RSS by default)
+    # Estimation (based on process-tree memory by default)
     per_company_min_mb: float = 256.0
     per_company_max_mb: float = 1024.0
     per_company_safety_factor: float = 1.30
@@ -86,8 +84,15 @@ class AdaptiveSchedulingConfig:
     restart_gate_min_uptime_sec: float = 180.0
     restart_gate_min_completed: int = 3
 
-    # “No progress” policy
-    no_progress_timeout_sec: float = 1800.0
+    # --- Stall detection (<= 5 minutes default) ---
+    company_inactivity_timeout_sec: float = 240.0
+    company_inactivity_cancel_max: int = 1
+
+    admission_starvation_timeout_sec: float = 240.0
+    block_log_interval_sec: float = 30.0
+
+    # “No progress” policy (<= 5 minutes default)
+    no_progress_timeout_sec: float = 240.0
     kill_on_no_progress: bool = True
 
     # Hard watchdog thread
@@ -110,17 +115,18 @@ class AdaptiveSchedulingConfig:
     # Important: subtract reclaimable cache from cgroup usage (prevents stalls)
     cgroup_subtract_inactive_file: bool = True
 
-    # Use process-tree RSS for estimator baseline/EMA (better than system used)
+    # Use process-tree memory for estimator baseline/EMA (better than system used)
     use_process_tree_rss_for_estimate: bool = True
 
 
 class AdaptiveScheduler:
     """
-    Public API preserved:
+    Public API:
       - start/stop
       - admissible_slots(num_waiting)
       - register_company_completed()
       - record_company_peak(company_id, peak_mb)
+      - touch_company(company_id)                      (NEW)
       - restart_recommended
       - get_state_snapshot()
     """
@@ -137,7 +143,7 @@ class AdaptiveScheduler:
         self._get_active_company_ids = get_active_company_ids
         self._request_cancel_companies = request_cancel_companies
 
-        # Memory sampling cache (system/cgroup)
+        # Memory sampling cache
         self._total_mem_bytes: int = 0
         self._used_bytes: int = 0  # effective
         self._used_frac: float = 0.0
@@ -152,7 +158,7 @@ class AdaptiveScheduler:
         self._ramp_eff_frac_per_sec: float = 0.0
         self._ramp_raw_frac_per_sec: float = 0.0
 
-        # Process tree RSS (python + chromium children)
+        # Process tree memory (USS-first)
         self._proc_rss_bytes: int = 0
 
         # Estimator (MB)
@@ -162,6 +168,11 @@ class AdaptiveScheduler:
 
         # Optional per-company peak tracking
         self._company_peak_mb: Dict[str, float] = {}
+
+        # Company activity tracking (NEW)
+        self._company_last_touch_mono: Dict[str, float] = {}
+        self._last_admission_mono: float = time.monotonic()
+        self._last_block_log_mono: float = 0.0
 
         # AIMD target
         self._target_parallel: int = max(
@@ -180,7 +191,7 @@ class AdaptiveScheduler:
         self._last_heartbeat_mono: float = time.monotonic()
         self._last_progress_mono: float = time.monotonic()
 
-        # “Observed” to infer progress
+        # Observed to infer progress
         self._last_obs_active_n: int = 0
         self._last_obs_waiting_n: int = 0
         self._last_obs_completed: int = 0
@@ -204,6 +215,15 @@ class AdaptiveScheduler:
     @property
     def restart_recommended(self) -> bool:
         return self._restart_recommended
+
+    # -----------------------------
+    # NEW: company activity touch
+    # -----------------------------
+    def touch_company(self, company_id: str) -> None:
+        if not company_id:
+            return
+        self._company_last_touch_mono[company_id] = time.monotonic()
+        self._mark_progress()
 
     async def start(self) -> None:
         self._started_ts = time.time()
@@ -230,7 +250,6 @@ class AdaptiveScheduler:
         self._proc_rss_bytes = self._read_process_tree_rss_bytes()
         self._last_sample_ts = time.time()
 
-        # seed ramp history
         now_mono = time.monotonic()
         self._update_ramp_locked(now_mono, self._used_frac, self._used_frac_raw)
 
@@ -269,6 +288,24 @@ class AdaptiveScheduler:
         if prev is None or peak_mb > prev:
             self._company_peak_mb[company_id] = peak_mb
 
+    def _maybe_log_block(self, reason: str, active_n: int, waiting: int) -> None:
+        now_mono = time.monotonic()
+        if (now_mono - self._last_block_log_mono) < float(
+            self.cfg.block_log_interval_sec
+        ):
+            return
+        self._last_block_log_mono = now_mono
+        logger.warning(
+            "[AdaptiveScheduling] admission blocked reason=%s used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s active=%d waiting=%d proc_mem_mb=%.1f",
+            reason,
+            self._used_frac_raw,
+            self._used_frac,
+            self._ramp_raw_frac_per_sec,
+            active_n,
+            waiting,
+            float(self._proc_rss_bytes) / _MB if self._proc_rss_bytes else 0.0,
+        )
+
     async def admissible_slots(self, num_waiting: int) -> int:
         self._last_num_waiting = max(0, int(num_waiting))
         self._mark_heartbeat()
@@ -279,6 +316,7 @@ class AdaptiveScheduler:
         if not self._psutil_available:
             self._ever_admitted = True
             self._mark_progress()
+            self._last_admission_mono = time.monotonic()
             return 1
 
         async with self._lock:
@@ -291,45 +329,30 @@ class AdaptiveScheduler:
             if active_n > 0:
                 self._ever_had_active = True
 
-            # baseline + estimator
             self._update_base_rss_locked(active_n)
             self._update_per_company_est_locked(active_n)
 
-            # AIMD target update
             self._update_target_parallel_locked(active_n)
 
-            # Hard block on raw high (OOM-risk) even if effective looks ok
+            # Block conditions (log periodically to avoid silent stall)
             if self._used_frac_raw >= float(self.cfg.mem_high_raw_frac):
-                self._maybe_log_state_locked(
-                    "block_mem_high_raw", extra={"active": active_n}
-                )
+                self._maybe_log_block("block_mem_high_raw", active_n, num_waiting)
                 return 0
 
-            # If memory is ramping too fast, do not admit more work.
-            # This is keyed off RAW ramp because that's what can OOM you.
             if active_n > 0 and self._ramp_raw_frac_per_sec >= float(
                 self.cfg.mem_ramp_high_frac_per_sec
             ):
-                self._maybe_log_state_locked(
-                    "block_mem_ramp_high",
-                    extra={
-                        "active": active_n,
-                        "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
-                        "used_frac_raw": self._used_frac_raw,
-                    },
-                )
+                self._maybe_log_block("block_mem_ramp_high", active_n, num_waiting)
                 return 0
 
-            # If already high effective memory, do not admit
             if self._used_frac >= float(self.cfg.mem_high_frac):
-                self._maybe_log_state_locked(
-                    "block_mem_high", extra={"active": active_n}
-                )
+                self._maybe_log_block("block_mem_high_eff", active_n, num_waiting)
                 return 0
 
             total = self._total_mem_bytes
             used_eff = self._used_bytes
             if total <= 0:
+                self._maybe_log_block("block_total_unknown", active_n, num_waiting)
                 return 0
 
             cap_bytes = int(self.cfg.mem_cap_frac * float(total))
@@ -339,10 +362,7 @@ class AdaptiveScheduler:
                 if active_n == 0 and self._used_frac < float(self.cfg.mem_high_frac):
                     slots = 1
                 else:
-                    self._maybe_log_state_locked(
-                        "block_mem_cap",
-                        extra={"active": active_n, "headroom_mb": headroom / _MB},
-                    )
+                    self._maybe_log_block("block_mem_cap", active_n, num_waiting)
                     return 0
             else:
                 per_company_bytes = self._per_company_reservation_bytes_locked()
@@ -359,9 +379,11 @@ class AdaptiveScheduler:
                 ):
                     slots = 1
 
+            slots = max(0, int(slots))
             if slots > 0:
                 self._ever_admitted = True
                 self._mark_progress()
+                self._last_admission_mono = time.monotonic()
                 self._maybe_log_state_locked(
                     "admission",
                     extra={
@@ -373,13 +395,13 @@ class AdaptiveScheduler:
                         "used_frac_raw": self._used_frac_raw,
                         "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
                         "per_company_est_mb": self._per_company_est_mb,
-                        "proc_rss_mb": float(self._proc_rss_bytes) / _MB
+                        "proc_mem_mb": float(self._proc_rss_bytes) / _MB
                         if self._proc_rss_bytes
                         else 0.0,
                     },
                 )
 
-            return max(0, int(slots))
+            return slots
 
     def get_state_snapshot(self) -> Dict[str, Any]:
         return {
@@ -394,7 +416,7 @@ class AdaptiveScheduler:
             "used_frac_raw": self._used_frac_raw,
             "ramp_eff_frac_per_sec": self._ramp_eff_frac_per_sec,
             "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
-            "proc_rss_mb": float(self._proc_rss_bytes) / _MB
+            "proc_mem_mb": float(self._proc_rss_bytes) / _MB
             if self._proc_rss_bytes
             else 0.0,
             "per_company_est_mb": self._per_company_est_mb,
@@ -410,6 +432,9 @@ class AdaptiveScheduler:
             ),
             "last_progress_age_sec": max(
                 0.0, time.monotonic() - self._last_progress_mono
+            ),
+            "last_admission_age_sec": max(
+                0.0, time.monotonic() - self._last_admission_mono
             ),
         }
 
@@ -442,7 +467,7 @@ class AdaptiveScheduler:
                 "used_frac_raw": self._used_frac_raw,
                 "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
                 "target_parallel": self._target_parallel,
-                "proc_rss_mb": float(self._proc_rss_bytes) / _MB
+                "proc_mem_mb": float(self._proc_rss_bytes) / _MB
                 if self._proc_rss_bytes
                 else 0.0,
             }
@@ -527,17 +552,32 @@ class AdaptiveScheduler:
         return 0, 0, 0
 
     def _read_process_tree_rss_bytes(self) -> int:
+        """
+        Use USS when available to avoid double-counting shared Chromium memory.
+        Fallback to RSS.
+        """
         if not self._psutil_available or psutil is None:
             return 0
         try:
             p = psutil.Process(os.getpid())  # type: ignore[union-attr]
-            rss = int(p.memory_info().rss)
-            for ch in p.children(recursive=True):
+
+            def mem_bytes(proc: Any) -> int:
                 try:
-                    rss += int(ch.memory_info().rss)
+                    full = proc.memory_full_info()
+                    uss = getattr(full, "uss", None)
+                    if uss is not None:
+                        return int(uss)
                 except Exception:
-                    continue
-            return rss
+                    pass
+                try:
+                    return int(proc.memory_info().rss)
+                except Exception:
+                    return 0
+
+            total = mem_bytes(p)
+            for ch in p.children(recursive=True):
+                total += mem_bytes(ch)
+            return int(total)
         except Exception:
             return 0
 
@@ -566,12 +606,9 @@ class AdaptiveScheduler:
     def _update_ramp_locked(
         self, now_mono: float, used_frac_eff: float, used_frac_raw: float
     ) -> None:
-        cfg = self.cfg
-        window = max(0.5, float(cfg.mem_ramp_window_sec))
+        window = max(0.5, float(self.cfg.mem_ramp_window_sec))
 
         self._mem_frac_hist.append((now_mono, used_frac_eff, used_frac_raw))
-
-        # prune to time window (even though maxlen exists)
         while self._mem_frac_hist and (now_mono - self._mem_frac_hist[0][0]) > window:
             self._mem_frac_hist.popleft()
 
@@ -673,7 +710,6 @@ class AdaptiveScheduler:
         cfg = self.cfg
         old = self._target_parallel
 
-        # Prefer raw watermark for multiplicative decrease (OOM-risk)
         if self._used_frac_raw >= float(
             cfg.mem_high_raw_frac
         ) or self._used_frac >= float(cfg.mem_high_frac):
@@ -692,7 +728,7 @@ class AdaptiveScheduler:
 
         if self._target_parallel != old and logger.isEnabledFor(logging.INFO):
             logger.info(
-                "[AdaptiveScheduling] target_parallel %d -> %d (used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s active=%d proc_rss_mb=%.1f)",
+                "[AdaptiveScheduling] target_parallel %d -> %d (used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s active=%d proc_mem_mb=%.1f)",
                 old,
                 self._target_parallel,
                 self._used_frac_raw,
@@ -751,7 +787,7 @@ class AdaptiveScheduler:
                     now = time.time()
                     self._sample_memory_locked(now)
 
-                    active_ids = self._get_active_company_ids()
+                    active_ids = list(self._get_active_company_ids())
                     active_n = len(active_ids)
                     if active_n > 0:
                         self._ever_had_active = True
@@ -770,7 +806,36 @@ class AdaptiveScheduler:
                         self._last_obs_waiting_n = self._last_num_waiting
                         self._last_obs_completed = self._completed_counter
 
-                    # No-progress -> recommend restart
+                    now_mono = time.monotonic()
+
+                    # Keep company touch map tidy; seed active companies
+                    active_set = set(active_ids)
+                    for cid in list(self._company_last_touch_mono.keys()):
+                        if cid not in active_set:
+                            self._company_last_touch_mono.pop(cid, None)
+                    for cid in active_ids:
+                        self._company_last_touch_mono.setdefault(cid, now_mono)
+
+                    # 1) Per-company inactivity cancel (<= 5 minutes)
+                    if self.cfg.company_inactivity_timeout_sec > 0 and active_n > 0:
+                        stuck: List[str] = []
+                        for cid in active_ids:
+                            last = self._company_last_touch_mono.get(cid, now_mono)
+                            if (now_mono - last) >= float(
+                                self.cfg.company_inactivity_timeout_sec
+                            ):
+                                stuck.append(cid)
+
+                        if stuck:
+                            stuck = stuck[: int(self.cfg.company_inactivity_cancel_max)]
+                            logger.error(
+                                "[AdaptiveScheduling] company inactivity %.1fs -> cancelling %s",
+                                float(self.cfg.company_inactivity_timeout_sec),
+                                stuck,
+                            )
+                            cancel_ids = list(stuck)
+
+                    # 2) No-progress -> recommend restart (<= 5 minutes)
                     if self.cfg.no_progress_timeout_sec > 0:
                         prog_age = time.monotonic() - self._last_progress_mono
                         if (
@@ -790,7 +855,32 @@ class AdaptiveScheduler:
                                         int(self.cfg.hard_watchdog_kill_signal),
                                     )
 
-                    # Hard danger: raw usage is what OOM cares about
+                    # 3) Admission starvation -> restart (<= 5 minutes), only if mem stuck high
+                    if self.cfg.admission_starvation_timeout_sec > 0:
+                        if active_n == 0 and self._last_num_waiting > 0:
+                            starve_age = now_mono - self._last_admission_mono
+                            if starve_age >= float(
+                                self.cfg.admission_starvation_timeout_sec
+                            ):
+                                if (
+                                    self._used_frac_raw
+                                    >= float(self.cfg.mem_high_raw_frac)
+                                ) or (self._used_frac >= float(self.cfg.mem_high_frac)):
+                                    if self._can_recommend_restart():
+                                        self._restart_recommended = True
+                                        logger.critical(
+                                            "[AdaptiveScheduling] admission starvation %.1fs with mem high (used_raw=%.3f used_eff=%.3f) -> restart recommended",
+                                            starve_age,
+                                            self._used_frac_raw,
+                                            self._used_frac,
+                                        )
+                                        if self.cfg.kill_on_no_progress:
+                                            os.kill(
+                                                os.getpid(),
+                                                int(self.cfg.hard_watchdog_kill_signal),
+                                            )
+
+                    # Raw mem kill
                     if self._used_frac_raw >= float(self.cfg.mem_kill_raw_frac):
                         if self._can_recommend_restart():
                             self._restart_recommended = True
@@ -804,7 +894,7 @@ class AdaptiveScheduler:
                                     os.getpid(), int(self.cfg.hard_watchdog_kill_signal)
                                 )
 
-                    # Ramp danger: if ramp is "kill-fast" while already mid/high, recommend restart early
+                    # Ramp kill
                     if self._ramp_raw_frac_per_sec >= float(
                         self.cfg.mem_ramp_kill_frac_per_sec
                     ) and self._used_frac_raw >= float(self.cfg.mem_high_raw_frac):
@@ -821,9 +911,7 @@ class AdaptiveScheduler:
                                     os.getpid(), int(self.cfg.hard_watchdog_kill_signal)
                                 )
 
-                    # Emergency cancellation:
-                    # - if raw/effective critical, OR
-                    # - if ramp is critical and we're already near cap (preempt OOM).
+                    # Emergency cancel (memory danger)
                     ramp_trigger = self._ramp_raw_frac_per_sec >= float(
                         self.cfg.mem_ramp_crit_frac_per_sec
                     ) and self._used_frac_raw >= float(self.cfg.mem_cap_frac)
@@ -831,22 +919,20 @@ class AdaptiveScheduler:
                         self.cfg.mem_crit_raw_frac
                     ) or self._used_frac >= float(self.cfg.mem_crit_frac)
 
-                    if (crit_trigger or ramp_trigger) and active_n > 0:
+                    if (
+                        (crit_trigger or ramp_trigger)
+                        and active_n > 0
+                        and not cancel_ids
+                    ):
                         if (now - self._last_emergency_cancel_ts) >= float(
                             self.cfg.emergency_cancel_cooldown_sec
                         ):
                             max_cancelable = max(
                                 0, active_n - int(self.cfg.min_active_keep)
                             )
-
-                            # Cancel more aggressively if ramp is extreme
-                            desired = int(self.cfg.emergency_cancel_max)
-                            if self._ramp_raw_frac_per_sec >= float(
-                                self.cfg.mem_ramp_kill_frac_per_sec
-                            ):
-                                desired = int(self.cfg.emergency_cancel_max)
-
-                            to_cancel = min(desired, max_cancelable)
+                            to_cancel = min(
+                                int(self.cfg.emergency_cancel_max), max_cancelable
+                            )
                             if to_cancel > 0:
                                 cancel_ids = self._select_cancel_ids(
                                     active_ids, to_cancel
@@ -854,7 +940,7 @@ class AdaptiveScheduler:
                                 self._last_emergency_cancel_ts = now
 
                                 logger.error(
-                                    "[AdaptiveScheduling] EMERGENCY used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s total_mb=%.1f used_raw_mb=%.1f used_eff_mb=%.1f proc_rss_mb=%.1f active=%d cancel=%s",
+                                    "[AdaptiveScheduling] EMERGENCY used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s total_mb=%.1f used_raw_mb=%.1f used_eff_mb=%.1f proc_mem_mb=%.1f active=%d cancel=%s",
                                     self._used_frac_raw,
                                     self._used_frac,
                                     self._ramp_raw_frac_per_sec,
@@ -983,7 +1069,7 @@ class AdaptiveScheduler:
             "used_frac_raw": self._used_frac_raw,
             "ramp_eff_frac_per_sec": self._ramp_eff_frac_per_sec,
             "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
-            "proc_rss_bytes": self._proc_rss_bytes,
+            "proc_mem_bytes": self._proc_rss_bytes,
             "per_company_est_mb": self._per_company_est_mb,
             "target_parallel": self._target_parallel,
             "completed_counter": self._completed_counter,
