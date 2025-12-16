@@ -7,12 +7,13 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import urlparse
 
 from crawl4ai import AsyncWebCrawler, CacheMode
@@ -113,6 +114,10 @@ class CriticalMemoryPressure(RuntimeError):
         self.severity = severity
 
 
+class CrawlerFatalError(RuntimeError):
+    """Raised when the Playwright driver/browser connection is irrecoverably broken."""
+
+
 # ---------------------------------------------------------------------------
 # Cancellation-safe cleanup (small + reliable)
 # ---------------------------------------------------------------------------
@@ -132,7 +137,7 @@ async def _run_cleanup_even_if_cancelled(coro: Any) -> None:
             await coro
         finally:
             try:
-                t.cancel()  # preserve cancellation semantics upstream
+                t.cancel()
             except Exception:
                 pass
         return
@@ -140,7 +145,7 @@ async def _run_cleanup_even_if_cancelled(coro: Any) -> None:
     try:
         await asyncio.shield(coro)
     except asyncio.CancelledError:
-        # If we can't reliably block, spawn it and re-raise.
+
         async def _bg() -> None:
             try:
                 await coro
@@ -149,6 +154,226 @@ async def _run_cleanup_even_if_cancelled(coro: Any) -> None:
 
         asyncio.create_task(_bg(), name="bg-cleanup")
         raise
+
+
+def _maybe_malloc_trim() -> None:
+    """
+    Optional RSS trim on glibc. Not enabled by default; use --enable-malloc-trim.
+    Helps when Python/Chromium freed memory but RSS stays high due to fragmentation.
+    """
+    if sys.platform != "linux":
+        return
+    try:
+        import ctypes  # lazy
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        return
+
+
+def _is_playwright_driver_disconnect(exc: BaseException) -> bool:
+    """
+    Heuristic detector for the pattern:
+      - "Connection closed while reading from the driver"
+      - "pipe closed by peer"
+      - "BrowserContext.new_page: Connection closed ..."
+    """
+    msg = f"{type(exc).__name__}: {exc}"
+    lowered = msg.lower()
+    needles = [
+        "connection closed while reading from the driver",
+        "pipe closed by peer",
+        "browsercontext.new_page: connection closed",
+        "browser has been closed",
+        "target page, context or browser has been closed",
+        "playwright connection closed",
+    ]
+    return any(n in lowered for n in needles)
+
+
+# ---------------------------------------------------------------------------
+# Crawler pool (prevents a single big crawl from serializing everything,
+# isolates driver crashes, and enables recycle)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _CrawlerSlot:
+    idx: int
+    crawler: AsyncWebCrawler
+    processed_companies: int = 0
+    last_restart_ts: float = 0.0
+
+
+class CrawlerPool:
+    def __init__(
+        self,
+        *,
+        browser_cfg: Any,
+        size: int,
+        recycle_after_companies: int,
+    ) -> None:
+        self._browser_cfg = browser_cfg
+        self._size = max(1, int(size))
+        self._recycle_after = max(0, int(recycle_after_companies))
+
+        self._queue: asyncio.Queue[_CrawlerSlot] = asyncio.Queue()
+        self._all: List[_CrawlerSlot] = []
+        self._started = False
+        self._closing = False
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def free_slots_approx(self) -> int:
+        # qsize is approximate but good enough for admission throttling.
+        try:
+            return int(self._queue.qsize())
+        except Exception:
+            return 0
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._closing = False
+
+        created: List[_CrawlerSlot] = []
+        try:
+            for i in range(self._size):
+                c = AsyncWebCrawler(config=self._browser_cfg)
+                await c.__aenter__()
+                slot = _CrawlerSlot(
+                    idx=i, crawler=c, processed_companies=0, last_restart_ts=time.time()
+                )
+                created.append(slot)
+
+            self._all = created
+            for slot in created:
+                self._queue.put_nowait(slot)
+
+            logger.info(
+                "[CrawlerPool] started size=%d recycle_after_companies=%d",
+                self._size,
+                self._recycle_after,
+            )
+        except Exception:
+            # best-effort cleanup
+            for slot in created:
+                try:
+                    await slot.crawler.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            self._all = []
+            self._started = False
+            raise
+
+    async def stop(self) -> None:
+        self._closing = True
+
+        # Drain queue first so we don't double-close.
+        drained: List[_CrawlerSlot] = []
+        while True:
+            try:
+                slot = self._queue.get_nowait()
+                drained.append(slot)
+            except Exception:
+                break
+
+        # Close all known slots (unique)
+        seen: set[int] = set()
+        for slot in drained + list(self._all):
+            if slot.idx in seen:
+                continue
+            seen.add(slot.idx)
+            try:
+                await slot.crawler.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+        self._all = []
+        self._started = False
+        logger.info("[CrawlerPool] stopped")
+
+    async def _restart_slot(self, slot: _CrawlerSlot, *, reason: str) -> _CrawlerSlot:
+        # Close old crawler
+        try:
+            await slot.crawler.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+        # Create new crawler
+        c = AsyncWebCrawler(config=self._browser_cfg)
+        await c.__aenter__()
+        slot.crawler = c
+        slot.processed_companies = 0
+        slot.last_restart_ts = time.time()
+        logger.warning("[CrawlerPool] restarted slot=%d reason=%s", slot.idx, reason)
+        return slot
+
+    async def lease(self) -> "_CrawlerLease":
+        slot = await self._queue.get()
+        return _CrawlerLease(pool=self, slot=slot)
+
+    async def _release(self, slot: _CrawlerSlot, *, fatal: bool, reason: str) -> None:
+        if self._closing:
+            # If shutting down, don't re-enqueue.
+            try:
+                await slot.crawler.__aexit__(None, None, None)
+            except Exception:
+                pass
+            return
+
+        if fatal:
+            slot = await self._restart_slot(slot, reason=reason)
+        else:
+            slot.processed_companies += 1
+            if (
+                self._recycle_after > 0
+                and slot.processed_companies >= self._recycle_after
+            ):
+                slot = await self._restart_slot(slot, reason="periodic_recycle")
+
+        # Put back for others
+        try:
+            self._queue.put_nowait(slot)
+        except Exception:
+            # last resort: close it to avoid leaks
+            try:
+                await slot.crawler.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+
+class _CrawlerLease:
+    def __init__(self, *, pool: CrawlerPool, slot: _CrawlerSlot) -> None:
+        self._pool = pool
+        self._slot = slot
+        self._fatal = False
+        self._reason = "ok"
+
+    @property
+    def crawler(self) -> AsyncWebCrawler:
+        return self._slot.crawler
+
+    def mark_fatal(self, reason: str) -> None:
+        self._fatal = True
+        self._reason = reason or "fatal"
+
+    async def __aenter__(self) -> AsyncWebCrawler:
+        return self._slot.crawler
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if exc is not None:
+            if isinstance(exc, CrawlerFatalError) or _is_playwright_driver_disconnect(
+                exc
+            ):
+                self._fatal = True
+                self._reason = "driver_disconnect"
+
+        await self._pool._release(self._slot, fatal=self._fatal, reason=self._reason)
 
 
 # ---------------------------------------------------------------------------
@@ -265,9 +490,10 @@ async def crawl_company(
     page_interaction_factory: PageInteractionFactory,
     page_timeout_ms: Optional[int] = None,
     page_result_concurrency: int = 8,
-    page_queue_maxsize: int = 0,
+    page_queue_maxsize: int = 64,
     url_index_flush_every: int = 64,
     url_index_flush_interval_sec: float = 1.0,
+    url_index_queue_maxsize: int = 2048,
 ) -> None:
     logger.info(
         "Starting crawl for company_id=%s url=%s",
@@ -281,7 +507,7 @@ async def crawl_company(
     flush_cfg = UrlIndexFlushConfig(
         flush_every=max(1, int(url_index_flush_every)),
         flush_interval_sec=max(0.2, float(url_index_flush_interval_sec)),
-        queue_maxsize=8192,
+        queue_maxsize=max(256, int(url_index_queue_maxsize)),
     )
 
     processor = ConcurrentPageResultProcessor(
@@ -292,7 +518,7 @@ async def crawl_company(
         mark_company_timeout_cb=mark_company_timeout,
         mark_company_memory_cb=mark_company_memory_pressure,
         concurrency=max(1, int(page_result_concurrency)),
-        page_queue_maxsize=int(page_queue_maxsize),
+        page_queue_maxsize=max(1, int(page_queue_maxsize)),  # IMPORTANT: bound memory
         url_index_flush_cfg=flush_cfg,
     )
 
@@ -329,13 +555,22 @@ async def crawl_company(
                 except Exception:
                     pass
 
-            results_or_gen = await crawler.arun(start_url, config=config)
+            try:
+                results_or_gen = await crawler.arun(start_url, config=config)
+            except Exception as e:
+                if _is_playwright_driver_disconnect(e):
+                    raise CrawlerFatalError(
+                        f"Playwright driver disconnected at arun(start_url={start_url})"
+                    ) from e
+                raise
 
             if not isinstance(results_or_gen, list):
                 agen = results_or_gen
                 try:
                     async for page_result in agen:
-                        await processor.submit(page_result)
+                        await processor.submit(
+                            page_result
+                        )  # backpressure if queue bounded
                 except asyncio.CancelledError as e:
                     cancelled_exc = e
                     abort = getattr(processor, "abort", None)
@@ -349,6 +584,12 @@ async def crawl_company(
                                 "Error aborting page processor (company_id=%s)",
                                 company.company_id,
                             )
+                except Exception as e:
+                    if _is_playwright_driver_disconnect(e):
+                        raise CrawlerFatalError(
+                            "Playwright driver disconnected during streaming"
+                        ) from e
+                    raise
                 finally:
                     aclose = getattr(agen, "aclose", None)
                     if callable(aclose):
@@ -363,8 +604,15 @@ async def crawl_company(
                 if cancelled_exc is not None:
                     raise cancelled_exc
             else:
-                for page_result in results_or_gen:
-                    await processor.submit(page_result)
+                try:
+                    for page_result in results_or_gen:
+                        await processor.submit(page_result)
+                except Exception as e:
+                    if _is_playwright_driver_disconnect(e):
+                        raise CrawlerFatalError(
+                            "Playwright driver disconnected while handling list results"
+                        ) from e
+                    raise
 
     except asyncio.CancelledError as e:
         cancelled_exc = e
@@ -408,7 +656,7 @@ async def run_company_pipeline(
     guard: ConnectivityGuard,
     gating_cfg: md_gating.MarkdownGatingConfig,
     timeout_error_marker: str,
-    crawler: AsyncWebCrawler,
+    crawler_pool: CrawlerPool,
     args: argparse.Namespace,
     dataset_externals: frozenset[str],
     url_scorer: Optional[DualBM25Scorer],
@@ -421,6 +669,7 @@ async def run_company_pipeline(
     page_policy: PageInteractionPolicy,
     page_interaction_factory: PageInteractionFactory,
     page_timeout_ms: Optional[int],
+    enable_malloc_trim: bool,
 ) -> bool:
     completed_ok = False
     token: Optional[Any] = None
@@ -497,27 +746,58 @@ async def run_company_pipeline(
 
         if do_crawl:
             await guard.wait_until_healthy()
-            await crawl_company(
-                company=company,
-                crawler=crawler,
-                deep_strategy=deep_strategy,
-                guard=guard,
-                gating_cfg=gating_cfg,
-                timeout_error_marker=timeout_error_marker,
-                root_urls=resume_roots,
-                crawler_base_cfg=crawler_base_cfg,
-                page_policy=page_policy,
-                page_interaction_factory=page_interaction_factory,
-                page_timeout_ms=page_timeout_ms,
-                page_result_concurrency=int(
-                    getattr(args, "page_result_concurrency", 8)
-                ),
-                page_queue_maxsize=int(getattr(args, "page_queue_maxsize", 0)),
-                url_index_flush_every=int(getattr(args, "url_index_flush_every", 64)),
-                url_index_flush_interval_sec=float(
-                    getattr(args, "url_index_flush_interval_sec", 1.0)
-                ),
-            )
+
+            # Retry once if Playwright driver disconnects (pool will restart that crawler).
+            last_err: Optional[BaseException] = None
+            for attempt in range(2):
+                try:
+                    async with await crawler_pool.lease() as crawler:
+                        await crawl_company(
+                            company=company,
+                            crawler=crawler,
+                            deep_strategy=deep_strategy,
+                            guard=guard,
+                            gating_cfg=gating_cfg,
+                            timeout_error_marker=timeout_error_marker,
+                            root_urls=resume_roots,
+                            crawler_base_cfg=crawler_base_cfg,
+                            page_policy=page_policy,
+                            page_interaction_factory=page_interaction_factory,
+                            page_timeout_ms=page_timeout_ms,
+                            page_result_concurrency=int(
+                                getattr(args, "page_result_concurrency", 6)
+                            ),
+                            page_queue_maxsize=int(
+                                getattr(args, "page_queue_maxsize", 64)
+                            ),
+                            url_index_flush_every=int(
+                                getattr(args, "url_index_flush_every", 24)
+                            ),
+                            url_index_flush_interval_sec=float(
+                                getattr(args, "url_index_flush_interval_sec", 0.5)
+                            ),
+                            url_index_queue_maxsize=int(
+                                getattr(args, "url_index_queue_maxsize", 2048)
+                            ),
+                        )
+                    last_err = None
+                    break
+                except CrawlerFatalError as e:
+                    last_err = e
+                    company_logger.error(
+                        "[CrawlerFatalError] company_id=%s attempt=%d/2 error=%s",
+                        company.company_id,
+                        attempt + 1,
+                        str(e),
+                    )
+                    if attempt == 0:
+                        await asyncio.sleep(0.5)
+                        continue
+                    raise
+
+            if last_err is not None:
+                raise last_err
+
             await state.recompute_company_from_index(
                 company.company_id,
                 name=None,
@@ -588,6 +868,9 @@ async def run_company_pipeline(
             except Exception:
                 pass
 
+            if enable_malloc_trim:
+                _maybe_malloc_trim()
+
         if cancelled_exc is not None:
             await _run_cleanup_even_if_cancelled(_finalize())
         else:
@@ -647,7 +930,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--company-concurrency",
         type=int,
         default=16,
-        help="Hard upper bound on concurrent companies.",
+        help="Hard upper bound on concurrent companies (tasks).",
     )
     parser.add_argument("--max-pages", type=int, default=100)
     parser.add_argument("--enable-resource-monitor", action="store_true")
@@ -667,10 +950,33 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Special mode: read crawl_global_state.json and force-mark markdown completion for in_progress companies (no LLM).",
     )
 
+    # IMPORTANT: default bounded to prevent unbounded in-RAM accumulation
     parser.add_argument("--page-result-concurrency", type=int, default=6)
-    parser.add_argument("--page-queue-maxsize", type=int, default=0)
+    parser.add_argument("--page-queue-maxsize", type=int, default=64)
     parser.add_argument("--url-index-flush-every", type=int, default=24)
     parser.add_argument("--url-index-flush-interval-sec", type=float, default=0.5)
+    parser.add_argument("--url-index-queue-maxsize", type=int, default=2048)
+
+    # New: crawler pool
+    parser.add_argument(
+        "--crawler-pool-size",
+        type=int,
+        default=2,
+        help="Number of independent AsyncWebCrawler instances (isolates crashes; avoids serialization).",
+    )
+    parser.add_argument(
+        "--crawler-recycle-after",
+        type=int,
+        default=40,
+        help="Recycle a crawler instance after N companies to drop Chromium memory.",
+    )
+
+    # Optional: RSS trim
+    parser.add_argument(
+        "--enable-malloc-trim",
+        action="store_true",
+        help="Call malloc_trim(0) after each company finalize (Linux/glibc only).",
+    )
 
     return parser.parse_args(list(argv) if argv is not None else None)
 
@@ -801,7 +1107,7 @@ async def main_async(args: argparse.Namespace) -> None:
     def get_active_company_ids() -> List[str]:
         return [cid for cid, t in inflight_by_cid.items() if not t.done()]
 
-    def request_cancel_companies(ids: Iterable[str]) -> None:
+    def request_cancel_companies(ids: Sequence[str]) -> None:
         for cid in ids:
             t = inflight_by_cid.get(cid)
             if t is None or t.done():
@@ -812,7 +1118,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
     scheduler: Optional[AdaptiveScheduler] = None
 
-    # Stop/restart coordination (prevents hanging forever on asyncio.wait)
+    # Stop/restart coordination
     stop_event = asyncio.Event()
     sigterm_received = False
     restart_due_to_scheduler = False
@@ -827,30 +1133,14 @@ async def main_async(args: argparse.Namespace) -> None:
         stop_event.set()
         logger.warning("[Signal] SIGINT received; requesting graceful shutdown.")
 
-    try:
-        loop = asyncio.get_running_loop()
-        try:
-            loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
-            loop.add_signal_handler(signal.SIGINT, _on_sigint)
-        except NotImplementedError:
-            # Fallback if add_signal_handler isn't available (unlikely on Linux)
-            signal.signal(signal.SIGTERM, lambda *_: _on_sigterm())
-            signal.signal(signal.SIGINT, lambda *_: _on_sigint())
-    except Exception:
-        # Never fail startup because of signal wiring
-        pass
+    crawler_pool: Optional[CrawlerPool] = None
 
     async def _cancel_inflight_and_maybe_exit_hard(
         *, reason: str, mark_timeout_like: bool, hard_exit_code: Optional[int]
     ) -> None:
-        """
-        Best-effort cancellation of inflight tasks.
-        If tasks refuse to die, force-exit to guarantee wrapper restart.
-        """
         if inflight_by_cid:
             logger.error("%s (inflight=%d)", reason, len(inflight_by_cid))
 
-        # Mark inflight for retry tracking
         if mark_timeout_like:
             for cid in list(inflight_by_cid.keys()):
                 try:
@@ -858,12 +1148,10 @@ async def main_async(args: argparse.Namespace) -> None:
                 except Exception:
                     pass
 
-        # Cancel tasks
         for t in list(inflight_by_cid.values()):
             if not t.done():
                 t.cancel()
 
-        # Wait bounded time; if still stuck, force exit
         try:
             await asyncio.wait_for(
                 asyncio.gather(*inflight_by_cid.values(), return_exceptions=True),
@@ -878,6 +1166,17 @@ async def main_async(args: argparse.Namespace) -> None:
         finally:
             inflight_by_cid.clear()
             cid_by_task.clear()
+
+    try:
+        loop = asyncio.get_running_loop()
+        try:
+            loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+            loop.add_signal_handler(signal.SIGINT, _on_sigint)
+        except NotImplementedError:
+            signal.signal(signal.SIGTERM, lambda *_: _on_sigterm())
+            signal.signal(signal.SIGINT, lambda *_: _on_sigint())
+    except Exception:
+        pass
 
     try:
         # ---- Load companies
@@ -987,7 +1286,15 @@ async def main_async(args: argparse.Namespace) -> None:
             headless=True,
         )
 
-        # ---- Adaptive scheduler (new simple one)
+        # ---- Crawler pool
+        crawler_pool = CrawlerPool(
+            browser_cfg=browser_cfg,
+            size=int(getattr(args, "crawler_pool_size", 2)),
+            recycle_after_companies=int(getattr(args, "crawler_recycle_after", 40)),
+        )
+        await crawler_pool.start()
+
+        # ---- Adaptive scheduler
         scheduler_cfg = AdaptiveSchedulingConfig(
             log_path=out_dir / "adaptive_scheduling_state.jsonl",
             heartbeat_path=out_dir / "heartbeat.json",
@@ -995,7 +1302,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 4, max(1, int(getattr(args, "company_concurrency", 20)))
             ),
             max_target=max(1, int(getattr(args, "company_concurrency", 20))),
-            # Be explicit: you said you already set default True; this prevents config drift.
             kill_on_no_progress=True,
         )
         scheduler = AdaptiveScheduler(
@@ -1013,131 +1319,133 @@ async def main_async(args: argparse.Namespace) -> None:
         total = len(companies)
         hard_max = max(1, int(getattr(args, "company_concurrency", 20)))
 
-        # Keep global recompute, but don’t overdo it.
         last_global_recompute_ts = 0.0
         global_recompute_interval_sec = 120.0
 
-        async with AsyncWebCrawler(config=browser_cfg) as crawler:
-            while ready or inflight_by_cid:
-                # Cooperative shutdown (SIGTERM/SIGINT)
-                if stop_event.is_set():
-                    # If SIGTERM came from scheduler kill_on_no_progress, restart_recommended was set first.
-                    if scheduler is not None and scheduler.restart_recommended:
-                        restart_due_to_scheduler = True
-                    await _cancel_inflight_and_maybe_exit_hard(
-                        reason="[Shutdown] stop requested; cancelling inflight.",
-                        mark_timeout_like=True,
-                        hard_exit_code=(
-                            RETRY_EXIT_CODE if restart_due_to_scheduler else None
-                        ),
-                    )
-                    break
+        enable_malloc_trim: bool = bool(getattr(args, "enable_malloc_trim", False))
 
-                # If scheduler says restart is needed, stop fast and let wrapper retry.
+        while ready or inflight_by_cid:
+            if stop_event.is_set():
                 if scheduler is not None and scheduler.restart_recommended:
                     restart_due_to_scheduler = True
-                    await _cancel_inflight_and_maybe_exit_hard(
-                        reason="[AdaptiveScheduling] restart recommended; cancelling inflight and exiting loop.",
-                        mark_timeout_like=True,
-                        hard_exit_code=RETRY_EXIT_CODE,
-                    )
-                    break
-
-                # Launch: bounded by hard_max AND scheduler admission.
-                active = len(inflight_by_cid)
-                capacity = max(0, hard_max - active)
-
-                if capacity > 0 and ready:
-                    want = len(ready)
-                    slots = capacity
-                    if scheduler is not None:
-                        slots = min(
-                            slots, await scheduler.admissible_slots(num_waiting=want)
-                        )
-                    to_start = min(slots, capacity, want)
-
-                    for _ in range(to_start):
-                        cid = ready.popleft()
-                        company = companies_by_id[cid]
-                        launched += 1
-
-                        task = asyncio.create_task(
-                            run_company_pipeline(
-                                company=company,
-                                idx=launched,
-                                total=total,
-                                logging_ext=logging_ext,
-                                state=state,
-                                guard=guard,
-                                gating_cfg=gating_cfg,
-                                timeout_error_marker=timeout_error_marker,
-                                crawler=crawler,
-                                args=args,
-                                dataset_externals=dataset_externals,
-                                url_scorer=url_scorer,
-                                bm25_filter=bm25_filter,
-                                run_id=run_id,
-                                presence_llm=presence_llm,
-                                full_llm=full_llm,
-                                dfs_factory=dfs_factory,
-                                crawler_base_cfg=crawler_base_cfg,
-                                page_policy=page_policy,
-                                page_interaction_factory=page_interaction_factory,
-                                page_timeout_ms=page_timeout_ms,
-                            ),
-                            name=f"company-{cid}",
-                        )
-                        inflight_by_cid[cid] = task
-                        cid_by_task[task] = cid
-
-                # If nothing inflight, just wait a bit and loop (scheduler may unblock).
-                if not inflight_by_cid:
-                    if ready:
-                        await asyncio.sleep(0.5)
-                        continue
-                    break
-
-                # IMPORTANT: never block forever. Wake up periodically to notice restart flags.
-                done, _ = await asyncio.wait(
-                    list(inflight_by_cid.values()),
-                    timeout=1.0,
-                    return_when=asyncio.FIRST_COMPLETED,
+                await _cancel_inflight_and_maybe_exit_hard(
+                    reason="[Shutdown] stop requested; cancelling inflight.",
+                    mark_timeout_like=True,
+                    hard_exit_code=(
+                        RETRY_EXIT_CODE if restart_due_to_scheduler else None
+                    ),
                 )
+                break
 
-                if done:
-                    for t in done:
-                        cid = cid_by_task.pop(t, None)
-                        if cid is not None:
-                            inflight_by_cid.pop(cid, None)
+            if scheduler is not None and scheduler.restart_recommended:
+                restart_due_to_scheduler = True
+                await _cancel_inflight_and_maybe_exit_hard(
+                    reason="[AdaptiveScheduling] restart recommended; cancelling inflight and exiting loop.",
+                    mark_timeout_like=True,
+                    hard_exit_code=RETRY_EXIT_CODE,
+                )
+                break
 
-                        if t.cancelled():
-                            continue
+            active = len(inflight_by_cid)
+            capacity = max(0, hard_max - active)
 
-                        ok = False
-                        try:
-                            ok = bool(t.result())
-                        except CriticalMemoryPressure:
-                            if cid:
-                                mark_company_memory_pressure(cid)
-                            ok = False
-                        except Exception:
-                            logger.exception("Company task failed (company_id=%s)", cid)
-                            ok = False
+            if capacity > 0 and ready:
+                want = len(ready)
+                slots = capacity
+                if scheduler is not None:
+                    slots = min(
+                        slots, await scheduler.admissible_slots(num_waiting=want)
+                    )
 
-                        if ok and scheduler is not None:
-                            scheduler.register_company_completed()
+                # Optional: don’t start a ton of tasks if crawler pool is small.
+                # This avoids “many tasks waiting on pool.acquire()” looking like active work.
+                if crawler_pool is not None:
+                    free_crawlers = crawler_pool.free_slots_approx()
+                    # allow some buffering, but not unbounded
+                    slots = min(slots, max(1, free_crawlers * 3))
 
-                # periodic global recompute (cheap sanity) - runs even if `done` is empty
-                now = time.time()
-                if now - last_global_recompute_ts >= global_recompute_interval_sec:
+                to_start = min(slots, capacity, want)
+
+                for _ in range(to_start):
+                    cid = ready.popleft()
+                    company = companies_by_id[cid]
+                    launched += 1
+
+                    task = asyncio.create_task(
+                        run_company_pipeline(
+                            company=company,
+                            idx=launched,
+                            total=total,
+                            logging_ext=logging_ext,
+                            state=state,
+                            guard=guard,
+                            gating_cfg=gating_cfg,
+                            timeout_error_marker=timeout_error_marker,
+                            crawler_pool=crawler_pool,
+                            args=args,
+                            dataset_externals=dataset_externals,
+                            url_scorer=url_scorer,
+                            bm25_filter=bm25_filter,
+                            run_id=run_id,
+                            presence_llm=presence_llm,
+                            full_llm=full_llm,
+                            dfs_factory=dfs_factory,
+                            crawler_base_cfg=crawler_base_cfg,
+                            page_policy=page_policy,
+                            page_interaction_factory=page_interaction_factory,
+                            page_timeout_ms=page_timeout_ms,
+                            enable_malloc_trim=enable_malloc_trim,
+                        ),
+                        name=f"company-{cid}",
+                    )
+                    inflight_by_cid[cid] = task
+                    cid_by_task[task] = cid
+
+            if not inflight_by_cid:
+                if ready:
+                    await asyncio.sleep(0.5)
+                    continue
+                break
+
+            done, _ = await asyncio.wait(
+                list(inflight_by_cid.values()),
+                timeout=1.0,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if done:
+                for t in done:
+                    cid = cid_by_task.pop(t, None)
+                    if cid is not None:
+                        inflight_by_cid.pop(cid, None)
+
+                    if t.cancelled():
+                        continue
+
+                    ok = False
                     try:
-                        await state.recompute_global_state()
+                        ok = bool(t.result())
+                    except CriticalMemoryPressure:
+                        if cid:
+                            mark_company_memory_pressure(cid)
+                        ok = False
                     except Exception:
-                        logger.exception(
-                            "Failed to recompute global crawl state (periodic)"
-                        )
-                    else:
-                        last_global_recompute_ts = now
+                        logger.exception("Company task failed (company_id=%s)", cid)
+                        ok = False
+
+                    if ok and scheduler is not None:
+                        scheduler.register_company_completed()
+
+            now = time.time()
+            if now - last_global_recompute_ts >= global_recompute_interval_sec:
+                try:
+                    await state.recompute_global_state()
+                except Exception:
+                    logger.exception(
+                        "Failed to recompute global crawl state (periodic)"
+                    )
+                else:
+                    last_global_recompute_ts = now
 
         try:
             await state.recompute_global_state()
@@ -1152,6 +1460,12 @@ async def main_async(args: argparse.Namespace) -> None:
             await guard.stop()
         except Exception:
             logger.exception("Error while stopping ConnectivityGuard")
+
+        if crawler_pool is not None:
+            try:
+                await crawler_pool.stop()
+            except Exception:
+                logger.exception("Error while stopping CrawlerPool")
 
         try:
             logging_ext.close()
@@ -1190,7 +1504,6 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         else:
             exit_code = 0
 
-        # Force retry exit code when scheduler asked for restart (even if retry tracker returns 0).
         if _forced_exit_code is not None:
             exit_code = int(_forced_exit_code)
 

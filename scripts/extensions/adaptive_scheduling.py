@@ -28,28 +28,18 @@ except Exception:  # pragma: no cover
 _MB = 1_000_000
 
 
-# ---------------------------------------------------------------------------
-# Config (SIMPLE)
-# ---------------------------------------------------------------------------
 @dataclass
 class AdaptiveSchedulingConfig:
     """
     Simple, effective scheduling:
+    - Uses *effective* cgroup memory when available (cgroup v2: current - inactive_file).
+      This prevents false "RAM stays high forever" stalls caused by page cache accounting.
 
-    - mem_cap_frac: admission headroom cap (aim to stay <= this)
-    - mem_high_frac: above this, stop admitting and reduce target
-    - mem_crit_frac: above this, cancel some running tasks
-
-    - per_company_min_mb/max_mb: clamps for memory estimate
-    - per_company_safety_factor: admission uses est * factor
-
-    - AIMD:
-        - ai_step: increase target by this when safe
-        - md_factor: multiply target by this when pressured
+    - Admission uses memory headroom + AIMD target_parallel.
 
     - Watchdogs:
-        - hard_watchdog_*: kills the process if heartbeat stops updating
-        - no_progress_timeout_sec: sets restart_recommended if nothing changes
+        - hard watchdog kills process if heartbeat stops (survives event-loop starvation)
+        - no_progress policy can recommend restart / optionally SIGTERM self
     """
 
     # Memory watermarks (fractions of effective limit)
@@ -57,7 +47,7 @@ class AdaptiveSchedulingConfig:
     mem_high_frac: float = 0.83
     mem_crit_frac: float = 0.90
 
-    # Estimation
+    # Estimation (based on process-tree RSS by default)
     per_company_min_mb: float = 256.0
     per_company_max_mb: float = 1024.0
     per_company_safety_factor: float = 1.30
@@ -77,22 +67,22 @@ class AdaptiveSchedulingConfig:
     emergency_cancel_max: int = 2
     emergency_cancel_cooldown_sec: float = 3.0
 
-    # Restart gating (prevents “restart too early”)
+    # Restart gating
     restart_gate_min_uptime_sec: float = 180.0
     restart_gate_min_completed: int = 3
 
     # “No progress” policy
-    no_progress_timeout_sec: float = 1800.0  # 30 min
+    no_progress_timeout_sec: float = 1800.0
     kill_on_no_progress: bool = True
 
-    # Hard watchdog thread (survives async starvation)
+    # Hard watchdog thread
     hard_watchdog_enabled: bool = True
     hard_watchdog_interval_sec: float = 5.0
     hard_watchdog_startup_grace_sec: float = 180.0
     hard_watchdog_no_heartbeat_timeout_sec: float = 120.0
     hard_watchdog_kill_signal: int = signal.SIGTERM
 
-    # Optional heartbeat file for external monitoring
+    # Optional heartbeat file
     heartbeat_path: Optional[Path] = None
 
     # Logging (optional JSONL state snapshots)
@@ -102,14 +92,15 @@ class AdaptiveSchedulingConfig:
     prefer_cgroup_limits: bool = True
     use_psutil: bool = True
 
+    # Important: subtract reclaimable cache from cgroup usage (prevents stalls)
+    cgroup_subtract_inactive_file: bool = True
 
-# ---------------------------------------------------------------------------
-# Scheduler (SIMPLE)
-# ---------------------------------------------------------------------------
+    # Use process-tree RSS for estimator baseline/EMA (better than system used)
+    use_process_tree_rss_for_estimate: bool = True
+
+
 class AdaptiveScheduler:
     """
-    Simple memory-based scheduler + hard heartbeat watchdog.
-
     Public API preserved:
       - start/stop
       - admissible_slots(num_waiting)
@@ -131,18 +122,21 @@ class AdaptiveScheduler:
         self._get_active_company_ids = get_active_company_ids
         self._request_cancel_companies = request_cancel_companies
 
-        # Memory sampling cache
+        # Memory sampling cache (system/cgroup)
         self._total_mem_bytes: int = 0
         self._used_bytes: int = 0
         self._used_frac: float = 0.0
         self._last_sample_ts: float = 0.0
 
-        # Estimator
+        # Process tree RSS (python + chromium children)
+        self._proc_rss_bytes: int = 0
+
+        # Estimator (MB)
         self._per_company_est_mb: float = cfg.per_company_min_mb
         self._base_rss_bytes: float = 0.0
         self._base_rss_samples: int = 0
 
-        # Optional per-company peak tracking (for smarter cancels)
+        # Optional per-company peak tracking
         self._company_peak_mb: Dict[str, float] = {}
 
         # AIMD target
@@ -179,9 +173,6 @@ class AdaptiveScheduler:
 
         self._last_log_ts: float = 0.0
 
-    # -----------------------
-    # Public properties
-    # -----------------------
     @property
     def psutil_available(self) -> bool:
         return self._psutil_available
@@ -190,9 +181,6 @@ class AdaptiveScheduler:
     def restart_recommended(self) -> bool:
         return self._restart_recommended
 
-    # -----------------------
-    # Public methods
-    # -----------------------
     async def start(self) -> None:
         self._started_ts = time.time()
         self._started_mono = time.monotonic()
@@ -208,17 +196,15 @@ class AdaptiveScheduler:
             )
             return
 
-        # Prime memory cache
         total, used = self._read_memory_usage_bytes()
         self._total_mem_bytes = total
         self._used_bytes = used
         self._used_frac = (float(used) / float(total)) if total > 0 else 0.0
+        self._proc_rss_bytes = self._read_process_tree_rss_bytes()
         self._last_sample_ts = time.time()
 
-        # Start async watchdog (emergency + no-progress)
         self._watchdog_task = asyncio.create_task(
-            self._watchdog_loop(),
-            name="adaptive-scheduling-watchdog",
+            self._watchdog_loop(), name="adaptive-scheduling-watchdog"
         )
 
         logger.info(
@@ -243,7 +229,6 @@ class AdaptiveScheduler:
 
     def register_company_completed(self) -> None:
         self._completed_counter += 1
-        self._mark_run_started()
         self._mark_progress()
 
     def record_company_peak(self, company_id: str, peak_mb: float) -> None:
@@ -254,25 +239,13 @@ class AdaptiveScheduler:
             self._company_peak_mb[company_id] = peak_mb
 
     async def admissible_slots(self, num_waiting: int) -> int:
-        """
-        Decide how many new companies may start *now*.
-
-        Simple policy:
-          slots = min(
-              waiting,
-              max(0, target_parallel - active),
-              floor((mem_cap - used) / (per_company_est*safety))
-          )
-        """
         self._last_num_waiting = max(0, int(num_waiting))
         self._mark_heartbeat()
 
         if num_waiting <= 0:
             return 0
 
-        # No psutil -> conservative but functional
         if not self._psutil_available:
-            self._mark_run_started()
             self._ever_admitted = True
             self._mark_progress()
             return 1
@@ -286,13 +259,12 @@ class AdaptiveScheduler:
             active_n = len(active_ids)
             if active_n > 0:
                 self._ever_had_active = True
-                self._mark_run_started()
 
-            # Update base RSS if idle, and estimator if active
-            self._update_base_rss_locked()
+            # baseline + estimator
+            self._update_base_rss_locked(active_n)
             self._update_per_company_est_locked(active_n)
 
-            # AIMD target update (memory pressure only)
+            # AIMD target update
             self._update_target_parallel_locked(active_n)
 
             # If already high memory, do not admit
@@ -310,7 +282,6 @@ class AdaptiveScheduler:
             cap_bytes = int(self.cfg.mem_cap_frac * float(total))
             headroom = cap_bytes - used
 
-            # If headroom is negative but idle, still allow 1 to avoid deadlocks caused by stale est.
             if headroom <= 0:
                 if active_n == 0 and self._used_frac < self.cfg.mem_high_frac:
                     slots = 1
@@ -337,7 +308,6 @@ class AdaptiveScheduler:
 
             if slots > 0:
                 self._ever_admitted = True
-                self._mark_run_started()
                 self._mark_progress()
                 self._maybe_log_state_locked(
                     "admission",
@@ -348,6 +318,9 @@ class AdaptiveScheduler:
                         "target_parallel": self._target_parallel,
                         "used_frac": self._used_frac,
                         "per_company_est_mb": self._per_company_est_mb,
+                        "proc_rss_mb": float(self._proc_rss_bytes) / _MB
+                        if self._proc_rss_bytes
+                        else 0.0,
                     },
                 )
 
@@ -360,6 +333,9 @@ class AdaptiveScheduler:
             else 0.0,
             "used_mem_mb": float(self._used_bytes) / _MB if self._used_bytes else 0.0,
             "used_frac": self._used_frac,
+            "proc_rss_mb": float(self._proc_rss_bytes) / _MB
+            if self._proc_rss_bytes
+            else 0.0,
             "per_company_est_mb": self._per_company_est_mb,
             "target_parallel": self._target_parallel,
             "completed_counter": self._completed_counter,
@@ -377,14 +353,8 @@ class AdaptiveScheduler:
         }
 
     # ------------------------------------------------------------------
-    # Internals: heartbeat + progress
+    # Heartbeat + progress
     # ------------------------------------------------------------------
-    def _mark_run_started(self) -> None:
-        # Run considered started once we’ve tried to admit, seen active, or completed.
-        # (Kept explicit to avoid future regressions.)
-        # This is used for restart gating.
-        return
-
     def _mark_heartbeat(self) -> None:
         self._last_heartbeat_mono = time.monotonic()
         self._maybe_write_heartbeat_file()
@@ -409,6 +379,9 @@ class AdaptiveScheduler:
                 "restart_recommended": self._restart_recommended,
                 "used_frac": self._used_frac,
                 "target_parallel": self._target_parallel,
+                "proc_rss_mb": float(self._proc_rss_bytes) / _MB
+                if self._proc_rss_bytes
+                else 0.0,
             }
             tmp = path.with_suffix(path.suffix + ".tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -417,14 +390,29 @@ class AdaptiveScheduler:
             return
 
     # ------------------------------------------------------------------
-    # Internals: memory reading
+    # Memory reading helpers
     # ------------------------------------------------------------------
+    def _parse_kv_lines(self, text: str) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for line in text.splitlines():
+            parts = line.strip().split()
+            if len(parts) != 2:
+                continue
+            k, v = parts
+            try:
+                out[k] = int(v)
+            except Exception:
+                continue
+        return out
+
     def _read_cgroup_memory_bytes(self) -> Tuple[int, int]:
         """
         Prefer cgroup v2 if present:
           /sys/fs/cgroup/memory.max
           /sys/fs/cgroup/memory.current
-        Fall back to common cgroup v1 files if available.
+          /sys/fs/cgroup/memory.stat (inactive_file reclaimable cache)
+
+        Returns (limit_bytes, used_bytes_effective)
         """
         try:
             base = Path("/sys/fs/cgroup")
@@ -432,29 +420,63 @@ class AdaptiveScheduler:
             # cgroup v2
             max_path = base / "memory.max"
             cur_path = base / "memory.current"
+            stat_path = base / "memory.stat"
             if max_path.exists() and cur_path.exists():
                 max_raw = max_path.read_text(encoding="utf-8").strip()
                 cur_raw = cur_path.read_text(encoding="utf-8").strip()
-                used = int(cur_raw) if cur_raw else 0
+                current = int(cur_raw) if cur_raw else 0
+
+                inactive_file = 0
+                if self.cfg.cgroup_subtract_inactive_file and stat_path.exists():
+                    st = self._parse_kv_lines(stat_path.read_text(encoding="utf-8"))
+                    inactive_file = int(st.get("inactive_file", 0))
+
+                used_effective = max(0, current - inactive_file)
+
                 if not max_raw or max_raw == "max":
-                    return 0, used
+                    return 0, used_effective
                 limit = int(max_raw)
-                return limit, used
+                return limit, used_effective
 
             # cgroup v1 (common)
             max_path = base / "memory" / "memory.limit_in_bytes"
             cur_path = base / "memory" / "memory.usage_in_bytes"
+            stat_path = base / "memory" / "memory.stat"
             if max_path.exists() and cur_path.exists():
                 limit = int(max_path.read_text(encoding="utf-8").strip() or "0")
-                used = int(cur_path.read_text(encoding="utf-8").strip() or "0")
-                # Some systems report absurdly large limit; treat as “no limit”
+                usage = int(cur_path.read_text(encoding="utf-8").strip() or "0")
+
+                inactive_file = 0
+                if self.cfg.cgroup_subtract_inactive_file and stat_path.exists():
+                    st = self._parse_kv_lines(stat_path.read_text(encoding="utf-8"))
+                    # v1 uses total_inactive_file
+                    inactive_file = int(st.get("total_inactive_file", 0))
+
+                used_effective = max(0, usage - inactive_file)
+
                 if limit > 0 and limit < (1 << 60):
-                    return limit, used
-                return 0, used
+                    return limit, used_effective
+                return 0, used_effective
 
         except Exception:
             pass
+
         return 0, 0
+
+    def _read_process_tree_rss_bytes(self) -> int:
+        if not self._psutil_available or psutil is None:
+            return 0
+        try:
+            p = psutil.Process(os.getpid())  # type: ignore[union-attr]
+            rss = int(p.memory_info().rss)
+            for ch in p.children(recursive=True):
+                try:
+                    rss += int(ch.memory_info().rss)
+                except Exception:
+                    continue
+            return rss
+        except Exception:
+            return 0
 
     def _read_memory_usage_bytes(self) -> Tuple[int, int]:
         if not self._psutil_available or psutil is None:
@@ -480,44 +502,60 @@ class AdaptiveScheduler:
             self._used_bytes = used
             self._used_frac = float(used) / float(total)
             self._last_sample_ts = now
+        self._proc_rss_bytes = self._read_process_tree_rss_bytes()
 
     # ------------------------------------------------------------------
-    # Internals: estimators + AIMD
+    # Estimators + AIMD
     # ------------------------------------------------------------------
-    def _update_base_rss_locked(self) -> None:
-        # Track baseline “idle” RSS when no work is active
-        active_n = len(self._get_active_company_ids())
-        if active_n != 0 or self._used_bytes <= 0:
+    def _update_base_rss_locked(self, active_n: int) -> None:
+        if active_n != 0:
             return
+
+        # Use proc rss for base if configured and available, else fallback to used_bytes
+        base_now = (
+            float(self._proc_rss_bytes)
+            if (self.cfg.use_process_tree_rss_for_estimate and self._proc_rss_bytes > 0)
+            else float(self._used_bytes)
+        )
+        if base_now <= 0:
+            return
+
         alpha = 0.1
         if self._base_rss_samples == 0:
-            self._base_rss_bytes = float(self._used_bytes)
+            self._base_rss_bytes = base_now
             self._base_rss_samples = 1
         else:
-            self._base_rss_bytes = (1.0 - alpha) * self._base_rss_bytes + alpha * float(
-                self._used_bytes
-            )
+            self._base_rss_bytes = (
+                1.0 - alpha
+            ) * self._base_rss_bytes + alpha * base_now
             self._base_rss_samples += 1
 
     def _update_per_company_est_locked(self, active_n: int) -> None:
-        if active_n <= 0 or self._used_bytes <= 0:
+        if active_n <= 0:
             return
 
-        effective_used = float(self._used_bytes) - float(self._base_rss_bytes)
+        used_for_est = (
+            float(self._proc_rss_bytes)
+            if (self.cfg.use_process_tree_rss_for_estimate and self._proc_rss_bytes > 0)
+            else float(self._used_bytes)
+        )
+        if used_for_est <= 0:
+            return
+
+        effective_used = used_for_est - float(self._base_rss_bytes)
         if effective_used < 0:
             effective_used = 0.0
+
         per_company_now_mb = (effective_used / float(active_n)) / _MB
         if per_company_now_mb <= 0:
             return
 
-        # EMA that reacts faster upward than downward (prevents underestimation)
         old = self._per_company_est_mb
         if per_company_now_mb > old:
             new = 0.7 * old + 0.3 * per_company_now_mb
         else:
             new = 0.9 * old + 0.1 * per_company_now_mb
 
-        # Clamp
         new = max(
             self.cfg.per_company_min_mb, min(float(new), self.cfg.per_company_max_mb)
         )
@@ -533,17 +571,14 @@ class AdaptiveScheduler:
         old = self._target_parallel
 
         if self._used_frac >= cfg.mem_high_frac:
-            # multiplicative decrease
             new = int(
                 max(cfg.min_target, max(1, int(float(old) * float(cfg.md_factor))))
             )
         elif self._used_frac <= (cfg.mem_cap_frac - 0.03):
-            # additive increase
             new = min(cfg.max_target, old + int(cfg.ai_step))
         else:
             new = old
 
-        # Don’t go below current active (helps avoid weird oscillation)
         if active_n > 0:
             new = max(new, active_n)
 
@@ -551,20 +586,20 @@ class AdaptiveScheduler:
 
         if self._target_parallel != old and logger.isEnabledFor(logging.INFO):
             logger.info(
-                "[AdaptiveScheduling] target_parallel %d -> %d (used_frac=%.3f active=%d)",
+                "[AdaptiveScheduling] target_parallel %d -> %d (used_frac=%.3f active=%d proc_rss_mb=%.1f)",
                 old,
                 self._target_parallel,
                 self._used_frac,
                 active_n,
+                float(self._proc_rss_bytes) / _MB if self._proc_rss_bytes else 0.0,
             )
 
     # ------------------------------------------------------------------
-    # Internals: cancellation selection
+    # Cancellation selection
     # ------------------------------------------------------------------
     def _select_cancel_ids(self, active_ids: Sequence[str], count: int) -> List[str]:
         if count <= 0 or not active_ids:
             return []
-        # Prefer heaviest by observed peak
         weighted: List[Tuple[str, float]] = []
         for cid in active_ids:
             mb = self._company_peak_mb.get(cid)
@@ -573,11 +608,10 @@ class AdaptiveScheduler:
         if weighted:
             weighted.sort(key=lambda kv: kv[1], reverse=True)
             return [cid for (cid, _) in weighted[:count]]
-        # Fallback: cancel last ones
         return list(active_ids)[-count:]
 
     # ------------------------------------------------------------------
-    # Internals: restart gating
+    # Restart gating
     # ------------------------------------------------------------------
     def _can_recommend_restart(self) -> bool:
         uptime = max(0.0, time.time() - self._started_ts)
@@ -585,7 +619,6 @@ class AdaptiveScheduler:
             return False
         if self._completed_counter < int(self.cfg.restart_gate_min_completed):
             return False
-        # Must have actually started doing work
         if not (
             self._ever_admitted or self._ever_had_active or self._completed_counter > 0
         ):
@@ -593,7 +626,7 @@ class AdaptiveScheduler:
         return True
 
     # ------------------------------------------------------------------
-    # Async watchdog: emergency cancel + no-progress
+    # Async watchdog
     # ------------------------------------------------------------------
     async def _watchdog_loop(self) -> None:
         interval = max(0.5, float(self.cfg.sample_interval_sec))
@@ -615,7 +648,7 @@ class AdaptiveScheduler:
                     if active_n > 0:
                         self._ever_had_active = True
 
-                    self._update_base_rss_locked()
+                    self._update_base_rss_locked(active_n)
                     self._update_per_company_est_locked(active_n)
 
                     # Progress inference
@@ -629,7 +662,7 @@ class AdaptiveScheduler:
                         self._last_obs_waiting_n = self._last_num_waiting
                         self._last_obs_completed = self._completed_counter
 
-                    # No-progress -> recommend restart (do not kill by default)
+                    # No-progress -> recommend restart
                     if self.cfg.no_progress_timeout_sec > 0:
                         prog_age = time.monotonic() - self._last_progress_mono
                         if (
@@ -643,7 +676,6 @@ class AdaptiveScheduler:
                                     prog_age,
                                     self._last_num_waiting,
                                 )
-
                                 if self.cfg.kill_on_no_progress:
                                     os.kill(
                                         os.getpid(),
@@ -671,10 +703,13 @@ class AdaptiveScheduler:
                                 self._last_emergency_cancel_ts = now
 
                                 logger.error(
-                                    "[AdaptiveScheduling] EMERGENCY used_frac=%.3f total_mb=%.1f used_mb=%.1f active=%d cancel=%s",
+                                    "[AdaptiveScheduling] EMERGENCY used_frac=%.3f total_mb=%.1f used_mb=%.1f proc_rss_mb=%.1f active=%d cancel=%s",
                                     self._used_frac,
                                     float(self._total_mem_bytes) / _MB,
                                     float(self._used_bytes) / _MB,
+                                    float(self._proc_rss_bytes) / _MB
+                                    if self._proc_rss_bytes
+                                    else 0.0,
                                     active_n,
                                     cancel_ids,
                                 )
@@ -706,7 +741,7 @@ class AdaptiveScheduler:
                 logger.exception("[AdaptiveScheduling] watchdog loop error")
 
     # ------------------------------------------------------------------
-    # Hard watchdog: kill on no heartbeat
+    # Hard watchdog
     # ------------------------------------------------------------------
     def _start_hard_watchdog_thread(self) -> None:
         if self._hard_thread is not None and self._hard_thread.is_alive():
@@ -765,7 +800,6 @@ class AdaptiveScheduler:
                     except Exception:
                         os._exit(2)  # noqa: S606
                     return
-
             except Exception:
                 continue
 
@@ -788,6 +822,7 @@ class AdaptiveScheduler:
             "total_mem_bytes": self._total_mem_bytes,
             "used_bytes": self._used_bytes,
             "used_frac": self._used_frac,
+            "proc_rss_bytes": self._proc_rss_bytes,
             "per_company_est_mb": self._per_company_est_mb,
             "target_parallel": self._target_parallel,
             "completed_counter": self._completed_counter,
