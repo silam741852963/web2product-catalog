@@ -929,7 +929,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-concurrency",
         type=int,
-        default=64,
+        default=12,
         help="Hard upper bound on concurrent companies (tasks).",
     )
     parser.add_argument("--max-pages", type=int, default=100)
@@ -950,18 +950,18 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Special mode: read crawl_global_state.json and force-mark markdown completion for in_progress companies (no LLM).",
     )
 
-    # IMPORTANT: default bounded to prevent unbounded in-RAM accumulation
+    # Default bounded to prevent unbounded in-RAM accumulation
     parser.add_argument("--page-result-concurrency", type=int, default=6)
     parser.add_argument("--page-queue-maxsize", type=int, default=64)
     parser.add_argument("--url-index-flush-every", type=int, default=24)
     parser.add_argument("--url-index-flush-interval-sec", type=float, default=0.5)
     parser.add_argument("--url-index-queue-maxsize", type=int, default=2048)
 
-    # New: crawler pool
+    # Crawler pool
     parser.add_argument(
         "--crawler-pool-size",
         type=int,
-        default=2,
+        default=6,
         help="Number of independent AsyncWebCrawler instances (isolates crashes; avoids serialization).",
     )
     parser.add_argument(
