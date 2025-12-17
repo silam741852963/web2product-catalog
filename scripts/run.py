@@ -1163,7 +1163,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--crawler-pool-size",
         type=int,
-        default=4,
+        default=5,
         help="Number of independent AsyncWebCrawler instances.",
     )
     parser.add_argument(
