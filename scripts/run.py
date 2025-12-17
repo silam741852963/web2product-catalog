@@ -13,7 +13,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import urlparse
 
 from crawl4ai import AsyncWebCrawler, CacheMode
@@ -119,20 +119,6 @@ class CrawlerFatalError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# Touch helper (scheduler heartbeats per company)
-# ---------------------------------------------------------------------------
-
-
-def _touch(touch_cb: Optional[Any], company_id: str) -> None:
-    if touch_cb is None:
-        return
-    try:
-        touch_cb(company_id)
-    except Exception:
-        return
-
-
-# ---------------------------------------------------------------------------
 # Cancellation-safe cleanup (small + reliable)
 # ---------------------------------------------------------------------------
 
@@ -187,12 +173,6 @@ def _maybe_malloc_trim() -> None:
 
 
 def _is_playwright_driver_disconnect(exc: BaseException) -> bool:
-    """
-    Heuristic detector for the pattern:
-      - "Connection closed while reading from the driver"
-      - "pipe closed by peer"
-      - "BrowserContext.new_page: Connection closed ..."
-    """
     msg = f"{type(exc).__name__}: {exc}"
     lowered = msg.lower()
     needles = [
@@ -236,7 +216,6 @@ class CrawlerPool:
         self._started = False
         self._closing = False
 
-        # Forced recycle (used on memory-pressure cancels)
         self._force_restart_budget: int = 0
         self._force_restart_reason: str = "forced_recycle"
 
@@ -542,12 +521,14 @@ async def crawl_company(
     url_index_flush_every: int = 64,
     url_index_flush_interval_sec: float = 1.0,
     url_index_queue_maxsize: int = 2048,
-    # --- stall prevention (new) ---
-    touch_cb: Optional[Any] = None,
-    arun_init_timeout_sec: float = 90.0,
-    stream_no_yield_timeout_sec: float = 150.0,
-    submit_timeout_sec: float = 30.0,
+    no_activity_timeout_sec: float = 300.0,
+    activity_cb: Optional[Callable[[str], None]] = None,
 ) -> None:
+    """
+    no_activity_timeout_sec:
+      - If arun() hangs OR stream yields no results for this duration OR processor.submit blocks
+        for this duration, abort the company (prevents silent stalls > 5min).
+    """
     logger.info(
         "Starting crawl for company_id=%s url=%s",
         company.company_id,
@@ -571,17 +552,24 @@ async def crawl_company(
         mark_company_timeout_cb=mark_company_timeout,
         mark_company_memory_cb=mark_company_memory_pressure,
         concurrency=max(1, int(page_result_concurrency)),
-        page_queue_maxsize=max(1, int(page_queue_maxsize)),  # IMPORTANT: bound memory
+        page_queue_maxsize=max(1, int(page_queue_maxsize)),
         url_index_flush_cfg=flush_cfg,
     )
 
+    idle_timeout = max(5.0, float(no_activity_timeout_sec))
     cancelled_exc: Optional[BaseException] = None
     await processor.start()
-    _touch(touch_cb, company.company_id)
+
+    def _ping_activity() -> None:
+        if activity_cb is not None:
+            try:
+                activity_cb(company.company_id)
+            except Exception:
+                pass
 
     try:
         for start_url in start_urls:
-            _touch(touch_cb, company.company_id)
+            _ping_activity()
 
             clone_kwargs: Dict[str, Any] = {
                 "cache_mode": CacheMode.BYPASS,
@@ -611,19 +599,22 @@ async def crawl_company(
                 except Exception:
                     pass
 
-            # ---- arun init timeout (new)
             try:
-                _touch(touch_cb, company.company_id)
+                # If Playwright navigation hangs before yielding anything, kill within idle_timeout.
                 results_or_gen = await asyncio.wait_for(
                     crawler.arun(start_url, config=config),
-                    timeout=float(arun_init_timeout_sec),
+                    timeout=idle_timeout,
                 )
-                _touch(touch_cb, company.company_id)
+                _ping_activity()
             except asyncio.TimeoutError as e:
-                # Treat as crawler wedge; recycle slot by raising CrawlerFatalError
-                raise CrawlerFatalError(
-                    f"crawler.arun init timeout ({arun_init_timeout_sec:.1f}s) company_id={company.company_id} url={start_url}"
-                ) from e
+                logger.error(
+                    "[NoActivityTimeout] company_id=%s start_url=%s arun() exceeded %.1fs -> abort",
+                    company.company_id,
+                    start_url,
+                    idle_timeout,
+                )
+                mark_company_timeout(company.company_id)
+                raise
             except Exception as e:
                 if _is_playwright_driver_disconnect(e):
                     raise CrawlerFatalError(
@@ -633,34 +624,45 @@ async def crawl_company(
 
             if not isinstance(results_or_gen, list):
                 agen = results_or_gen
+                aiter = agen.__aiter__()
+
                 try:
                     while True:
                         try:
                             page_result = await asyncio.wait_for(
-                                agen.__anext__(),
-                                timeout=float(stream_no_yield_timeout_sec),
+                                aiter.__anext__(),
+                                timeout=idle_timeout,
                             )
                         except StopAsyncIteration:
                             break
-                        except asyncio.TimeoutError as e:
-                            # No yield for too long => treat as wedge; recycle slot
-                            raise CrawlerFatalError(
-                                f"stream no-yield timeout ({stream_no_yield_timeout_sec:.1f}s) company_id={company.company_id} url={start_url}"
-                            ) from e
+                        except asyncio.TimeoutError:
+                            logger.error(
+                                "[NoActivityTimeout] company_id=%s start_url=%s stream idle >= %.1fs -> abort",
+                                company.company_id,
+                                start_url,
+                                idle_timeout,
+                            )
+                            mark_company_timeout(company.company_id)
+                            raise
 
-                        _touch(touch_cb, company.company_id)
+                        _ping_activity()
 
+                        # If downstream processor is wedged (queue deadlock), abort within idle_timeout.
                         try:
                             await asyncio.wait_for(
                                 processor.submit(page_result),
-                                timeout=float(submit_timeout_sec),
+                                timeout=idle_timeout,
                             )
-                        except asyncio.TimeoutError as e:
-                            raise CrawlerFatalError(
-                                f"processor.submit timeout ({submit_timeout_sec:.1f}s) company_id={company.company_id} url={start_url}"
-                            ) from e
+                        except asyncio.TimeoutError:
+                            logger.error(
+                                "[NoActivityTimeout] company_id=%s processor.submit blocked >= %.1fs -> abort",
+                                company.company_id,
+                                idle_timeout,
+                            )
+                            mark_company_timeout(company.company_id)
+                            raise
 
-                        _touch(touch_cb, company.company_id)
+                        _ping_activity()
 
                 except asyncio.CancelledError as e:
                     cancelled_exc = e
@@ -675,19 +677,8 @@ async def crawl_company(
                                 "Error aborting page processor (company_id=%s)",
                                 company.company_id,
                             )
+                    raise
                 except Exception as e:
-                    abort = getattr(processor, "abort", None)
-                    if callable(abort):
-                        try:
-                            maybe = abort()
-                            if asyncio.iscoroutine(maybe):
-                                await maybe
-                        except Exception:
-                            logger.exception(
-                                "Error aborting page processor on error (company_id=%s)",
-                                company.company_id,
-                            )
-
                     if _is_playwright_driver_disconnect(e):
                         raise CrawlerFatalError(
                             "Playwright driver disconnected during streaming"
@@ -709,17 +700,11 @@ async def crawl_company(
             else:
                 try:
                     for page_result in results_or_gen:
-                        _touch(touch_cb, company.company_id)
-                        try:
-                            await asyncio.wait_for(
-                                processor.submit(page_result),
-                                timeout=float(submit_timeout_sec),
-                            )
-                        except asyncio.TimeoutError as e:
-                            raise CrawlerFatalError(
-                                f"processor.submit timeout ({submit_timeout_sec:.1f}s) company_id={company.company_id} url={start_url}"
-                            ) from e
-                        _touch(touch_cb, company.company_id)
+                        _ping_activity()
+                        await asyncio.wait_for(
+                            processor.submit(page_result), timeout=idle_timeout
+                        )
+                        _ping_activity()
                 except Exception as e:
                     if _is_playwright_driver_disconnect(e):
                         raise CrawlerFatalError(
@@ -727,23 +712,8 @@ async def crawl_company(
                         ) from e
                     raise
 
-    except asyncio.CancelledError as e:
-        cancelled_exc = e
-        abort = getattr(processor, "abort", None)
-        if callable(abort):
-            try:
-                maybe = abort()
-                if asyncio.iscoroutine(maybe):
-                    await maybe
-            except Exception:
-                logger.exception(
-                    "Error aborting page processor on cancel (company_id=%s)",
-                    company.company_id,
-                )
-        raise
     finally:
         try:
-            _touch(touch_cb, company.company_id)
             if cancelled_exc is not None:
                 await _run_cleanup_even_if_cancelled(processor.finish())
             else:
@@ -784,8 +754,8 @@ async def run_company_pipeline(
     page_interaction_factory: PageInteractionFactory,
     page_timeout_ms: Optional[int],
     enable_malloc_trim: bool,
-    # --- stall prevention (new) ---
-    touch_cb: Optional[Any] = None,
+    no_activity_timeout_sec: float,
+    activity_cb: Optional[Callable[[str], None]] = None,
 ) -> bool:
     completed_ok = False
     token: Optional[Any] = None
@@ -795,8 +765,6 @@ async def run_company_pipeline(
     )
 
     try:
-        _touch(touch_cb, company.company_id)
-
         try:
             snap = await state.get_company_snapshot(company.company_id)
             status = snap.status or COMPANY_STATUS_PENDING
@@ -843,6 +811,12 @@ async def run_company_pipeline(
             company.domain_url,
         )
 
+        if activity_cb is not None:
+            try:
+                activity_cb(company.company_id)
+            except Exception:
+                pass
+
         filter_chain = _build_filter_chain(
             company=company,
             args=args,
@@ -864,23 +838,11 @@ async def run_company_pipeline(
 
         if do_crawl:
             await guard.wait_until_healthy()
-            _touch(touch_cb, company.company_id)
-
-            lease_timeout = float(getattr(args, "crawler_lease_timeout_sec", 120.0))
-            arun_init_timeout_sec = float(getattr(args, "arun_init_timeout_sec", 90.0))
-            stream_no_yield_timeout_sec = float(
-                getattr(args, "stream_no_yield_timeout_sec", 150.0)
-            )
-            submit_timeout_sec = float(getattr(args, "submit_timeout_sec", 30.0))
 
             last_err: Optional[BaseException] = None
             for attempt in range(2):
                 try:
-                    lease = await asyncio.wait_for(
-                        crawler_pool.lease(), timeout=lease_timeout
-                    )
-                    async with lease as crawler:
-                        _touch(touch_cb, company.company_id)
+                    async with await crawler_pool.lease() as crawler:
                         await crawl_company(
                             company=company,
                             crawler=crawler,
@@ -908,32 +870,13 @@ async def run_company_pipeline(
                             url_index_queue_maxsize=int(
                                 getattr(args, "url_index_queue_maxsize", 2048)
                             ),
-                            touch_cb=touch_cb,
-                            arun_init_timeout_sec=arun_init_timeout_sec,
-                            stream_no_yield_timeout_sec=stream_no_yield_timeout_sec,
-                            submit_timeout_sec=submit_timeout_sec,
+                            no_activity_timeout_sec=float(no_activity_timeout_sec),
+                            activity_cb=activity_cb,
                         )
                     last_err = None
                     break
-
-                except asyncio.TimeoutError as e:
-                    last_err = e
-                    mark_company_timeout(company.company_id)
-                    company_logger.error(
-                        "[Timeout] company_id=%s attempt=%d/2 stage=%s error=%s",
-                        company.company_id,
-                        attempt + 1,
-                        "crawler_pool.lease",
-                        str(e),
-                    )
-                    if attempt == 0:
-                        await asyncio.sleep(0.5)
-                        continue
-                    return False
-
                 except CrawlerFatalError as e:
                     last_err = e
-                    mark_company_timeout(company.company_id)
                     company_logger.error(
                         "[CrawlerFatalError] company_id=%s attempt=%d/2 error=%s",
                         company.company_id,
@@ -949,11 +892,12 @@ async def run_company_pipeline(
                 raise last_err
 
             await state.recompute_company_from_index(
-                company.company_id, name=None, root_url=company.domain_url
+                company.company_id,
+                name=None,
+                root_url=company.domain_url,
             )
 
         if will_run_llm:
-            _touch(touch_cb, company.company_id)
             if args.llm_mode == "presence":
                 await run_presence_pass_for_company(
                     company, presence_strategy=presence_llm
@@ -1079,11 +1023,18 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--company-concurrency",
         type=int,
         default=8,
-        help="Hard upper bound on concurrent companies.",
+        help="Hard upper bound on concurrent companies (tasks).",
     )
     parser.add_argument("--max-pages", type=int, default=100)
     parser.add_argument("--enable-resource-monitor", action="store_true")
     parser.add_argument("--page-timeout-ms", type=int, default=30000)
+
+    parser.add_argument(
+        "--no-activity-timeout-sec",
+        type=float,
+        default=300.0,
+        help="Abort a company if no activity (no results / blocked submit / hung arun) for this many seconds. Clamped to <=300.",
+    )
 
     parser.add_argument(
         "--retry-mode",
@@ -1099,34 +1050,25 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Special mode: read crawl_global_state.json and force-mark markdown completion for in_progress companies (no LLM).",
     )
 
-    # Default bounded to prevent unbounded in-RAM accumulation
     parser.add_argument("--page-result-concurrency", type=int, default=6)
     parser.add_argument("--page-queue-maxsize", type=int, default=64)
     parser.add_argument("--url-index-flush-every", type=int, default=24)
     parser.add_argument("--url-index-flush-interval-sec", type=float, default=0.5)
     parser.add_argument("--url-index-queue-maxsize", type=int, default=2048)
 
-    # Crawler pool
     parser.add_argument(
         "--crawler-pool-size",
         type=int,
-        default=4,
-        help="Number of independent AsyncWebCrawler instances.",
+        default=5,
+        help="Number of independent AsyncWebCrawler instances (isolates crashes; avoids serialization).",
     )
     parser.add_argument(
         "--crawler-recycle-after",
         type=int,
-        default=20,
-        help="Recycle a crawler instance after N companies.",
+        default=15,
+        help="Recycle a crawler instance after N companies to drop Chromium memory.",
     )
 
-    # Stall prevention timeouts (new)
-    parser.add_argument("--crawler-lease-timeout-sec", type=float, default=120.0)
-    parser.add_argument("--arun-init-timeout-sec", type=float, default=90.0)
-    parser.add_argument("--stream-no-yield-timeout-sec", type=float, default=150.0)
-    parser.add_argument("--submit-timeout-sec", type=float, default=30.0)
-
-    # Optional: RSS trim
     parser.add_argument(
         "--enable-malloc-trim",
         action="store_true",
@@ -1150,7 +1092,8 @@ async def main_async(args: argparse.Namespace) -> None:
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(
-        level=log_level, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
     )
     logger.setLevel(log_level)
 
@@ -1158,7 +1101,6 @@ async def main_async(args: argparse.Namespace) -> None:
         logger.warning("--finalize-in-progress-md enabled; forcing --llm-mode none.")
         args.llm_mode = "none"
 
-    # Retry tracker
     retry_cfg = RetryTrackerConfig(out_dir=out_dir)
     retry_tracker = RetryTracker(retry_cfg)
     _retry_tracker_instance = retry_tracker
@@ -1170,7 +1112,12 @@ async def main_async(args: argparse.Namespace) -> None:
     page_timeout_ms: int = int(getattr(args, "page_timeout_ms", 60000))
     timeout_error_marker = f"Timeout {page_timeout_ms}ms exceeded."
 
-    # Logging extension
+    no_activity_timeout_sec = float(getattr(args, "no_activity_timeout_sec", 300.0))
+    if no_activity_timeout_sec > 300.0:
+        no_activity_timeout_sec = 300.0
+    if no_activity_timeout_sec < 10.0:
+        no_activity_timeout_sec = 10.0
+
     enable_session_log = getattr(args, "enable_session_log", False)
     logging_ext = LoggingExtension(
         global_level=log_level,
@@ -1180,16 +1127,15 @@ async def main_async(args: argparse.Namespace) -> None:
         session_log_path=(out_dir / "session.log") if enable_session_log else None,
     )
 
-    # Optional resource monitor
     resource_monitor: Optional[ResourceMonitor] = None
     if getattr(args, "enable_resource_monitor", False):
         rm_config = ResourceMonitorConfig()
         resource_monitor = ResourceMonitor(
-            output_path=out_dir / "resource_usage.json", config=rm_config
+            output_path=out_dir / "resource_usage.json",
+            config=rm_config,
         )
         resource_monitor.start()
 
-    # Language + LLM setup
     default_language_factory.set_language(args.lang)
 
     presence_llm = None
@@ -1199,7 +1145,9 @@ async def main_async(args: argparse.Namespace) -> None:
             default_ollama_provider_strategy
             if args.llm_provider == "ollama"
             else RemoteAPIProviderStrategy(
-                provider=args.llm_api_provider, api_token=None, base_url=None
+                provider=args.llm_api_provider,
+                api_token=None,
+                base_url=None,
             )
         )
         llm_factory = LLMExtractionFactory(
@@ -1212,11 +1160,9 @@ async def main_async(args: argparse.Namespace) -> None:
         if args.llm_mode == "full":
             full_llm = llm_factory.create(mode="schema")
 
-    # Connectivity guard
     guard = ConnectivityGuard()
     await guard.start()
 
-    # Markdown gating + crawler base cfg
     gating_cfg = md_gating.build_gating_config(
         min_meaningful_words=30,
         cookie_max_fraction=0.02,
@@ -1232,7 +1178,8 @@ async def main_async(args: argparse.Namespace) -> None:
         require_structure=gating_cfg.require_structure,
     )
     crawler_base_cfg = default_crawler_factory.create(
-        markdown_generator=markdown_generator, page_timeout=page_timeout_ms
+        markdown_generator=markdown_generator,
+        page_timeout=page_timeout_ms,
     )
 
     page_policy = PageInteractionPolicy(
@@ -1250,7 +1197,6 @@ async def main_async(args: argparse.Namespace) -> None:
 
     state = get_crawl_state()
 
-    # Inflight tracking
     inflight_by_cid: Dict[str, asyncio.Task] = {}
     cid_by_task: Dict[asyncio.Task, str] = {}
 
@@ -1259,14 +1205,16 @@ async def main_async(args: argparse.Namespace) -> None:
 
     crawler_pool: Optional[CrawlerPool] = None
 
+    scheduler: Optional[AdaptiveScheduler] = None
+
     def request_cancel_companies(ids: Sequence[str]) -> None:
         if crawler_pool is not None and ids:
             try:
-                crawler_pool.request_recycle(len(ids), reason="mem_pressure_cancel")
+                crawler_pool.request_recycle(len(ids), reason="cancel_recycle")
                 asyncio.create_task(
                     crawler_pool.recycle_idle_now(
                         min(len(ids), crawler_pool.size),
-                        reason="mem_pressure_idle_recycle",
+                        reason="cancel_idle_recycle",
                     )
                 )
             except Exception:
@@ -1280,14 +1228,20 @@ async def main_async(args: argparse.Namespace) -> None:
             mark_company_memory_pressure(cid)
             t.cancel()
 
-    scheduler: Optional[AdaptiveScheduler] = None
-    touch_cb: Optional[Any] = None
+    def record_activity(cid: str) -> None:
+        if scheduler is not None:
+            try:
+                scheduler.record_company_activity(cid)
+            except Exception:
+                pass
 
-    # Stop/restart coordination
     stop_event = asyncio.Event()
+    sigterm_received = False
     restart_due_to_scheduler = False
 
     def _on_sigterm() -> None:
+        nonlocal sigterm_received
+        sigterm_received = True
         stop_event.set()
         logger.error("[Signal] SIGTERM received; requesting graceful shutdown.")
 
@@ -1339,7 +1293,6 @@ async def main_async(args: argparse.Namespace) -> None:
         pass
 
     try:
-        # ---- Load companies
         if args.company_file:
             companies = _companies_from_source(Path(args.company_file))
         else:
@@ -1382,7 +1335,6 @@ async def main_async(args: argparse.Namespace) -> None:
             elif retry_mode == "only-retry":
                 companies = [c for c in companies if c.company_id in prev_retry_ids]
 
-        # ---- State init
         run_id = await state.start_run(
             pipeline="deep_crawl", version=None, args_hash=None
         )
@@ -1436,10 +1388,11 @@ async def main_async(args: argparse.Namespace) -> None:
 
         http_lang = _HTTP_LANG_MAP.get(args.lang, f"{args.lang}-US")
         browser_cfg = default_browser_factory.create(
-            lang=http_lang, add_common_cookies_for=[], headless=True
+            lang=http_lang,
+            add_common_cookies_for=[],
+            headless=True,
         )
 
-        # ---- Crawler pool
         crawler_pool = CrawlerPool(
             browser_cfg=browser_cfg,
             size=int(getattr(args, "crawler_pool_size", 2)),
@@ -1447,7 +1400,6 @@ async def main_async(args: argparse.Namespace) -> None:
         )
         await crawler_pool.start()
 
-        # ---- Adaptive scheduler (<=5 minutes inactivity/action)
         scheduler_cfg = AdaptiveSchedulingConfig(
             log_path=out_dir / "adaptive_scheduling_state.jsonl",
             heartbeat_path=out_dir / "heartbeat.json",
@@ -1456,11 +1408,8 @@ async def main_async(args: argparse.Namespace) -> None:
             ),
             max_target=max(1, int(getattr(args, "company_concurrency", 20))),
             kill_on_no_progress=True,
-            # hard requirement: no-activity actions within 5 minutes
-            no_progress_timeout_sec=240.0,
-            company_inactivity_timeout_sec=240.0,
-            admission_starvation_timeout_sec=240.0,
-            block_log_interval_sec=30.0,
+            no_progress_timeout_sec=min(300.0, float(no_activity_timeout_sec)),
+            company_no_activity_timeout_sec=min(300.0, float(no_activity_timeout_sec)),
         )
         scheduler = AdaptiveScheduler(
             cfg=scheduler_cfg,
@@ -1468,9 +1417,7 @@ async def main_async(args: argparse.Namespace) -> None:
             request_cancel_companies=request_cancel_companies,
         )
         await scheduler.start()
-        touch_cb = scheduler.touch_company
 
-        # ---- Work queue
         companies_by_id: Dict[str, Company] = {c.company_id: c for c in companies}
         ready: deque[str] = deque(c.company_id for c in companies)
 
@@ -1551,13 +1498,13 @@ async def main_async(args: argparse.Namespace) -> None:
                             page_interaction_factory=page_interaction_factory,
                             page_timeout_ms=page_timeout_ms,
                             enable_malloc_trim=enable_malloc_trim,
-                            touch_cb=touch_cb,
+                            no_activity_timeout_sec=no_activity_timeout_sec,
+                            activity_cb=record_activity,
                         ),
                         name=f"company-{cid}",
                     )
                     inflight_by_cid[cid] = task
                     cid_by_task[task] = cid
-                    _touch(touch_cb, cid)
 
             if not inflight_by_cid:
                 if ready:
