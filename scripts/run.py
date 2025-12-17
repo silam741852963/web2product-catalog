@@ -94,15 +94,6 @@ from extensions.dataset_external import build_dataset_externals
 
 logger = logging.getLogger("deep_crawl_runner")
 
-# psutil optional (used only for emergency child-kill)
-try:
-    import psutil  # type: ignore
-
-    _PSUTIL_AVAILABLE = True
-except Exception:  # pragma: no cover
-    psutil = None  # type: ignore
-    _PSUTIL_AVAILABLE = False
-
 _HTTP_LANG_MAP: Dict[str, str] = {
     "en": "en-US",
     "ja": "ja-JP",
@@ -213,68 +204,6 @@ def _is_playwright_driver_disconnect(exc: BaseException) -> bool:
         "playwright connection closed",
     ]
     return any(n in lowered for n in needles)
-
-
-async def _kill_own_descendants_async(
-    *,
-    reason: str,
-    terminate_timeout_sec: float = 1.5,
-    kill_timeout_sec: float = 1.5,
-) -> None:
-    """
-    Emergency: kill ONLY this process's descendants (Chromium/Chrome/Playwright trees)
-    to free memory quickly before kernel OOM-kills them.
-
-    Safe: does not touch unrelated system processes.
-    """
-    if not _PSUTIL_AVAILABLE or psutil is None:
-        return
-    try:
-        root = psutil.Process(os.getpid())  # type: ignore[union-attr]
-        children = root.children(recursive=True)
-
-        if not children:
-            return
-
-        # Prefer to target browser-like children first, but in emergencies we terminate all descendants.
-        # We do leaf-first terminate to reduce respawn races.
-        children_sorted = list(reversed(children))
-
-        logger.critical(
-            "[OOM-Guard] terminating %d descendant processes (reason=%s)",
-            len(children_sorted),
-            reason,
-        )
-
-        for p in children_sorted:
-            try:
-                p.terminate()
-            except Exception:
-                pass
-
-        try:
-            gone, alive = psutil.wait_procs(
-                children_sorted, timeout=float(terminate_timeout_sec)
-            )  # type: ignore[attr-defined]
-        except Exception:
-            alive = children_sorted
-
-        if alive:
-            logger.critical(
-                "[OOM-Guard] force-killing %d stubborn descendants", len(alive)
-            )
-            for p in alive:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
-            try:
-                psutil.wait_procs(alive, timeout=float(kill_timeout_sec))  # type: ignore[attr-defined]
-            except Exception:
-                pass
-
-    except Exception:
-        logger.exception("[OOM-Guard] failed to kill descendants (reason=%s)", reason)
 
 
 # ---------------------------------------------------------------------------
@@ -486,17 +415,11 @@ class _CrawlerLease:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         if exc is not None:
-            # Treat driver disconnect as fatal slot corruption
             if isinstance(exc, CrawlerFatalError) or _is_playwright_driver_disconnect(
                 exc
             ):
                 self._fatal = True
                 self._reason = "driver_disconnect"
-
-            # Treat memory-pressure abort as fatal for the slot (Chromium likely bloated)
-            if isinstance(exc, CriticalMemoryPressure):
-                self._fatal = True
-                self._reason = "mem_pressure"
 
         await self._pool._release(self._slot, fatal=self._fatal, reason=self._reason)
 
@@ -601,6 +524,60 @@ def _should_skip_company(status: str, llm_mode: str) -> bool:
     return status == COMPANY_STATUS_LLM_DONE
 
 
+def _tune_page_pipeline_params(
+    args: argparse.Namespace,
+    scheduler: Optional[AdaptiveScheduler],
+) -> Dict[str, Any]:
+    """
+    Moderate OOM protection:
+    - When memory is hot (raw usage high or ramping), reduce per-company in-RAM queues/concurrency.
+    - When memory is cool, keep user's configured defaults for throughput.
+    """
+    conc = int(getattr(args, "page_result_concurrency", 6))
+    qmax = int(getattr(args, "page_queue_maxsize", 64))
+    flush_every = int(getattr(args, "url_index_flush_every", 24))
+    flush_interval = float(getattr(args, "url_index_flush_interval_sec", 0.5))
+    idx_qmax = int(getattr(args, "url_index_queue_maxsize", 2048))
+
+    used_raw = 0.0
+    used_eff = 0.0
+    ramp_raw = 0.0
+    if scheduler is not None:
+        try:
+            snap = scheduler.get_state_snapshot()
+            used_raw = float(snap.get("used_frac_raw", 0.0) or 0.0)
+            used_eff = float(snap.get("used_frac", 0.0) or 0.0)
+            ramp_raw = float(snap.get("ramp_raw_frac_per_sec", 0.0) or 0.0)
+        except Exception:
+            pass
+
+    # Tiered softening — no cancels, just reduce per-company buffering.
+    # Thresholds aligned with the scheduler defaults.
+    hot2 = (used_raw >= 0.88) or (used_eff >= 0.83) or (ramp_raw >= 0.020)
+    hot1 = (used_raw >= 0.84) or (used_eff >= 0.80) or (ramp_raw >= 0.012)
+
+    if hot2:
+        conc = max(1, conc // 3)
+        qmax = max(16, qmax // 2)
+        idx_qmax = max(512, idx_qmax // 2)
+        flush_every = max(8, flush_every // 2)
+        flush_interval = max(0.2, flush_interval / 2.0)
+    elif hot1:
+        conc = max(1, conc // 2)
+        qmax = max(32, qmax // 2)
+        idx_qmax = max(1024, idx_qmax)
+        flush_every = max(12, flush_every)
+        flush_interval = max(0.3, flush_interval)
+
+    return {
+        "page_result_concurrency": conc,
+        "page_queue_maxsize": qmax,
+        "url_index_flush_every": flush_every,
+        "url_index_flush_interval_sec": flush_interval,
+        "url_index_queue_maxsize": idx_qmax,
+    }
+
+
 async def crawl_company(
     company: Company,
     *,
@@ -619,7 +596,7 @@ async def crawl_company(
     url_index_flush_every: int = 64,
     url_index_flush_interval_sec: float = 1.0,
     url_index_queue_maxsize: int = 2048,
-    # --- stall prevention ---
+    # --- stall prevention (new) ---
     touch_cb: Optional[Any] = None,
     arun_init_timeout_sec: float = 90.0,
     stream_no_yield_timeout_sec: float = 150.0,
@@ -688,7 +665,7 @@ async def crawl_company(
                 except Exception:
                     pass
 
-            # ---- arun init timeout
+            # ---- arun init timeout (new)
             try:
                 _touch(touch_cb, company.company_id)
                 results_or_gen = await asyncio.wait_for(
@@ -859,8 +836,10 @@ async def run_company_pipeline(
     page_interaction_factory: PageInteractionFactory,
     page_timeout_ms: Optional[int],
     enable_malloc_trim: bool,
-    # --- stall prevention ---
+    # --- stall prevention (new) ---
     touch_cb: Optional[Any] = None,
+    # --- moderate OOM protection (new) ---
+    scheduler: Optional[AdaptiveScheduler] = None,
 ) -> bool:
     completed_ok = False
     token: Optional[Any] = None
@@ -948,6 +927,9 @@ async def run_company_pipeline(
             )
             submit_timeout_sec = float(getattr(args, "submit_timeout_sec", 30.0))
 
+            # Moderate OOM protection: tune per-company buffering only when memory is hot.
+            tuned = _tune_page_pipeline_params(args=args, scheduler=scheduler)
+
             last_err: Optional[BaseException] = None
             for attempt in range(2):
                 try:
@@ -969,19 +951,15 @@ async def run_company_pipeline(
                             page_interaction_factory=page_interaction_factory,
                             page_timeout_ms=page_timeout_ms,
                             page_result_concurrency=int(
-                                getattr(args, "page_result_concurrency", 6)
+                                tuned["page_result_concurrency"]
                             ),
-                            page_queue_maxsize=int(
-                                getattr(args, "page_queue_maxsize", 64)
-                            ),
-                            url_index_flush_every=int(
-                                getattr(args, "url_index_flush_every", 24)
-                            ),
+                            page_queue_maxsize=int(tuned["page_queue_maxsize"]),
+                            url_index_flush_every=int(tuned["url_index_flush_every"]),
                             url_index_flush_interval_sec=float(
-                                getattr(args, "url_index_flush_interval_sec", 0.5)
+                                tuned["url_index_flush_interval_sec"]
                             ),
                             url_index_queue_maxsize=int(
-                                getattr(args, "url_index_queue_maxsize", 2048)
+                                tuned["url_index_queue_maxsize"]
                             ),
                             touch_cb=touch_cb,
                             arun_init_timeout_sec=arun_init_timeout_sec,
@@ -1043,7 +1021,6 @@ async def run_company_pipeline(
         cancelled_exc = e
         raise
     except CriticalMemoryPressure:
-        # propagate so main loop marks + scheduler reacts
         raise
     except Exception:
         logger.exception(
@@ -1182,7 +1159,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument("--url-index-flush-interval-sec", type=float, default=0.5)
     parser.add_argument("--url-index-queue-maxsize", type=int, default=2048)
 
-    # Crawler pool (OOM safety defaults: fewer browsers, faster recycle)
+    # Crawler pool
     parser.add_argument(
         "--crawler-pool-size",
         type=int,
@@ -1192,11 +1169,39 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--crawler-recycle-after",
         type=int,
-        default=8,
+        default=20,
         help="Recycle a crawler instance after N companies.",
     )
 
-    # Stall prevention timeouts
+    # Moderate admission smoothing (prevents burst ramps)
+    parser.add_argument(
+        "--max-start-per-tick",
+        type=int,
+        default=3,
+        help="Upper bound of new company tasks started per main loop tick (anti-burst).",
+    )
+
+    # Idle crawler recycle under sustained memory pressure (no cancels)
+    parser.add_argument(
+        "--idle-recycle-interval-sec",
+        type=float,
+        default=25.0,
+        help="Minimum interval between recycling one idle crawler slot under memory pressure.",
+    )
+    parser.add_argument(
+        "--idle-recycle-raw-frac",
+        type=float,
+        default=0.88,
+        help="Recycle one idle crawler if used_frac_raw >= this threshold.",
+    )
+    parser.add_argument(
+        "--idle-recycle-eff-frac",
+        type=float,
+        default=0.83,
+        help="Recycle one idle crawler if used_frac_eff >= this threshold.",
+    )
+
+    # Stall prevention timeouts (new)
     parser.add_argument("--crawler-lease-timeout-sec", type=float, default=120.0)
     parser.add_argument("--arun-init-timeout-sec", type=float, default=90.0)
     parser.add_argument("--stream-no-yield-timeout-sec", type=float, default=150.0)
@@ -1207,13 +1212,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         "--enable-malloc-trim",
         action="store_true",
         help="Call malloc_trim(0) after each company finalize (Linux/glibc only).",
-    )
-
-    # OOM-guard: when we get SIGTERM (scheduler memory kill), kill descendants immediately
-    parser.add_argument(
-        "--kill-children-on-sigterm",
-        action="store_true",
-        help="On SIGTERM, aggressively terminate/kill this process's descendants to free memory quickly (recommended for avoiding kernel OOM-kill).",
     )
 
     return parser.parse_args(list(argv) if argv is not None else None)
@@ -1370,23 +1368,9 @@ async def main_async(args: argparse.Namespace) -> None:
     stop_event = asyncio.Event()
     restart_due_to_scheduler = False
 
-    # emergency child-kill scheduling (avoid duplicates)
-    _kill_children_scheduled = False
-
-    def _schedule_kill_children(reason: str) -> None:
-        nonlocal _kill_children_scheduled
-        if _kill_children_scheduled:
-            return
-        _kill_children_scheduled = True
-        asyncio.create_task(
-            _kill_own_descendants_async(reason=reason), name="oom-guard-kill-children"
-        )
-
     def _on_sigterm() -> None:
         stop_event.set()
         logger.error("[Signal] SIGTERM received; requesting graceful shutdown.")
-        if bool(getattr(args, "kill_children_on_sigterm", False)):
-            _schedule_kill_children("sigterm")
 
     def _on_sigint() -> None:
         stop_event.set()
@@ -1419,13 +1403,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 "Inflight tasks did not cancel within timeout; forcing exit."
             )
             if hard_exit_code is not None:
-                if bool(getattr(args, "kill_children_on_sigterm", False)):
-                    try:
-                        await _kill_own_descendants_async(
-                            reason="hard_exit_cancel_timeout"
-                        )
-                    except Exception:
-                        pass
                 os._exit(int(hard_exit_code))  # noqa: S606
         finally:
             inflight_by_cid.clear()
@@ -1551,7 +1528,7 @@ async def main_async(args: argparse.Namespace) -> None:
         )
         await crawler_pool.start()
 
-        # ---- Adaptive scheduler (OOM-guard tuned defaults live in AdaptiveSchedulingConfig)
+        # ---- Adaptive scheduler (<=5 minutes inactivity/action)
         scheduler_cfg = AdaptiveSchedulingConfig(
             log_path=out_dir / "adaptive_scheduling_state.jsonl",
             heartbeat_path=out_dir / "heartbeat.json",
@@ -1587,6 +1564,14 @@ async def main_async(args: argparse.Namespace) -> None:
 
         enable_malloc_trim: bool = bool(getattr(args, "enable_malloc_trim", False))
 
+        max_start_per_tick = max(1, int(getattr(args, "max_start_per_tick", 3)))
+        idle_recycle_interval_sec = float(
+            getattr(args, "idle_recycle_interval_sec", 25.0)
+        )
+        idle_recycle_raw_frac = float(getattr(args, "idle_recycle_raw_frac", 0.88))
+        idle_recycle_eff_frac = float(getattr(args, "idle_recycle_eff_frac", 0.83))
+        last_idle_recycle_mono = 0.0
+
         while ready or inflight_by_cid:
             if stop_event.is_set():
                 if scheduler is not None and scheduler.restart_recommended:
@@ -1609,6 +1594,28 @@ async def main_async(args: argparse.Namespace) -> None:
                 )
                 break
 
+            # Moderate OOM protection: recycle ONE idle crawler under sustained pressure.
+            if (
+                scheduler is not None
+                and crawler_pool is not None
+                and (time.monotonic() - last_idle_recycle_mono)
+                >= idle_recycle_interval_sec
+            ):
+                try:
+                    snap = scheduler.get_state_snapshot()
+                    used_raw = float(snap.get("used_frac_raw", 0.0) or 0.0)
+                    used_eff = float(snap.get("used_frac", 0.0) or 0.0)
+                    if (used_raw >= idle_recycle_raw_frac) or (
+                        used_eff >= idle_recycle_eff_frac
+                    ):
+                        restarted = await crawler_pool.recycle_idle_now(
+                            1, reason="mem_pressure_idle_recycle"
+                        )
+                        if restarted > 0:
+                            last_idle_recycle_mono = time.monotonic()
+                except Exception:
+                    pass
+
             active = len(inflight_by_cid)
             capacity = max(0, hard_max - active)
 
@@ -1620,15 +1627,12 @@ async def main_async(args: argparse.Namespace) -> None:
                         slots, await scheduler.admissible_slots(num_waiting=want)
                     )
 
-                # IMPORTANT: do not enqueue new work if no crawler is available
                 if crawler_pool is not None:
                     free_crawlers = crawler_pool.free_slots_approx()
-                    if free_crawlers <= 0:
-                        slots = 0
-                    else:
-                        slots = min(slots, free_crawlers * 3)
+                    slots = min(slots, max(1, free_crawlers * 3))
 
                 to_start = min(slots, capacity, want)
+                to_start = min(to_start, max_start_per_tick)  # anti-burst
 
                 for _ in range(to_start):
                     cid = ready.popleft()
@@ -1660,6 +1664,7 @@ async def main_async(args: argparse.Namespace) -> None:
                             page_timeout_ms=page_timeout_ms,
                             enable_malloc_trim=enable_malloc_trim,
                             touch_cb=touch_cb,
+                            scheduler=scheduler,
                         ),
                         name=f"company-{cid}",
                     )

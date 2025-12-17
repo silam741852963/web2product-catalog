@@ -32,56 +32,41 @@ _MB = 1_000_000
 @dataclass
 class AdaptiveSchedulingConfig:
     """
-    Scheduling + OOM safety:
-    - Tracks BOTH:
-        * effective memory (cgroup current - inactive_file) for admission
-        * raw memory (cgroup current) which correlates with kernel OOM risk
-    - Adds process-tree memory ("proc") guardrails:
-        * proc_frac (proc_rss / total_limit)
-        * proc ramp (MB/s) to catch runaway Chromium growth early
-    - Adds stall detection and hard watchdog.
+    Scheduling + safety:
+    - Uses effective cgroup memory when available (cgroup v2: current - inactive_file)
+    - ALSO tracks raw cgroup usage (OOM cares about raw)
+    - Adds memory ramp protection
+    - Adds admission smoothing (anti-burst)
+    - Adds stall detection:
+        * per-company inactivity -> cancel
+        * admission starvation (ready>0, active==0, no admission) -> restart
+        * periodic log while blocked -> no silent stall
     """
 
-    # -----------------------------
-    # Effective memory watermarks
-    # -----------------------------
-    mem_cap_frac: float = 0.75
-    mem_high_frac: float = 0.80
-    mem_crit_frac: float = 0.88
+    # Effective memory watermarks (fractions of effective limit)
+    mem_cap_frac: float = 0.78
+    mem_high_frac: float = 0.83
+    mem_crit_frac: float = 0.90
 
-    # -----------------------------
-    # Raw cgroup usage fractions
-    # (OOM cares about raw, but cache can be reclaimable => we combine signals)
-    # -----------------------------
-    mem_high_raw_frac: float = 0.85
-    mem_crit_raw_frac: float = 0.90
-    mem_kill_raw_frac: float = 0.94  # earlier than OOM zone
+    # Raw (non-subtracted) cgroup usage fractions (what OOM cares about)
+    mem_high_raw_frac: float = 0.88
+    mem_crit_raw_frac: float = 0.92
+    mem_kill_raw_frac: float = (
+        0.96  # if exceeded -> recommend restart (+ optional SIGTERM)
+    )
 
-    # -----------------------------
-    # Memory ramp detection (%/sec)
-    # -----------------------------
+    # Memory ramp detection (fractions per second)
     mem_ramp_window_sec: float = 3.0
-    mem_ramp_high_frac_per_sec: float = 0.015
-    mem_ramp_crit_frac_per_sec: float = 0.025
-    mem_ramp_kill_frac_per_sec: float = 0.040
+    mem_ramp_high_frac_per_sec: float = 0.020
+    mem_ramp_crit_frac_per_sec: float = 0.030
+    mem_ramp_kill_frac_per_sec: float = 0.050
 
-    # -----------------------------
-    # Process-tree guard (proc = this process + descendants)
-    # Fractions of total limit
-    # -----------------------------
-    proc_high_frac: float = 0.65
-    proc_crit_frac: float = 0.72
-    proc_kill_frac: float = 0.80
+    # Admission smoothing (NEW): prevents bursty starts that cause rapid ramps.
+    max_admit_per_call: int = 3
+    ramp_admit_guard_frac_per_sec: float = 0.012
+    max_admit_per_call_when_ramping: int = 1
 
-    # Process-tree ramp (MB/s) - catches runaway Chromium before raw hits 95%+
-    proc_ramp_window_sec: float = 3.0
-    proc_ramp_high_mb_per_sec: float = 25.0
-    proc_ramp_crit_mb_per_sec: float = 45.0
-    proc_ramp_kill_mb_per_sec: float = 70.0
-
-    # -----------------------------
-    # Estimation (based on proc tree memory by default)
-    # -----------------------------
+    # Estimation (based on process-tree memory by default)
     per_company_min_mb: float = 256.0
     per_company_max_mb: float = 1024.0
     per_company_safety_factor: float = 1.30
@@ -96,17 +81,16 @@ class AdaptiveSchedulingConfig:
     ai_step: int = 1
     md_factor: float = 0.50
 
-    # Emergency cancellation
-    min_active_keep: int = 0
-    emergency_cancel_max: int = 4
-    emergency_cancel_cooldown_sec: float = 2.0
+    # Emergency cancellation (MODERATE DEFAULTS)
+    # - keep at least 1 active whenever possible
+    # - cancel at most 1 company per emergency window
+    min_active_keep: int = 1
+    emergency_cancel_max: int = 1
+    emergency_cancel_cooldown_sec: float = 8.0
 
-    # Restart gating (general)
+    # Restart gating
     restart_gate_min_uptime_sec: float = 180.0
     restart_gate_min_completed: int = 3
-
-    # Restart gating (memory kill only) – allow earlier restart when clearly in danger
-    restart_gate_memory_min_uptime_sec: float = 30.0
 
     # --- Stall detection (<= 5 minutes default) ---
     company_inactivity_timeout_sec: float = 240.0
@@ -136,7 +120,7 @@ class AdaptiveSchedulingConfig:
     prefer_cgroup_limits: bool = True
     use_psutil: bool = True
 
-    # subtract reclaimable cache from cgroup usage (effective admission)
+    # Important: subtract reclaimable cache from cgroup usage (prevents stalls)
     cgroup_subtract_inactive_file: bool = True
 
     # Use process-tree memory for estimator baseline/EMA (better than system used)
@@ -184,13 +168,6 @@ class AdaptiveScheduler:
 
         # Process tree memory (USS-first)
         self._proc_rss_bytes: int = 0
-        self._proc_frac: float = 0.0
-
-        # Process ramp (MB/s)
-        self._proc_hist: Deque[Tuple[float, int]] = deque(
-            maxlen=256
-        )  # (mono, proc_bytes)
-        self._proc_ramp_mb_per_sec: float = 0.0
 
         # Estimator (MB)
         self._per_company_est_mb: float = cfg.per_company_min_mb
@@ -247,9 +224,6 @@ class AdaptiveScheduler:
     def restart_recommended(self) -> bool:
         return self._restart_recommended
 
-    # -----------------------------
-    # company activity touch
-    # -----------------------------
     def touch_company(self, company_id: str) -> None:
         if not company_id:
             return
@@ -279,15 +253,10 @@ class AdaptiveScheduler:
         self._used_frac_raw = (float(used_raw) / float(total)) if total > 0 else 0.0
 
         self._proc_rss_bytes = self._read_process_tree_rss_bytes()
-        self._proc_frac = (
-            (float(self._proc_rss_bytes) / float(total)) if total > 0 else 0.0
-        )
-
         self._last_sample_ts = time.time()
 
         now_mono = time.monotonic()
         self._update_ramp_locked(now_mono, self._used_frac, self._used_frac_raw)
-        self._update_proc_ramp_locked(now_mono, self._proc_rss_bytes)
 
         self._watchdog_task = asyncio.create_task(
             self._watchdog_loop(), name="adaptive-scheduling-watchdog"
@@ -332,13 +301,11 @@ class AdaptiveScheduler:
             return
         self._last_block_log_mono = now_mono
         logger.warning(
-            "[AdaptiveScheduling] admission blocked reason=%s used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s proc=%.3f proc_ramp=%.1fMB/s active=%d waiting=%d proc_mem_mb=%.1f",
+            "[AdaptiveScheduling] admission blocked reason=%s used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s active=%d waiting=%d proc_mem_mb=%.1f",
             reason,
             self._used_frac_raw,
             self._used_frac,
             self._ramp_raw_frac_per_sec,
-            self._proc_frac,
-            self._proc_ramp_mb_per_sec,
             active_n,
             waiting,
             float(self._proc_rss_bytes) / _MB if self._proc_rss_bytes else 0.0,
@@ -372,25 +339,17 @@ class AdaptiveScheduler:
 
             self._update_target_parallel_locked(active_n)
 
-            # Process guard blocks first (runaway Chromium)
-            if self._proc_frac >= float(self.cfg.proc_high_frac):
-                self._maybe_log_block("block_proc_high", active_n, num_waiting)
-                return 0
-            if active_n > 0 and self._proc_ramp_mb_per_sec >= float(
-                self.cfg.proc_ramp_high_mb_per_sec
-            ):
-                self._maybe_log_block("block_proc_ramp_high", active_n, num_waiting)
-                return 0
-
-            # Raw / ramp blocks
+            # Block conditions (log periodically to avoid silent stall)
             if self._used_frac_raw >= float(self.cfg.mem_high_raw_frac):
                 self._maybe_log_block("block_mem_high_raw", active_n, num_waiting)
                 return 0
+
             if active_n > 0 and self._ramp_raw_frac_per_sec >= float(
                 self.cfg.mem_ramp_high_frac_per_sec
             ):
                 self._maybe_log_block("block_mem_ramp_high", active_n, num_waiting)
                 return 0
+
             if self._used_frac >= float(self.cfg.mem_high_frac):
                 self._maybe_log_block("block_mem_high_eff", active_n, num_waiting)
                 return 0
@@ -426,6 +385,17 @@ class AdaptiveScheduler:
                     slots = 1
 
             slots = max(0, int(slots))
+
+            # ---- NEW: anti-burst admission smoothing
+            # Limit how many NEW companies can start per loop iteration.
+            slots = min(slots, max(1, int(self.cfg.max_admit_per_call)))
+            if active_n > 0 and self._ramp_raw_frac_per_sec >= float(
+                self.cfg.ramp_admit_guard_frac_per_sec
+            ):
+                slots = min(
+                    slots, max(1, int(self.cfg.max_admit_per_call_when_ramping))
+                )
+
             if slots > 0:
                 self._ever_admitted = True
                 self._mark_progress()
@@ -440,8 +410,6 @@ class AdaptiveScheduler:
                         "used_frac": self._used_frac,
                         "used_frac_raw": self._used_frac_raw,
                         "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
-                        "proc_frac": self._proc_frac,
-                        "proc_ramp_mb_per_sec": self._proc_ramp_mb_per_sec,
                         "per_company_est_mb": self._per_company_est_mb,
                         "proc_mem_mb": float(self._proc_rss_bytes) / _MB
                         if self._proc_rss_bytes
@@ -467,8 +435,6 @@ class AdaptiveScheduler:
             "proc_mem_mb": float(self._proc_rss_bytes) / _MB
             if self._proc_rss_bytes
             else 0.0,
-            "proc_frac": self._proc_frac,
-            "proc_ramp_mb_per_sec": self._proc_ramp_mb_per_sec,
             "per_company_est_mb": self._per_company_est_mb,
             "target_parallel": self._target_parallel,
             "completed_counter": self._completed_counter,
@@ -516,8 +482,6 @@ class AdaptiveScheduler:
                 "used_frac": self._used_frac,
                 "used_frac_raw": self._used_frac_raw,
                 "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
-                "proc_frac": self._proc_frac,
-                "proc_ramp_mb_per_sec": self._proc_ramp_mb_per_sec,
                 "target_parallel": self._target_parallel,
                 "proc_mem_mb": float(self._proc_rss_bytes) / _MB
                 if self._proc_rss_bytes
@@ -548,8 +512,8 @@ class AdaptiveScheduler:
     def _read_cgroup_memory_bytes(self) -> Tuple[int, int, int]:
         """
         Returns (limit_bytes, used_effective_bytes, used_raw_bytes)
-          - used_raw is memory.current/usage_in_bytes
-          - used_effective subtracts inactive_file
+          - used_raw is memory.current/usage_in_bytes (what OOM cares about)
+          - used_effective subtracts inactive_file (better for admission)
         """
         try:
             base = Path("/sys/fs/cgroup")
@@ -680,25 +644,6 @@ class AdaptiveScheduler:
         self._ramp_eff_frac_per_sec = float(eff1 - eff0) / dt
         self._ramp_raw_frac_per_sec = float(raw1 - raw0) / dt
 
-    def _update_proc_ramp_locked(self, now_mono: float, proc_bytes: int) -> None:
-        window = max(0.5, float(self.cfg.proc_ramp_window_sec))
-        self._proc_hist.append((now_mono, int(proc_bytes)))
-        while self._proc_hist and (now_mono - self._proc_hist[0][0]) > window:
-            self._proc_hist.popleft()
-
-        if len(self._proc_hist) < 2:
-            self._proc_ramp_mb_per_sec = 0.0
-            return
-
-        t0, b0 = self._proc_hist[0]
-        t1, b1 = self._proc_hist[-1]
-        dt = float(t1 - t0)
-        if dt <= 1e-3:
-            self._proc_ramp_mb_per_sec = 0.0
-            return
-
-        self._proc_ramp_mb_per_sec = float(b1 - b0) / dt / _MB
-
     def _sample_memory_locked(self, now: float) -> None:
         total, used_eff, used_raw = self._read_memory_usage_bytes()
         if total > 0:
@@ -715,12 +660,6 @@ class AdaptiveScheduler:
             self._update_ramp_locked(now_mono, self._used_frac, self._used_frac_raw)
 
         self._proc_rss_bytes = self._read_process_tree_rss_bytes()
-        self._proc_frac = (
-            (float(self._proc_rss_bytes) / float(self._total_mem_bytes))
-            if self._total_mem_bytes > 0
-            else 0.0
-        )
-        self._update_proc_ramp_locked(time.monotonic(), self._proc_rss_bytes)
 
     # ------------------------------------------------------------------
     # Estimators + AIMD
@@ -787,18 +726,9 @@ class AdaptiveScheduler:
         cfg = self.cfg
         old = self._target_parallel
 
-        # Backoff if any strong pressure signal
-        strong_pressure = (
-            self._used_frac_raw >= float(cfg.mem_high_raw_frac)
-            or self._used_frac >= float(cfg.mem_high_frac)
-            or self._proc_frac >= float(cfg.proc_high_frac)
-            or (
-                active_n > 0
-                and self._proc_ramp_mb_per_sec >= float(cfg.proc_ramp_high_mb_per_sec)
-            )
-        )
-
-        if strong_pressure:
+        if self._used_frac_raw >= float(
+            cfg.mem_high_raw_frac
+        ) or self._used_frac >= float(cfg.mem_high_frac):
             new = int(
                 max(cfg.min_target, max(1, int(float(old) * float(cfg.md_factor))))
             )
@@ -814,14 +744,12 @@ class AdaptiveScheduler:
 
         if self._target_parallel != old and logger.isEnabledFor(logging.INFO):
             logger.info(
-                "[AdaptiveScheduling] target_parallel %d -> %d (used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s proc=%.3f proc_ramp=%.1fMB/s active=%d proc_mem_mb=%.1f)",
+                "[AdaptiveScheduling] target_parallel %d -> %d (used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s active=%d proc_mem_mb=%.1f)",
                 old,
                 self._target_parallel,
                 self._used_frac_raw,
                 self._used_frac,
                 self._ramp_raw_frac_per_sec,
-                self._proc_frac,
-                self._proc_ramp_mb_per_sec,
                 active_n,
                 float(self._proc_rss_bytes) / _MB if self._proc_rss_bytes else 0.0,
             )
@@ -845,7 +773,7 @@ class AdaptiveScheduler:
     # ------------------------------------------------------------------
     # Restart gating
     # ------------------------------------------------------------------
-    def _can_recommend_restart_general(self) -> bool:
+    def _can_recommend_restart(self) -> bool:
         uptime = max(0.0, time.time() - self._started_ts)
         if uptime < float(self.cfg.restart_gate_min_uptime_sec):
             return False
@@ -855,13 +783,6 @@ class AdaptiveScheduler:
             self._ever_admitted or self._ever_had_active or self._completed_counter > 0
         ):
             return False
-        return True
-
-    def _can_recommend_restart_memory(self) -> bool:
-        uptime = max(0.0, time.time() - self._started_ts)
-        if uptime < float(self.cfg.restart_gate_memory_min_uptime_sec):
-            return False
-        # for memory kill, allow even before completions
         return True
 
     # ------------------------------------------------------------------
@@ -911,7 +832,7 @@ class AdaptiveScheduler:
                     for cid in active_ids:
                         self._company_last_touch_mono.setdefault(cid, now_mono)
 
-                    # 1) Per-company inactivity cancel
+                    # 1) Per-company inactivity cancel (<= 5 minutes)
                     if self.cfg.company_inactivity_timeout_sec > 0 and active_n > 0:
                         stuck: List[str] = []
                         for cid in active_ids:
@@ -930,28 +851,14 @@ class AdaptiveScheduler:
                             )
                             cancel_ids = list(stuck)
 
-                    # Helper: interpret "danger" combining raw+eff+proc
-                    eff_high = self._used_frac >= float(self.cfg.mem_high_frac)
-                    raw_high = self._used_frac_raw >= float(self.cfg.mem_high_raw_frac)
-                    raw_crit = self._used_frac_raw >= float(self.cfg.mem_crit_raw_frac)
-                    proc_high = self._proc_frac >= float(self.cfg.proc_high_frac)
-                    proc_crit = self._proc_frac >= float(self.cfg.proc_crit_frac)
-
-                    ramp_raw_crit = self._ramp_raw_frac_per_sec >= float(
-                        self.cfg.mem_ramp_crit_frac_per_sec
-                    )
-                    ramp_proc_crit = self._proc_ramp_mb_per_sec >= float(
-                        self.cfg.proc_ramp_crit_mb_per_sec
-                    )
-
-                    # 2) No-progress -> recommend restart (general gating)
+                    # 2) No-progress -> recommend restart (<= 5 minutes)
                     if self.cfg.no_progress_timeout_sec > 0:
                         prog_age = time.monotonic() - self._last_progress_mono
                         if (
                             prog_age >= float(self.cfg.no_progress_timeout_sec)
                             and self._last_num_waiting > 0
                         ):
-                            if self._can_recommend_restart_general():
+                            if self._can_recommend_restart():
                                 self._restart_recommended = True
                                 logger.error(
                                     "[AdaptiveScheduling] no progress for %.1fs with waiting=%d -> restart recommended",
@@ -964,22 +871,24 @@ class AdaptiveScheduler:
                                         int(self.cfg.hard_watchdog_kill_signal),
                                     )
 
-                    # 3) Admission starvation -> restart (general gating), only if pressure persists
+                    # 3) Admission starvation -> restart (<= 5 minutes), only if mem stuck high
                     if self.cfg.admission_starvation_timeout_sec > 0:
                         if active_n == 0 and self._last_num_waiting > 0:
                             starve_age = now_mono - self._last_admission_mono
                             if starve_age >= float(
                                 self.cfg.admission_starvation_timeout_sec
                             ):
-                                if raw_high or eff_high or proc_high:
-                                    if self._can_recommend_restart_general():
+                                if (
+                                    self._used_frac_raw
+                                    >= float(self.cfg.mem_high_raw_frac)
+                                ) or (self._used_frac >= float(self.cfg.mem_high_frac)):
+                                    if self._can_recommend_restart():
                                         self._restart_recommended = True
                                         logger.critical(
-                                            "[AdaptiveScheduling] admission starvation %.1fs with pressure (raw=%.3f eff=%.3f proc=%.3f) -> restart recommended",
+                                            "[AdaptiveScheduling] admission starvation %.1fs with mem high (used_raw=%.3f used_eff=%.3f) -> restart recommended",
                                             starve_age,
                                             self._used_frac_raw,
                                             self._used_frac,
-                                            self._proc_frac,
                                         )
                                         if self.cfg.kill_on_no_progress:
                                             os.kill(
@@ -987,52 +896,45 @@ class AdaptiveScheduler:
                                                 int(self.cfg.hard_watchdog_kill_signal),
                                             )
 
-                    # 4) HARD memory kill (memory gating: allow early)
-                    raw_kill = self._used_frac_raw >= float(self.cfg.mem_kill_raw_frac)
-                    proc_kill = self._proc_frac >= float(self.cfg.proc_kill_frac)
-                    ramp_raw_kill = self._ramp_raw_frac_per_sec >= float(
-                        self.cfg.mem_ramp_kill_frac_per_sec
-                    )
-                    ramp_proc_kill = self._proc_ramp_mb_per_sec >= float(
-                        self.cfg.proc_ramp_kill_mb_per_sec
-                    )
-
-                    # Avoid false positives when raw is high due to reclaimable cache:
-                    # require at least one "non-cache-ish" corroboration (eff_high or proc_high or ramps)
-                    corroborated_raw_kill = raw_kill and (
-                        eff_high or proc_high or ramp_raw_crit or ramp_proc_crit
-                    )
-
-                    if (
-                        proc_kill
-                        or ramp_proc_kill
-                        or corroborated_raw_kill
-                        or (ramp_raw_kill and raw_high)
-                    ) and not self._restart_recommended:
-                        if self._can_recommend_restart_memory():
+                    # Raw mem kill
+                    if self._used_frac_raw >= float(self.cfg.mem_kill_raw_frac):
+                        if self._can_recommend_restart():
                             self._restart_recommended = True
                             logger.critical(
-                                "[AdaptiveScheduling] MEMORY KILL -> restart recommended (raw=%.3f eff=%.3f ramp_raw=%.3f/s proc=%.3f proc_ramp=%.1fMB/s)",
+                                "[AdaptiveScheduling] raw mem %.3f >= kill %.3f -> restart recommended",
                                 self._used_frac_raw,
-                                self._used_frac,
-                                self._ramp_raw_frac_per_sec,
-                                self._proc_frac,
-                                self._proc_ramp_mb_per_sec,
+                                float(self.cfg.mem_kill_raw_frac),
                             )
                             if self.cfg.kill_on_no_progress:
                                 os.kill(
                                     os.getpid(), int(self.cfg.hard_watchdog_kill_signal)
                                 )
 
-                    # 5) Emergency cancel (earlier + proc-driven)
-                    ramp_trigger = (ramp_raw_crit and raw_high) or (
-                        ramp_proc_crit and proc_high
-                    )
+                    # Ramp kill
+                    if self._ramp_raw_frac_per_sec >= float(
+                        self.cfg.mem_ramp_kill_frac_per_sec
+                    ) and self._used_frac_raw >= float(self.cfg.mem_high_raw_frac):
+                        if self._can_recommend_restart():
+                            self._restart_recommended = True
+                            logger.critical(
+                                "[AdaptiveScheduling] mem ramp raw=%.3f/s with used_raw=%.3f (>=high %.3f) -> restart recommended",
+                                self._ramp_raw_frac_per_sec,
+                                self._used_frac_raw,
+                                float(self.cfg.mem_high_raw_frac),
+                            )
+                            if self.cfg.kill_on_no_progress:
+                                os.kill(
+                                    os.getpid(), int(self.cfg.hard_watchdog_kill_signal)
+                                )
+
+                    # Emergency cancel (memory danger) - MODERATE:
+                    # Only cancel as a last resort, and at most 1, leaving at least 1 active if possible.
                     crit_trigger = (
-                        raw_crit
-                        or (self._used_frac >= float(self.cfg.mem_crit_frac))
-                        or proc_crit
-                    )
+                        self._used_frac_raw >= float(self.cfg.mem_crit_raw_frac)
+                    ) or (self._used_frac >= float(self.cfg.mem_crit_frac))
+                    ramp_trigger = self._ramp_raw_frac_per_sec >= float(
+                        self.cfg.mem_ramp_crit_frac_per_sec
+                    ) and self._used_frac_raw >= float(self.cfg.mem_crit_raw_frac)
 
                     if (
                         (crit_trigger or ramp_trigger)
@@ -1055,12 +957,10 @@ class AdaptiveScheduler:
                                 self._last_emergency_cancel_ts = now
 
                                 logger.error(
-                                    "[AdaptiveScheduling] EMERGENCY used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s proc=%.3f proc_ramp=%.1fMB/s total_mb=%.1f used_raw_mb=%.1f used_eff_mb=%.1f proc_mem_mb=%.1f active=%d cancel=%s",
+                                    "[AdaptiveScheduling] EMERGENCY used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s total_mb=%.1f used_raw_mb=%.1f used_eff_mb=%.1f proc_mem_mb=%.1f active=%d cancel=%s",
                                     self._used_frac_raw,
                                     self._used_frac,
                                     self._ramp_raw_frac_per_sec,
-                                    self._proc_frac,
-                                    self._proc_ramp_mb_per_sec,
                                     float(self._total_mem_bytes) / _MB,
                                     float(self._used_bytes_raw) / _MB,
                                     float(self._used_bytes) / _MB,
@@ -1078,8 +978,6 @@ class AdaptiveScheduler:
                                         "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
                                         "used_frac_raw": self._used_frac_raw,
                                         "used_frac": self._used_frac,
-                                        "proc_frac": self._proc_frac,
-                                        "proc_ramp_mb_per_sec": self._proc_ramp_mb_per_sec,
                                     },
                                 )
 
@@ -1189,8 +1087,6 @@ class AdaptiveScheduler:
             "ramp_eff_frac_per_sec": self._ramp_eff_frac_per_sec,
             "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
             "proc_mem_bytes": self._proc_rss_bytes,
-            "proc_frac": self._proc_frac,
-            "proc_ramp_mb_per_sec": self._proc_ramp_mb_per_sec,
             "per_company_est_mb": self._per_company_est_mb,
             "target_parallel": self._target_parallel,
             "completed_counter": self._completed_counter,
