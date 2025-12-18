@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from configs.llm import parse_extracted_payload, parse_presence_result
+from configs.llm import call_llm_extract, parse_extracted_payload, parse_presence_result
 from extensions.crawl_state import (
     get_crawl_state,
     load_url_index,
@@ -17,36 +18,67 @@ from extensions.output_paths import save_stage_output
 logger = logging.getLogger("llm_passes")
 
 
+def _read_text(path: str) -> Optional[str]:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+
+def _md_debug_stats(url: str, md_path: str, text: str) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    import hashlib
+
+    ss = " ".join((text or "").split())
+    sha1 = hashlib.sha1(ss.encode("utf-8", errors="ignore")).hexdigest()
+
+    head = ss[:260] + ("…" if len(ss) > 260 else "")
+    tail = ("…" if len(ss) > 260 else "") + ss[-260:]
+
+    logger.debug(
+        "[llm_passes] md_stats url=%s md_path=%s text_len=%d sha1=%s head=%s tail=%s",
+        url,
+        md_path,
+        len(ss),
+        sha1,
+        head,
+        tail,
+    )
+
+
+def _save_raw_stage(company_id: str, url: str, raw: Any, stage: str) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    try:
+        if isinstance(raw, (dict, list)):
+            data = json.dumps(raw, ensure_ascii=False)
+        else:
+            data = str(raw)
+        save_stage_output(bvdid=company_id, url=url, data=data, stage=stage)
+    except Exception as e:
+        logger.debug(
+            "[llm_passes] raw_save_failed stage=%s url=%s err=%s", stage, url, e
+        )
+
+
 # ---------------------------------------------------------------------------
-# LLM presence second pass
+# Presence pass
 # ---------------------------------------------------------------------------
 
 
 async def run_presence_pass_for_company(
-    company: Any,
-    *,
-    presence_strategy: Any,
+    company: Any, *, presence_strategy: Any
 ) -> None:
-    """
-    LLM presence pass for a single company.
-
-    - Enumerates pending URLs for LLM presence.
-    - Reads markdown for each.
-    - Calls presence_strategy.extract(url, text) in a thread.
-    - Parses result with parse_presence_result.
-    - Updates url_index entries and recomputes company state.
-    """
     state = get_crawl_state()
     pending_urls = await state.get_pending_urls_for_llm(company.company_id)
+
     if not pending_urls:
         logger.info(
-            "LLM presence: no pending URLs for company_id=%s",
-            company.company_id,
+            "LLM presence: no pending URLs for company_id=%s", company.company_id
         )
         await state.recompute_company_from_index(
-            company.company_id,
-            name=None,
-            root_url=company.domain_url,
+            company.company_id, name=None, root_url=company.domain_url
         )
         return
 
@@ -64,7 +96,7 @@ async def run_presence_pass_for_company(
         patch_full = {
             "presence": 0,
             "presence_checked": True,
-            "status": "llm_extracted_empty",
+            "status": "llm_presence_empty",
             "llm_presence_reason": reason,
         }
         patch_full.update(patch)
@@ -76,17 +108,16 @@ async def run_presence_pass_for_company(
         md_path = ent.get("markdown_path")
 
         if not md_path:
-            _update(url, {}, "no_markdown")
+            _update(url, {}, "no_markdown_path")
             continue
 
-        try:
-            text = Path(md_path).read_text(encoding="utf-8")
-        except Exception as e:
+        text = _read_text(md_path)
+        if text is None:
             logger.error(
-                "LLM presence: failed reading markdown for %s (company=%s): %s",
+                "LLM presence: failed reading markdown url=%s company=%s path=%s",
                 url,
                 company.company_id,
-                e,
+                md_path,
             )
             _update(url, {}, "markdown_read_error")
             continue
@@ -95,32 +126,49 @@ async def run_presence_pass_for_company(
             _update(url, {}, "empty_markdown")
             continue
 
+        _md_debug_stats(url, md_path, text)
+
+        t0 = time.perf_counter()
         try:
-            raw_result = await asyncio.to_thread(presence_strategy.extract, url, text)
+            raw_result = await asyncio.to_thread(
+                call_llm_extract, presence_strategy, url, text, kind="presence"
+            )
         except Exception as e:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
             logger.exception(
-                "LLM presence: error for %s (company=%s): %s",
+                "LLM presence: extract error url=%s company=%s elapsed_ms=%.1f err=%s",
                 url,
                 company.company_id,
+                elapsed_ms,
                 e,
             )
             await state.mark_url_failed(
-                company.company_id,
-                url,
-                f"presence_error:{type(e).__name__}",
+                company.company_id, url, f"presence_error:{type(e).__name__}"
             )
             _update(url, {}, "presence_exception")
             continue
 
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        _save_raw_stage(company.company_id, url, raw_result, stage="llm_presence_raw")
+
         has_offering, confidence, preview = parse_presence_result(
-            raw_result,
-            default=False,
+            raw_result, default=False
         )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[llm_passes] presence_result url=%s elapsed_ms=%.1f has=%s conf=%s preview=%s",
+                url,
+                elapsed_ms,
+                has_offering,
+                confidence,
+                preview,
+            )
 
         patch: Dict[str, Any] = {
             "presence": 1 if has_offering else 0,
             "presence_checked": True,
-            "status": "llm_extracted" if has_offering else "llm_extracted_empty",
+            "status": "llm_presence_yes" if has_offering else "llm_presence_no",
         }
         if confidence is not None:
             patch["llm_presence_confidence"] = confidence
@@ -131,44 +179,23 @@ async def run_presence_pass_for_company(
         updated += 1
 
     logger.info(
-        "LLM presence: updated %d URLs for company_id=%s",
-        updated,
-        company.company_id,
+        "LLM presence: updated %d URLs for company_id=%s", updated, company.company_id
     )
-
     await state.recompute_company_from_index(
-        company.company_id,
-        name=None,
-        root_url=company.domain_url,
+        company.company_id, name=None, root_url=company.domain_url
     )
 
 
 # ---------------------------------------------------------------------------
-# LLM full extraction second pass
+# Full extraction pass
 # ---------------------------------------------------------------------------
 
 
-async def run_full_pass_for_company(
-    company: Any,
-    *,
-    full_strategy: Any,
-) -> None:
-    """
-    LLM full extraction pass for a single company.
-
-    - Iterates url_index.
-    - For each markdown that is not yet extracted:
-      - reads markdown
-      - calls full_strategy.extract(url, text) in a thread
-      - parses payload with parse_extracted_payload
-      - writes product JSON with save_stage_output
-      - updates url_index entry
-    """
+async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None:
     index = load_url_index(company.company_id)
     if not isinstance(index, dict) or not index:
         logger.info(
-            "LLM full: no url_index entries for company_id=%s",
-            company.company_id,
+            "LLM full: no url_index entries for company_id=%s", company.company_id
         )
         return
 
@@ -179,17 +206,18 @@ async def run_full_pass_for_company(
             continue
 
         md_path = ent.get("markdown_path")
-        if not md_path or ent.get("extracted"):
+        if not md_path:
+            continue
+        if ent.get("extracted"):
             continue
 
-        try:
-            text = Path(md_path).read_text(encoding="utf-8")
-        except Exception as e:
+        text = _read_text(md_path)
+        if text is None:
             logger.error(
-                "LLM full: failed reading markdown for %s (company=%s): %s",
+                "LLM full: failed reading markdown url=%s company=%s path=%s",
                 url,
                 company.company_id,
-                e,
+                md_path,
             )
             upsert_url_index_entry(
                 company.company_id,
@@ -211,13 +239,20 @@ async def run_full_pass_for_company(
             )
             continue
 
+        _md_debug_stats(url, md_path, text)
+
+        t0 = time.perf_counter()
         try:
-            raw_result = await asyncio.to_thread(full_strategy.extract, url, text)
+            raw_result = await asyncio.to_thread(
+                call_llm_extract, full_strategy, url, text, kind="full"
+            )
         except Exception as e:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
             logger.exception(
-                "LLM full: error for %s (company=%s): %s",
+                "LLM full: extract error url=%s company=%s elapsed_ms=%.1f err=%s",
                 url,
                 company.company_id,
+                elapsed_ms,
                 e,
             )
             upsert_url_index_entry(
@@ -227,8 +262,19 @@ async def run_full_pass_for_company(
             )
             continue
 
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        _save_raw_stage(company.company_id, url, raw_result, stage="llm_full_raw")
+
         payload = parse_extracted_payload(raw_result)
         payload_dict = payload.model_dump()
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[llm_passes] full_parsed url=%s elapsed_ms=%.1f offerings=%d",
+                url,
+                elapsed_ms,
+                len(payload.offerings),
+            )
 
         try:
             product_path = save_stage_output(
@@ -239,7 +285,7 @@ async def run_full_pass_for_company(
             )
         except Exception as e:
             logger.error(
-                "LLM full: failed writing product JSON for %s (company=%s): %s",
+                "LLM full: failed writing product JSON url=%s company=%s err=%s",
                 url,
                 company.company_id,
                 e,
@@ -272,7 +318,5 @@ async def run_full_pass_for_company(
 
     state = get_crawl_state()
     await state.recompute_company_from_index(
-        company.company_id,
-        name=None,
-        root_url=company.domain_url,
+        company.company_id, name=None, root_url=company.domain_url
     )

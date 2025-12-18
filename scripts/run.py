@@ -1163,7 +1163,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--crawler-pool-size",
         type=int,
-        default=5,
+        default=6,
         help="Number of independent AsyncWebCrawler instances.",
     )
     parser.add_argument(
@@ -1201,7 +1201,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Recycle one idle crawler if used_frac_eff >= this threshold.",
     )
 
-    # Stall prevention timeouts (new)
+    # Stall prevention timeouts
     parser.add_argument("--crawler-lease-timeout-sec", type=float, default=120.0)
     parser.add_argument("--arun-init-timeout-sec", type=float, default=90.0)
     parser.add_argument("--stream-no-yield-timeout-sec", type=float, default=150.0)
