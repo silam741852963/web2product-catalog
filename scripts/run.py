@@ -1131,7 +1131,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-concurrency",
         type=int,
-        default=8,
+        default=12,
         help="Hard upper bound on concurrent companies.",
     )
     parser.add_argument("--max-pages", type=int, default=100)
@@ -1163,7 +1163,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--crawler-pool-size",
         type=int,
-        default=6,
+        default=8,
         help="Number of independent AsyncWebCrawler instances.",
     )
     parser.add_argument(
