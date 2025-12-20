@@ -31,18 +31,6 @@ _MB = 1_000_000
 
 @dataclass
 class AdaptiveSchedulingConfig:
-    """
-    Scheduling + safety:
-    - Uses effective cgroup memory when available (cgroup v2: current - inactive_file)
-    - ALSO tracks raw cgroup usage (OOM cares about raw)
-    - Adds memory ramp protection
-    - Adds admission smoothing (anti-burst)
-    - Adds stall detection:
-        * per-company inactivity -> cancel
-        * admission starvation (ready>0, active==0, no admission) -> restart
-        * periodic log while blocked -> no silent stall
-    """
-
     # Effective memory watermarks (fractions of effective limit)
     mem_cap_frac: float = 0.78
     mem_high_frac: float = 0.83
@@ -61,7 +49,7 @@ class AdaptiveSchedulingConfig:
     mem_ramp_crit_frac_per_sec: float = 0.030
     mem_ramp_kill_frac_per_sec: float = 0.050
 
-    # Admission smoothing (NEW): prevents bursty starts that cause rapid ramps.
+    # Admission smoothing: prevents bursty starts that cause rapid ramps.
     max_admit_per_call: int = 3
     ramp_admit_guard_frac_per_sec: float = 0.012
     max_admit_per_call_when_ramping: int = 1
@@ -81,9 +69,7 @@ class AdaptiveSchedulingConfig:
     ai_step: int = 1
     md_factor: float = 0.50
 
-    # Emergency cancellation (MODERATE DEFAULTS)
-    # - keep at least 1 active whenever possible
-    # - cancel at most 1 company per emergency window
+    # Emergency cancellation (moderate)
     min_active_keep: int = 1
     emergency_cancel_max: int = 1
     emergency_cancel_cooldown_sec: float = 8.0
@@ -92,14 +78,13 @@ class AdaptiveSchedulingConfig:
     restart_gate_min_uptime_sec: float = 180.0
     restart_gate_min_completed: int = 3
 
-    # --- Stall detection (<= 5 minutes default) ---
+    # --- Stall detection defaults (match run.py previous defaults) ---
     company_inactivity_timeout_sec: float = 240.0
     company_inactivity_cancel_max: int = 1
 
     admission_starvation_timeout_sec: float = 240.0
     block_log_interval_sec: float = 30.0
 
-    # “No progress” policy (<= 5 minutes default)
     no_progress_timeout_sec: float = 240.0
     kill_on_no_progress: bool = True
 
@@ -135,6 +120,7 @@ class AdaptiveScheduler:
       - register_company_completed()
       - record_company_peak(company_id, peak_mb)
       - touch_company(company_id)
+      - suspend_stall_detection(...) / resume_stall_detection(...)
       - restart_recommended
       - get_state_snapshot()
     """
@@ -208,6 +194,9 @@ class AdaptiveScheduler:
         self._restart_recommended: bool = False
         self._last_emergency_cancel_ts: float = 0.0
 
+        # Stall detection suspension (NEW)
+        self._stall_suspensions: set[str] = set()
+
         # Async + thread watchdog
         self._lock = asyncio.Lock()
         self._watchdog_task: Optional[asyncio.Task] = None
@@ -223,6 +212,84 @@ class AdaptiveScheduler:
     @property
     def restart_recommended(self) -> bool:
         return self._restart_recommended
+
+    @property
+    def stall_detection_enabled(self) -> bool:
+        return len(self._stall_suspensions) == 0
+
+    async def suspend_stall_detection(
+        self,
+        *,
+        key: str,
+        company_id: Optional[str] = None,
+        reset_timers: bool = True,
+        reason: str = "",
+    ) -> None:
+        """
+        Disable stall detection checks globally while at least one suspension key is active.
+        Intended for stages like LLM extraction where long silent periods are expected.
+        """
+        if not key:
+            return
+        async with self._lock:
+            was_enabled = self.stall_detection_enabled
+            self._stall_suspensions.add(key)
+
+            if reset_timers:
+                now_mono = time.monotonic()
+                self._last_progress_mono = now_mono
+                self._last_heartbeat_mono = now_mono
+                self._last_admission_mono = now_mono
+                if company_id:
+                    self._company_last_touch_mono[company_id] = now_mono
+
+            if was_enabled and not self.stall_detection_enabled:
+                logger.info(
+                    "[AdaptiveScheduling] stall detection suspended key=%s reason=%s",
+                    key,
+                    reason or "unspecified",
+                )
+
+        # write heartbeat/progress outside lock (safe)
+        if reset_timers:
+            self._mark_heartbeat()
+            self._mark_progress()
+
+    async def resume_stall_detection(
+        self,
+        *,
+        key: str,
+        company_id: Optional[str] = None,
+        reset_timers: bool = True,
+        reason: str = "",
+    ) -> None:
+        """
+        Re-enable stall detection when the last suspension key is removed.
+        """
+        if not key:
+            return
+        async with self._lock:
+            was_enabled = self.stall_detection_enabled
+            self._stall_suspensions.discard(key)
+
+            if reset_timers:
+                now_mono = time.monotonic()
+                self._last_progress_mono = now_mono
+                self._last_heartbeat_mono = now_mono
+                self._last_admission_mono = now_mono
+                if company_id:
+                    self._company_last_touch_mono[company_id] = now_mono
+
+            if (not was_enabled) and self.stall_detection_enabled:
+                logger.info(
+                    "[AdaptiveScheduling] stall detection resumed key=%s reason=%s",
+                    key,
+                    reason or "unspecified",
+                )
+
+        if reset_timers:
+            self._mark_heartbeat()
+            self._mark_progress()
 
     def touch_company(self, company_id: str) -> None:
         if not company_id:
@@ -386,8 +453,7 @@ class AdaptiveScheduler:
 
             slots = max(0, int(slots))
 
-            # ---- NEW: anti-burst admission smoothing
-            # Limit how many NEW companies can start per loop iteration.
+            # Anti-burst admission smoothing
             slots = min(slots, max(1, int(self.cfg.max_admit_per_call)))
             if active_n > 0 and self._ramp_raw_frac_per_sec >= float(
                 self.cfg.ramp_admit_guard_frac_per_sec
@@ -414,6 +480,8 @@ class AdaptiveScheduler:
                         "proc_mem_mb": float(self._proc_rss_bytes) / _MB
                         if self._proc_rss_bytes
                         else 0.0,
+                        "stall_detection_enabled": self.stall_detection_enabled,
+                        "stall_suspensions": len(self._stall_suspensions),
                     },
                 )
 
@@ -443,6 +511,8 @@ class AdaptiveScheduler:
             "psutil_available": self._psutil_available,
             "ever_admitted": self._ever_admitted,
             "ever_had_active": self._ever_had_active,
+            "stall_detection_enabled": self.stall_detection_enabled,
+            "stall_suspensions": len(self._stall_suspensions),
             "last_heartbeat_age_sec": max(
                 0.0, time.monotonic() - self._last_heartbeat_mono
             ),
@@ -486,6 +556,8 @@ class AdaptiveScheduler:
                 "proc_mem_mb": float(self._proc_rss_bytes) / _MB
                 if self._proc_rss_bytes
                 else 0.0,
+                "stall_detection_enabled": self.stall_detection_enabled,
+                "stall_suspensions": len(self._stall_suspensions),
             }
             tmp = path.with_suffix(path.suffix + ".tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -832,8 +904,14 @@ class AdaptiveScheduler:
                     for cid in active_ids:
                         self._company_last_touch_mono.setdefault(cid, now_mono)
 
-                    # 1) Per-company inactivity cancel (<= 5 minutes)
-                    if self.cfg.company_inactivity_timeout_sec > 0 and active_n > 0:
+                    stall_enabled = self.stall_detection_enabled
+
+                    # 1) Per-company inactivity cancel (disabled during LLM stage)
+                    if (
+                        stall_enabled
+                        and self.cfg.company_inactivity_timeout_sec > 0
+                        and active_n > 0
+                    ):
                         stuck: List[str] = []
                         for cid in active_ids:
                             last = self._company_last_touch_mono.get(cid, now_mono)
@@ -851,8 +929,8 @@ class AdaptiveScheduler:
                             )
                             cancel_ids = list(stuck)
 
-                    # 2) No-progress -> recommend restart (<= 5 minutes)
-                    if self.cfg.no_progress_timeout_sec > 0:
+                    # 2) No-progress -> recommend restart (disabled during LLM stage)
+                    if stall_enabled and self.cfg.no_progress_timeout_sec > 0:
                         prog_age = time.monotonic() - self._last_progress_mono
                         if (
                             prog_age >= float(self.cfg.no_progress_timeout_sec)
@@ -871,8 +949,8 @@ class AdaptiveScheduler:
                                         int(self.cfg.hard_watchdog_kill_signal),
                                     )
 
-                    # 3) Admission starvation -> restart (<= 5 minutes), only if mem stuck high
-                    if self.cfg.admission_starvation_timeout_sec > 0:
+                    # 3) Admission starvation -> restart (disabled during LLM stage)
+                    if stall_enabled and self.cfg.admission_starvation_timeout_sec > 0:
                         if active_n == 0 and self._last_num_waiting > 0:
                             starve_age = now_mono - self._last_admission_mono
                             if starve_age >= float(
@@ -896,7 +974,7 @@ class AdaptiveScheduler:
                                                 int(self.cfg.hard_watchdog_kill_signal),
                                             )
 
-                    # Raw mem kill
+                    # Raw mem kill (still active even if stall detection disabled)
                     if self._used_frac_raw >= float(self.cfg.mem_kill_raw_frac):
                         if self._can_recommend_restart():
                             self._restart_recommended = True
@@ -910,7 +988,7 @@ class AdaptiveScheduler:
                                     os.getpid(), int(self.cfg.hard_watchdog_kill_signal)
                                 )
 
-                    # Ramp kill
+                    # Ramp kill (still active)
                     if self._ramp_raw_frac_per_sec >= float(
                         self.cfg.mem_ramp_kill_frac_per_sec
                     ) and self._used_frac_raw >= float(self.cfg.mem_high_raw_frac):
@@ -927,8 +1005,7 @@ class AdaptiveScheduler:
                                     os.getpid(), int(self.cfg.hard_watchdog_kill_signal)
                                 )
 
-                    # Emergency cancel (memory danger) - MODERATE:
-                    # Only cancel as a last resort, and at most 1, leaving at least 1 active if possible.
+                    # Emergency cancel (memory danger) - still active
                     crit_trigger = (
                         self._used_frac_raw >= float(self.cfg.mem_crit_raw_frac)
                     ) or (self._used_frac >= float(self.cfg.mem_crit_frac))
@@ -978,6 +1055,10 @@ class AdaptiveScheduler:
                                         "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
                                         "used_frac_raw": self._used_frac_raw,
                                         "used_frac": self._used_frac,
+                                        "stall_detection_enabled": stall_enabled,
+                                        "stall_suspensions": len(
+                                            self._stall_suspensions
+                                        ),
                                     },
                                 )
 
@@ -1094,6 +1175,8 @@ class AdaptiveScheduler:
             "restart_recommended": self._restart_recommended,
             "ever_admitted": self._ever_admitted,
             "ever_had_active": self._ever_had_active,
+            "stall_detection_enabled": self.stall_detection_enabled,
+            "stall_suspensions": len(self._stall_suspensions),
         }
         if extra:
             state.update(extra)

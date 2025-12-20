@@ -118,11 +118,6 @@ class CrawlerFatalError(RuntimeError):
     """Raised when the Playwright driver/browser connection is irrecoverably broken."""
 
 
-# ---------------------------------------------------------------------------
-# Touch helper (scheduler heartbeats per company)
-# ---------------------------------------------------------------------------
-
-
 def _touch(touch_cb: Optional[Any], company_id: str) -> None:
     if touch_cb is None:
         return
@@ -132,16 +127,7 @@ def _touch(touch_cb: Optional[Any], company_id: str) -> None:
         return
 
 
-# ---------------------------------------------------------------------------
-# Cancellation-safe cleanup (small + reliable)
-# ---------------------------------------------------------------------------
-
-
 async def _run_cleanup_even_if_cancelled(coro: Any) -> None:
-    """
-    Best-effort: ensure cleanup runs even if current task is cancelled.
-    We prefer uncancel() on Py3.11+, otherwise shield and re-raise.
-    """
     t = asyncio.current_task()
     uncancel = getattr(t, "uncancel", None) if t is not None else None
 
@@ -171,14 +157,10 @@ async def _run_cleanup_even_if_cancelled(coro: Any) -> None:
 
 
 def _maybe_malloc_trim() -> None:
-    """
-    Optional RSS trim on glibc. Not enabled by default; use --enable-malloc-trim.
-    Helps when Python/Chromium freed memory but RSS stays high due to fragmentation.
-    """
     if sys.platform != "linux":
         return
     try:
-        import ctypes  # lazy
+        import ctypes
 
         libc = ctypes.CDLL("libc.so.6")
         libc.malloc_trim(0)
@@ -187,12 +169,6 @@ def _maybe_malloc_trim() -> None:
 
 
 def _is_playwright_driver_disconnect(exc: BaseException) -> bool:
-    """
-    Heuristic detector for the pattern:
-      - "Connection closed while reading from the driver"
-      - "pipe closed by peer"
-      - "BrowserContext.new_page: Connection closed ..."
-    """
     msg = f"{type(exc).__name__}: {exc}"
     lowered = msg.lower()
     needles = [
@@ -236,7 +212,6 @@ class CrawlerPool:
         self._started = False
         self._closing = False
 
-        # Forced recycle (used on memory-pressure cancels)
         self._force_restart_budget: int = 0
         self._force_restart_reason: str = "forced_recycle"
 
@@ -450,7 +425,7 @@ def _crawl_meta_path(company_id: str) -> Path:
     if meta_dir is None:
         meta_dir = Path(output_paths.OUTPUT_ROOT) / company_id / "metadata"
         meta_dir.mkdir(parents=True, exist_ok=True)
-    return meta_dir / "crawl_meta.json"
+    return Path(meta_dir) / "crawl_meta.json"
 
 
 def _write_crawl_meta(company: Company, snapshot: Any) -> None:
@@ -492,6 +467,56 @@ def _read_in_progress_companies(out_dir: Path) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Retry cleanup helpers (NEW)
+# ---------------------------------------------------------------------------
+
+
+def _should_skip_company(status: str, llm_mode: str) -> bool:
+    """
+    Defines what "DONE" means under each mode:
+      - llm_mode == none: markdown_done OR llm_done means no more work
+      - otherwise: must be llm_done
+    """
+    if llm_mode == "none":
+        return status in (COMPANY_STATUS_MD_DONE, COMPANY_STATUS_LLM_DONE)
+    return status == COMPANY_STATUS_LLM_DONE
+
+
+async def _cleanup_completed_retry_ids(
+    *,
+    retry_tracker: RetryTracker,
+    state: Any,
+    llm_mode: str,
+) -> int:
+    """
+    If a company is still listed in retry_companies.json from a prior failure,
+    but is now complete according to current state, remove it immediately.
+    This prevents "no work to do" runs from repeatedly exiting with RETRY_EXIT_CODE.
+    """
+    ids = sorted(retry_tracker.get_previous_retry_ids())
+    if not ids:
+        return 0
+
+    cleared = 0
+    for cid in ids:
+        try:
+            snap = await state.recompute_company_from_index(
+                cid, name=None, root_url=None
+            )
+            st = getattr(snap, "status", None) or COMPANY_STATUS_PENDING
+        except Exception:
+            continue
+
+        if _should_skip_company(st, llm_mode):
+            retry_tracker.clear_company(cid)
+            cleared += 1
+
+    if cleared:
+        retry_tracker.flush(force=True)
+    return cleared
+
+
+# ---------------------------------------------------------------------------
 # Crawl helpers
 # ---------------------------------------------------------------------------
 
@@ -518,21 +543,10 @@ def _build_filter_chain(
     return FilterChain(filters)
 
 
-def _should_skip_company(status: str, llm_mode: str) -> bool:
-    if llm_mode == "none":
-        return status in (COMPANY_STATUS_MD_DONE, COMPANY_STATUS_LLM_DONE)
-    return status == COMPANY_STATUS_LLM_DONE
-
-
 def _tune_page_pipeline_params(
     args: argparse.Namespace,
     scheduler: Optional[AdaptiveScheduler],
 ) -> Dict[str, Any]:
-    """
-    Moderate OOM protection:
-    - When memory is hot (raw usage high or ramping), reduce per-company in-RAM queues/concurrency.
-    - When memory is cool, keep user's configured defaults for throughput.
-    """
     conc = int(getattr(args, "page_result_concurrency", 6))
     qmax = int(getattr(args, "page_queue_maxsize", 64))
     flush_every = int(getattr(args, "url_index_flush_every", 24))
@@ -551,8 +565,6 @@ def _tune_page_pipeline_params(
         except Exception:
             pass
 
-    # Tiered softening — no cancels, just reduce per-company buffering.
-    # Thresholds aligned with the scheduler defaults.
     hot2 = (used_raw >= 0.88) or (used_eff >= 0.83) or (ramp_raw >= 0.020)
     hot1 = (used_raw >= 0.84) or (used_eff >= 0.80) or (ramp_raw >= 0.012)
 
@@ -596,7 +608,6 @@ async def crawl_company(
     url_index_flush_every: int = 64,
     url_index_flush_interval_sec: float = 1.0,
     url_index_queue_maxsize: int = 2048,
-    # --- stall prevention (new) ---
     touch_cb: Optional[Any] = None,
     arun_init_timeout_sec: float = 90.0,
     stream_no_yield_timeout_sec: float = 150.0,
@@ -625,7 +636,7 @@ async def crawl_company(
         mark_company_timeout_cb=mark_company_timeout,
         mark_company_memory_cb=mark_company_memory_pressure,
         concurrency=max(1, int(page_result_concurrency)),
-        page_queue_maxsize=max(1, int(page_queue_maxsize)),  # IMPORTANT: bound memory
+        page_queue_maxsize=max(1, int(page_queue_maxsize)),
         url_index_flush_cfg=flush_cfg,
     )
 
@@ -665,7 +676,6 @@ async def crawl_company(
                 except Exception:
                     pass
 
-            # ---- arun init timeout (new)
             try:
                 _touch(touch_cb, company.company_id)
                 results_or_gen = await asyncio.wait_for(
@@ -836,9 +846,7 @@ async def run_company_pipeline(
     page_interaction_factory: PageInteractionFactory,
     page_timeout_ms: Optional[int],
     enable_malloc_trim: bool,
-    # --- stall prevention (new) ---
     touch_cb: Optional[Any] = None,
-    # --- moderate OOM protection (new) ---
     scheduler: Optional[AdaptiveScheduler] = None,
 ) -> bool:
     completed_ok = False
@@ -882,7 +890,10 @@ async def run_company_pipeline(
             will_run_llm_presence or will_run_llm_full
         ) and not finalize_in_progress_md
 
+        # IMPORTANT FIX: even if there's "no work", treat it as a successful completion
+        # so retry_companies.json can be cleaned in finalize().
         if not do_crawl and not will_run_llm:
+            completed_ok = True
             return True
 
         record_company_attempt(company.company_id)
@@ -927,7 +938,6 @@ async def run_company_pipeline(
             )
             submit_timeout_sec = float(getattr(args, "submit_timeout_sec", 30.0))
 
-            # Moderate OOM protection: tune per-company buffering only when memory is hot.
             tuned = _tune_page_pipeline_params(args=args, scheduler=scheduler)
 
             last_err: Optional[BaseException] = None
@@ -1007,12 +1017,44 @@ async def run_company_pipeline(
 
         if will_run_llm:
             _touch(touch_cb, company.company_id)
-            if args.llm_mode == "presence":
-                await run_presence_pass_for_company(
-                    company, presence_strategy=presence_llm
-                )
-            elif args.llm_mode == "full":
-                await run_full_pass_for_company(company, full_strategy=full_llm)
+
+            # IMPORTANT: Disable stall detection during LLM extraction stage.
+            # This prevents 4-minute inactivity/no-progress/admission-starvation from killing LLM runs.
+            if scheduler is not None:
+                try:
+                    await scheduler.suspend_stall_detection(
+                        key=f"llm:{company.company_id}",
+                        company_id=company.company_id,
+                        reset_timers=True,
+                        reason="llm_extraction",
+                    )
+                except Exception:
+                    logger.exception(
+                        "[AdaptiveScheduling] failed to suspend stall detection (company_id=%s)",
+                        company.company_id,
+                    )
+
+            try:
+                if args.llm_mode == "presence":
+                    await run_presence_pass_for_company(
+                        company, presence_strategy=presence_llm
+                    )
+                elif args.llm_mode == "full":
+                    await run_full_pass_for_company(company, full_strategy=full_llm)
+            finally:
+                if scheduler is not None:
+                    try:
+                        await scheduler.resume_stall_detection(
+                            key=f"llm:{company.company_id}",
+                            company_id=company.company_id,
+                            reset_timers=True,
+                            reason="llm_extraction_done",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[AdaptiveScheduling] failed to resume stall detection (company_id=%s)",
+                            company.company_id,
+                        )
 
         completed_ok = True
         return True
@@ -1131,7 +1173,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-concurrency",
         type=int,
-        default=12,
+        default=16,
         help="Hard upper bound on concurrent companies.",
     )
     parser.add_argument("--max-pages", type=int, default=100)
@@ -1152,18 +1194,16 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Special mode: read crawl_global_state.json and force-mark markdown completion for in_progress companies (no LLM).",
     )
 
-    # Default bounded to prevent unbounded in-RAM accumulation
     parser.add_argument("--page-result-concurrency", type=int, default=6)
     parser.add_argument("--page-queue-maxsize", type=int, default=64)
     parser.add_argument("--url-index-flush-every", type=int, default=24)
     parser.add_argument("--url-index-flush-interval-sec", type=float, default=0.5)
     parser.add_argument("--url-index-queue-maxsize", type=int, default=2048)
 
-    # Crawler pool
     parser.add_argument(
         "--crawler-pool-size",
         type=int,
-        default=8,
+        default=10,
         help="Number of independent AsyncWebCrawler instances.",
     )
     parser.add_argument(
@@ -1173,7 +1213,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Recycle a crawler instance after N companies.",
     )
 
-    # Moderate admission smoothing (prevents burst ramps)
     parser.add_argument(
         "--max-start-per-tick",
         type=int,
@@ -1181,7 +1220,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Upper bound of new company tasks started per main loop tick (anti-burst).",
     )
 
-    # Idle crawler recycle under sustained memory pressure (no cancels)
     parser.add_argument(
         "--idle-recycle-interval-sec",
         type=float,
@@ -1201,13 +1239,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Recycle one idle crawler if used_frac_eff >= this threshold.",
     )
 
-    # Stall prevention timeouts
     parser.add_argument("--crawler-lease-timeout-sec", type=float, default=120.0)
     parser.add_argument("--arun-init-timeout-sec", type=float, default=90.0)
     parser.add_argument("--stream-no-yield-timeout-sec", type=float, default=150.0)
     parser.add_argument("--submit-timeout-sec", type=float, default=30.0)
 
-    # Optional: RSS trim
     parser.add_argument(
         "--enable-malloc-trim",
         action="store_true",
@@ -1251,7 +1287,6 @@ async def main_async(args: argparse.Namespace) -> None:
     page_timeout_ms: int = int(getattr(args, "page_timeout_ms", 60000))
     timeout_error_marker = f"Timeout {page_timeout_ms}ms exceeded."
 
-    # Logging extension
     enable_session_log = getattr(args, "enable_session_log", False)
     logging_ext = LoggingExtension(
         global_level=log_level,
@@ -1261,7 +1296,6 @@ async def main_async(args: argparse.Namespace) -> None:
         session_log_path=(out_dir / "session.log") if enable_session_log else None,
     )
 
-    # Optional resource monitor
     resource_monitor: Optional[ResourceMonitor] = None
     if getattr(args, "enable_resource_monitor", False):
         rm_config = ResourceMonitorConfig()
@@ -1270,7 +1304,6 @@ async def main_async(args: argparse.Namespace) -> None:
         )
         resource_monitor.start()
 
-    # Language + LLM setup
     default_language_factory.set_language(args.lang)
 
     presence_llm = None
@@ -1293,11 +1326,9 @@ async def main_async(args: argparse.Namespace) -> None:
         if args.llm_mode == "full":
             full_llm = llm_factory.create(mode="schema")
 
-    # Connectivity guard
     guard = ConnectivityGuard()
     await guard.start()
 
-    # Markdown gating + crawler base cfg
     gating_cfg = md_gating.build_gating_config(
         min_meaningful_words=30,
         cookie_max_fraction=0.02,
@@ -1329,9 +1360,25 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     page_interaction_factory = default_page_interaction_factory
 
-    state = get_crawl_state()
+    # IMPORTANT FIX: state DB is now anchored to out_dir
+    state = get_crawl_state(db_path=out_dir / "crawl_state.sqlite3")
 
-    # Inflight tracking
+    # NEW: clean retry ids that are already complete (prevents infinite restarts)
+    try:
+        cleared = await _cleanup_completed_retry_ids(
+            retry_tracker=retry_tracker,
+            state=state,
+            llm_mode=args.llm_mode,
+        )
+        if cleared:
+            logger.info(
+                "Cleaned %d completed IDs from retry_companies.json before starting.",
+                cleared,
+            )
+            prev_retry_ids = retry_tracker.get_previous_retry_ids()
+    except Exception:
+        logger.exception("Failed cleaning completed retry IDs at startup")
+
     inflight_by_cid: Dict[str, asyncio.Task] = {}
     cid_by_task: Dict[asyncio.Task, str] = {}
 
@@ -1364,7 +1411,6 @@ async def main_async(args: argparse.Namespace) -> None:
     scheduler: Optional[AdaptiveScheduler] = None
     touch_cb: Optional[Any] = None
 
-    # Stop/restart coordination
     stop_event = asyncio.Event()
     restart_due_to_scheduler = False
 
@@ -1420,7 +1466,6 @@ async def main_async(args: argparse.Namespace) -> None:
         pass
 
     try:
-        # ---- Load companies
         if args.company_file:
             companies = _companies_from_source(Path(args.company_file))
         else:
@@ -1463,7 +1508,6 @@ async def main_async(args: argparse.Namespace) -> None:
             elif retry_mode == "only-retry":
                 companies = [c for c in companies if c.company_id in prev_retry_ids]
 
-        # ---- State init
         run_id = await state.start_run(
             pipeline="deep_crawl", version=None, args_hash=None
         )
@@ -1489,6 +1533,15 @@ async def main_async(args: argparse.Namespace) -> None:
             companies = kept
 
         if not companies:
+            try:
+                await _cleanup_completed_retry_ids(
+                    retry_tracker=retry_tracker,
+                    state=state,
+                    llm_mode=args.llm_mode,
+                )
+            except Exception:
+                pass
+
             logger.info(
                 "No companies require work for llm_mode=%s; exiting.", args.llm_mode
             )
@@ -1520,7 +1573,6 @@ async def main_async(args: argparse.Namespace) -> None:
             lang=http_lang, add_common_cookies_for=[], headless=True
         )
 
-        # ---- Crawler pool
         crawler_pool = CrawlerPool(
             browser_cfg=browser_cfg,
             size=int(getattr(args, "crawler_pool_size", 2)),
@@ -1528,21 +1580,16 @@ async def main_async(args: argparse.Namespace) -> None:
         )
         await crawler_pool.start()
 
-        # ---- Adaptive scheduler (<=5 minutes inactivity/action)
+        # IMPORTANT: minimize what run.py passes to AdaptiveSchedulingConfig.
+        # Everything else uses AdaptiveSchedulingConfig defaults.
+        cc = max(1, int(getattr(args, "company_concurrency", 16)))
         scheduler_cfg = AdaptiveSchedulingConfig(
             log_path=out_dir / "adaptive_scheduling_state.jsonl",
             heartbeat_path=out_dir / "heartbeat.json",
-            initial_target=min(
-                4, max(1, int(getattr(args, "company_concurrency", 20)))
-            ),
-            max_target=max(1, int(getattr(args, "company_concurrency", 20))),
-            kill_on_no_progress=True,
-            # hard requirement: no-activity actions within 5 minutes
-            no_progress_timeout_sec=240.0,
-            company_inactivity_timeout_sec=240.0,
-            admission_starvation_timeout_sec=240.0,
-            block_log_interval_sec=30.0,
+            initial_target=min(4, cc),
+            max_target=cc,
         )
+
         scheduler = AdaptiveScheduler(
             cfg=scheduler_cfg,
             get_active_company_ids=get_active_company_ids,
@@ -1551,13 +1598,12 @@ async def main_async(args: argparse.Namespace) -> None:
         await scheduler.start()
         touch_cb = scheduler.touch_company
 
-        # ---- Work queue
         companies_by_id: Dict[str, Company] = {c.company_id: c for c in companies}
         ready: deque[str] = deque(c.company_id for c in companies)
 
         launched = 0
         total = len(companies)
-        hard_max = max(1, int(getattr(args, "company_concurrency", 20)))
+        hard_max = cc
 
         last_global_recompute_ts = 0.0
         global_recompute_interval_sec = 120.0
@@ -1594,7 +1640,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 )
                 break
 
-            # Moderate OOM protection: recycle ONE idle crawler under sustained pressure.
             if (
                 scheduler is not None
                 and crawler_pool is not None
@@ -1632,7 +1677,7 @@ async def main_async(args: argparse.Namespace) -> None:
                     slots = min(slots, max(1, free_crawlers * 3))
 
                 to_start = min(slots, capacity, want)
-                to_start = min(to_start, max_start_per_tick)  # anti-burst
+                to_start = min(to_start, max_start_per_tick)
 
                 for _ in range(to_start):
                     cid = ready.popleft()

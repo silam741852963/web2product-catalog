@@ -71,8 +71,38 @@ async def run_presence_pass_for_company(
     company: Any, *, presence_strategy: Any
 ) -> None:
     state = get_crawl_state()
-    pending_urls = await state.get_pending_urls_for_llm(company.company_id)
 
+    # ---- SAFETY SWEEP (before pending_urls) ----
+    index = load_url_index(company.company_id) or {}
+    if not isinstance(index, dict):
+        index = {}
+
+    swept = 0
+    for url, ent in list(index.items()):
+        ent = ent if isinstance(ent, dict) else {}
+        if ent.get("presence_checked") is True:
+            continue
+        if ent.get("markdown_path"):
+            continue
+        upsert_url_index_entry(
+            company.company_id,
+            url,
+            {
+                "presence": 0,
+                "presence_checked": True,
+                "status": ent.get("status") or "llm_presence_skipped_no_markdown",
+                "llm_presence_reason": "no_markdown_path",
+            },
+        )
+        swept += 1
+    if swept:
+        logger.info(
+            "LLM presence: swept %d no-markdown URLs (company_id=%s)",
+            swept,
+            company.company_id,
+        )
+
+    pending_urls = await state.get_pending_urls_for_llm(company.company_id)
     if not pending_urls:
         logger.info(
             "LLM presence: no pending URLs for company_id=%s", company.company_id
@@ -88,7 +118,10 @@ async def run_presence_pass_for_company(
         company.company_id,
     )
 
+    # Reload index after sweeps for consistency
     index = load_url_index(company.company_id) or {}
+    index = index if isinstance(index, dict) else {}
+
     updated = 0
 
     def _update(url: str, patch: Dict[str, Any], reason: str) -> None:
@@ -192,6 +225,47 @@ async def run_presence_pass_for_company(
 
 
 async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None:
+    state = get_crawl_state()
+
+    # ---- SAFETY SWEEP (before pending_urls) ----
+    index0 = load_url_index(company.company_id)
+    index0 = index0 if isinstance(index0, dict) else {}
+
+    swept = 0
+    for url, ent in list(index0.items()):
+        ent = ent if isinstance(ent, dict) else {}
+        if ent.get("extracted") == 1:
+            continue
+        if ent.get("markdown_path"):
+            continue
+        upsert_url_index_entry(
+            company.company_id,
+            url,
+            {
+                "extracted": 1,
+                "presence": 0,
+                "presence_checked": True,
+                "status": ent.get("status") or "llm_full_skipped_no_markdown",
+                "llm_full_reason": "no_markdown_path",
+            },
+        )
+        swept += 1
+
+    if swept:
+        logger.info(
+            "LLM full: swept %d no-markdown URLs (company_id=%s)",
+            swept,
+            company.company_id,
+        )
+
+    pending_urls = await state.get_pending_urls_for_llm(company.company_id)
+    if not pending_urls:
+        logger.info("LLM full: no pending URLs for company_id=%s", company.company_id)
+        await state.recompute_company_from_index(
+            company.company_id, name=None, root_url=company.domain_url
+        )
+        return
+
     index = load_url_index(company.company_id)
     if not isinstance(index, dict) or not index:
         logger.info(
@@ -199,16 +273,33 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
         )
         return
 
+    logger.info(
+        "LLM full: %d pending URLs for company_id=%s",
+        len(pending_urls),
+        company.company_id,
+    )
+
     updated = 0
 
-    for url, ent in index.items():
-        if not isinstance(ent, dict):
-            continue
+    for url in pending_urls:
+        ent = index.get(url)
+        ent = ent if isinstance(ent, dict) else {}
 
         md_path = ent.get("markdown_path")
+
+        # URLs can be markdown-complete (e.g. markdown_suppressed) but have no markdown_path.
+        # In full mode, mark them LLM-complete so they don't block llm_done.
         if not md_path:
-            continue
-        if ent.get("extracted"):
+            patch: Dict[str, Any] = {
+                "extracted": 1,
+                "presence": 0,
+                "presence_checked": True,
+                "llm_full_reason": "no_markdown_path",
+            }
+            if not ent.get("status"):
+                patch["status"] = "llm_full_skipped_no_markdown"
+            upsert_url_index_entry(company.company_id, url, patch)
+            updated += 1
             continue
 
         text = _read_text(md_path)
@@ -231,12 +322,13 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
                 company.company_id,
                 url,
                 {
-                    "extracted": 0,
+                    "extracted": 1,
                     "presence": 0,
                     "presence_checked": True,
                     "status": "llm_full_empty_markdown",
                 },
             )
+            updated += 1
             continue
 
         _md_debug_stats(url, md_path, text)
@@ -265,8 +357,22 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         _save_raw_stage(company.company_id, url, raw_result, stage="llm_full_raw")
 
-        payload = parse_extracted_payload(raw_result)
-        payload_dict = payload.model_dump()
+        try:
+            payload = parse_extracted_payload(raw_result)
+            payload_dict = payload.model_dump()
+        except Exception as e:
+            logger.exception(
+                "LLM full: parse error url=%s company=%s err=%s",
+                url,
+                company.company_id,
+                e,
+            )
+            upsert_url_index_entry(
+                company.company_id,
+                url,
+                {"extracted": 0, "status": "llm_full_parse_error"},
+            )
+            continue
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -298,25 +404,21 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
             continue
 
         presence_flag = 1 if payload.offerings else 0
-        patch: Dict[str, Any] = {
+        patch2: Dict[str, Any] = {
             "extracted": 1,
             "presence": presence_flag,
             "presence_checked": True,
             "status": "llm_full_extracted",
         }
         if product_path is not None:
-            patch["product_path"] = str(product_path)
+            patch2["product_path"] = str(product_path)
 
-        upsert_url_index_entry(company.company_id, url, patch)
+        upsert_url_index_entry(company.company_id, url, patch2)
         updated += 1
 
     logger.info(
-        "LLM full: wrote product JSON for %d URLs (company_id=%s)",
-        updated,
-        company.company_id,
+        "LLM full: updated %d URLs (company_id=%s)", updated, company.company_id
     )
-
-    state = get_crawl_state()
     await state.recompute_company_from_index(
         company.company_id, name=None, root_url=company.domain_url
     )

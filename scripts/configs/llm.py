@@ -19,31 +19,34 @@ from typing import (
     Annotated,
 )
 
-from pydantic import (
-    BaseModel,
-    Field,
-    StringConstraints,
-    ValidationError,
-    field_validator,
-)
+from pydantic import BaseModel, Field, StringConstraints, ValidationError, field_validator
 
 from crawl4ai import LLMConfig, LLMExtractionStrategy
 
 logger = logging.getLogger(__name__)
 
+
 # --------------------------------------------------------------------------- #
 # Constants / helpers
 # --------------------------------------------------------------------------- #
 
-SHORT_MAX = 400
-DEBUG_PREVIEW_CHARS = 900
-DEBUG_RAW_CHARS = 6000
+NAME_MAX = 160
+DESC_MAX = 520
+TAG_MAX = 50
 
-# Internal (not emitted in schema) – used to validate/cull hallucinations/nav.
+DEBUG_PREVIEW_CHARS = 900
+DEBUG_RAW_CHARS = 7000
+
 EVIDENCE_SNIPPET_MAX_CHARS = 240
 
-ShortStr = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=SHORT_MAX)
+NameStr = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=NAME_MAX)
+]
+DescStr = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=DESC_MAX)
+]
+TagStr = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=TAG_MAX)
 ]
 
 
@@ -95,7 +98,7 @@ def _chunk_text(
     if not words:
         return [""]
 
-    max_words = max(50, int(chunk_token_threshold * word_token_rate))
+    max_words = max(80, int(chunk_token_threshold * word_token_rate))
     if len(words) <= max_words:
         return [" ".join(words)]
 
@@ -111,47 +114,116 @@ def _chunk_text(
     return chunks
 
 
+def _as_list(v: Any) -> List[Any]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, tuple):
+        return list(v)
+    if isinstance(v, (str, bytes, bytearray)):
+        s = _clean_ws(_to_text(v))
+        if not s:
+            return []
+        # split on common separators
+        if "|" in s:
+            return [x.strip() for x in s.split("|") if x.strip()]
+        if ";" in s:
+            return [x.strip() for x in s.split(";") if x.strip()]
+        if "," in s:
+            return [x.strip() for x in s.split(",") if x.strip()]
+        return [s]
+    return [v]
+
+
+def _dedup_norm_list(items: Iterable[str], *, max_items: int) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for it in items:
+        s = _clean_ws(_to_text(it))
+        if not s:
+            continue
+        k = s.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(s)
+        if len(out) >= max_items:
+            break
+    return out
+
+
 # --------------------------------------------------------------------------- #
-# Pydantic schemas (NO evidence field — keep LLM output small)
+# Pydantic schemas (SIMPLIFIED, higher recall)
 # --------------------------------------------------------------------------- #
 
 
 class Offering(BaseModel):
-    type: ShortStr = Field(..., description="Must be 'product' or 'service'.")
-    name: ShortStr = Field(..., description="Short label for the offering.")
-    description: ShortStr = Field(..., description="1–3 sentence grounded summary.")
+    type: str = Field(
+        ...,
+        description=(
+            "Offering class. Must be 'product' or 'service'. "
+            "Choose 'product' for goods, devices, materials, components, software products, product lines, brands. "
+            "Choose 'service' for services, solutions, platforms provided as a service, consulting, manufacturing-as-a-service, "
+            "installation, maintenance, training, logistics, R&D/testing, integration, managed services."
+        ),
+    )
+
+    name: NameStr = Field(
+        ...,
+        description=(
+            "Short on-page name/label for the offering (use headings/labels if available). "
+            "Examples: brand name, product family, model series, platform name, solution name, service line."
+        ),
+    )
+
+    description: DescStr = Field(
+        ...,
+        description=(
+            "1–3 grounded sentences explaining what it is and what value it provides. "
+            "Keep factual; avoid generic marketing claims; do not invent details not on the page."
+        ),
+    )
+
+    tags: List[TagStr] = Field(
+        default_factory=list,
+        description=(
+            "0–10 short tags to improve retrieval/grouping. Prefer domain nouns and capability keywords. "
+            "Do not include navigation terms like 'home', 'about', 'contact'."
+        ),
+    )
 
     @field_validator("type", mode="before")
     @classmethod
     def _norm_type(cls, v: Any) -> str:
         s = _clean_ws(_to_text(v)).lower()
-        if s in {"product", "products", "prod", "goods", "good", "brand", "line"}:
+        if s in {"product", "products", "prod", "goods", "good", "brand", "line", "hardware"}:
             return "product"
-        if s in {
-            "service",
-            "services",
-            "svc",
-            "solution",
-            "solutions",
-            "capability",
-            "capabilities",
-        }:
+        if s in {"service", "services", "svc", "solution", "solutions", "capability", "capabilities"}:
             return "service"
-        if "product" in s:
+        if "product" in s or "brand" in s or "goods" in s:
             return "product"
-        if ("service" in s) or ("solution" in s) or ("capabilit" in s):
+        if "service" in s or "solution" in s or "capabilit" in s:
             return "service"
-        return s
+        return s or "product"
 
     @field_validator("name", mode="before")
     @classmethod
     def _norm_name(cls, v: Any) -> str:
-        return _clean_ws(_to_text(v))[:SHORT_MAX]
+        return _clean_ws(_to_text(v))[:NAME_MAX]
 
     @field_validator("description", mode="before")
     @classmethod
     def _norm_desc(cls, v: Any) -> str:
-        return _clean_ws(_to_text(v))[:SHORT_MAX]
+        return _clean_ws(_to_text(v))[:DESC_MAX]
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _norm_tags(cls, v: Any) -> List[str]:
+        items = _as_list(v)
+        normed = _dedup_norm_list((_clean_ws(_to_text(x))[:TAG_MAX] for x in items), max_items=10)
+        junk = {"home", "about", "contact", "privacy", "terms", "cookie", "careers", "news", "blog", "sitemap"}
+        return [t for t in normed if t.lower() not in junk]
 
 
 class ExtractionPayload(BaseModel):
@@ -183,9 +255,7 @@ class OllamaProviderStrategy(LLMProviderStrategy):
             api_token=None,
             base_url=self.base_url,
         )
-        logger.debug(
-            "[llm] provider=ollama model=%s base_url=%s", self.model, self.base_url
-        )
+        logger.debug("[llm] provider=ollama model=%s base_url=%s", self.model, self.base_url)
         return cfg
 
 
@@ -197,32 +267,26 @@ class RemoteAPIProviderStrategy(LLMProviderStrategy):
 
     def build_config(self) -> LLMConfig:
         if not self.provider:
-            raise ValueError(
-                "RemoteAPIProviderStrategy requires non-empty provider string."
-            )
-        cfg = LLMConfig(
-            provider=self.provider, api_token=self.api_token, base_url=self.base_url
-        )
+            raise ValueError("RemoteAPIProviderStrategy requires non-empty provider string.")
+        cfg = LLMConfig(provider=self.provider, api_token=self.api_token, base_url=self.base_url)
         logger.debug("[llm] provider=%s base_url=%s", self.provider, self.base_url)
         return cfg
 
 
 # --------------------------------------------------------------------------- #
-# Default instructions (NO evidence)
+# Default instructions
 # --------------------------------------------------------------------------- #
 
 DEFAULT_PRESENCE_INSTRUCTION = (
     "Classify if the page MAIN CONTENT includes any offerings (products/brands/product lines or services/solutions).\n"
-    "Ignore cookie/privacy banners, accessibility boilerplate, navigation/menus, and legal footers.\n"
-    'Return ONLY JSON: {"r":1} or {"r":0}. No other keys.'
+    "Ignore cookie/privacy banners, navigation/menus, and legal footers.\n"
+    'Return ONLY JSON: {"r":1} or {"r":0}.'
 )
 
 DEFAULT_FULL_INSTRUCTION = (
     "Extract the company's offerings from the page MAIN CONTENT.\n"
-    "Ignore cookie/privacy banners, accessibility boilerplate, navigation/menus, and legal footers.\n"
-    "Include products/brands/product lines and services/solutions that the company offers.\n"
-    "Do NOT invent offerings. Use names/headings used on the page when available.\n"
-    "Merge duplicates; keep descriptions concise and factual.\n"
+    "Ignore cookie/privacy banners, navigation/menus, and legal footers.\n"
+    "Do NOT invent offerings.\n"
     "Return ONLY valid JSON matching the provided schema."
 )
 
@@ -238,16 +302,18 @@ class LLMExtractionFactory:
     default_full_instruction: str = DEFAULT_FULL_INSTRUCTION
     default_presence_instruction: str = DEFAULT_PRESENCE_INSTRUCTION
 
-    default_chunk_token_threshold: int = 1400
-    default_overlap_rate: float = 0.08
+    # More room to avoid truncation
+    default_chunk_token_threshold: int = 2200
+    default_overlap_rate: float = 0.10
     default_apply_chunking: bool = True
     default_input_format: str = "fit_markdown"
 
-    # With evidence removed, outputs are smaller; you can reduce max_tokens safely.
-    default_schema_temperature: float = 0.25
+    default_schema_temperature: float = 0.2
     default_presence_temperature: float = 0.0
-    default_schema_max_tokens: int = 900
-    default_presence_max_tokens: int = 300
+
+    # Bigger output budget
+    default_schema_max_tokens: int = 2200
+    default_presence_max_tokens: int = 350
 
     def create(
         self,
@@ -265,20 +331,14 @@ class LLMExtractionFactory:
     ) -> LLMExtractionStrategy:
         m = (mode or "schema").strip().lower()
         if m not in {"schema", "presence"}:
-            raise ValueError(
-                f"Unsupported mode={mode!r}; expected 'schema' or 'presence'."
-            )
+            raise ValueError(f"Unsupported mode={mode!r}; expected 'schema' or 'presence'.")
 
         llm_cfg = self.provider_strategy.build_config()
 
         used_instruction = (
             instruction
             if instruction is not None
-            else (
-                self.default_presence_instruction
-                if m == "presence"
-                else self.default_full_instruction
-            )
+            else (self.default_presence_instruction if m == "presence" else self.default_full_instruction)
         )
 
         if m == "presence":
@@ -292,22 +352,10 @@ class LLMExtractionFactory:
             temperature = self.default_schema_temperature
             max_tokens = self.default_schema_max_tokens
 
-        used_chunk_threshold = (
-            self.default_chunk_token_threshold
-            if chunk_token_threshold is None
-            else int(chunk_token_threshold)
-        )
-        used_overlap_rate = (
-            self.default_overlap_rate if overlap_rate is None else float(overlap_rate)
-        )
-        used_apply_chunking = (
-            self.default_apply_chunking
-            if apply_chunking is None
-            else bool(apply_chunking)
-        )
-        used_input_format = (
-            input_format or self.default_input_format or "markdown"
-        ).strip()
+        used_chunk_threshold = self.default_chunk_token_threshold if chunk_token_threshold is None else int(chunk_token_threshold)
+        used_overlap_rate = self.default_overlap_rate if overlap_rate is None else float(overlap_rate)
+        used_apply_chunking = self.default_apply_chunking if apply_chunking is None else bool(apply_chunking)
+        used_input_format = (input_format or self.default_input_format or "markdown").strip()
 
         _extra: Dict[str, Any] = {"temperature": temperature, "max_tokens": max_tokens}
         if extra_args:
@@ -342,68 +390,156 @@ class LLMExtractionFactory:
 
 
 # --------------------------------------------------------------------------- #
-# Parsing (robust, tolerant) – schema has no evidence
+# JSON salvage WITHOUT recursive regex (Python 3.13 safe)
 # --------------------------------------------------------------------------- #
 
+def _iter_balanced_json_blobs(s: str) -> Iterable[str]:
+    """
+    Yield balanced JSON object/array substrings from arbitrary text.
+
+    Handles braces inside strings and escaped quotes.
+    Works with Python's stdlib only (no regex recursion).
+    """
+    if not s:
+        return
+
+    n = len(s)
+    i = 0
+    while i < n:
+        ch = s[i]
+        if ch not in "{[":
+            i += 1
+            continue
+
+        open_ch = ch
+        close_ch = "}" if open_ch == "{" else "]"
+        start = i
+
+        stack = [close_ch]
+        i += 1
+
+        in_str = False
+        esc = False
+
+        while i < n and stack:
+            c = s[i]
+
+            if in_str:
+                if esc:
+                    esc = False
+                else:
+                    if c == "\\":
+                        esc = True
+                    elif c == '"':
+                        in_str = False
+                i += 1
+                continue
+
+            # not in string
+            if c == '"':
+                in_str = True
+                i += 1
+                continue
+
+            if c == "{":
+                stack.append("}")
+            elif c == "[":
+                stack.append("]")
+            elif c == "}" or c == "]":
+                if stack and c == stack[-1]:
+                    stack.pop()
+                else:
+                    # mismatch -> abort this candidate
+                    stack.clear()
+                    break
+
+            i += 1
+
+        if not stack:
+            blob = s[start:i]
+            yield blob
+        # continue scanning from start+1 to find later blobs, even if aborted
+        i = start + 1
+
+
+def _extract_first_json_blob(s: str) -> Optional[str]:
+    """
+    Salvage JSON if model prints extra text.
+    Preference: first object/array containing offerings-ish keys, else first balanced blob.
+    """
+    if not s:
+        return None
+
+    ss = s.strip()
+    if (ss.startswith("{") and ss.endswith("}")) or (ss.startswith("[") and ss.endswith("]")):
+        return ss
+
+    best_any: Optional[str] = None
+    for blob in _iter_balanced_json_blobs(ss):
+        if best_any is None:
+            best_any = blob
+        if any(k in blob for k in ('"offerings"', '"items"', '"products"', '"services"', '"r"')):
+            return blob
+    return best_any
+
+
+# --------------------------------------------------------------------------- #
+# Parsing (robust, tolerant) – simplified schema but accepts legacy shapes
+# --------------------------------------------------------------------------- #
 
 def _looks_like_offering_dict(d: Dict[str, Any]) -> bool:
     name = _clean_ws(_to_text(d.get("name") or d.get("title") or d.get("label")))
-    desc = _clean_ws(
-        _to_text(d.get("description") or d.get("summary") or d.get("details"))
-    )
-    typ = _clean_ws(
-        _to_text(d.get("type") or d.get("kind") or d.get("category"))
-    ).lower()
-    return bool(name) and (bool(desc) or bool(typ))
+    desc = _clean_ws(_to_text(d.get("description") or d.get("summary") or d.get("details")))
+    typ = _clean_ws(_to_text(d.get("type") or d.get("kind") or d.get("category"))).lower()
+    return bool(name) and (bool(desc) or bool(typ) or isinstance(d.get("tags"), list))
 
 
-def _guess_type_from_text(name: str, desc: str) -> str:
-    s = (name + " " + desc).lower()
+def _guess_type_from_text(name: str, desc: str, tags: List[str]) -> str:
+    s = (name + " " + desc + " " + " ".join(tags)).lower()
     svc_hints = (
         "service",
         "solution",
         "capabilit",
         "consult",
-        "platform",
-        "subscription",
-        "manufactur",
-        "processing",
-        "sourcing",
+        "managed",
+        "support",
+        "maintenance",
+        "repair",
         "installation",
+        "deployment",
+        "integration",
+        "migration",
+        "logistics",
+        "fulfillment",
+        "training",
+        "certification",
+        "testing",
+        "inspection",
+        "manufactur",
+        "contract manufacturing",
     )
     return "service" if any(h in s for h in svc_hints) else "product"
 
 
 def _sanitize_offering(d: Dict[str, Any]) -> Dict[str, Any]:
-    name = _clean_ws(_to_text(d.get("name") or d.get("title") or d.get("label")))[
-        :SHORT_MAX
-    ]
-    desc = _clean_ws(
-        _to_text(d.get("description") or d.get("summary") or d.get("details"))
-    )[:SHORT_MAX]
-    typ = _clean_ws(
-        _to_text(d.get("type") or d.get("kind") or d.get("category"))
-    ).lower()
+    name = _clean_ws(_to_text(d.get("name") or d.get("title") or d.get("label")))[:NAME_MAX]
+    desc = _clean_ws(_to_text(d.get("description") or d.get("summary") or d.get("details")))[:DESC_MAX]
+    typ = _clean_ws(_to_text(d.get("type") or d.get("kind") or d.get("category"))).lower()
 
-    if typ in {"products", "product", "prod", "brand", "line"}:
+    tags = d.get("tags") or d.get("keywords") or d.get("key_terms") or d.get("tag")
+    tag_list = _dedup_norm_list((_clean_ws(_to_text(x))[:TAG_MAX] for x in _as_list(tags)), max_items=10)
+
+    if typ in {"products", "product", "prod", "brand", "line", "goods"}:
         typ = "product"
-    elif typ in {
-        "services",
-        "service",
-        "svc",
-        "solutions",
-        "solution",
-        "capabilities",
-        "capability",
-    }:
+    elif typ in {"services", "service", "svc", "solutions", "solution", "capabilities", "capability"}:
         typ = "service"
     elif typ not in {"product", "service"}:
-        typ = _guess_type_from_text(name, desc)
+        typ = _guess_type_from_text(name, desc, tag_list)
 
     if not desc:
         desc = name
 
-    return {"type": typ, "name": name, "description": desc}
+    return {"type": typ, "name": name, "description": desc, "tags": tag_list}
 
 
 def _collect_offering_candidates(obj: Any) -> Iterable[Dict[str, Any]]:
@@ -429,6 +565,7 @@ def _collect_offering_candidates(obj: Any) -> Iterable[Dict[str, Any]]:
             for o in obj["items"]:
                 if isinstance(o, dict):
                     yield o
+
         if isinstance(obj.get("products"), list):
             for p in obj["products"]:
                 if isinstance(p, dict):
@@ -436,7 +573,8 @@ def _collect_offering_candidates(obj: Any) -> Iterable[Dict[str, Any]]:
                     p2.setdefault("type", "product")
                     yield p2
                 elif isinstance(p, str):
-                    yield {"type": "product", "name": p, "description": p}
+                    yield {"type": "product", "name": p, "description": p, "tags": []}
+
         if isinstance(obj.get("services"), list):
             for s in obj["services"]:
                 if isinstance(s, dict):
@@ -444,7 +582,7 @@ def _collect_offering_candidates(obj: Any) -> Iterable[Dict[str, Any]]:
                     s2.setdefault("type", "service")
                     yield s2
                 elif isinstance(s, str):
-                    yield {"type": "service", "name": s, "description": s}
+                    yield {"type": "service", "name": s, "description": s, "tags": []}
 
         if _looks_like_offering_dict(obj):
             yield obj
@@ -465,36 +603,49 @@ def parse_extracted_payload(
 
     raw_preview = _short_preview(extracted_content, max_chars=DEBUG_PREVIEW_CHARS)
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "[llm.parse] raw_type=%s preview=%s",
-            type(extracted_content).__name__,
-            raw_preview,
-        )
+        logger.debug("[llm.parse] raw_type=%s preview=%s", type(extracted_content).__name__, raw_preview)
 
-    # Load JSON if needed
     data: Any = extracted_content
+
+    # Load JSON if needed (with salvage)
     if isinstance(extracted_content, (str, bytes, bytearray)):
-        s = _to_text(extracted_content).strip()
+        s0 = _to_text(extracted_content).strip()
         try:
-            data = json.loads(s)
-        except Exception as e:
-            logger.debug(
-                "[llm.parse] json.loads failed err=%s preview=%s", e, raw_preview
-            )
-            return ExtractionPayload(offerings=[])
+            data = json.loads(s0)
+        except Exception:
+            blob = _extract_first_json_blob(s0)
+            if blob:
+                try:
+                    data = json.loads(blob)
+                except Exception as e2:
+                    logger.debug(
+                        "[llm.parse] salvage json.loads failed err=%s blob_preview=%s",
+                        e2,
+                        _short_preview(blob, max_chars=600),
+                    )
+                    return ExtractionPayload(offerings=[])
+            else:
+                logger.debug("[llm.parse] json missing; preview=%s", raw_preview)
+                return ExtractionPayload(offerings=[])
 
     # Unwrap common wrappers containing JSON strings
     if isinstance(data, dict):
         for k in ("extracted_content", "content", "data", "result", "output"):
             if isinstance(data.get(k), (str, bytes, bytearray)):
+                inner = _to_text(data[k]).strip()
                 try:
-                    data = json.loads(_to_text(data[k]))
-                    logger.debug(
-                        "[llm.parse] unwrapped key=%s -> %s", k, type(data).__name__
-                    )
+                    data = json.loads(inner)
+                    logger.debug("[llm.parse] unwrapped key=%s -> %s", k, type(data).__name__)
                     break
                 except Exception:
-                    pass
+                    blob = _extract_first_json_blob(inner)
+                    if blob:
+                        try:
+                            data = json.loads(blob)
+                            logger.debug("[llm.parse] unwrapped+salvaged key=%s -> %s", k, type(data).__name__)
+                            break
+                        except Exception:
+                            pass
 
     candidates = list(_collect_offering_candidates(data))
     if logger.isEnabledFor(logging.DEBUG):
@@ -510,32 +661,23 @@ def parse_extracted_payload(
             cleaned = _sanitize_offering(c)
             off = Offering.model_validate(cleaned)
         except ValidationError as e:
-            logger.debug(
-                "[llm.parse] drop idx=%d validation_err=%s raw=%s",
-                i,
-                e.errors()[:2],
-                _short_preview(c, max_chars=500),
-            )
+            logger.debug("[llm.parse] drop idx=%d validation_err=%s raw=%s", i, e.errors()[:2], _short_preview(c, max_chars=500))
             continue
         except Exception as e:
-            logger.debug(
-                "[llm.parse] drop idx=%d unexpected=%s raw=%s",
-                i,
-                e,
-                _short_preview(c, max_chars=500),
-            )
+            logger.debug("[llm.parse] drop idx=%d unexpected=%s raw=%s", i, e, _short_preview(c, max_chars=500))
             continue
 
         key = (off.type, off.name.lower())
         if key in seen:
             j = seen[key]
             cur = valid[j]
-            best_desc = (
-                off.description
-                if len(off.description) > len(cur.description)
-                else cur.description
-            )
-            valid[j] = Offering(type=cur.type, name=cur.name, description=best_desc)
+            pick = False
+            if len(off.description) > len(cur.description):
+                pick = True
+            elif len(off.description) == len(cur.description) and len(off.tags) > len(cur.tags):
+                pick = True
+            if pick:
+                valid[j] = off
         else:
             seen[key] = len(valid)
             valid.append(off)
@@ -555,11 +697,7 @@ def parse_presence_result(
 ) -> Tuple[bool, Optional[float], Optional[str]]:
     preview = _short_preview(extracted_content, max_chars=DEBUG_PREVIEW_CHARS)
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "[llm.presence.parse] raw_type=%s preview=%s",
-            type(extracted_content).__name__,
-            preview,
-        )
+        logger.debug("[llm.presence.parse] raw_type=%s preview=%s", type(extracted_content).__name__, preview)
 
     if extracted_content is None:
         return (default, None, preview)
@@ -570,7 +708,14 @@ def parse_presence_result(
         try:
             loaded = json.loads(s)
         except Exception:
-            loaded = s
+            blob = _extract_first_json_blob(s)
+            if blob:
+                try:
+                    loaded = json.loads(blob)
+                except Exception:
+                    loaded = s
+            else:
+                loaded = s
 
     def _scalar01(v: Any) -> Optional[int]:
         if isinstance(v, bool):
@@ -613,14 +758,7 @@ def parse_presence_result(
             if r is not None:
                 return (bool(r), conf, preview)
 
-        for key in (
-            "has_offering",
-            "presence",
-            "present",
-            "classification",
-            "result",
-            "value",
-        ):
+        for key in ("has_offering", "presence", "present", "classification", "result", "value"):
             if key in loaded:
                 r = _scalar01(loaded[key])
                 if r is not None:
@@ -640,40 +778,18 @@ def parse_presence_result(
 
 
 # --------------------------------------------------------------------------- #
-# Evidence-based culling (drop offerings with no evidence in MAIN-ish content)
+# Evidence-based culling (SOFTER to avoid false negatives)
 # --------------------------------------------------------------------------- #
 
 _STOPWORDS = {
-    "the",
-    "and",
-    "or",
-    "of",
-    "to",
-    "a",
-    "an",
-    "for",
-    "in",
-    "on",
-    "with",
-    "by",
-    "at",
-    "from",
-    "into",
-    "our",
-    "your",
-    "their",
-    "its",
-    "is",
-    "are",
-    "be",
-    "as",
-    "this",
-    "that",
-    "these",
-    "those",
-    "we",
-    "you",
-    "they",
+    "the", "and", "or", "of", "to", "a", "an", "for", "in", "on", "with", "by", "at",
+    "from", "into", "our", "your", "their", "its", "is", "are", "be", "as", "this",
+    "that", "these", "those", "we", "you", "they",
+}
+
+_JUNK_NAMES = {
+    "home", "about", "contact", "privacy", "terms", "cookie", "cookies", "careers",
+    "news", "blog", "sitemap", "login", "sign in", "signin", "register",
 }
 
 _TRADEMARK_CHARS_RE = re.compile(r"[®™©]+")
@@ -685,14 +801,13 @@ def _strip_trademarks(s: str) -> str:
 
 def _mainish_text(text: str) -> str:
     """
-    Heuristic: use content from the first Markdown H1 ("# ") onward.
-    This intentionally removes cookie banners + global nav that usually precede H1.
+    Heuristic: drop top boilerplate if an H1 exists; otherwise keep full.
     """
     if not text:
         return ""
     lines = text.splitlines()
     for i, ln in enumerate(lines):
-        if ln.startswith("# "):  # first H1
+        if ln.startswith("# "):
             return "\n".join(lines[i:])
     return text
 
@@ -713,7 +828,6 @@ def _keyword_tokens(s: str) -> List[str]:
 def _find_snippet(haystack: str, needle: str) -> Optional[str]:
     if not haystack or not needle:
         return None
-    # case-insensitive search
     m = re.search(re.escape(needle), haystack, flags=re.IGNORECASE)
     if not m:
         return None
@@ -723,86 +837,87 @@ def _find_snippet(haystack: str, needle: str) -> Optional[str]:
     return snip[:EVIDENCE_SNIPPET_MAX_CHARS] if snip else None
 
 
-def _has_any_evidence(offer: Offering, source_text: str) -> Tuple[bool, Optional[str]]:
+def _has_any_evidence_soft(off: Offering, source_text: str) -> bool:
     """
-    Return (has_evidence, snippet_preview).
-    Evidence rule (strict-ish):
-      - prefer finding the offering name (or name without trademarks) in main-ish text
-      - else require >=2 keyword tokens from the name present in main-ish text
-      - else require >=3 keyword tokens from the description present in main-ish text
+    Soft evidence:
+      - accept if name appears
+      - OR if >=1 keyword token from name appears
+      - OR if >=2 keyword tokens from description appear
     """
     t = _mainish_text(source_text)
     if not t:
-        return (False, None)
+        return True
 
-    name = _clean_ws(offer.name)
+    name = _clean_ws(off.name)
+    if not name:
+        return False
+
     name2 = _strip_trademarks(name)
+    if _find_snippet(t, name) or (_find_snippet(t, name2) if name2 and name2 != name else None):
+        return True
 
-    # 1) exact-ish name match
-    snip = _find_snippet(t, name) or (
-        _find_snippet(t, name2) if name2 and name2 != name else None
-    )
-    if snip:
-        return (True, snip)
-
-    # 2) keyword matches from name (>=2)
     name_keys = _keyword_tokens(name2 or name)
     if name_keys:
-        hits = sum(
-            1
-            for k in set(name_keys)
-            if re.search(rf"\b{re.escape(k)}\b", t, flags=re.IGNORECASE)
-        )
-        if hits >= 2 or (hits >= 1 and len(name_keys) == 1):
-            # produce a snippet from the first hit keyword
-            for k in name_keys:
-                snip2 = _find_snippet(t, k)
-                if snip2:
-                    return (True, snip2)
-            return (True, None)
+        for k in set(name_keys):
+            if re.search(rf"\b{re.escape(k)}\b", t, flags=re.IGNORECASE):
+                return True
 
-    # 3) keyword matches from description (>=3)
-    desc_keys = _keyword_tokens(offer.description)
-    if desc_keys:
-        hits = sum(
-            1
-            for k in set(desc_keys)
-            if re.search(rf"\b{re.escape(k)}\b", t, flags=re.IGNORECASE)
-        )
-        if hits >= 3:
-            for k in desc_keys:
-                snip3 = _find_snippet(t, k)
-                if snip3:
-                    return (True, snip3)
-            return (True, None)
+    desc_keys = _keyword_tokens(off.description)
+    hits = 0
+    for k in set(desc_keys):
+        if re.search(rf"\b{re.escape(k)}\b", t, flags=re.IGNORECASE):
+            hits += 1
+            if hits >= 2:
+                return True
 
-    return (False, None)
+    return False
 
 
-def _filter_offerings_require_evidence(
+def _filter_offerings_soft(
     offerings: List[Offering], *, source_text: str
 ) -> List[Offering]:
+    """
+    Only drop:
+      - obvious nav/junk names
+      - OR no evidence AND very weak/generic description
+    """
     kept: List[Offering] = []
     dropped = 0
 
     for off in offerings:
-        ok, snip = _has_any_evidence(off, source_text)
+        nm = _clean_ws(off.name).lower()
+        if nm in _JUNK_NAMES:
+            dropped += 1
+            continue
+
+        # tags => lenient
+        if off.tags:
+            kept.append(off)
+            continue
+
+        ok = _has_any_evidence_soft(off, source_text)
         if ok:
             kept.append(off)
-        else:
+            continue
+
+        desc = _clean_ws(off.description).lower()
+        if len(desc) < 40 or desc in _JUNK_NAMES or desc == nm:
             dropped += 1
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    "[llm.filter] drop_no_evidence type=%s name=%s desc=%s",
+                    "[llm.filter] drop_soft type=%s name=%s desc=%s",
                     off.type,
                     off.name,
                     _short_preview(off.description, max_chars=220),
                 )
+            continue
+
+        kept.append(off)
 
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("[llm.filter] kept=%d dropped=%d", len(kept), dropped)
 
-    # Dedup again after filtering (same rule as parse)
+    # Dedup after filtering
     out: List[Offering] = []
     seen: Dict[Tuple[str, str], int] = {}
     for off in kept:
@@ -810,12 +925,13 @@ def _filter_offerings_require_evidence(
         if key in seen:
             j = seen[key]
             cur = out[j]
-            best_desc = (
-                off.description
-                if len(off.description) > len(cur.description)
-                else cur.description
-            )
-            out[j] = Offering(type=cur.type, name=cur.name, description=best_desc)
+            pick = False
+            if len(off.description) > len(cur.description):
+                pick = True
+            elif len(off.description) == len(cur.description) and len(off.tags) > len(cur.tags):
+                pick = True
+            if pick:
+                out[j] = off
         else:
             seen[key] = len(out)
             out.append(off)
@@ -880,20 +996,13 @@ def _build_call_args(
                 return ix
             if "fit_markdown" in name or ("fit" in name and "markdown" in name):
                 return text
-            if "markdown" in name or name in {
-                "md",
-                "text",
-                "content",
-                "document",
-                "input",
-            }:
+            if "markdown" in name or name in {"md", "text", "content", "document", "input"}:
                 return text
             if "html" in name:
                 return html if html else primary
             return "" if p.default is inspect._empty else p.default
 
         val = pick_value()
-
         if p.kind == p.KEYWORD_ONLY:
             kwargs[p.name] = val
         else:
@@ -909,6 +1018,7 @@ def call_llm_extract(
     *,
     html: str = "",
     kind: str = "full",  # "full" | "presence"
+    require_evidence: bool = True,
 ) -> Any:
     """
     Offline-safe extraction wrapper.
@@ -919,10 +1029,9 @@ def call_llm_extract(
       - extract(url, html, markdown)
       - extract(url, ix, html)   (per-chunk API)
 
-    IMPORTANT BEHAVIOR CHANGE:
-      - For kind="full": returns a *dict* already filtered to drop offerings with no evidence in main-ish content,
-        and the dict does NOT contain an evidence field.
-      - For kind="presence": returns raw (or merged {"r":0/1} for per-chunk variants).
+    Behavior:
+      - kind="presence": returns raw (or merged {"r":0/1} for per-chunk variants).
+      - kind="full": returns dict payload; by default applies *soft* evidence filtering.
     """
     if text is None:
         text = ""
@@ -930,9 +1039,7 @@ def call_llm_extract(
 
     fn = getattr(strategy, "extract", None)
     if fn is None or not callable(fn):
-        raise TypeError(
-            f"strategy has no callable extract(): {type(strategy).__name__}"
-        )
+        raise TypeError(f"strategy has no callable extract(): {type(strategy).__name__}")
 
     sig_str = _signature_summary(fn)
     input_format = getattr(strategy, "input_format", "markdown") or "markdown"
@@ -950,7 +1057,7 @@ def call_llm_extract(
         logger.debug("[llm.call] extract_signature=%s", sig_str)
         logger.debug("[llm.call] strategy_input_format=%s", input_format)
 
-    # Detect if extract requires ix (per-chunk API)
+    # Detect per-chunk API
     requires_ix = False
     try:
         sig = inspect.signature(fn)
@@ -968,8 +1075,8 @@ def call_llm_extract(
     # ------------------------------------------------------------------ #
     if requires_ix:
         apply_chunking = bool(getattr(strategy, "apply_chunking", True))
-        chunk_threshold = int(getattr(strategy, "chunk_token_threshold", 1400))
-        overlap_rate = float(getattr(strategy, "overlap_rate", 0.08))
+        chunk_threshold = int(getattr(strategy, "chunk_token_threshold", 2200))
+        overlap_rate = float(getattr(strategy, "overlap_rate", 0.10))
         word_token_rate = float(getattr(strategy, "word_token_rate", 0.75))
 
         chunks = [text]
@@ -1003,12 +1110,7 @@ def call_llm_extract(
                 strategy_input_format=str(input_format),
             )
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "[llm.call] chunk_call ix=%d args_len=%d kwargs_keys=%s",
-                    ix,
-                    len(args),
-                    sorted(kwargs.keys()),
-                )
+                logger.debug("[llm.call] chunk_call ix=%d args_len=%d kwargs_keys=%s", ix, len(args), sorted(kwargs.keys()))
             raw_results.append(fn(*args, **kwargs))
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -1041,36 +1143,26 @@ def call_llm_extract(
             if p.offerings:
                 merged_payload.offerings.extend(p.offerings)
 
-        # Evidence filter + final dict
-        filtered = _filter_offerings_require_evidence(
-            merged_payload.offerings, source_text=text
-        )
-        out_payload = ExtractionPayload(offerings=filtered)
+        offerings = merged_payload.offerings
+        if require_evidence:
+            offerings = _filter_offerings_soft(offerings, source_text=text)
+
+        out_payload = ExtractionPayload(offerings=offerings)
         out_dict = out_payload.model_dump()
 
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "[llm.call] merged_offerings=%d filtered_offerings=%d",
-                len(merged_payload.offerings),
-                len(filtered),
-            )
-            _debug_dump_raw("llm.call.full.filtered", out_dict)
+            logger.debug("[llm.call] merged_offerings=%d final_offerings=%d", len(merged_payload.offerings), len(offerings))
+            _debug_dump_raw("llm.call.full.final", out_dict)
 
         return out_dict
 
     # ------------------------------------------------------------------ #
     # Single-call API path
     # ------------------------------------------------------------------ #
-    args, kwargs = _build_call_args(
-        fn, url=url, text=text, html=html, ix=0, strategy_input_format=str(input_format)
-    )
+    args, kwargs = _build_call_args(fn, url=url, text=text, html=html, ix=0, strategy_input_format=str(input_format))
 
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "[llm.call] single_call args_len=%d kwargs_keys=%s",
-            len(args),
-            sorted(kwargs.keys()),
-        )
+        logger.debug("[llm.call] single_call args_len=%d kwargs_keys=%s", len(args), sorted(kwargs.keys()))
 
     try:
         raw = fn(*args, **kwargs)
@@ -1087,42 +1179,31 @@ def call_llm_extract(
 
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "[llm.call] done single elapsed_ms=%.1f raw_type=%s raw_preview=%s",
-            elapsed_ms,
-            type(raw).__name__,
-            _short_preview(raw),
-        )
+        logger.debug("[llm.call] done single elapsed_ms=%.1f raw_type=%s raw_preview=%s", elapsed_ms, type(raw).__name__, _short_preview(raw))
         _debug_dump_raw("llm.call.raw", raw)
 
         try:
             total_usage = getattr(strategy, "total_usage", None)
             usages = getattr(strategy, "usages", None)
             if total_usage is not None or usages is not None:
-                logger.debug(
-                    "[llm.call] usage total=%s usages_preview=%s",
-                    total_usage,
-                    (usages[:3] if isinstance(usages, list) else usages),
-                )
+                logger.debug("[llm.call] usage total=%s usages_preview=%s", total_usage, (usages[:3] if isinstance(usages, list) else usages))
         except Exception:
             pass
 
-    # For presence we keep raw; for full we parse+filter+return dict (small + safe).
     if kind == "presence":
         return raw
 
     payload = parse_extracted_payload(raw)
-    filtered = _filter_offerings_require_evidence(payload.offerings, source_text=text)
-    out_payload = ExtractionPayload(offerings=filtered)
+    offerings = payload.offerings
+    if require_evidence:
+        offerings = _filter_offerings_soft(offerings, source_text=text)
+
+    out_payload = ExtractionPayload(offerings=offerings)
     out_dict = out_payload.model_dump()
 
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "[llm.call] single_offerings=%d filtered_offerings=%d",
-            len(payload.offerings),
-            len(filtered),
-        )
-        _debug_dump_raw("llm.call.full.filtered", out_dict)
+        logger.debug("[llm.call] single_offerings=%d final_offerings=%d", len(payload.offerings), len(offerings))
+        _debug_dump_raw("llm.call.full.final", out_dict)
 
     return out_dict
 

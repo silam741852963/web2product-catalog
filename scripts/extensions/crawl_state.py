@@ -14,8 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
+from extensions import output_paths
 from extensions.output_paths import (
-    OUTPUT_ROOT as OUTPUTS_DIR,
     ensure_company_dirs,
     sanitize_bvdid,
 )
@@ -42,6 +42,24 @@ _FILE_LOCKS: Dict[Path, threading.Lock] = {}
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _output_root() -> Path:
+    """
+    IMPORTANT: output_paths.OUTPUT_ROOT is mutated by run.py at runtime.
+    Never capture it at import-time. Always resolve dynamically here.
+    """
+    try:
+        root = getattr(output_paths, "OUTPUT_ROOT", None)
+        if root is None:
+            return Path("outputs").resolve()
+        return Path(root).resolve()
+    except Exception:
+        return Path("outputs").resolve()
+
+
+def default_db_path() -> Path:
+    return _output_root() / "crawl_state.sqlite3"
 
 
 def _retry_emfile(fn, attempts: int = 6, base_delay: float = 0.15):
@@ -92,7 +110,6 @@ def _atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
                     pass
             os.replace(tmp, path)
         finally:
-            # If something failed before replace, avoid leaving temp files behind.
             with suppress(Exception):
                 if tmp.exists() and tmp != path:
                     tmp.unlink()
@@ -103,7 +120,6 @@ def _atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
 def _json_dumps(obj: Any, *, pretty: bool) -> str:
     if pretty:
         return json.dumps(obj, ensure_ascii=False, indent=2)
-    # Compact is significantly faster/smaller for huge dicts (e.g., url_index.json)
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -115,7 +131,6 @@ def _json_cache_get(path: Path, mtime_ns: int) -> Optional[Any]:
         cached_mtime_ns, obj = entry
         if cached_mtime_ns != mtime_ns:
             return None
-        # refresh LRU
         _JSON_CACHE.move_to_end(path, last=True)
         return obj
 
@@ -189,7 +204,9 @@ def _json_load_nocache(path: Path) -> Any:
 META_NAME = "crawl_meta.json"
 URL_INDEX_NAME = "url_index.json"
 GLOBAL_STATE_NAME = "crawl_global_state.json"
-DEFAULT_DB = OUTPUTS_DIR / "crawl_state.sqlite3"
+
+# Keep for backwards compat imports (but DO NOT rely on it being dynamic).
+DEFAULT_DB = default_db_path()
 
 CompanyStatus = Literal[
     "pending",
@@ -226,12 +243,11 @@ def _company_metadata_dir(bvdid: str) -> Path:
             _DIR_CACHE.move_to_end(bvdid, last=True)
             return cached
 
-    # Prefer existing project conventions
     dirs = ensure_company_dirs(bvdid)
     meta = dirs.get("metadata") or dirs.get("checkpoints")
     if meta is None:
         safe = sanitize_bvdid(bvdid)
-        meta = OUTPUTS_DIR / safe / "metadata"
+        meta = _output_root() / safe / "metadata"
         meta.mkdir(parents=True, exist_ok=True)
     else:
         meta = Path(meta)
@@ -255,7 +271,8 @@ def _url_index_path_for(bvdid: str) -> Path:
 
 
 def _global_state_path() -> Path:
-    return OUTPUTS_DIR / GLOBAL_STATE_NAME
+    # IMPORTANT: dynamic output root
+    return _output_root() / GLOBAL_STATE_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +348,6 @@ def _row_to_run_snapshot(row: sqlite3.Row) -> RunSnapshot:
 def load_url_index(bvdid: str) -> Dict[str, Any]:
     """
     Public helper to read url_index.json from outputs/{safe}/metadata/url_index.json.
-    This is the single entry point in the state module for URL manifest access.
     """
     p = _url_index_path_for(bvdid)
     if not p.exists():
@@ -345,7 +361,6 @@ def upsert_url_index_entry(bvdid: str, url: str, patch: Dict[str, Any]) -> None:
     Central upsert helper for url_index.json.
 
     - Merges `patch` into the per-URL entry.
-    - Creates url_index.json or the URL entry if missing.
     - Uses a per-file lock to avoid lost updates under concurrency.
     - Writes compact JSON (faster/smaller) and avoids caching the full dict.
     """
@@ -365,7 +380,6 @@ def upsert_url_index_entry(bvdid: str, url: str, patch: Dict[str, Any]) -> None:
             ent_dict.update(patch)
             existing[url] = ent_dict
 
-            # compact + no cache
             _atomic_write_json(idx_path, existing, cache=False, pretty=False)
 
     _update()
@@ -377,30 +391,36 @@ def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
       - markdown_done: True if Markdown is considered done
       - llm_done:      True if LLM / presence is considered done
 
-    Based on fields used in run_utils.upsert_url_index.
+    IMPORTANT FIX:
+      - Treat legacy/existing `"extracted": 1` as LLM-complete.
+        Older url_index writers sometimes set extracted without setting
+        status/product_path consistently; global state must still become llm_done.
     """
     status = (ent.get("status") or "").lower()
     has_md_path = bool(ent.get("markdown_path"))
-    # Support both legacy 'json_path' and current 'product_path' key
+
+    # Legacy + current LLM artifact keys
     has_llm_artifact = bool(ent.get("json_path") or ent.get("product_path"))
+
+    # Presence-only completion
     presence_checked = bool(ent.get("presence_checked"))
 
+    # Legacy full-extraction boolean (critical for your reported bug)
+    extracted_flag = bool(ent.get("extracted"))
+
     markdown_done = has_md_path or status in _MARKDOWN_COMPLETE_STATUSES
-    # Treat either full LLM extraction or presence-only as LLM stage completion.
-    llm_done = has_llm_artifact or status in _LLM_COMPLETE_STATUSES or presence_checked
+    llm_done = (
+        extracted_flag
+        or has_llm_artifact
+        or status in _LLM_COMPLETE_STATUSES
+        or presence_checked
+    )
     return markdown_done, llm_done
 
 
 def _compute_company_stage_from_index(
     index: Dict[str, Any],
 ) -> Tuple[CompanyStatus, int, int, int]:
-    """
-    Given the full url_index dict for a company, compute:
-      - company-level status in the limited enum
-      - urls_total
-      - urls_markdown_done
-      - urls_llm_done
-    """
     if not index:
         return COMPANY_STATUS_PENDING, 0, 0, 0
 
@@ -420,11 +440,6 @@ def _compute_company_stage_from_index(
     if urls_total == 0:
         return COMPANY_STATUS_PENDING, 0, 0, 0
 
-    # Stage precedence:
-    # 1) llm_done (all URLs)
-    # 2) llm_not_done (some but not all)
-    # 3) markdown_done (all URLs markdown-complete but no llm)
-    # 4) markdown_not_done (anything else with URLs discovered)
     if llm_done == urls_total:
         status: CompanyStatus = COMPANY_STATUS_LLM_DONE
     elif llm_done > 0:
@@ -440,12 +455,6 @@ def _compute_company_stage_from_index(
 def _pending_urls_for_stage(
     index: Dict[str, Any], stage: Literal["markdown", "llm"]
 ) -> List[str]:
-    """
-    Compute URLs that are *not done* for the given stage, using url_index only.
-
-    - For 'markdown': URLs where markdown is not considered done.
-    - For 'llm':      URLs where markdown is done but llm/presence is not.
-    """
     pending: List[str] = []
     for url, raw_ent in index.items():
         ent = raw_ent if isinstance(raw_ent, dict) else {}
@@ -466,18 +475,12 @@ def _pending_urls_for_stage(
 
 class CrawlState:
     """
-    Unified state backend (plugin-style):
-
-    * Owns per-company high-level state (status + URL counts) derived from url_index.json.
-    * Owns global run-level state (run_id, counters, timings, version).
-    * Exposes a clean async API for callers in the pipeline.
-
-    All detailed per-URL status is still persisted in url_index.json (written elsewhere),
-    but this module is the *only* place that interprets that for global planning.
+    Unified state backend.
     """
 
-    def __init__(self, db_path: Path = DEFAULT_DB) -> None:
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: Optional[Path] = None) -> None:
+        self.db_path = Path(db_path) if db_path is not None else default_db_path()
+        self.db_path = self.db_path.resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._conn = sqlite3.connect(
@@ -495,11 +498,8 @@ class CrawlState:
             with self._lock:
                 self._conn.close()
 
-    # ---------- schema ----------
-
     def _init_schema(self) -> None:
         with self._lock:
-            # Pragmas first for better behavior under load
             with suppress(Exception):
                 self._conn.execute("PRAGMA journal_mode=WAL")
             with suppress(Exception):
@@ -539,8 +539,6 @@ class CrawlState:
                 """
             )
 
-    # ---------- tiny async executors ----------
-
     async def _exec(self, stmt: _Stmt) -> None:
         def _run() -> None:
             with self._lock:
@@ -574,9 +572,6 @@ class CrawlState:
         args_hash: Optional[str] = None,
         run_id: Optional[str] = None,
     ) -> str:
-        """
-        Create (or re-init) a run row. Returns the run_id.
-        """
         rid = run_id or f"run-{int(time.time())}-{os.getpid()}"
         now = _now_iso()
         await self._exec(
@@ -627,10 +622,6 @@ class CrawlState:
         await self._exec(_Stmt(sql, tuple(args)))
 
     async def mark_company_completed(self, run_id: str, bvdid: str) -> None:
-        """
-        Convenience: increment completed_companies and set last_company_bvdid.
-        Implemented as a single atomic UPDATE (no pre-read).
-        """
         now = _now_iso()
         await self._exec(
             _Stmt(
@@ -668,16 +659,8 @@ class CrawlState:
         urls_llm_done: Optional[int] = None,
         last_error: Optional[str] = None,
     ) -> None:
-        """
-        Lightweight upsert that updates only provided fields.
-
-        Optimization vs old version:
-          - Avoids SELECT existence check by doing INSERT OR IGNORE first.
-          - Then runs a single UPDATE with only provided fields.
-        """
         now = _now_iso()
 
-        # Ensure a row exists (no read needed)
         await self._exec(
             _Stmt(
                 """
@@ -729,10 +712,6 @@ class CrawlState:
         name: Optional[str] = None,
         root_url: Optional[str] = None,
     ) -> CompanySnapshot:
-        """
-        Read url_index.json, derive (status, url counts) and upsert into the DB.
-        This is the canonical way to sync company-level status with per-URL state.
-        """
         index = await asyncio.to_thread(load_url_index, bvdid)
         status, urls_total, md_done, llm_done = _compute_company_stage_from_index(index)
         now = _now_iso()
@@ -768,7 +747,6 @@ class CrawlState:
                 ),
             )
         )
-        # Return authoritative row
         return await self.get_company_snapshot(bvdid, recompute=False)
 
     async def set_company_error(self, bvdid: str, reason: str) -> None:
@@ -777,12 +755,6 @@ class CrawlState:
     async def get_company_snapshot(
         self, bvdid: str, *, recompute: bool = True
     ) -> CompanySnapshot:
-        """
-        Get an immutable snapshot of company state.
-
-        If no DB row exists and recompute=True, compute status from url_index.json.
-        If still nothing, create a minimal 'pending' row.
-        """
         row = await self._query_one("SELECT * FROM companies WHERE bvdid=?", (bvdid,))
         if row is None and recompute:
             return await self.recompute_company_from_index(bvdid)
@@ -805,23 +777,15 @@ class CrawlState:
                 "SELECT * FROM companies WHERE bvdid=?", (bvdid,)
             )
 
-        # row must exist now
         return _row_to_company_snapshot(row)  # type: ignore[arg-type]
 
     async def list_companies(self) -> List[CompanySnapshot]:
-        """
-        Return all known companies in the DB as snapshots.
-        """
         rows = await self._query_all(
             "SELECT * FROM companies ORDER BY created_at, bvdid", tuple()
         )
         return [_row_to_company_snapshot(r) for r in rows]
 
     async def get_companies_by_ids(self, bvdids: List[str]) -> List[CompanySnapshot]:
-        """
-        Convenience helper: return snapshots for a specific subset of companies.
-        Preserves the input order for easier downstream handling.
-        """
         if not bvdids:
             return []
 
@@ -894,6 +858,8 @@ class CrawlState:
 
             payload: Dict[str, Any] = {
                 "generated_at": _now_iso(),
+                "output_root": str(_output_root()),
+                "db_path": str(self.db_path),
                 "total_companies": total,
                 "crawled_companies": crawled,
                 "completed_companies": completed,
@@ -905,18 +871,12 @@ class CrawlState:
                 "latest_run": latest_run,
             }
 
-            # This can be huge (lists of bvdid) => do not cache, keep pretty for readability.
             _atomic_write_json(path, payload, cache=False, pretty=True)
             return payload
 
         return await asyncio.to_thread(_compute_and_write)
 
-    # ---------- URL-level helpers (derived from url_index) ----------
-
     async def get_pending_urls_for_markdown(self, bvdid: str) -> List[str]:
-        """
-        URLs that still need Markdown (markdown_not_done).
-        """
         index = await asyncio.to_thread(load_url_index, bvdid)
         return (
             _pending_urls_for_stage(index, "markdown")
@@ -925,20 +885,10 @@ class CrawlState:
         )
 
     async def get_pending_urls_for_llm(self, bvdid: str) -> List[str]:
-        """
-        URLs that still need LLM/presence (llm_not_done):
-          - Markdown considered done
-          - LLM/presence not yet considered done
-        """
         index = await asyncio.to_thread(load_url_index, bvdid)
         return _pending_urls_for_stage(index, "llm") if isinstance(index, dict) else []
 
     async def mark_url_failed(self, bvdid: str, url: str, reason: str) -> None:
-        """
-        Best-effort helper to mirror a failure into url_index.json.
-        Does *not* modify the main status field; it only adds dedicated failure metadata.
-        """
-
         def _update() -> None:
             patch: Dict[str, Any] = {
                 "failed": True,
@@ -949,12 +899,7 @@ class CrawlState:
 
         await asyncio.to_thread(_update)
 
-    # ---------- last_crawled_at helpers (company-level meta) ----------
-
     async def read_last_crawl_date(self, bvdid: str) -> Optional[datetime]:
-        """
-        Read last_crawled_at from crawl_meta.json for the company, if present.
-        """
         meta_p = _meta_path_for(bvdid)
 
         def _load() -> Optional[datetime]:
@@ -974,9 +919,6 @@ class CrawlState:
     async def write_last_crawl_date(
         self, bvdid: str, dt: Optional[datetime] = None
     ) -> None:
-        """
-        Update last_crawled_at in crawl_meta.json. Other keys are preserved.
-        """
         meta_p = _meta_path_for(bvdid)
 
         def _write() -> None:
@@ -1005,12 +947,31 @@ _default_crawl_state: Optional[CrawlState] = None
 def get_crawl_state(db_path: Optional[Path] = None) -> CrawlState:
     """
     Return the default CrawlState backend (singleton).
-    Other modules should depend on this function rather than constructing
-    CrawlState directly, to keep the plugin-style boundary clean.
+
+    IMPORTANT FIX:
+      - If db_path is provided and differs from the current singleton DB,
+        close and recreate the backend. This avoids cross-outdir corruption.
+      - If db_path is None, compute default dynamically from output_paths.OUTPUT_ROOT.
     """
     global _default_crawl_state
+
+    want = Path(db_path) if db_path is not None else default_db_path()
+    want = want.resolve()
+
     if _default_crawl_state is None:
-        _default_crawl_state = CrawlState(db_path or DEFAULT_DB)
+        _default_crawl_state = CrawlState(want)
+        return _default_crawl_state
+
+    try:
+        cur = Path(getattr(_default_crawl_state, "db_path", "")).resolve()
+    except Exception:
+        cur = want
+
+    if cur != want:
+        with suppress(Exception):
+            _default_crawl_state.close()
+        _default_crawl_state = CrawlState(want)
+
     return _default_crawl_state
 
 
@@ -1027,4 +988,6 @@ __all__ = [
     "get_crawl_state",
     "load_url_index",
     "upsert_url_index_entry",
+    "default_db_path",
+    "DEFAULT_DB",
 ]

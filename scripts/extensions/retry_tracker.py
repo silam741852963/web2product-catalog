@@ -19,6 +19,7 @@ class RetryTrackerConfig:
     filename: name of the JSON file (default: retry_companies.json)
     flush_threshold: number of changes before auto flush
     """
+
     out_dir: Path
     filename: str = "retry_companies.json"
     flush_threshold: int = 1
