@@ -99,9 +99,6 @@ def _mark_failure_compat(
     """
     Call RetryStateStore.mark_failure using only parameters supported by the
     installed retry_state.py signature.
-
-    This prevents runtime errors if adaptive_scheduling.py passes args that
-    retry_state.py does not accept (e.g., previously: max_attempts_mem).
     """
     try:
         sig = inspect.signature(store.mark_failure)
@@ -122,8 +119,6 @@ class AdaptiveSchedulingConfig:
       - restart recommendation (raw memory kill threshold)
       - retry/quarantine/backoff filtering
       - worklist queueing (ready + deferred)
-
-    run.py should be execution-only: it starts company tasks for IDs returned by plan_start_batch().
     """
 
     # --- Memory thresholds (effective / raw) ---
@@ -214,6 +209,11 @@ class AdaptiveSchedulingConfig:
     min_idle_sleep_sec: float = 0.25
     max_idle_sleep_sec: float = 5.0
 
+    # When the scheduler cancels a company (stall/mem), do not re-admit it immediately.
+    # We still rely on retry_state.py for the real backoff schedule; this is only a small
+    # "cancel grace" to avoid duplicate starts while cancellation is in-flight.
+    cancel_requeue_min_delay_sec: float = 2.0
+
 
 class AdaptiveScheduler:
     """
@@ -228,11 +228,6 @@ class AdaptiveScheduler:
       - suspend_stall_detection(...) / resume_stall_detection(...)
       - restart_recommended
       - get_state_snapshot()
-
-    Notes:
-      - retry/quarantine/backoff filtering lives here via RetryStateStore.
-      - When scheduler cancels due to memory pressure, it records the cancel in RetryStateStore
-        as a memory-class failure (so it re-enters retry/backoff).
     """
 
     def __init__(
@@ -256,6 +251,12 @@ class AdaptiveScheduler:
         # Worklist
         self._work_ready: Deque[str] = deque()
         self._work_deferred: List[Tuple[float, str]] = []  # heap (eligible_at_ts, cid)
+        self._deferred_at: Dict[
+            str, float
+        ] = {}  # cid -> current eligible_at (heap has stale entries)
+        self._queued: set[str] = (
+            set()
+        )  # cid present in ready or deferred (prevents duplicates)
         self._work_seen: set[str] = set()
         self._work_total_hint: int = 0
         self._is_company_runnable: Optional[Callable[[str], Awaitable[bool]]] = None
@@ -334,7 +335,7 @@ class AdaptiveScheduler:
         return len(self._work_ready)
 
     def pending_total(self) -> int:
-        return len(self._work_ready) + len(self._work_deferred)
+        return len(self._work_ready) + len(self._deferred_at)
 
     def has_pending(self) -> bool:
         return self.pending_total() > 0
@@ -351,11 +352,18 @@ class AdaptiveScheduler:
         if not self._work_deferred:
             return float(self.cfg.min_idle_sleep_sec)
         now = time.time()
-        eligible_at, _ = self._work_deferred[0]
-        dt = max(0.0, float(eligible_at - now))
-        return float(
-            max(self.cfg.min_idle_sleep_sec, min(dt, self.cfg.max_idle_sleep_sec))
-        )
+        # Find the next valid deferred entry (skip stale heap entries)
+        while self._work_deferred:
+            eligible_at, cid = self._work_deferred[0]
+            cur = self._deferred_at.get(cid)
+            if cur is None or abs(cur - eligible_at) > 1e-6:
+                heapq.heappop(self._work_deferred)
+                continue
+            dt = max(0.0, float(eligible_at - now))
+            return float(
+                max(self.cfg.min_idle_sleep_sec, min(dt, self.cfg.max_idle_sleep_sec))
+            )
+        return float(self.cfg.min_idle_sleep_sec)
 
     async def set_worklist(
         self,
@@ -398,24 +406,28 @@ class AdaptiveScheduler:
                 except Exception:
                     pass
 
+                # already queued?
+                if cid in self._queued:
+                    continue
+
                 # backoff
                 try:
                     if not self.retry_store.is_eligible(cid, now=now):
                         ts = float(self.retry_store.next_eligible_at(cid))
-                        heapq.heappush(self._work_deferred, (ts, cid))
+                        self._enqueue_deferred_locked(cid, ts)
                         continue
                 except Exception:
                     # if uncertain, allow it (better than deadlock)
                     pass
 
-                self._work_ready.append(cid)
+                self._enqueue_ready_locked(cid)
 
         logger.info(
             "[AdaptiveScheduling] seeded worklist ids=%d retry_mode=%s ready=%d deferred=%d",
             len(ids),
             retry_mode,
             self.pending_ready(),
-            len(self._work_deferred),
+            len(self._deferred_at),
         )
 
     async def cleanup_completed_retry_ids(
@@ -443,6 +455,90 @@ class AdaptiveScheduler:
             except Exception:
                 continue
         return cleared
+
+    # ----------------------------
+    # Queue helpers (LOCKED)
+    # ----------------------------
+    def _enqueue_ready_locked(self, cid: str) -> None:
+        if not cid:
+            return
+        if cid in self._queued:
+            # already queued (ready or deferred)
+            return
+        self._queued.add(cid)
+        self._work_ready.append(cid)
+
+    def _enqueue_deferred_locked(self, cid: str, eligible_at: float) -> None:
+        if not cid:
+            return
+        ts = float(eligible_at)
+        if cid not in self._queued:
+            self._queued.add(cid)
+        prev = self._deferred_at.get(cid)
+        if prev is None:
+            self._deferred_at[cid] = ts
+            heapq.heappush(self._work_deferred, (ts, cid))
+            return
+
+        # Respect the latest schedule (typically later) from retry_state.py
+        new_ts = max(float(prev), ts)
+        if abs(new_ts - float(prev)) > 1e-6:
+            self._deferred_at[cid] = new_ts
+            heapq.heappush(self._work_deferred, (new_ts, cid))
+
+    def _pop_ready_locked(self) -> Optional[str]:
+        while self._work_ready:
+            cid = self._work_ready.popleft()
+            if not cid:
+                continue
+            # remove from queued now; if we decide to defer it again, we will re-add
+            self._queued.discard(cid)
+            return cid
+        return None
+
+    def _move_due_deferred_locked(self, now: float) -> None:
+        moved = 0
+        while self._work_deferred:
+            ts, cid = self._work_deferred[0]
+            cur = self._deferred_at.get(cid)
+            # discard stale heap entries
+            if cur is None or abs(float(cur) - float(ts)) > 1e-6:
+                heapq.heappop(self._work_deferred)
+                continue
+            if float(ts) > float(now):
+                break
+
+            heapq.heappop(self._work_deferred)
+            # this is the current schedule for cid
+            self._deferred_at.pop(cid, None)
+
+            # quarantine/backoff can change; re-check
+            try:
+                if self.retry_store.is_quarantined(cid):
+                    self._queued.discard(cid)
+                    continue
+            except Exception:
+                pass
+            try:
+                if not self.retry_store.is_eligible(cid, now=now):
+                    ts2 = float(self.retry_store.next_eligible_at(cid))
+                    self._enqueue_deferred_locked(cid, ts2)
+                    continue
+            except Exception:
+                # if uncertain, allow it (better than deadlock)
+                pass
+
+            # move to ready
+            self._work_ready.append(cid)
+            moved += 1
+
+        if moved and logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "[AdaptiveScheduling] moved %d deferred -> ready (ready=%d deferred=%d)",
+                moved,
+                len(self._work_ready),
+                len(self._deferred_at),
+            )
 
     # ----------------------------
     # Properties
@@ -640,7 +736,7 @@ class AdaptiveScheduler:
                 0.0, time.monotonic() - self._last_admission_mono
             ),
             "ready": len(self._work_ready),
-            "deferred": len(self._work_deferred),
+            "deferred": len(self._deferred_at),
         }
 
     # ----------------------------
@@ -650,6 +746,10 @@ class AdaptiveScheduler:
         """
         Decide which company IDs should start now.
         """
+        # Snapshot active early (also used to prevent duplicate starts)
+        active_ids = list(self._get_active_company_ids())
+        active_set = set(active_ids)
+
         # 1) move deferred due
         async with self._lock:
             self._move_due_deferred_locked(time.time())
@@ -664,7 +764,6 @@ class AdaptiveScheduler:
             return []
 
         # 4) enforce hard capacity based on max_target and active
-        active_ids = list(self._get_active_company_ids())
         active_n = len(active_ids)
         hard_capacity = max(0, int(self.cfg.max_target) - active_n)
         if hard_capacity <= 0:
@@ -691,17 +790,24 @@ class AdaptiveScheduler:
         picked: List[str] = []
         scanned = 0
         max_scan = max(want * 4, want + 8)
+        now = time.time()
 
         while len(picked) < want and scanned < max_scan:
             scanned += 1
-            cid: Optional[str] = None
             async with self._lock:
-                if not self._work_ready:
-                    break
-                cid = self._work_ready.popleft()
+                cid = self._pop_ready_locked()
 
             if cid is None:
                 break
+
+            # If it's still active (e.g., we re-queued after a cancel but cancel hasn't taken effect yet),
+            # defer a bit to avoid duplicate runs.
+            if cid in active_set:
+                async with self._lock:
+                    self._enqueue_deferred_locked(
+                        cid, now + float(self.cfg.cancel_requeue_min_delay_sec)
+                    )
+                continue
 
             if self._is_company_runnable is not None:
                 try:
@@ -729,36 +835,6 @@ class AdaptiveScheduler:
             self._mark_progress()
 
         return picked
-
-    def _move_due_deferred_locked(self, now: float) -> None:
-        moved = 0
-        while self._work_deferred and self._work_deferred[0][0] <= now:
-            _, cid = heapq.heappop(self._work_deferred)
-
-            # quarantine/backoff can change; re-check
-            try:
-                if self.retry_store.is_quarantined(cid):
-                    continue
-            except Exception:
-                pass
-            try:
-                if not self.retry_store.is_eligible(cid, now=now):
-                    ts2 = float(self.retry_store.next_eligible_at(cid))
-                    heapq.heappush(self._work_deferred, (ts2, cid))
-                    continue
-            except Exception:
-                pass
-
-            self._work_ready.append(cid)
-            moved += 1
-
-        if moved and logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "[AdaptiveScheduling] moved %d deferred -> ready (ready=%d deferred=%d)",
-                moved,
-                len(self._work_ready),
-                len(self._work_deferred),
-            )
 
     # ----------------------------
     # Admission control
@@ -887,66 +963,95 @@ class AdaptiveScheduler:
                         "stall_detection_enabled": self.stall_detection_enabled,
                         "stall_suspensions": len(self._stall_suspensions),
                         "ready": len(self._work_ready),
-                        "deferred": len(self._work_deferred),
+                        "deferred": len(self._deferred_at),
                     },
                 )
 
             return slots
 
     # ----------------------------
-    # Watchdog loop + cancel recording
+    # Cancel recording + re-queueing (uses retry_state.py schedule)
     # ----------------------------
-    def _record_memory_cancels(
-        self, cancel_ids: Sequence[str], *, severity: str
+    async def _record_cancels_and_schedule_retries(
+        self,
+        cancel_ids: Sequence[str],
+        *,
+        cls_hint: str,
+        error: str,
+        stage: str,
+        status_code: Optional[int] = None,
+        permanent_reason: str = "",
     ) -> None:
         """
-        Record scheduler-triggered cancels as memory-class failures in RetryStateStore.
-
-        IMPORTANT:
-        retry_state.py (provided) does NOT accept max_attempts_mem/max_attempts_mem_heavy.
-        So we call mark_failure using a compatibility filter (_mark_failure_compat).
+        Record cancellations in RetryStateStore AND re-queue them using the
+        retry_state.py computed next_eligible_at (scheduler does not implement backoff).
         """
         if not cancel_ids:
             return
 
-        cls_hint = "mem_heavy" if severity == "heavy" else "mem"
-        stage = "scheduler_mem_cancel"
-        err = (
-            f"cancelled_by_scheduler:{cls_hint} "
-            f"used_raw={self._used_frac_raw:.3f} used_eff={self._used_frac_eff:.3f} "
-            f"ramp_raw={self._ramp_raw_frac_per_sec:.3f}/s "
-            f"proc_mb={(float(self._proc_rss_bytes) / _MB) if self._proc_rss_bytes else 0.0:.1f}"
-        )
-
+        # 1) record failures (IO + store lock)
         for cid in cancel_ids:
             _mark_failure_compat(
                 self.retry_store,
                 str(cid),
-                cls=cls_hint,  # retry_state.py normalizes mem_heavy -> mem
-                error=err,
-                stage=stage,
-                status_code=None,
-                permanent_reason="",
+                cls=str(cls_hint),
+                error=str(error),
+                stage=str(stage),
+                status_code=status_code,
+                permanent_reason=str(permanent_reason or ""),
             )
 
-    def _record_stall_cancels(self, cancel_ids: Sequence[str]) -> None:
-        if not cancel_ids:
+        # 2) build schedules (no lock held)
+        now = time.time()
+        active_set = set(self._get_active_company_ids())
+        items: List[Tuple[str, float]] = []
+        for cid in cancel_ids:
+            try:
+                if self.retry_store.is_quarantined(str(cid)):
+                    continue
+            except Exception:
+                pass
+
+            ts = 0.0
+            try:
+                ts = float(self.retry_store.next_eligible_at(str(cid)))
+            except Exception:
+                ts = 0.0
+
+            # enforce small cancel grace; also avoid re-admitting while still active
+            grace = float(self.cfg.cancel_requeue_min_delay_sec)
+            min_ts = now + grace
+            if str(cid) in active_set:
+                min_ts = now + grace
+            ts = max(float(ts or 0.0), float(min_ts))
+            items.append((str(cid), ts))
+
+        if not items:
             return
-        err = (
-            "cancelled_by_scheduler:stall "
-            f"inactivity_timeout={float(self.cfg.company_inactivity_timeout_sec):.1f}s"
-        )
-        for cid in cancel_ids:
-            _mark_failure_compat(
-                self.retry_store,
-                str(cid),
-                cls="stall",
-                error=err,
-                stage="scheduler_inactivity_cancel",
-                status_code=None,
-                permanent_reason="",
-            )
 
+        # 3) enqueue (LOCKED)
+        async with self._lock:
+            for cid, ts in items:
+                # If already queued, just update deferred schedule if needed.
+                if cid in self._queued:
+                    if cid in self._deferred_at:
+                        self._enqueue_deferred_locked(cid, ts)
+                    # if it's already ready, keep it (do not duplicate)
+                    continue
+
+                # If eligible now (after grace), put ready; else deferred.
+                try:
+                    if self.retry_store.is_eligible(cid, now=now) and ts <= now:
+                        self._enqueue_ready_locked(cid)
+                    else:
+                        self._enqueue_deferred_locked(cid, ts)
+                except Exception:
+                    # best-effort: defer by ts
+                    self._enqueue_deferred_locked(cid, ts)
+
+    # ----------------------------
+    # Watchdog loop
+    # ----------------------------
     async def _watchdog_loop(self) -> None:
         interval = max(0.5, float(self.cfg.sample_interval_sec))
         while True:
@@ -1195,7 +1300,7 @@ class AdaptiveScheduler:
                                 should_recycle_idle = True
                                 self._last_idle_recycle_mono = now_mono
 
-                # Outside lock: apply cancels and record to retry store
+                # Outside lock: apply cancels and record+schedule retries via RetryStateStore
                 if cancel_ids:
                     try:
                         self._request_cancel_companies(cancel_ids)
@@ -1206,14 +1311,37 @@ class AdaptiveScheduler:
                         )
                     else:
                         if cancel_reason in ("mem", "mem_heavy"):
-                            self._record_memory_cancels(
+                            cls_hint = (
+                                "mem_heavy" if cancel_reason == "mem_heavy" else "mem"
+                            )
+                            err = (
+                                f"cancelled_by_scheduler:{cls_hint} "
+                                f"used_raw={self._used_frac_raw:.3f} used_eff={self._used_frac_eff:.3f} "
+                                f"ramp_raw={self._ramp_raw_frac_per_sec:.3f}/s "
+                                f"proc_mb={(float(self._proc_rss_bytes) / _MB) if self._proc_rss_bytes else 0.0:.1f}"
+                            )
+                            await self._record_cancels_and_schedule_retries(
                                 cancel_ids,
-                                severity="heavy"
-                                if cancel_reason == "mem_heavy"
-                                else "normal",
+                                cls_hint=cls_hint,
+                                error=err,
+                                stage="scheduler_mem_cancel",
+                                status_code=None,
+                                permanent_reason="",
                             )
                         elif cancel_reason == "stall":
-                            self._record_stall_cancels(cancel_ids)
+                            # REQUIRED: inactivity cancels are marked as "stall" in retry_state.py
+                            err = (
+                                "cancelled_by_scheduler:stall "
+                                f"inactivity_timeout={float(self.cfg.company_inactivity_timeout_sec):.1f}s"
+                            )
+                            await self._record_cancels_and_schedule_retries(
+                                cancel_ids,
+                                cls_hint="stall",
+                                error=err,
+                                stage="scheduler_inactivity_cancel",
+                                status_code=None,
+                                permanent_reason="",
+                            )
 
                     try:
                         gc.collect()
@@ -1299,7 +1427,7 @@ class AdaptiveScheduler:
                 "stall_detection_enabled": self.stall_detection_enabled,
                 "stall_suspensions": len(self._stall_suspensions),
                 "ready": len(self._work_ready),
-                "deferred": len(self._work_deferred),
+                "deferred": len(self._deferred_at),
             }
             tmp = path.with_suffix(path.suffix + ".tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -1654,7 +1782,7 @@ class AdaptiveScheduler:
             "stall_detection_enabled": self.stall_detection_enabled,
             "stall_suspensions": len(self._stall_suspensions),
             "ready": len(self._work_ready),
-            "deferred": len(self._work_deferred),
+            "deferred": len(self._deferred_at),
         }
         if extra:
             state.update(extra)
