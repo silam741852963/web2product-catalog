@@ -132,6 +132,61 @@ def _touch(touch_cb: Optional[Any], company_id: str) -> None:
         return
 
 
+async def _await_with_periodic_touch(
+    coro: Any,
+    *,
+    company_id: str,
+    touch_cb: Optional[Any],
+    interval_sec: float = 5.0,
+) -> Any:
+    """
+    Await a coroutine while periodically touching the scheduler to avoid false inactivity cancels.
+    """
+    t = asyncio.create_task(coro)
+    try:
+        while True:
+            done, _ = await asyncio.wait({t}, timeout=max(0.25, float(interval_sec)))
+            if done:
+                return await t
+            _touch(touch_cb, company_id)
+    except asyncio.CancelledError:
+        t.cancel()
+        raise
+
+
+async def _lease_with_touch(
+    crawler_pool: "CrawlerPool",
+    *,
+    company_id: str,
+    touch_cb: Optional[Any],
+    timeout_sec: float,
+    tick_sec: float = 3.0,
+) -> "_CrawlerLease":
+    """
+    Lease a crawler slot with a hard timeout, but keep touching while waiting.
+    Avoids scheduler inactivity cancels when admission gets ahead of crawler leasing.
+    """
+    start = time.monotonic()
+    lease_task = asyncio.create_task(crawler_pool.lease())
+    try:
+        while True:
+            remaining = float(timeout_sec) - (time.monotonic() - start)
+            if remaining <= 0:
+                lease_task.cancel()
+                raise asyncio.TimeoutError(
+                    f"crawler_pool.lease timed out after {timeout_sec:.1f}s"
+                )
+            done, _ = await asyncio.wait(
+                {lease_task}, timeout=min(max(0.25, float(tick_sec)), remaining)
+            )
+            if done:
+                return await lease_task
+            _touch(touch_cb, company_id)
+    except asyncio.CancelledError:
+        lease_task.cancel()
+        raise
+
+
 async def _run_cleanup_even_if_cancelled(coro: Any) -> None:
     """
     Ensure cleanup runs even if the current task is cancelled.
@@ -195,12 +250,6 @@ def _classify_failure_for_retry(
 ) -> Tuple[str, bool, Optional[int]]:
     """
     Return (cls, nxdomain_like, status_code).
-
-    Policy:
-      - network-like issues => cls="net"
-      - resource/scheduling/timeout/overload => cls="stall" (wait longer, retry more)
-      - memory pressure => cls="mem"
-      - unknown => cls="stall" (safer: avoids hammering; still retries)
     """
     msg = f"{type(exc).__name__}: {exc}"
     low = msg.lower()
@@ -211,24 +260,19 @@ def _classify_failure_for_retry(
     except Exception:
         status_code = None
 
-    # Memory
     if isinstance(exc, CriticalMemoryPressure):
         return "mem", False, status_code
 
-    # Any explicit timeout stages or asyncio timeouts => stall
     if isinstance(exc, (asyncio.TimeoutError, CrawlerTimeoutError)):
         return "stall", False, status_code
 
-    # Playwright driver disconnect / fatal crawler errors => treat as net-ish
     if isinstance(exc, CrawlerFatalError) or _is_playwright_driver_disconnect(exc):
         return "net", RetryStateStore.classify_unreachable_error(str(exc)), status_code
 
-    # DNS/NXDOMAIN-like => net (with nxdomain flag)
     nxdomain_like = RetryStateStore.classify_unreachable_error(str(exc))
     if nxdomain_like:
         return "net", True, status_code
 
-    # Obvious network-ish needles
     net_needles = [
         "connection refused",
         "connection reset",
@@ -257,7 +301,6 @@ def _classify_failure_for_retry(
     if any(n in low for n in net_needles):
         return "net", False, status_code
 
-    # LLM rate limiting / quota / transient provider errors: treat as stall
     stall_needles = [
         "rate limit",
         "too many requests",
@@ -272,7 +315,6 @@ def _classify_failure_for_retry(
     if any(n in low for n in stall_needles):
         return "stall", False, status_code
 
-    # Default: stall (wait longer + retry more)
     return "stall", False, status_code
 
 
@@ -483,13 +525,22 @@ class _CrawlerLease:
         return self._slot.crawler
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        # If we are cancelled mid-crawl, release MUST still happen (otherwise crawler slots leak).
+        if exc_type is asyncio.CancelledError:
+            self._fatal = True
+            self._reason = "cancelled"
+
         if exc is not None:
             if isinstance(exc, CrawlerFatalError) or _is_playwright_driver_disconnect(
                 exc
             ):
                 self._fatal = True
                 self._reason = "driver_disconnect"
-        await self._pool._release(self._slot, fatal=self._fatal, reason=self._reason)
+
+        # Shield release to prevent slot leak under cancellation.
+        await asyncio.shield(
+            self._pool._release(self._slot, fatal=self._fatal, reason=self._reason)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -810,13 +861,15 @@ async def crawl_company(
                     aclose = getattr(agen, "aclose", None)
                     if callable(aclose):
                         try:
-                            await aclose()
+                            if cancelled_exc is not None:
+                                await _run_cleanup_even_if_cancelled(aclose())
+                            else:
+                                await aclose()
                         except Exception:
                             logger.exception(
                                 "Error closing deep crawl generator (company_id=%s)",
                                 company.company_id,
                             )
-
             else:
                 for page_result in results_or_gen:
                     _touch(touch_cb, company.company_id)
@@ -847,7 +900,6 @@ async def crawl_company(
             except Exception:
                 pass
 
-    # Return summary so run.py can decide company retry class from per-page markers
     try:
         return await processor.get_summary()
     except Exception:
@@ -860,11 +912,6 @@ async def crawl_company(
 
 
 def _should_skip_company(status: str, llm_mode: str) -> bool:
-    """
-    Defines what "DONE" means under each mode:
-      - llm_mode == none: markdown_done OR llm_done means no more work
-      - otherwise: must be llm_done
-    """
     if llm_mode == "none":
         return status in (
             COMPANY_STATUS_MD_DONE,
@@ -877,14 +924,6 @@ def _should_skip_company(status: str, llm_mode: str) -> bool:
 def _should_retry_company_from_page_summary(
     summary: PagePipelineSummary,
 ) -> Tuple[Optional[str], str]:
-    """
-    Convert per-page markers into a *company-level* retry decision.
-
-    Returns: (retry_cls or None, reason_string)
-      - "mem" when any memory_pressure pages exist
-      - "stall" when timeout dominance suggests crawl is compromised
-      - None when no escalation is needed
-    """
     tp = max(0, int(summary.total_pages))
     ts = int(summary.timeout_pages)
     mp = int(summary.memory_pressure_pages)
@@ -893,13 +932,10 @@ def _should_retry_company_from_page_summary(
     if mp > 0:
         return "mem", f"page_pipeline saw memory_pressure_pages={mp}/{tp}"
 
-    # If we got no pages, treat as stall (often blocked / immediate failure)
     if tp == 0:
         return "stall", "page_pipeline yielded 0 pages"
 
     timeout_ratio = float(ts) / float(tp or 1)
-
-    # Escalate timeouts only when they dominate or nothing useful was saved.
     if (md_saved == 0 and ts > 0) or (ts >= 3 and timeout_ratio >= 0.60):
         return "stall", (
             f"page_pipeline excessive timeouts: timeout_pages={ts}/{tp} "
@@ -1015,7 +1051,13 @@ async def run_company_pipeline(
 
         # -------------------- Crawl stage --------------------
         if do_crawl:
-            await guard.wait_until_healthy()
+            # Avoid false inactivity cancels while waiting for guard health
+            await _await_with_periodic_touch(
+                guard.wait_until_healthy(),
+                company_id=company.company_id,
+                touch_cb=touch_cb,
+                interval_sec=5.0,
+            )
             _touch(touch_cb, company.company_id)
 
             lease_timeout = float(getattr(args, "crawler_lease_timeout_sec", 120.0))
@@ -1024,6 +1066,20 @@ async def run_company_pipeline(
                 getattr(args, "stream_no_yield_timeout_sec", 900.0)
             )
             submit_timeout_sec = float(getattr(args, "submit_timeout_sec", 30.0))
+
+            # IMPORTANT:
+            # If scheduler inactivity timeout is shorter than stream_no_yield_timeout,
+            # the scheduler will cancel tasks mid-await -> cancellation storms + crawl4ai cancel weirdness.
+            if scheduler is not None and scheduler.stall_detection_enabled:
+                try:
+                    inact = float(scheduler.cfg.company_inactivity_timeout_sec)  # type: ignore[attr-defined]
+                    if inact > 0:
+                        stream_no_yield_timeout_sec = min(
+                            stream_no_yield_timeout_sec,
+                            max(30.0, inact * 0.85),
+                        )
+                except Exception:
+                    pass
 
             tuned = _tune_page_pipeline_params(args=args, scheduler=scheduler)
 
@@ -1036,10 +1092,13 @@ async def run_company_pipeline(
 
             for attempt in range(max_attempts):
                 try:
-                    # IMPORTANT: distinguish lease timeout from other timeouts
                     try:
-                        lease = await asyncio.wait_for(
-                            crawler_pool.lease(), timeout=lease_timeout
+                        lease = await _lease_with_touch(
+                            crawler_pool,
+                            company_id=company.company_id,
+                            touch_cb=touch_cb,
+                            timeout_sec=lease_timeout,
+                            tick_sec=3.0,
                         )
                     except asyncio.TimeoutError as e:
                         raise CrawlerTimeoutError(
@@ -1080,7 +1139,6 @@ async def run_company_pipeline(
                             submit_timeout_sec=submit_timeout_sec,
                         )
 
-                    # ---- NEW: Escalate per-page markers into company-level retry when needed
                     if page_summary is not None:
                         retry_cls, reason = _should_retry_company_from_page_summary(
                             page_summary
@@ -1184,7 +1242,6 @@ async def run_company_pipeline(
             llm_last_nxdomain = False
             llm_last_status_code: Optional[int] = None
 
-            # small in-run retries; final failure always scheduled in retry_store
             llm_attempts = 2
 
             try:
@@ -1220,7 +1277,6 @@ async def run_company_pipeline(
                                 llm_last_cls,
                             )
 
-                        # lightweight in-run delay; real backoff handled by RetryStateStore
                         if attempt + 1 < llm_attempts:
                             await asyncio.sleep(0.75)
 
@@ -1428,7 +1484,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         help="Recycle a crawler instance after N companies.",
     )
 
-    # NOTE: scheduling knobs are now *used by AdaptiveScheduler*, not run.py
     parser.add_argument(
         "--max-start-per-tick",
         type=int,
@@ -1564,7 +1619,6 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     page_interaction_factory = default_page_interaction_factory
 
-    # State DB anchored to out_dir
     state = get_crawl_state(db_path=out_dir / "crawl_state.sqlite3")
 
     inflight_by_cid: Dict[str, asyncio.Task] = {}
@@ -1586,15 +1640,24 @@ async def main_async(args: argparse.Namespace) -> None:
             return 0
 
     def request_cancel_companies(ids: Sequence[str]) -> None:
-        nonlocal retry_store
+        """
+        Scheduler already:
+          - records cancel as mem/stall
+          - schedules retry using RetryStateStore.next_eligible_at
+          - applies cancel grace + cancel-inflight spam guard
 
+        So run.py must ONLY cancel tasks + request crawler recycle.
+        DO NOT mark retry_store here (prevents wrong cls + retry churn).
+        """
         if crawler_pool is not None and ids:
             try:
-                crawler_pool.request_recycle(len(ids), reason="mem_pressure_cancel")
+                crawler_pool.request_recycle(
+                    len(ids), reason="scheduler_cancel_recycle"
+                )
                 asyncio.create_task(
                     crawler_pool.recycle_idle_now(
                         min(len(ids), crawler_pool.size),
-                        reason="mem_pressure_idle_recycle",
+                        reason="scheduler_cancel_idle_recycle",
                     )
                 )
             except Exception:
@@ -1605,20 +1668,6 @@ async def main_async(args: argparse.Namespace) -> None:
             if t is None or t.done():
                 continue
             logger.error("[AdaptiveScheduling] cancelling company_id=%s", cid)
-
-            # IMPORTANT: mark as mem cancellation; cancelled tasks are skipped later so no overwrite.
-            if retry_store is not None:
-                try:
-                    retry_store.mark_failure(
-                        cid,
-                        cls="mem",
-                        error="cancelled by AdaptiveScheduler due to memory pressure/inactivity",
-                        stage="scheduler_cancel",
-                        max_attempts_net=6,
-                        max_attempts_stall=8,
-                    )
-                except Exception:
-                    pass
             t.cancel()
 
     scheduler: Optional[AdaptiveScheduler] = None
@@ -1728,7 +1777,6 @@ async def main_async(args: argparse.Namespace) -> None:
         companies_by_id: Dict[str, Company] = {c.company_id: c for c in companies}
         company_ids_all: List[str] = [c.company_id for c in companies]
 
-        # FIX: CrawlState.start_run signature is start_run(pipeline, *, version, args_hash, run_id)
         run_id = await state.start_run(
             "deep_crawl",
             version=None,
@@ -1742,7 +1790,6 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception:
             logger.exception("Failed to recompute global crawl state at startup")
 
-        # -------------------- IMPORTANT: filter DONE companies BEFORE queuing --------------------
         try:
             runnable_ids = await state.filter_runnable_company_ids(
                 company_ids_all,
@@ -1766,7 +1813,6 @@ async def main_async(args: argparse.Namespace) -> None:
             args.llm_mode,
         )
 
-        # Prefer progress totals to reflect runnable work
         await state.update_run_totals(run_id, total_companies=len(runnable_ids))
 
         dataset_externals: frozenset[str] = build_dataset_externals(
@@ -1799,7 +1845,7 @@ async def main_async(args: argparse.Namespace) -> None:
         )
         await crawler_pool.start()
 
-        # -------------------- scheduler (owns retry + scheduling) --------------------
+        # -------------------- scheduler --------------------
         cc = max(1, int(getattr(args, "company_concurrency", 16)))
 
         scheduler_cfg = AdaptiveSchedulingConfig(
@@ -1814,6 +1860,10 @@ async def main_async(args: argparse.Namespace) -> None:
             ),
             idle_recycle_raw_frac=float(getattr(args, "idle_recycle_raw_frac", 0.88)),
             idle_recycle_eff_frac=float(getattr(args, "idle_recycle_eff_frac", 0.83)),
+            # CRITICAL FIX:
+            # Prevent admitting > free crawler slots; otherwise tasks wait for lease,
+            # go "inactive", get cancelled, then re-admitted -> churn with flat CPU/network.
+            crawler_capacity_multiplier=1,
         )
 
         scheduler = AdaptiveScheduler(
@@ -1951,7 +2001,6 @@ async def main_async(args: argparse.Namespace) -> None:
                     if cid is not None:
                         inflight_by_cid.pop(cid, None)
 
-                    # IMPORTANT: cancelled tasks were already scheduled as "mem" (or "stall" on shutdown)
                     if t.cancelled():
                         continue
 

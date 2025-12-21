@@ -214,6 +214,12 @@ class AdaptiveSchedulingConfig:
     # "cancel grace" to avoid duplicate starts while cancellation is in-flight.
     cancel_requeue_min_delay_sec: float = 2.0
 
+    # Cancel spam guard:
+    # - If a cancel has been requested for a company, don't request it again for a short cooldown.
+    # - Also keep a bounded in-flight record so we can avoid churn even if active bookkeeping lags.
+    company_cancel_repeat_cooldown_sec: float = 15.0
+    company_cancel_inflight_timeout_sec: float = 600.0
+
 
 class AdaptiveScheduler:
     """
@@ -251,12 +257,8 @@ class AdaptiveScheduler:
         # Worklist
         self._work_ready: Deque[str] = deque()
         self._work_deferred: List[Tuple[float, str]] = []  # heap (eligible_at_ts, cid)
-        self._deferred_at: Dict[
-            str, float
-        ] = {}  # cid -> current eligible_at (heap has stale entries)
-        self._queued: set[str] = (
-            set()
-        )  # cid present in ready or deferred (prevents duplicates)
+        self._deferred_at: Dict[str, float] = {}  # cid -> current eligible_at
+        self._queued: set[str] = set()  # cid present in ready or deferred
         self._work_seen: set[str] = set()
         self._work_total_hint: int = 0
         self._is_company_runnable: Optional[Callable[[str], Awaitable[bool]]] = None
@@ -318,6 +320,10 @@ class AdaptiveScheduler:
 
         # Stall detection suspension
         self._stall_suspensions: set[str] = set()
+
+        # Cancel-in-flight guard
+        # cid -> monotonic timestamp when cancel requested
+        self._cancel_inflight_mono: Dict[str, float] = {}
 
         # Async + optional thread watchdog
         self._lock = asyncio.Lock()
@@ -463,7 +469,6 @@ class AdaptiveScheduler:
         if not cid:
             return
         if cid in self._queued:
-            # already queued (ready or deferred)
             return
         self._queued.add(cid)
         self._work_ready.append(cid)
@@ -491,7 +496,6 @@ class AdaptiveScheduler:
             cid = self._work_ready.popleft()
             if not cid:
                 continue
-            # remove from queued now; if we decide to defer it again, we will re-add
             self._queued.discard(cid)
             return cid
         return None
@@ -509,7 +513,6 @@ class AdaptiveScheduler:
                 break
 
             heapq.heappop(self._work_deferred)
-            # this is the current schedule for cid
             self._deferred_at.pop(cid, None)
 
             # quarantine/backoff can change; re-check
@@ -525,10 +528,8 @@ class AdaptiveScheduler:
                     self._enqueue_deferred_locked(cid, ts2)
                     continue
             except Exception:
-                # if uncertain, allow it (better than deadlock)
                 pass
 
-            # move to ready
             self._work_ready.append(cid)
             moved += 1
 
@@ -726,6 +727,7 @@ class AdaptiveScheduler:
             "ever_had_active": self._ever_had_active,
             "stall_detection_enabled": self.stall_detection_enabled,
             "stall_suspensions": len(self._stall_suspensions),
+            "cancel_inflight": len(self._cancel_inflight_mono),
             "last_heartbeat_age_sec": max(
                 0.0, time.monotonic() - self._last_heartbeat_mono
             ),
@@ -745,6 +747,10 @@ class AdaptiveScheduler:
     async def plan_start_batch(self, *, free_crawlers: int) -> List[str]:
         """
         Decide which company IDs should start now.
+
+        IMPORTANT:
+          If free_crawlers <= 0, we start NOTHING. This prevents a churn loop where
+          tasks get admitted but cannot lease a crawler slot, then hit inactivity cancels.
         """
         # Snapshot active early (also used to prevent duplicate starts)
         active_ids = list(self._get_active_company_ids())
@@ -769,11 +775,16 @@ class AdaptiveScheduler:
         if hard_capacity <= 0:
             return []
 
-        # 5) crawler pressure
-        crawler_cap = max(
-            1, int(max(0, free_crawlers)) * int(self.cfg.crawler_capacity_multiplier)
-        )
-        crawler_cap = max(1, crawler_cap)
+        # 5) crawler pressure (STRICT: 0 free crawlers => start 0)
+        free = int(free_crawlers)
+        if free <= 0:
+            return []
+        mult = int(self.cfg.crawler_capacity_multiplier)
+        if mult <= 0:
+            return []
+        crawler_cap = max(0, free * mult)
+        if crawler_cap <= 0:
+            return []
 
         # 6) final plan size
         want = min(
@@ -962,6 +973,7 @@ class AdaptiveScheduler:
                         else 0.0,
                         "stall_detection_enabled": self.stall_detection_enabled,
                         "stall_suspensions": len(self._stall_suspensions),
+                        "cancel_inflight": len(self._cancel_inflight_mono),
                         "ready": len(self._work_ready),
                         "deferred": len(self._deferred_at),
                     },
@@ -1036,7 +1048,6 @@ class AdaptiveScheduler:
                 if cid in self._queued:
                     if cid in self._deferred_at:
                         self._enqueue_deferred_locked(cid, ts)
-                    # if it's already ready, keep it (do not duplicate)
                     continue
 
                 # If eligible now (after grace), put ready; else deferred.
@@ -1046,7 +1057,6 @@ class AdaptiveScheduler:
                     else:
                         self._enqueue_deferred_locked(cid, ts)
                 except Exception:
-                    # best-effort: defer by ts
                     self._enqueue_deferred_locked(cid, ts)
 
     # ----------------------------
@@ -1099,6 +1109,28 @@ class AdaptiveScheduler:
                     for cid in active_ids:
                         self._company_last_touch_mono.setdefault(cid, now_mono)
 
+                    # Maintain cancel-inflight map:
+                    # - drop if no longer active, or too old (bounded memory / stale cleanup)
+                    inflight_timeout = float(
+                        self.cfg.company_cancel_inflight_timeout_sec
+                    )
+                    for cid, ts in list(self._cancel_inflight_mono.items()):
+                        if cid not in active_set:
+                            self._cancel_inflight_mono.pop(cid, None)
+                            continue
+                        if inflight_timeout > 0 and (now_mono - ts) >= inflight_timeout:
+                            self._cancel_inflight_mono.pop(cid, None)
+
+                    repeat_cooldown = float(self.cfg.company_cancel_repeat_cooldown_sec)
+
+                    def _recently_cancelled(cid: str) -> bool:
+                        ts = self._cancel_inflight_mono.get(cid)
+                        return (
+                            ts is not None
+                            and repeat_cooldown > 0
+                            and ((now_mono - ts) < repeat_cooldown)
+                        )
+
                     stall_enabled = self.stall_detection_enabled
 
                     # 1) Per-company inactivity cancel (gated)
@@ -1109,6 +1141,9 @@ class AdaptiveScheduler:
                     ):
                         stuck: List[str] = []
                         for cid in active_ids:
+                            # If we already asked to cancel it recently, don't spam-cancel.
+                            if _recently_cancelled(cid):
+                                continue
                             last = self._company_last_touch_mono.get(cid, now_mono)
                             if (now_mono - last) >= float(
                                 self.cfg.company_inactivity_timeout_sec
@@ -1242,15 +1277,28 @@ class AdaptiveScheduler:
                         if (now - self._last_emergency_cancel_ts) >= float(
                             self.cfg.emergency_cancel_cooldown_sec
                         ):
+                            # Don't repeatedly cancel the same companies.
+                            cancelable = [
+                                cid
+                                for cid in active_ids
+                                if not _recently_cancelled(cid)
+                            ]
+                            inflight_active = sum(
+                                1
+                                for cid in active_ids
+                                if cid in self._cancel_inflight_mono
+                            )
                             max_cancelable = max(
-                                0, active_n - int(self.cfg.min_active_keep)
+                                0,
+                                (active_n - inflight_active)
+                                - int(self.cfg.min_active_keep),
                             )
                             to_cancel = min(
                                 int(self.cfg.emergency_cancel_max), max_cancelable
                             )
-                            if to_cancel > 0:
+                            if to_cancel > 0 and cancelable:
                                 cancel_ids = self._select_cancel_ids(
-                                    active_ids, to_cancel
+                                    cancelable, to_cancel
                                 )
                                 self._last_emergency_cancel_ts = now
                                 cancel_reason = "mem_heavy" if ramp_trigger else "mem"
@@ -1302,6 +1350,13 @@ class AdaptiveScheduler:
 
                 # Outside lock: apply cancels and record+schedule retries via RetryStateStore
                 if cancel_ids:
+                    # Mark inflight BEFORE sending cancel to suppress repeat cancels.
+                    # If cancel request fails, we remove these inflight marks.
+                    inflight_mark_ts = time.monotonic()
+                    async with self._lock:
+                        for cid in cancel_ids:
+                            self._cancel_inflight_mono[str(cid)] = inflight_mark_ts
+
                     try:
                         self._request_cancel_companies(cancel_ids)
                         self._mark_progress()
@@ -1309,6 +1364,10 @@ class AdaptiveScheduler:
                         logger.exception(
                             "[AdaptiveScheduling] request_cancel_companies failed"
                         )
+                        # undo inflight marks to allow retry next tick
+                        async with self._lock:
+                            for cid in cancel_ids:
+                                self._cancel_inflight_mono.pop(str(cid), None)
                     else:
                         if cancel_reason in ("mem", "mem_heavy"):
                             cls_hint = (
@@ -1426,6 +1485,7 @@ class AdaptiveScheduler:
                 else 0.0,
                 "stall_detection_enabled": self.stall_detection_enabled,
                 "stall_suspensions": len(self._stall_suspensions),
+                "cancel_inflight": len(self._cancel_inflight_mono),
                 "ready": len(self._work_ready),
                 "deferred": len(self._deferred_at),
             }
@@ -1781,6 +1841,7 @@ class AdaptiveScheduler:
             "ever_had_active": self._ever_had_active,
             "stall_detection_enabled": self.stall_detection_enabled,
             "stall_suspensions": len(self._stall_suspensions),
+            "cancel_inflight": len(self._cancel_inflight_mono),
             "ready": len(self._work_ready),
             "deferred": len(self._deferred_at),
         }
