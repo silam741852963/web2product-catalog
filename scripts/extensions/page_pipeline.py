@@ -5,24 +5,91 @@ import errno
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Callable, Awaitable, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
-from extensions.connectivity_guard import ConnectivityGuard
 from extensions import md_gating
 from extensions import output_paths
+from extensions.connectivity_guard import ConnectivityGuard
 from extensions.output_paths import (
-    save_stage_output,
     ensure_company_dirs,
     sanitize_bvdid,
+    save_stage_output,
 )
 
 logger = logging.getLogger("page_pipeline")
 
+# --------------------------------------------------------------------------------------
+# Unified failure markers + smarter detection (single source of truth)
+# --------------------------------------------------------------------------------------
+
+# This marker is emitted by your crawler layer today; keep as a strong signal.
 MEMORY_PRESSURE_MARKER = "Requeued due to critical memory pressure"
+
+# Timeout messages vary across Playwright / Crawl4AI / underlying stacks.
+# We detect *families* of timeout texts rather than a single exact string.
+_TIMEOUT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Crawl4AI style: "Timeout 60000ms exceeded."
+    re.compile(r"\btimeout\s+\d+\s*ms\s+exceeded\b", re.IGNORECASE),
+    re.compile(r"\btimeout\s+\d+\s*ms\s+exceeded\.\b", re.IGNORECASE),
+    # Playwright style: "Navigation timeout of 30000 ms exceeded"
+    re.compile(r"\bnavigation\s+timeout\s+of\s+\d+\s*ms\s+exceeded\b", re.IGNORECASE),
+    # Generic: "... timed out ..."
+    re.compile(r"\btimed\s+out\b", re.IGNORECASE),
+    # TimeoutError wrappers
+    re.compile(r"\btimeouterror\b", re.IGNORECASE),
+)
+
+# Memory pressure messages vary too; keep conservative.
+_MEMORY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(re.escape(MEMORY_PRESSURE_MARKER), re.IGNORECASE),
+    re.compile(r"\bcritical\s+memory\s+pressure\b", re.IGNORECASE),
+    re.compile(r"\bmemory\s+pressure\b", re.IGNORECASE),
+    re.compile(r"\bout\s+of\s+memory\b", re.IGNORECASE),
+    re.compile(r"\boomed\b|\boom\b", re.IGNORECASE),
+)
+
+
+def is_timeout_error_message(error: str, marker: Optional[str] = None) -> bool:
+    """
+    Smarter timeout detection:
+      - optional legacy substring marker (if someone still passes one)
+      - pattern-based matching for common timeout families
+    """
+    if not error:
+        return False
+
+    if marker:
+        try:
+            if marker in error:
+                return True
+        except Exception:
+            pass
+
+    for rx in _TIMEOUT_PATTERNS:
+        try:
+            if rx.search(error):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def is_memory_pressure_error_message(error: str) -> bool:
+    if not error:
+        return False
+    for rx in _MEMORY_PATTERNS:
+        try:
+            if rx.search(error):
+                return True
+        except Exception:
+            continue
+    return False
+
 
 # --------------------------------------------------------------------------------------
 # Small, fast atomic JSON write (local, because we want batched url_index writing here)
@@ -68,7 +135,6 @@ def _atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
 
 
 def _atomic_write_json_compact(path: Path, obj: Any) -> None:
-    # compact JSON => much faster & smaller for big url_index.json
     payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     _atomic_write_text(path, payload, "utf-8")
 
@@ -127,10 +193,8 @@ class UrlIndexBatchWriter:
         self._index: Dict[str, Any] = {}
         self._dirty = 0
         self._last_flush = 0.0
-        self._stop = asyncio.Event()
 
     async def start(self) -> None:
-        # Load once (thread offload for big files)
         def _load() -> Dict[str, Any]:
             if self.path.exists():
                 obj = _json_load_nocache(self.path)
@@ -144,13 +208,11 @@ class UrlIndexBatchWriter:
         )
 
     async def enqueue(self, url: str, patch: Dict[str, Any]) -> None:
-        # Patch objects are small; allow backpressure if queue is full
         await self._q.put((url, patch))
 
     async def close(self) -> None:
         if self._task is None:
             return
-        # sentinel
         await self._q.put(None)
         await self._task
         self._task = None
@@ -177,7 +239,6 @@ class UrlIndexBatchWriter:
             try:
                 item = await asyncio.wait_for(self._q.get(), timeout=timeout)
             except asyncio.TimeoutError:
-                # periodic flush when dirty
                 if self._dirty > 0:
                     try:
                         await self._flush()
@@ -188,7 +249,6 @@ class UrlIndexBatchWriter:
                 continue
 
             if item is None:
-                # final flush
                 try:
                     await self._flush()
                 except Exception:
@@ -214,17 +274,12 @@ class UrlIndexBatchWriter:
 
 
 # --------------------------------------------------------------------------------------
-# Page result processing (now async-friendly: offloads disk I/O; supports batched writer)
+# Page result processing
 # --------------------------------------------------------------------------------------
 
-
-async def _maybe_call(cb: Optional[Callable[[str], None]], company_id: str) -> None:
-    if cb is None:
-        return
-    try:
-        cb(company_id)
-    except Exception:
-        logger.exception("company callback failed (company=%s)", company_id)
+# NOTE: We intentionally do NOT call company-level retry callbacks here.
+# Per-page timeouts/memory pressure are URL-level noise and should stay in url_index only.
+_warned_company_callbacks = False
 
 
 async def _save_stage_threaded(
@@ -249,20 +304,29 @@ async def process_page_result(
     company: Any,
     guard: Optional[ConnectivityGuard],
     gating_cfg: md_gating.MarkdownGatingConfig,
-    timeout_error_marker: str,
+    timeout_error_marker: str = "",
     mark_company_timeout_cb: Optional[Callable[[str], None]] = None,
     mark_company_memory_cb: Optional[Callable[[str], None]] = None,
-    # NEW: if provided, we do NOT touch url_index.json directly; we enqueue patches.
     url_index_sink: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
 ) -> None:
     """
     Per page processing.
 
-    PERF changes:
-      - No longer calls guard.wait_until_healthy() (page processing does not perform requests).
-      - Disk writes are offloaded via asyncio.to_thread.
-      - url_index updates can be batched via url_index_sink.
+    IMPORTANT POLICY:
+      - We do NOT promote per-page timeout/memory pressure into company-level retry callbacks.
+        These are recorded in url_index only; company retry classification happens at pipeline boundaries.
     """
+    global _warned_company_callbacks
+
+    if (
+        mark_company_timeout_cb is not None or mark_company_memory_cb is not None
+    ) and not _warned_company_callbacks:
+        logger.warning(
+            "process_page_result received company-level retry callbacks, but they are intentionally ignored "
+            "(per-page signals remain URL-level only)."
+        )
+        _warned_company_callbacks = True
+
     company_id = getattr(company, "company_id", None)
     if not company_id:
         logger.warning(
@@ -287,13 +351,10 @@ async def process_page_result(
     )
 
     error_str = error if isinstance(error, str) else ""
-    timeout_exceeded = bool(error_str and timeout_error_marker in error_str)
-    memory_pressure = bool(error_str and MEMORY_PRESSURE_MARKER in error_str)
-
-    if timeout_exceeded:
-        await _maybe_call(mark_company_timeout_cb, company_id)
-    if memory_pressure:
-        await _maybe_call(mark_company_memory_cb, company_id)
+    timeout_exceeded = is_timeout_error_message(
+        error_str, marker=(timeout_error_marker or None)
+    )
+    memory_pressure = is_memory_pressure_error_message(error_str)
 
     html = _getattr(page_result, "html", None) or _getattr(
         page_result, "final_html", None
@@ -371,14 +432,13 @@ async def process_page_result(
     if url_index_sink is not None:
         await url_index_sink(url, entry)
     else:
-        # Fallback (slower): immediate write. Keep it thread-offloaded to avoid blocking loop.
         from extensions.crawl_state import upsert_url_index_entry
 
         await asyncio.to_thread(upsert_url_index_entry, company_id, url, entry)
 
 
 # --------------------------------------------------------------------------------------
-# Concurrent page pipeline (bounded worker pool + backpressure)
+# Concurrent page pipeline
 # --------------------------------------------------------------------------------------
 
 
@@ -397,7 +457,7 @@ class ConcurrentPageResultProcessor:
         company: Any,
         guard: Optional[ConnectivityGuard],
         gating_cfg: md_gating.MarkdownGatingConfig,
-        timeout_error_marker: str,
+        timeout_error_marker: str = "",
         mark_company_timeout_cb: Optional[Callable[[str], None]] = None,
         mark_company_memory_cb: Optional[Callable[[str], None]] = None,
         concurrency: int = 8,
@@ -409,6 +469,8 @@ class ConcurrentPageResultProcessor:
         self.guard = guard
         self.gating_cfg = gating_cfg
         self.timeout_error_marker = timeout_error_marker
+
+        # kept for signature compatibility, but intentionally unused by process_page_result
         self.mark_company_timeout_cb = mark_company_timeout_cb
         self.mark_company_memory_cb = mark_company_memory_cb
 
@@ -420,7 +482,7 @@ class ConcurrentPageResultProcessor:
         )
         self._q: asyncio.Queue[Optional[Any]] = asyncio.Queue(maxsize=maxsize)
 
-        self._workers: List[asyncio.Task] = []
+        self._workers: list[asyncio.Task] = []
         self._fatal: Optional[BaseException] = None
 
         flush_cfg = url_index_flush_cfg or UrlIndexFlushConfig()
@@ -440,7 +502,6 @@ class ConcurrentPageResultProcessor:
         if self._fatal is not None:
             raise self._fatal
 
-        # Put with periodic checks to avoid deadlock if a fatal error happens while queue is full.
         while True:
             if self._fatal is not None:
                 raise self._fatal
@@ -451,11 +512,9 @@ class ConcurrentPageResultProcessor:
                 await asyncio.sleep(0.05)
 
     async def finish(self) -> None:
-        # Signal workers
         for _ in self._workers:
             await self._q.put(None)
 
-        # Wait workers
         try:
             await asyncio.gather(*self._workers, return_exceptions=False)
         finally:
@@ -499,5 +558,4 @@ class ConcurrentPageResultProcessor:
                 finally:
                     self._q.task_done()
         finally:
-            # Ensure we don't leave q.task_done unbalanced (best-effort)
             return
