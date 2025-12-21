@@ -15,10 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from extensions import output_paths
-from extensions.output_paths import (
-    ensure_company_dirs,
-    sanitize_bvdid,
-)
+from extensions.output_paths import ensure_company_dirs, sanitize_bvdid
 
 # ---------------------------------------------------------------------------
 # Atomic file I/O + bounded JSON cache + per-path locks
@@ -140,29 +137,6 @@ def _atomic_write_json(
             _json_cache_put(path, mtime_ns, obj)
 
 
-def _json_load_cached(path: Path) -> Any:
-    try:
-        st = path.stat()
-        mtime_ns = st.st_mtime_ns
-    except OSError:
-        return {}
-
-    cached = _json_cache_get(path, mtime_ns)
-    if cached is not None:
-        return cached
-
-    def _read() -> Any:
-        try:
-            raw = path.read_text(encoding="utf-8")
-            return json.loads(raw)
-        except Exception:
-            return {}
-
-    obj = _retry_emfile(_read)
-    _json_cache_put(path, mtime_ns, obj)
-    return obj
-
-
 def _json_load_nocache(path: Path) -> Any:
     def _read() -> Any:
         try:
@@ -200,11 +174,27 @@ COMPANY_STATUS_LLM_NOT_DONE: CompanyStatus = "llm_not_done"
 COMPANY_STATUS_LLM_DONE: CompanyStatus = "llm_done"
 COMPANY_STATUS_TERMINAL_DONE: CompanyStatus = "terminal_done"
 
-_MARKDOWN_COMPLETE_STATUSES = {"markdown_saved", "markdown_suppressed"}
+# Legacy/variant URL statuses we treat as "markdown complete"
+_MARKDOWN_COMPLETE_STATUSES = {
+    "markdown_saved",
+    "markdown_suppressed",
+    "markdown_done",
+    "md_done",
+    "md_saved",
+    "saved_markdown",
+}
+
+# Legacy/variant URL statuses we treat as "llm complete"
 _LLM_COMPLETE_STATUSES = {
     "llm_extracted",
     "llm_extracted_empty",
     "llm_full_extracted",
+    "llm_done",
+    "extracted",
+    "product_saved",
+    "products_saved",
+    "json_saved",
+    "presence_done",
 }
 
 
@@ -359,25 +349,80 @@ def upsert_url_index_entry(bvdid: str, url: str, patch: Dict[str, Any]) -> None:
             ent_dict.update(patch)
             existing[url] = ent_dict
 
-            _atomic_write_json(idx_path, existing, cache=False, pretty=False)
+            # compact; no cache for hot mutation
+            payload = json.dumps(existing, ensure_ascii=False, separators=(",", ":"))
+            _atomic_write_text(idx_path, payload, "utf-8")
 
     _update()
 
 
+def _status_has_any(s: str, needles: Tuple[str, ...]) -> bool:
+    return any(n in s for n in needles)
+
+
 def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
-    status = (ent.get("status") or "").lower()
-    has_md_path = bool(ent.get("markdown_path"))
+    """
+    Return (markdown_done, llm_done).
 
-    has_llm_artifact = bool(ent.get("json_path") or ent.get("product_path"))
-    presence_checked = bool(ent.get("presence_checked"))
-    extracted_flag = bool(ent.get("extracted"))
+    Be tolerant to:
+      - varying status strings
+      - different artifact field names
+      - presence-check-only entries
+    """
+    status = str(ent.get("status") or "").strip().lower()
 
-    markdown_done = has_md_path or status in _MARKDOWN_COMPLETE_STATUSES
-    llm_done = (
-        extracted_flag
-        or has_llm_artifact
-        or status in _LLM_COMPLETE_STATUSES
-        or presence_checked
+    # Artifacts (common field variants)
+    has_md_path = bool(ent.get("markdown_path") or ent.get("md_path"))
+    has_llm_artifact = bool(
+        ent.get("json_path")
+        or ent.get("product_path")
+        or ent.get("products_path")
+        or ent.get("llm_json_path")
+        or ent.get("extraction_path")
+    )
+
+    # Flags
+    presence_checked = bool(ent.get("presence_checked") or ent.get("presence_done"))
+    extracted_flag = bool(ent.get("extracted") or ent.get("llm_extracted"))
+
+    # Status heuristics
+    status_md_done = (
+        status in _MARKDOWN_COMPLETE_STATUSES
+        or _status_has_any(
+            status, ("markdown_done", "markdown_saved", "md_done", "md_saved")
+        )
+        or (
+            ("markdown" in status or "md" == status)
+            and _status_has_any(status, ("done", "saved", "complete", "suppressed"))
+        )
+    )
+    status_llm_done = (
+        status in _LLM_COMPLETE_STATUSES
+        or _status_has_any(
+            status,
+            (
+                "llm_done",
+                "llm_extracted",
+                "full_extracted",
+                "product_saved",
+                "products_saved",
+                "json_saved",
+            ),
+        )
+        or (
+            ("llm" in status or "extract" in status)
+            and _status_has_any(status, ("done", "saved", "complete", "extracted"))
+        )
+    )
+
+    markdown_done = bool(has_md_path or status_md_done)
+
+    # If LLM artifacts exist, markdown is implicitly done in your pipeline
+    if has_llm_artifact or extracted_flag or status_llm_done or presence_checked:
+        markdown_done = True
+
+    llm_done = bool(
+        extracted_flag or has_llm_artifact or status_llm_done or presence_checked
     )
     return markdown_done, llm_done
 
@@ -631,6 +676,50 @@ class CrawlState:
             root_url=root_url,
         )
 
+    def clear_company_terminal_sync(
+        self, bvdid: str, *, keep_status: bool = False
+    ) -> None:
+        """
+        Remove terminal_done markers (done_reason/details/done_at).
+        Used when a quarantined company later succeeds or is manually re-enabled.
+
+        If keep_status=False (default), status is reset to 'pending' (and done fields cleared).
+        If keep_status=True, status is preserved but done fields are cleared.
+        """
+        now = _now_iso()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM companies WHERE bvdid=?",
+                (bvdid,),
+            ).fetchone()
+            if row is None:
+                return
+
+            st = str(row["status"] or "")
+            new_status = st
+            if (not keep_status) and st.strip().lower() == COMPANY_STATUS_TERMINAL_DONE:
+                new_status = COMPANY_STATUS_PENDING
+
+            self._conn.execute(
+                """
+                UPDATE companies
+                   SET status=?,
+                       done_reason=NULL,
+                       done_details=NULL,
+                       done_at=NULL,
+                       updated_at=?
+                 WHERE bvdid=?
+                """,
+                (new_status, now, bvdid),
+            )
+
+    async def clear_company_terminal(
+        self, bvdid: str, *, keep_status: bool = False
+    ) -> None:
+        await asyncio.to_thread(
+            self.clear_company_terminal_sync, bvdid, keep_status=keep_status
+        )
+
     # ---------- run-level API ----------
 
     async def start_run(
@@ -877,6 +966,10 @@ class CrawlState:
         return _row_to_company_snapshot(row)  # type: ignore[arg-type]
 
     async def recompute_global_state(self) -> Dict[str, Any]:
+        """
+        Compute crawl_global_state.json from the DB only.
+        Robust to unknown/legacy statuses: they are preserved and counted under unknown_statuses.
+        """
         path = _global_state_path()
 
         def _compute_and_write() -> Dict[str, Any]:
@@ -892,15 +985,18 @@ class CrawlState:
                     "SELECT * FROM runs ORDER BY started_at DESC LIMIT 1"
                 ).fetchone()
 
-            total = len(rows)
-            by_status: Dict[str, int] = {
-                COMPANY_STATUS_PENDING: 0,
-                COMPANY_STATUS_MD_NOT_DONE: 0,
-                COMPANY_STATUS_MD_DONE: 0,
-                COMPANY_STATUS_LLM_NOT_DONE: 0,
-                COMPANY_STATUS_LLM_DONE: 0,
-                COMPANY_STATUS_TERMINAL_DONE: 0,
+            known_statuses = {
+                COMPANY_STATUS_PENDING,
+                COMPANY_STATUS_MD_NOT_DONE,
+                COMPANY_STATUS_MD_DONE,
+                COMPANY_STATUS_LLM_NOT_DONE,
+                COMPANY_STATUS_LLM_DONE,
+                COMPANY_STATUS_TERMINAL_DONE,
             }
+
+            total = len(rows)
+            by_status: Dict[str, int] = {k: 0 for k in known_statuses}
+            unknown_statuses: Dict[str, int] = {}
 
             pending: List[str] = []
             in_progress: List[str] = []
@@ -909,10 +1005,30 @@ class CrawlState:
 
             terminal_reasons: Dict[str, int] = {}
 
+            urls_total_sum = 0
+            urls_md_done_sum = 0
+            urls_llm_done_sum = 0
+
             for r in rows:
-                st = r["status"] or COMPANY_STATUS_PENDING
-                b = r["bvdid"]
-                by_status[st] = by_status.get(st, 0) + 1
+                raw_st = r["status"]
+                st = (
+                    str(raw_st).strip().lower() if raw_st is not None else ""
+                ) or COMPANY_STATUS_PENDING
+                b = str(r["bvdid"])
+
+                urls_total_sum += int(r["urls_total"] or 0)
+                urls_md_done_sum += int(r["urls_markdown_done"] or 0)
+                urls_llm_done_sum += int(r["urls_llm_done"] or 0)
+
+                if st in known_statuses:
+                    by_status[st] = by_status.get(st, 0) + 1
+                else:
+                    # Reflect DB "correctly": count what is actually stored
+                    unknown_statuses[st] = unknown_statuses.get(st, 0) + 1
+                    # For queue semantics, treat unknown as "in_progress" unless it looks done.
+                    # But we keep lists aligned with your known pipeline statuses.
+                    st = COMPANY_STATUS_PENDING
+                    by_status[st] = by_status.get(st, 0) + 1
 
                 if st == COMPANY_STATUS_PENDING:
                     pending.append(b)
@@ -952,11 +1068,15 @@ class CrawlState:
                 "completed_companies": completed,
                 "percentage_completed": percentage_completed,
                 "by_status": by_status,
+                "unknown_statuses": unknown_statuses,  # important for diagnosing legacy writes
                 "pending_companies": pending,
                 "in_progress_companies": in_progress,
                 "done_companies": done,
                 "terminal_done_companies": terminal_done,
                 "terminal_done_by_reason": terminal_reasons,
+                "urls_total_sum": urls_total_sum,
+                "urls_markdown_done_sum": urls_md_done_sum,
+                "urls_llm_done_sum": urls_llm_done_sum,
                 "latest_run": latest_run,
             }
 
@@ -1020,11 +1140,9 @@ class CrawlState:
 
         llm_mode = (llm_mode or "none").strip().lower()
 
-        # SQLite parameter limits: keep chunk_size conservative.
         chunk_size = max(50, int(chunk_size))
         concurrency = max(1, int(concurrency))
 
-        # 1) Bulk fetch statuses
         status_map: Dict[str, str] = {}
 
         async def _fetch_chunk(chunk: List[str]) -> None:
@@ -1037,7 +1155,6 @@ class CrawlState:
         for i in range(0, len(bvdids), chunk_size):
             await _fetch_chunk(bvdids[i : i + chunk_size])
 
-        # 2) Optional refresh of "pending" rows that actually have url_index.json
         if refresh_pending:
             sem = asyncio.Semaphore(concurrency)
 
@@ -1045,19 +1162,16 @@ class CrawlState:
                 st = status_map.get(cid, COMPANY_STATUS_PENDING)
                 if st != COMPANY_STATUS_PENDING:
                     return
-                # if url_index exists, recompute from it
                 try:
                     if _url_index_path_for(cid).exists():
                         async with sem:
                             snap = await self.recompute_company_from_index(cid)
                         status_map[cid] = snap.status
                 except Exception:
-                    # keep pending on errors
                     return
 
             await asyncio.gather(*(_refresh_one(cid) for cid in bvdids))
 
-        # 3) Filter by status under mode, preserving order
         runnable: List[str] = []
         for cid in bvdids:
             st = status_map.get(cid, COMPANY_STATUS_PENDING)

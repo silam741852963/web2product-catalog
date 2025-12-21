@@ -16,8 +16,12 @@ from extensions import output_paths
 # RetryState: compact company-level failure state + append-only failure ledger
 # --------------------------------------------------------------------------------------
 
-# Classes are intentionally coarse and stable
-RetryClass = str  # "net" | "stall" | "mem" | "mem_heavy" | "permanent"
+RetryClass = str  # "net" | "stall" | "mem" | "other" | "permanent"
+
+DEFAULT_MAX_ATTEMPTS_NET = 6
+DEFAULT_MAX_ATTEMPTS_STALL = 8
+DEFAULT_NXDOMAIN_CUTOFF = 2
+DEFAULT_JITTER_FRAC = 0.20
 
 
 def _output_root() -> Path:
@@ -110,41 +114,29 @@ def _now_ts() -> float:
     return time.time()
 
 
-def _jitter(seconds: float, frac: float = 0.20) -> float:
-    """
-    Add +/- frac jitter (default +/-20%).
-    """
+def _jitter(seconds: float, frac: float = DEFAULT_JITTER_FRAC) -> float:
     if seconds <= 0:
         return 0.0
-    r = random.random()  # 0..1
+    r = random.random()
     delta = (r * 2.0 - 1.0) * frac
     return max(0.0, seconds * (1.0 + delta))
 
 
-def _backoff_schedule_seconds(
-    attempts: int,
-    *,
-    kind: RetryClass,
-) -> float:
-    """
-    Conservative defaults that behave well on droplets.
-    """
+def _backoff_schedule_seconds(attempts: int, *, kind: RetryClass) -> float:
     a = max(1, int(attempts))
 
     if kind == "net":
-        # 1m, 5m, 20m, 1h, 3h, 8h
         schedule = [60, 300, 1200, 3600, 10800, 28800]
     elif kind == "stall":
-        # 10m, 30m, 2h, 6h
-        schedule = [600, 1800, 7200, 21600]
-    elif kind in ("mem", "mem_heavy"):
-        # 15m, 1h, 6h, 24h
+        schedule = [600, 1800, 7200, 21600, 43200, 86400]
+    elif kind == "mem":
         schedule = [900, 3600, 21600, 86400]
+    elif kind == "other":
+        schedule = [300, 1200, 7200, 43200, 86400]
     elif kind == "permanent":
-        return 10**9  # effectively never (quarantine handles this)
+        return 10**9
     else:
-        # unknown class: treat as net
-        schedule = [60, 300, 1200, 3600, 10800, 28800]
+        schedule = [300, 1200, 7200, 43200, 86400]
 
     idx = min(a, len(schedule)) - 1
     return float(schedule[idx])
@@ -158,16 +150,17 @@ def _backoff_schedule_seconds(
 @dataclass(slots=True)
 class CompanyRetryState:
     cls: RetryClass = "net"
-    attempts: int = 0  # total attempts (all classes)
-    next_eligible_at: float = 0.0  # epoch seconds; 0 means eligible now
+    attempts: int = 0
+    next_eligible_at: float = 0.0
     updated_at: float = 0.0
     last_error: str = ""
     last_stage: str = ""
-    # per-class counters (so "reasonable retries" can be class-specific)
+
     net_attempts: int = 0
     stall_attempts: int = 0
     mem_attempts: int = 0
-    # mem-specific escalation signal (kept for backward compatibility)
+    other_attempts: int = 0
+
     mem_hits: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -175,8 +168,12 @@ class CompanyRetryState:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "CompanyRetryState":
+        cls = str(d.get("cls") or "net")
+        if cls == "mem_heavy":
+            cls = "mem"
+
         return CompanyRetryState(
-            cls=str(d.get("cls") or "net"),
+            cls=cls,
             attempts=int(d.get("attempts") or 0),
             next_eligible_at=float(d.get("next_eligible_at") or 0.0),
             updated_at=float(d.get("updated_at") or 0.0),
@@ -185,6 +182,7 @@ class CompanyRetryState:
             net_attempts=int(d.get("net_attempts") or 0),
             stall_attempts=int(d.get("stall_attempts") or 0),
             mem_attempts=int(d.get("mem_attempts") or 0),
+            other_attempts=int(d.get("other_attempts") or 0),
             mem_hits=int(d.get("mem_hits") or 0),
         )
 
@@ -196,14 +194,15 @@ class CompanyRetryState:
 
 class RetryStateStore:
     """
-    A small, bounded company-level retry state store:
+    Company-level retry state store:
       - retry_state.json : compact snapshot (atomic rewrite)
       - failure_ledger.jsonl : append-only audit trail
-      - quarantine.json : permanently failed companies (small set)
+      - quarantine.json : terminal quarantines (small set)
 
-    NEW:
-      - When a company is quarantined, we best-effort mark it as terminal_done
-        in crawl_state.sqlite3 so it stays out of the pending queue.
+    POLICY:
+      - net/stall are LIMITED retries
+      - mem/other are UNLIMITED retries
+      - permanent quarantines immediately
     """
 
     def __init__(self, base_dir: Optional[Path] = None) -> None:
@@ -221,12 +220,13 @@ class RetryStateStore:
         self._quarantine: Dict[str, Dict[str, Any]] = {}
 
         self._load()
+        # Ensure files exist even if empty (reduces “missing file” ambiguity)
+        self.flush()
 
     # ------------------ persistence ------------------
 
     def _load(self) -> None:
         with self._lock:
-            # retry_state.json
             raw = _json_load_nocache(self.state_path)
             if isinstance(raw, dict):
                 st: Dict[str, CompanyRetryState] = {}
@@ -237,7 +237,6 @@ class RetryStateStore:
             else:
                 self._state = {}
 
-            # quarantine.json
             qraw = _json_load_nocache(self.quarantine_path)
             if isinstance(qraw, dict):
                 self._quarantine = {
@@ -247,9 +246,6 @@ class RetryStateStore:
                 self._quarantine = {}
 
     def flush(self) -> None:
-        """
-        Persist snapshot files. JSONL ledger is append-only and doesn't need flushing.
-        """
         with self._lock:
             snapshot = {cid: s.to_dict() for cid, s in self._state.items()}
             quarantine = dict(self._quarantine)
@@ -257,7 +253,10 @@ class RetryStateStore:
         _atomic_write_json_compact(self.state_path, snapshot)
         _atomic_write_json_compact(self.quarantine_path, quarantine)
 
-    # ------------------ crawl_state integration ------------------
+    # ------------------ crawl_state integration (best-effort) ------------------
+
+    def _crawl_state_db_path(self) -> Path:
+        return _output_root() / "crawl_state.sqlite3"
 
     def _try_mark_terminal_done(
         self,
@@ -269,33 +268,116 @@ class RetryStateStore:
     ) -> None:
         """
         Best-effort integration: mark terminal_done in crawl_state.sqlite3.
-        Must NEVER raise (retry bookkeeping must be resilient).
+        Must NEVER raise.
         """
         try:
-            # Lazy import avoids cycles / heavy imports at module load time
-            from crawl_state import get_crawl_state  # type: ignore
+            from extensions.crawl_state import get_crawl_state  # type: ignore
 
-            cs = get_crawl_state()
-            cs.mark_company_terminal_sync(
-                company_id,
-                reason=done_reason,
-                details=details,
-                last_error=last_error,
-            )
+            cs = get_crawl_state(db_path=self._crawl_state_db_path())
+            fn = getattr(cs, "mark_company_terminal_sync", None)
+            if callable(fn):
+                fn(
+                    company_id,
+                    reason=done_reason,
+                    details=details,
+                    last_error=last_error,
+                )
         except Exception:
             return
 
     def _try_clear_terminal_done(self, company_id: str) -> None:
         """
-        Best-effort: clear terminal marker if someone manually re-runs / overrides.
+        Best-effort: clear terminal marker if someone later succeeds or re-runs.
         """
         try:
-            from crawl_state import get_crawl_state  # type: ignore
+            from extensions.crawl_state import get_crawl_state  # type: ignore
 
-            cs = get_crawl_state()
-            cs.clear_company_terminal_sync(company_id, keep_status=False)
+            cs = get_crawl_state(db_path=self._crawl_state_db_path())
+            fn = getattr(cs, "clear_company_terminal_sync", None)
+            if callable(fn):
+                fn(company_id, keep_status=False)
         except Exception:
             return
+
+    # ------------------ classification helpers ------------------
+
+    @staticmethod
+    def classify_unreachable_error(error: str) -> bool:
+        if not error:
+            return False
+        e = error.lower()
+        needles = [
+            "name or service not known",
+            "nxdomain",
+            "temporary failure in name resolution",
+            "nodename nor servname provided",
+            "no address associated with hostname",
+        ]
+        return any(n in e for n in needles)
+
+    @staticmethod
+    def _looks_rate_limited(error: str, status_code: Optional[int]) -> bool:
+        e = (error or "").lower()
+        if status_code == 429:
+            return True
+        needles = [
+            "rate limit",
+            "too many requests",
+            "quota",
+            "overloaded",
+            "try again later",
+        ]
+        return any(n in e for n in needles)
+
+    @staticmethod
+    def _looks_gateway_or_transport(status_code: Optional[int], error: str) -> bool:
+        if status_code in (502, 503, 504, 520, 521, 522, 523, 524):
+            return True
+        e = (error or "").lower()
+        needles = [
+            "connection refused",
+            "connection reset",
+            "network is unreachable",
+            "no route to host",
+            "server disconnected",
+            "socket hang up",
+            "broken pipe",
+            "timed out",
+            "read timeout",
+            "connect timeout",
+            "dns",
+            "nxdomain",
+            "name resolution",
+        ]
+        return any(n in e for n in needles)
+
+    def normalize_class(
+        self,
+        cls_hint: RetryClass,
+        *,
+        error: str,
+        stage: str,
+        status_code: Optional[int],
+    ) -> RetryClass:
+        cls = str(cls_hint or "").strip().lower()
+        if cls == "permanent":
+            return "permanent"
+        if cls in ("mem", "mem_heavy"):
+            return "mem"
+
+        if cls in ("net", "stall"):
+            if self._looks_rate_limited(error, status_code):
+                return "stall"
+            if self._looks_gateway_or_transport(status_code, error):
+                return "net"
+            return cls
+
+        if self._looks_rate_limited(error, status_code):
+            return "stall"
+        if self._looks_gateway_or_transport(status_code, error):
+            return "net"
+
+        return "other"
 
     # ------------------ queries ------------------
 
@@ -327,19 +409,17 @@ class RetryStateStore:
     # ------------------ core transitions ------------------
 
     def mark_success(self, company_id: str, *, stage: str = "", note: str = "") -> None:
-        """
-        Company succeeded: clear retry state and remove from quarantine (if any).
-        Also best-effort clear terminal_done marker in crawl_state.
-        """
         now = _now_ts()
-        event = {
-            "ts": now,
-            "company_id": company_id,
-            "event": "success",
-            "stage": stage,
-            "note": note,
-        }
-        _append_jsonl(self.ledger_path, event)
+        _append_jsonl(
+            self.ledger_path,
+            {
+                "ts": now,
+                "company_id": company_id,
+                "event": "success",
+                "stage": stage,
+                "note": note,
+            },
+        )
 
         with self._lock:
             if company_id in self._state:
@@ -359,23 +439,35 @@ class RetryStateStore:
         stage: str = "",
         status_code: Optional[int] = None,
         permanent_reason: str = "",
-        # policy knobs (reasonable retry limits)
-        max_attempts_net: int = 6,
-        max_attempts_stall: int = 4,
-        max_attempts_mem: int = 6,
-        max_attempts_mem_heavy: int = 4,
         nxdomain_like: bool = False,
+        max_attempts_net: Optional[int] = None,
+        max_attempts_stall: Optional[int] = None,
+        nxdomain_cutoff: Optional[int] = None,
     ) -> Tuple[CompanyRetryState, bool]:
-        """
-        Record a company-level failure and compute next eligibility with backoff.
-
-        Returns: (new_state, quarantined_bool)
-
-        NEW:
-          - When quarantined, mark terminal_done in crawl_state with clear reason/details.
-        """
         now = _now_ts()
-        cls = str(cls or "net")
+
+        max_net = (
+            int(max_attempts_net)
+            if max_attempts_net is not None
+            else DEFAULT_MAX_ATTEMPTS_NET
+        )
+        max_stall = (
+            int(max_attempts_stall)
+            if max_attempts_stall is not None
+            else DEFAULT_MAX_ATTEMPTS_STALL
+        )
+        nx_cutoff = (
+            int(nxdomain_cutoff)
+            if nxdomain_cutoff is not None
+            else DEFAULT_NXDOMAIN_CUTOFF
+        )
+
+        cls_canon = self.normalize_class(
+            cls,
+            error=error or "",
+            stage=stage or "",
+            status_code=status_code,
+        )
 
         quarantined = False
         quarantine_meta: Dict[str, Any] = {}
@@ -384,32 +476,28 @@ class RetryStateStore:
             prev = self._state.get(company_id) or CompanyRetryState()
             s = CompanyRetryState.from_dict(prev.to_dict())
 
-            # Update total counters
-            s.cls = cls
+            s.cls = cls_canon
             s.attempts = int(s.attempts) + 1
             s.updated_at = now
             s.last_error = (error or "")[:2000]
             s.last_stage = (stage or "")[:128]
 
-            # Update per-class counters and compute class_attempts (for backoff and limits)
             class_attempts = s.attempts
-            if cls == "net":
+            if cls_canon == "net":
                 s.net_attempts = int(s.net_attempts) + 1
                 class_attempts = s.net_attempts
-            elif cls == "stall":
+            elif cls_canon == "stall":
                 s.stall_attempts = int(s.stall_attempts) + 1
                 class_attempts = s.stall_attempts
-            elif cls in ("mem", "mem_heavy"):
+            elif cls_canon == "mem":
                 s.mem_attempts = int(s.mem_attempts) + 1
                 class_attempts = s.mem_attempts
                 s.mem_hits = int(s.mem_hits) + 1
-                # escalate after repeated hits
-                if s.mem_hits >= 3:
-                    s.cls = "mem_heavy"
-                    cls = "mem_heavy"
+            else:
+                s.other_attempts = int(s.other_attempts) + 1
+                class_attempts = s.other_attempts
 
-            # Decide quarantine (terminal)
-            if cls == "permanent":
+            if cls_canon == "permanent":
                 quarantined = True
                 quarantine_meta = {
                     "reason": permanent_reason or "permanent",
@@ -419,8 +507,10 @@ class RetryStateStore:
                     "status_code": status_code,
                 }
             else:
-                # NXDOMAIN-like errors should be cut off quickly (net-like)
-                if (not quarantined) and nxdomain_like and s.net_attempts >= 2:
+                inferred_nx = self.classify_unreachable_error(error or "")
+                nx = bool(nxdomain_like or inferred_nx)
+
+                if (not quarantined) and nx and s.net_attempts >= nx_cutoff:
                     quarantined = True
                     quarantine_meta = {
                         "reason": "nxdomain_like",
@@ -428,13 +518,13 @@ class RetryStateStore:
                         "stage": stage,
                         "last_error": s.last_error,
                         "status_code": status_code,
+                        "cutoff": nx_cutoff,
                     }
 
-                # class-specific "reasonable" caps
                 if (
                     (not quarantined)
-                    and cls == "net"
-                    and s.net_attempts >= int(max_attempts_net)
+                    and cls_canon == "net"
+                    and s.net_attempts >= max_net
                 ):
                     quarantined = True
                     quarantine_meta = {
@@ -443,12 +533,13 @@ class RetryStateStore:
                         "stage": stage,
                         "last_error": s.last_error,
                         "status_code": status_code,
+                        "max": max_net,
                     }
 
                 if (
                     (not quarantined)
-                    and cls == "stall"
-                    and s.stall_attempts >= int(max_attempts_stall)
+                    and cls_canon == "stall"
+                    and s.stall_attempts >= max_stall
                 ):
                     quarantined = True
                     quarantine_meta = {
@@ -457,113 +548,86 @@ class RetryStateStore:
                         "stage": stage,
                         "last_error": s.last_error,
                         "status_code": status_code,
+                        "max": max_stall,
                     }
-
-                if (not quarantined) and cls in ("mem", "mem_heavy"):
-                    cap = (
-                        int(max_attempts_mem_heavy)
-                        if cls == "mem_heavy"
-                        else int(max_attempts_mem)
-                    )
-                    if s.mem_attempts >= cap:
-                        quarantined = True
-                        quarantine_meta = {
-                            "reason": "max_attempts_mem_heavy"
-                            if cls == "mem_heavy"
-                            else "max_attempts_mem",
-                            "ts": now,
-                            "stage": stage,
-                            "last_error": s.last_error,
-                            "status_code": status_code,
-                        }
 
             if quarantined:
                 s.cls = "permanent"
-                s.next_eligible_at = 10**9  # effectively never
+                s.next_eligible_at = 10**9
                 self._quarantine[company_id] = quarantine_meta
             else:
-                base = _backoff_schedule_seconds(class_attempts, kind=cls)
-                s.next_eligible_at = now + _jitter(base, frac=0.20)
+                base = _backoff_schedule_seconds(class_attempts, kind=cls_canon)
+                s.next_eligible_at = now + _jitter(base, frac=DEFAULT_JITTER_FRAC)
 
             self._state[company_id] = s
 
-        # ledger entry outside lock
-        event = {
-            "ts": now,
-            "company_id": company_id,
-            "event": "failure",
-            "class": cls,
-            "attempts_total": s.attempts,
-            "net_attempts": s.net_attempts,
-            "stall_attempts": s.stall_attempts,
-            "mem_attempts": s.mem_attempts,
-            "next_eligible_at": s.next_eligible_at,
-            "stage": stage,
-            "status_code": status_code,
-            "error": (error or "")[:4000],
-            "quarantined": quarantined,
-            "permanent_reason": permanent_reason,
-            "mem_hits": s.mem_hits,
-            "quarantine_meta": quarantine_meta if quarantined else None,
-        }
-        _append_jsonl(self.ledger_path, event)
-
-        self.flush()
-
-        # If quarantined => mark terminal_done in CrawlState so it won't be queued again
-        if quarantined:
-            done_reason = (
-                f"retry_quarantined:{(quarantine_meta.get('reason') or 'unknown')}"
-            )
-            details = {
-                "retry_class": cls,
+        _append_jsonl(
+            self.ledger_path,
+            {
+                "ts": now,
+                "company_id": company_id,
+                "event": "failure",
+                "class_hint": str(cls or ""),
+                "class": cls_canon,
                 "attempts_total": s.attempts,
                 "net_attempts": s.net_attempts,
                 "stall_attempts": s.stall_attempts,
                 "mem_attempts": s.mem_attempts,
+                "other_attempts": s.other_attempts,
+                "next_eligible_at": s.next_eligible_at,
                 "stage": stage,
                 "status_code": status_code,
-                "quarantine_reason": quarantine_meta.get("reason"),
+                "error": (error or "")[:4000],
+                "quarantined": quarantined,
                 "permanent_reason": permanent_reason,
-                "next_eligible_at": s.next_eligible_at,
-            }
-            self._try_mark_terminal_done(
-                company_id,
-                done_reason=done_reason,
-                details=details,
-                last_error=s.last_error,
-            )
+                "mem_hits": s.mem_hits,
+                "policy": {
+                    "max_attempts_net": max_net,
+                    "max_attempts_stall": max_stall,
+                    "nxdomain_cutoff": nx_cutoff,
+                    "defaults": {
+                        "DEFAULT_MAX_ATTEMPTS_NET": DEFAULT_MAX_ATTEMPTS_NET,
+                        "DEFAULT_MAX_ATTEMPTS_STALL": DEFAULT_MAX_ATTEMPTS_STALL,
+                        "DEFAULT_NXDOMAIN_CUTOFF": DEFAULT_NXDOMAIN_CUTOFF,
+                    },
+                },
+                "quarantine_meta": quarantine_meta if quarantined else None,
+            },
+        )
+
+        self.flush()
+
+        if quarantined:
+            # Avoid repeated DB writes if already quarantined
+            already_quarantined = self.is_quarantined(company_id)
+            if already_quarantined:
+                done_reason = (
+                    f"retry_quarantined:{(quarantine_meta.get('reason') or 'unknown')}"
+                )
+                details = {
+                    "retry_class_hint": str(cls or ""),
+                    "retry_class": cls_canon,
+                    "attempts_total": s.attempts,
+                    "net_attempts": s.net_attempts,
+                    "stall_attempts": s.stall_attempts,
+                    "mem_attempts": s.mem_attempts,
+                    "other_attempts": s.other_attempts,
+                    "stage": stage,
+                    "status_code": status_code,
+                    "quarantine_reason": quarantine_meta.get("reason"),
+                    "permanent_reason": permanent_reason,
+                    "next_eligible_at": s.next_eligible_at,
+                    "policy": {
+                        "max_attempts_net": max_net,
+                        "max_attempts_stall": max_stall,
+                        "nxdomain_cutoff": nx_cutoff,
+                    },
+                }
+                self._try_mark_terminal_done(
+                    company_id,
+                    done_reason=done_reason,
+                    details=details,
+                    last_error=s.last_error,
+                )
 
         return s, quarantined
-
-    # ------------------ optional helpers ------------------
-
-    @staticmethod
-    def classify_unreachable_error(error: str) -> bool:
-        """
-        Conservative "NXDOMAIN-like" detector.
-        """
-        if not error:
-            return False
-        e = error.lower()
-        needles = [
-            "name or service not known",
-            "nxdomain",
-            "temporary failure in name resolution",  # can be transient, but retry policy handles repeats
-            "nodename nor servname provided",
-            "no address associated with hostname",
-        ]
-        return any(n in e for n in needles)
-
-    @staticmethod
-    def classify_tls_error(error: str) -> bool:
-        if not error:
-            return False
-        e = error.lower()
-        needles = [
-            "ssl",
-            "tls",
-            "certificate verify failed",
-            "handshake",
-        ]
-        return any(n in e for n in needles)

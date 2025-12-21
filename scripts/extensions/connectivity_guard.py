@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import random
+import socket
 import time
 from dataclasses import dataclass, field
 from typing import Iterable, List, Tuple
@@ -14,6 +15,7 @@ from urllib.parse import urlparse
 # Configuration
 # --------------------------------------------------------------------------- #
 
+
 @dataclass
 class ConnectivityGuardConfig:
     """
@@ -22,30 +24,35 @@ class ConnectivityGuardConfig:
     Multiple probe targets; success if ANY succeed, fail if ALL fail.
     """
 
-    probe_targets: List[Tuple[str, int]] = field(default_factory=lambda: [
-        ("1.1.1.1", 443),
-        ("8.8.8.8", 443),
-        ("9.9.9.9", 443),
-    ])
-    interval_s: float = 10.0
-    trip_heartbeats: int = 4            # consecutive ALL-fail rounds to consider outage
-    connect_timeout_s: float = 2.0
+    probe_targets: List[Tuple[str, int]] = field(
+        default_factory=lambda: [
+            ("1.1.1.1", 443),
+            ("8.8.8.8", 443),
+            ("9.9.9.9", 443),
+        ]
+    )
+
+    # Probing cadence
+    interval_s: float = 15.0
+    trip_heartbeats: int = 4  # consecutive ALL-fail rounds to consider outage
+
+    # IMPORTANT: this is the *socket connect* timeout; keep >= 4s on busy droplets.
+    connect_timeout_s: float = 4.0
 
     # Hysteresis / backoff
-    min_open_s: float = 8.0             # hold OPEN at least this long
-    min_closed_s: float = 3.0           # after closing, ignore brief fail bursts
+    min_open_s: float = 8.0  # hold OPEN at least this long
+    min_closed_s: float = 3.0  # after closing, ignore brief fail bursts
     base_cooloff_s: float = 8.0
     max_cooloff_s: float = 180.0
     backoff_factor: float = 2.0
     jitter_s: float = 0.35
 
     # Hybrid decision with crawler signals (decayed window)
-    ewma_half_life_s: float = 30.0      # half-life for manual counters
-    err_ratio_trip: float = 0.85        # require high transport error ratio to OPEN
-    err_ratio_floor_samples: float = 10 # min effective sample count before ratio considered
+    ewma_half_life_s: float = 30.0  # half-life for manual counters
+    err_ratio_trip: float = 0.85  # require high transport error ratio to OPEN
+    err_ratio_floor_samples: float = 10  # min effective samples before ratio considered
 
     # Logging control for low-level probe failures
-    # If False (default), we will NOT log each individual probe failure.
     log_probe_failures: bool = False
 
 
@@ -100,18 +107,19 @@ def _parse_probe_endpoints(
 # ConnectivityGuard
 # --------------------------------------------------------------------------- #
 
+
 class ConnectivityGuard:
     """
     Robust, low-false-positive connectivity guard.
 
-    Decision to OPEN (pause) now requires:
+    Decision to OPEN (pause) requires:
       1) ALL configured probe targets fail for `trip_heartbeats` consecutive rounds, AND
       2) recent crawler transport error ratio is high (>= err_ratio_trip),
     OR
       3) probes keep failing long enough (>= 2 * trip_heartbeats), regardless of crawler signals.
 
     HALF_OPEN is a transient probing state and **does not block callers**.
-    Only OPEN will make `url_index` await `wait_until_healthy()`.
+    Only OPEN causes `wait_until_healthy()` to block.
     """
 
     __slots__ = (
@@ -143,9 +151,9 @@ class ConnectivityGuard:
         *,
         probe_host: str | None = None,
         probe_port: int | None = None,
-        interval_s: float = 10.0,
+        interval_s: float = 15.0,
         trip_heartbeats: int = 4,
-        connect_timeout_s: float = 2.0,
+        connect_timeout_s: float = 4.0,
         base_cooloff_s: float = 8.0,
         max_cooloff_s: float = 180.0,
         backoff_factor: float = 2.0,
@@ -158,7 +166,6 @@ class ConnectivityGuard:
         log_probe_failures: bool | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
-        # Config object (plugin-style)
         self.cfg = ConnectivityGuardConfig(
             interval_s=float(interval_s),
             trip_heartbeats=int(trip_heartbeats),
@@ -171,7 +178,7 @@ class ConnectivityGuard:
             min_closed_s=float(min_closed_s),
             ewma_half_life_s=float(ewma_half_life_s),
             err_ratio_trip=float(err_ratio_trip),
-            err_ratio_floor_samples=float(err_ratio_floor_samples),
+            err_ratio_floor_samples=int(err_ratio_floor_samples),
             log_probe_failures=bool(log_probe_failures)
             if log_probe_failures is not None
             else False,
@@ -179,27 +186,28 @@ class ConnectivityGuard:
 
         targets = _parse_probe_endpoints(probe_endpoints, probe_host, probe_port)
         self.cfg.probe_targets = targets
-        self.targets: Tuple[Tuple[str, int], ...] = tuple(targets)  # exposed for diagnostics
+        self.targets: Tuple[Tuple[str, int], ...] = tuple(targets)
 
-        # state
         self._state: str = self.CLOSED
         self._open_seq_total: int = 0
         self._hb_allfail_streak: int = 0
-        self._healthy_event: asyncio.Event = asyncio.Event(); self._healthy_event.set()
-        self._stop: asyncio.Event = asyncio.Event()
+
+        self._healthy_event = asyncio.Event()
+        self._healthy_event.set()
+
+        self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
-        self._logger: logging.Logger = logger or logging.getLogger("connectivity_guard")
+        self._logger = logger or logging.getLogger("connectivity_guard")
 
         now = time.time()
         self._last_open_ts: float = 0.0
         self._last_closed_ts: float = now
 
-        # EWMA manual counters
+        # EWMA manual counters (optional: caller may feed in transport signal)
         self._ew_ok: float = 1.0
         self._ew_err: float = 0.0
         self._last_decay_ts: float = now
 
-        # backoff stage
         self._open_backoff_stage: int = 0
         self._cooloff_until: float = 0.0
 
@@ -208,7 +216,7 @@ class ConnectivityGuard:
     async def start(self) -> None:
         if self._task is None or self._task.done():
             self._stop.clear()
-            self._task = asyncio.create_task(self._run())
+            self._task = asyncio.create_task(self._run(), name="connectivity-guard")
 
     async def stop(self) -> None:
         self._stop.set()
@@ -222,9 +230,9 @@ class ConnectivityGuard:
 
     async def wait_until_healthy(self) -> None:
         """
-        Wait only when actually OPEN; HALF_OPEN should not block workers.
+        Block only when state is OPEN.
+        HALF_OPEN is probing and should not block workers.
         """
-        # original semantics: spin while OPEN & not healthy
         while self._state == self.OPEN and not self._healthy_event.is_set():
             await asyncio.sleep(0.1)
 
@@ -247,7 +255,6 @@ class ConnectivityGuard:
     # ---------- internals: EWMA ----------
 
     def _cap_ewma(self) -> None:
-        # keep numbers bounded
         if self._ew_ok > 1e6 or self._ew_err > 1e6:
             scale = 1e-6
             self._ew_ok *= scale
@@ -258,7 +265,6 @@ class ConnectivityGuard:
         dt = max(0.0, now - self._last_decay_ts)
         if dt <= 0.05:
             return
-        # EWMA decay factor using half-life
         hl = max(1e-3, self.cfg.ewma_half_life_s)
         k = 0.5 ** (dt / hl)
         self._ew_ok *= k
@@ -275,7 +281,7 @@ class ConnectivityGuard:
 
     def _compute_cooloff_s(self) -> float:
         stage = self._open_backoff_stage
-        base = self.cfg.base_cooloff_s * (self.cfg.backoff_factor ** stage)
+        base = self.cfg.base_cooloff_s * (self.cfg.backoff_factor**stage)
         base = min(base, self.cfg.max_cooloff_s)
         return base + random.uniform(0.0, self.cfg.jitter_s)
 
@@ -313,17 +319,30 @@ class ConnectivityGuard:
 
     # ---------- internals: probes ----------
 
-    async def _tcp_probe(self, host: str, port: int, timeout: float) -> bool:
+    @staticmethod
+    def _blocking_tcp_connect(host: str, port: int, timeout: float) -> bool:
+        """
+        Blocking connect to avoid event-loop starvation false positives.
+        """
         try:
-            fut = asyncio.open_connection(host=host, port=port, family=0)
-            r, w = await asyncio.wait_for(fut, timeout=timeout)
-            w.close()
-            with contextlib.suppress(Exception):
-                await w.wait_closed()
-            return True
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except Exception:
+            return False
+
+    async def _tcp_probe(self, host: str, port: int, timeout: float) -> bool:
+        """
+        Probe via a blocking socket connect in a thread, then await with some slack.
+
+        Even with to_thread, the *await* still needs scheduling; slack reduces false timeouts.
+        """
+        slack = max(0.75, timeout * 0.25)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._blocking_tcp_connect, host, port, timeout),
+                timeout=timeout + slack,
+            )
         except Exception as e:
-            # These failures are expected in many environments (firewalls, transient
-            # outages, etc). They are now *opt-in* to keep logs clean.
             if self.cfg.log_probe_failures:
                 self._logger.debug(
                     "ConnectivityGuard probe failed: %s:%d err=%r", host, port, e
@@ -333,9 +352,7 @@ class ConnectivityGuard:
     async def _probe_round(self) -> Tuple[int, int]:
         """
         Probe all targets in parallel; success if any succeed.
-
-        Speed tweak: stop early as soon as at least one probe succeeds, instead of
-        waiting for every target to finish (but still ensure we clean up tasks).
+        Early-exit on first success to reduce load.
         """
         if not self.cfg.probe_targets:
             return 0, 0
@@ -356,19 +373,16 @@ class ConnectivityGuard:
         try:
             while pending:
                 done, pending = await asyncio.wait(
-                    pending,
-                    return_when=asyncio.FIRST_COMPLETED,
+                    pending, return_when=asyncio.FIRST_COMPLETED
                 )
-
                 for t in done:
                     try:
-                        res = t.result()
+                        res = bool(t.result())
                     except Exception:
                         res = False
                     if res:
                         ok += 1
 
-                # Early exit if any success; cancel remaining tasks to save time.
                 if ok > 0:
                     for t in pending:
                         t.cancel()
@@ -377,7 +391,6 @@ class ConnectivityGuard:
                     pending.clear()
                     break
         finally:
-            # Make sure nothing is left running
             for t in pending:
                 t.cancel()
             with contextlib.suppress(Exception):
@@ -390,19 +403,17 @@ class ConnectivityGuard:
     async def _run(self) -> None:
         while not self._stop.is_set():
             try:
-                # If OPEN and still in cooloff window, sleep a bit
                 if self._state == self.OPEN:
                     remaining = self._cooloff_until - time.time()
                     if remaining > 0:
                         await asyncio.sleep(min(remaining, self.cfg.interval_s))
                         continue
-                    # after cooloff, try a probe in HALF_OPEN
                     self._transition(self.HALF_OPEN)
 
                 ok_count, n_targets = await self._probe_round()
-                all_failed = (n_targets > 0 and ok_count == 0)
+                all_failed = n_targets > 0 and ok_count == 0
 
-                # hysteresis: if we just closed recently, ignore tiny fail bursts
+                # ignore very brief fail bursts right after closing
                 if (
                     self._state == self.CLOSED
                     and (time.time() - self._last_closed_ts) < self.cfg.min_closed_s
@@ -410,14 +421,11 @@ class ConnectivityGuard:
                     all_failed = False
 
                 if not all_failed:
-                    # success path
                     if self._state != self.CLOSED:
                         self._transition(self.CLOSED)
                     else:
-                        # stay closed, reset fail streak
                         self._hb_allfail_streak = 0
                 else:
-                    # all targets failed this round
                     self._hb_allfail_streak += 1
                     ratio, total = self._err_ratio()
                     self._logger.debug(
@@ -428,17 +436,19 @@ class ConnectivityGuard:
                         total,
                     )
 
-                    open_due_to_hybrid = (
-                        self._hb_allfail_streak >= max(1, int(self.cfg.trip_heartbeats))
-                        and (total >= self.cfg.err_ratio_floor_samples
-                             and ratio >= self.cfg.err_ratio_trip)
+                    open_due_to_hybrid = self._hb_allfail_streak >= max(
+                        1, int(self.cfg.trip_heartbeats)
+                    ) and (
+                        total >= float(self.cfg.err_ratio_floor_samples)
+                        and ratio >= float(self.cfg.err_ratio_trip)
                     )
-                    open_due_to_persistence = (
-                        self._hb_allfail_streak
-                        >= max(2, int(self.cfg.trip_heartbeats) * 2)
+                    open_due_to_persistence = self._hb_allfail_streak >= max(
+                        2, int(self.cfg.trip_heartbeats) * 2
                     )
 
-                    if self._state == self.CLOSED and (open_due_to_hybrid or open_due_to_persistence):
+                    if self._state == self.CLOSED and (
+                        open_due_to_hybrid or open_due_to_persistence
+                    ):
                         self._transition(self.OPEN)
                     elif self._state == self.HALF_OPEN:
                         self._transition(self.OPEN)
@@ -448,13 +458,13 @@ class ConnectivityGuard:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                # treat unexpected exceptions as a single round failure
                 self._logger.exception("ConnectivityGuard loop exception: %r", e)
                 self._hb_allfail_streak += 1
-                if (
-                    self._state in (self.CLOSED, self.HALF_OPEN)
-                    and self._hb_allfail_streak
-                    >= max(2, int(self.cfg.trip_heartbeats) * 2)
+                if self._state in (
+                    self.CLOSED,
+                    self.HALF_OPEN,
+                ) and self._hb_allfail_streak >= max(
+                    2, int(self.cfg.trip_heartbeats) * 2
                 ):
                     self._transition(self.OPEN)
                 await asyncio.sleep(self.cfg.interval_s)

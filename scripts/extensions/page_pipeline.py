@@ -53,6 +53,41 @@ _MEMORY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\boomed\b|\boom\b", re.IGNORECASE),
 )
 
+# IMPORTANT:
+# These patterns are used ONLY to feed ConnectivityGuard's EWMA counters.
+# We must be conservative to prevent "false outage" when:
+#   - a site is slow / rate-limiting / timing out,
+#   - a site returns 5xx,
+#   - the event loop is busy and some awaits are delayed.
+# Therefore, we only count errors that look like *network/transport* failures.
+_TRANSPORT_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # DNS / resolution
+    re.compile(r"\bnxdomain\b", re.IGNORECASE),
+    re.compile(r"\bname or service not known\b", re.IGNORECASE),
+    re.compile(r"\btemporary failure in name resolution\b", re.IGNORECASE),
+    re.compile(r"\bno address associated with hostname\b", re.IGNORECASE),
+    re.compile(r"\bgetaddrinfo\b", re.IGNORECASE),
+    re.compile(r"\bdns\b", re.IGNORECASE),
+    re.compile(r"\bname resolution\b", re.IGNORECASE),
+    # TCP / routing
+    re.compile(r"\bconnection refused\b", re.IGNORECASE),
+    re.compile(r"\bconnection reset\b", re.IGNORECASE),
+    re.compile(r"\bconnection aborted\b", re.IGNORECASE),
+    re.compile(r"\bnetwork is unreachable\b", re.IGNORECASE),
+    re.compile(r"\bno route to host\b", re.IGNORECASE),
+    re.compile(r"\bhost is down\b", re.IGNORECASE),
+    re.compile(r"\bbroken pipe\b", re.IGNORECASE),
+    re.compile(r"\bsocket hang up\b", re.IGNORECASE),
+    re.compile(r"\bserver disconnected\b", re.IGNORECASE),
+    re.compile(r"\bssl\b.*\bhandshake\b", re.IGNORECASE),
+    re.compile(r"\btls\b.*\bhandshake\b", re.IGNORECASE),
+)
+
+# Certain HTTP status codes are often "transport-ish" (gateway/proxy issues),
+# but still can be site-specific. We'll count them as transport ONLY when paired
+# with a transport-like error string OR when there's no usable content at all.
+_TRANSPORT_LIKE_HTTP = {502, 503, 504, 520, 521, 522, 523, 524}
+
 
 def is_timeout_error_message(error: str, marker: Optional[str] = None) -> bool:
     """
@@ -89,6 +124,75 @@ def is_memory_pressure_error_message(error: str) -> bool:
         except Exception:
             continue
     return False
+
+
+def _looks_transport_error_for_guard(error: str) -> bool:
+    """
+    Conservative "transport" detector for ConnectivityGuard EWMA signal.
+
+    We intentionally do NOT treat generic timeouts as transport errors, because:
+      - slow/blocked sites are common,
+      - event-loop starvation can delay awaits,
+      - and ConnectivityGuard already performs independent TCP probes.
+
+    So: timeouts => NOT counted here (let probes decide).
+    """
+    if not error:
+        return False
+
+    # Exclude timeout family from guard's transport signal to reduce false outage.
+    if is_timeout_error_message(error):
+        return False
+
+    e = error
+    for rx in _TRANSPORT_ERROR_PATTERNS:
+        try:
+            if rx.search(e):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _update_connectivity_guard_from_page(
+    guard: ConnectivityGuard,
+    *,
+    error_str: str,
+    status_code: Any,
+) -> None:
+    """
+    Feed ConnectivityGuard with *conservative* signals to avoid false internet outage.
+
+    Policy:
+      - Count "transport errors" only when they look like DNS/TCP/routing failures.
+      - Do NOT count generic timeouts as transport errors (too noisy / site-specific / event-loop delays).
+      - Do NOT count ordinary HTTP 5xx as transport errors (often site-specific).
+      - Count "success" when we have a concrete HTTP response (any status code), OR when no error.
+      - For 5xx with no transport-like error string, count as success (still means connectivity exists).
+    """
+    try:
+        code_int = int(status_code) if status_code is not None else None
+    except Exception:
+        code_int = None
+
+    transport_like = _looks_transport_error_for_guard(error_str)
+
+    if transport_like:
+        guard.record_transport_error()
+        return
+
+    # If we got an HTTP response at all (even 404/500), connectivity exists.
+    if code_int is not None:
+        guard.record_success()
+        return
+
+    # No status code: if there's no error text, count as success; otherwise be neutral
+    # (do not push error ratio up unless it's transport-like).
+    if not error_str.strip():
+        guard.record_success()
+        return
+
+    # Neutral: do nothing
 
 
 # --------------------------------------------------------------------------------------
@@ -274,6 +378,41 @@ class UrlIndexBatchWriter:
 
 
 # --------------------------------------------------------------------------------------
+# Per-company summary (this is what run.py can use to decide retry class)
+# --------------------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class PagePipelineSummary:
+    total_pages: int = 0
+    markdown_saved: int = 0
+    markdown_suppressed: int = 0
+    timeout_pages: int = 0
+    memory_pressure_pages: int = 0
+
+    def as_dict(self) -> Dict[str, Any]:
+        tp = max(0, int(self.total_pages))
+        return {
+            "total_pages": tp,
+            "markdown_saved": int(self.markdown_saved),
+            "markdown_suppressed": int(self.markdown_suppressed),
+            "timeout_pages": int(self.timeout_pages),
+            "memory_pressure_pages": int(self.memory_pressure_pages),
+            "timeout_ratio": float(self.timeout_pages) / float(tp or 1),
+            "mem_ratio": float(self.memory_pressure_pages) / float(tp or 1),
+        }
+
+
+@dataclass(slots=True)
+class PageProcessOutcome:
+    url: str
+    md_saved: bool
+    md_suppressed: bool
+    timeout_exceeded: bool
+    memory_pressure: bool
+
+
+# --------------------------------------------------------------------------------------
 # Page result processing
 # --------------------------------------------------------------------------------------
 
@@ -308,7 +447,7 @@ async def process_page_result(
     mark_company_timeout_cb: Optional[Callable[[str], None]] = None,
     mark_company_memory_cb: Optional[Callable[[str], None]] = None,
     url_index_sink: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
-) -> None:
+) -> PageProcessOutcome:
     """
     Per page processing.
 
@@ -332,7 +471,13 @@ async def process_page_result(
         logger.warning(
             "process_page_result called without company_id on company=%r", company
         )
-        return
+        return PageProcessOutcome(
+            url="",
+            md_saved=False,
+            md_suppressed=False,
+            timeout_exceeded=False,
+            memory_pressure=False,
+        )
 
     _getattr = getattr
     requested_url = _getattr(page_result, "url", None)
@@ -341,7 +486,13 @@ async def process_page_result(
         logger.warning(
             "Page result missing URL; skipping entry (company_id=%s)", company_id
         )
-        return
+        return PageProcessOutcome(
+            url="",
+            md_saved=False,
+            md_suppressed=False,
+            timeout_exceeded=False,
+            memory_pressure=False,
+        )
     url = final_url
 
     markdown = _getattr(page_result, "markdown", None)
@@ -373,17 +524,17 @@ async def process_page_result(
             bvdid=company_id, url=url, data=html, stage="html"
         )
 
-    # ConnectivityGuard update
+    # ConnectivityGuard update (FIX: avoid false "internet outage")
     if guard is not None:
         try:
-            code_int = int(status_code) if status_code is not None else None
+            _update_connectivity_guard_from_page(
+                guard,
+                error_str=error_str,
+                status_code=status_code,
+            )
         except Exception:
-            code_int = None
-
-        if error or (code_int is not None and code_int >= 500):
-            guard.record_transport_error()
-        else:
-            guard.record_success()
+            # Guard should never break page processing.
+            pass
 
     gating_accept = action == "save"
     md_path: Optional[str] = None
@@ -397,6 +548,7 @@ async def process_page_result(
     else:
         md_status = "markdown_suppressed"
 
+    # Override status to make the signal visible in url_index
     if timeout_exceeded:
         md_status = "timeout_page_exceeded"
     if memory_pressure:
@@ -435,6 +587,14 @@ async def process_page_result(
         from extensions.crawl_state import upsert_url_index_entry
 
         await asyncio.to_thread(upsert_url_index_entry, company_id, url, entry)
+
+    return PageProcessOutcome(
+        url=url,
+        md_saved=(md_path is not None and md_status == "markdown_saved"),
+        md_suppressed=(md_status == "markdown_suppressed"),
+        timeout_exceeded=timeout_exceeded,
+        memory_pressure=memory_pressure,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -488,6 +648,10 @@ class ConcurrentPageResultProcessor:
         flush_cfg = url_index_flush_cfg or UrlIndexFlushConfig()
         self._writer = UrlIndexBatchWriter(self.company_id, cfg=flush_cfg)
 
+        # summary state (read by run.py via crawl_company return)
+        self._summary = PagePipelineSummary()
+        self._summary_lock = asyncio.Lock()
+
     async def start(self) -> None:
         ensure_company_dirs(self.company_id)
         await self._writer.start()
@@ -524,6 +688,28 @@ class ConcurrentPageResultProcessor:
         if self._fatal is not None:
             raise self._fatal
 
+    async def get_summary(self) -> PagePipelineSummary:
+        async with self._summary_lock:
+            return PagePipelineSummary(
+                total_pages=self._summary.total_pages,
+                markdown_saved=self._summary.markdown_saved,
+                markdown_suppressed=self._summary.markdown_suppressed,
+                timeout_pages=self._summary.timeout_pages,
+                memory_pressure_pages=self._summary.memory_pressure_pages,
+            )
+
+    async def _accumulate(self, outcome: PageProcessOutcome) -> None:
+        async with self._summary_lock:
+            self._summary.total_pages += 1
+            if outcome.md_saved:
+                self._summary.markdown_saved += 1
+            if outcome.md_suppressed:
+                self._summary.markdown_suppressed += 1
+            if outcome.timeout_exceeded:
+                self._summary.timeout_pages += 1
+            if outcome.memory_pressure:
+                self._summary.memory_pressure_pages += 1
+
     async def _worker_loop(self, worker_idx: int) -> None:
         try:
             while True:
@@ -532,7 +718,7 @@ class ConcurrentPageResultProcessor:
                     return
 
                 try:
-                    await process_page_result(
+                    outcome = await process_page_result(
                         page_result=item,
                         company=self.company,
                         guard=self.guard,
@@ -542,6 +728,12 @@ class ConcurrentPageResultProcessor:
                         mark_company_memory_cb=self.mark_company_memory_cb,
                         url_index_sink=self._writer.enqueue,
                     )
+                    # update summary for run.py
+                    try:
+                        await self._accumulate(outcome)
+                    except Exception:
+                        pass
+
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:

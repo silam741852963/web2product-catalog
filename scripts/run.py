@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from crawl4ai import AsyncWebCrawler, CacheMode
@@ -78,7 +78,12 @@ from extensions.logging import LoggingExtension
 from extensions import md_gating
 from extensions import output_paths
 from extensions.output_paths import ensure_company_dirs
-from extensions.page_pipeline import ConcurrentPageResultProcessor, UrlIndexFlushConfig
+from extensions.page_pipeline import (
+    ConcurrentPageResultProcessor,
+    UrlIndexFlushConfig,
+    PagePipelineSummary,
+    MEMORY_PRESSURE_MARKER,
+)
 from extensions.resource_monitor import ResourceMonitor, ResourceMonitorConfig
 from extensions.retry_state import RetryStateStore
 
@@ -183,6 +188,92 @@ def _is_playwright_driver_disconnect(exc: BaseException) -> bool:
         "playwright connection closed",
     ]
     return any(n in lowered for n in needles)
+
+
+def _classify_failure_for_retry(
+    exc: BaseException, *, stage: str
+) -> Tuple[str, bool, Optional[int]]:
+    """
+    Return (cls, nxdomain_like, status_code).
+
+    Policy:
+      - network-like issues => cls="net"
+      - resource/scheduling/timeout/overload => cls="stall" (wait longer, retry more)
+      - memory pressure => cls="mem"
+      - unknown => cls="stall" (safer: avoids hammering; still retries)
+    """
+    msg = f"{type(exc).__name__}: {exc}"
+    low = msg.lower()
+
+    status_code = getattr(exc, "status_code", None)
+    try:
+        status_code = int(status_code) if status_code is not None else None
+    except Exception:
+        status_code = None
+
+    # Memory
+    if isinstance(exc, CriticalMemoryPressure):
+        return "mem", False, status_code
+
+    # Any explicit timeout stages or asyncio timeouts => stall
+    if isinstance(exc, (asyncio.TimeoutError, CrawlerTimeoutError)):
+        return "stall", False, status_code
+
+    # Playwright driver disconnect / fatal crawler errors => treat as net-ish
+    if isinstance(exc, CrawlerFatalError) or _is_playwright_driver_disconnect(exc):
+        return "net", RetryStateStore.classify_unreachable_error(str(exc)), status_code
+
+    # DNS/NXDOMAIN-like => net (with nxdomain flag)
+    nxdomain_like = RetryStateStore.classify_unreachable_error(str(exc))
+    if nxdomain_like:
+        return "net", True, status_code
+
+    # Obvious network-ish needles
+    net_needles = [
+        "connection refused",
+        "connection reset",
+        "network is unreachable",
+        "no route to host",
+        "remote disconnected",
+        "server disconnected",
+        "socket hang up",
+        "broken pipe",
+        "timeout while reading",
+        "timed out",
+        "read timeout",
+        "connect timeout",
+        "ssl",
+        "tls",
+        "handshake",
+        "certificate",
+        "proxy",
+        "http 502",
+        "http 503",
+        "http 504",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+    ]
+    if any(n in low for n in net_needles):
+        return "net", False, status_code
+
+    # LLM rate limiting / quota / transient provider errors: treat as stall
+    stall_needles = [
+        "rate limit",
+        "too many requests",
+        "429",
+        "quota",
+        "overloaded",
+        "try again",
+        "temporarily unavailable",
+        "context length",
+        "deadline exceeded",
+    ]
+    if any(n in low for n in stall_needles):
+        return "stall", False, status_code
+
+    # Default: stall (wait longer + retry more)
+    return "stall", False, status_code
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +653,7 @@ async def crawl_company(
     arun_init_timeout_sec: float = 90.0,
     stream_no_yield_timeout_sec: float = 900.0,
     submit_timeout_sec: float = 30.0,
-) -> None:
+) -> PagePipelineSummary:
     logger.info(
         "Starting crawl for company_id=%s url=%s",
         company.company_id,
@@ -756,6 +847,12 @@ async def crawl_company(
             except Exception:
                 pass
 
+    # Return summary so run.py can decide company retry class from per-page markers
+    try:
+        return await processor.get_summary()
+    except Exception:
+        return PagePipelineSummary()
+
 
 # ---------------------------------------------------------------------------
 # Company pipeline
@@ -777,6 +874,41 @@ def _should_skip_company(status: str, llm_mode: str) -> bool:
     return status in (COMPANY_STATUS_LLM_DONE, "terminal_done")
 
 
+def _should_retry_company_from_page_summary(
+    summary: PagePipelineSummary,
+) -> Tuple[Optional[str], str]:
+    """
+    Convert per-page markers into a *company-level* retry decision.
+
+    Returns: (retry_cls or None, reason_string)
+      - "mem" when any memory_pressure pages exist
+      - "stall" when timeout dominance suggests crawl is compromised
+      - None when no escalation is needed
+    """
+    tp = max(0, int(summary.total_pages))
+    ts = int(summary.timeout_pages)
+    mp = int(summary.memory_pressure_pages)
+    md_saved = int(summary.markdown_saved)
+
+    if mp > 0:
+        return "mem", f"page_pipeline saw memory_pressure_pages={mp}/{tp}"
+
+    # If we got no pages, treat as stall (often blocked / immediate failure)
+    if tp == 0:
+        return "stall", "page_pipeline yielded 0 pages"
+
+    timeout_ratio = float(ts) / float(tp or 1)
+
+    # Escalate timeouts only when they dominate or nothing useful was saved.
+    if (md_saved == 0 and ts > 0) or (ts >= 3 and timeout_ratio >= 0.60):
+        return "stall", (
+            f"page_pipeline excessive timeouts: timeout_pages={ts}/{tp} "
+            f"(ratio={timeout_ratio:.2f}), markdown_saved={md_saved}"
+        )
+
+    return None, "ok"
+
+
 async def run_company_pipeline(
     company: Company,
     idx: int,
@@ -786,7 +918,7 @@ async def run_company_pipeline(
     state: Any,
     guard: ConnectivityGuard,
     gating_cfg: md_gating.MarkdownGatingConfig,
-    crawler_pool: CrawlerPool,
+    crawler_pool: "CrawlerPool",
     args: argparse.Namespace,
     dataset_externals: frozenset[str],
     url_scorer: Optional[DualBM25Scorer],
@@ -898,16 +1030,29 @@ async def run_company_pipeline(
             max_attempts = 2
             last_err: Optional[BaseException] = None
             last_stage: str = "crawl"
-            last_cls: str = "net"
+            last_cls: str = "stall"
+            last_nxdomain: bool = False
+            last_status_code: Optional[int] = None
 
             for attempt in range(max_attempts):
                 try:
-                    lease = await asyncio.wait_for(
-                        crawler_pool.lease(), timeout=lease_timeout
-                    )
+                    # IMPORTANT: distinguish lease timeout from other timeouts
+                    try:
+                        lease = await asyncio.wait_for(
+                            crawler_pool.lease(), timeout=lease_timeout
+                        )
+                    except asyncio.TimeoutError as e:
+                        raise CrawlerTimeoutError(
+                            f"crawler_pool.lease timeout ({lease_timeout:.1f}s) company_id={company.company_id}",
+                            stage="lease",
+                            company_id=company.company_id,
+                            url=company.domain_url,
+                        ) from e
+
+                    page_summary: Optional[PagePipelineSummary] = None
                     async with lease as crawler:
                         _touch(touch_cb, company.company_id)
-                        await crawl_company(
+                        page_summary = await crawl_company(
                             company=company,
                             crawler=crawler,
                             deep_strategy=deep_strategy,
@@ -934,6 +1079,26 @@ async def run_company_pipeline(
                             stream_no_yield_timeout_sec=stream_no_yield_timeout_sec,
                             submit_timeout_sec=submit_timeout_sec,
                         )
+
+                    # ---- NEW: Escalate per-page markers into company-level retry when needed
+                    if page_summary is not None:
+                        retry_cls, reason = _should_retry_company_from_page_summary(
+                            page_summary
+                        )
+                        if retry_cls == "mem":
+                            raise CriticalMemoryPressure(
+                                f"{MEMORY_PRESSURE_MARKER} | {reason}",
+                                severity="critical",
+                            )
+                        if retry_cls == "stall":
+                            raise CrawlerTimeoutError(
+                                f"{reason} | summary={page_summary.as_dict()}",
+                                stage="page_pipeline_timeout_dominance",
+                                company_id=company.company_id,
+                                url=company.domain_url,
+                            )
+
+                    guard.record_success()
                     last_err = None
                     break
 
@@ -941,45 +1106,36 @@ async def run_company_pipeline(
                     raise
                 except CriticalMemoryPressure:
                     raise
-                except (asyncio.TimeoutError, CrawlerTimeoutError) as e:
-                    last_err = e
-                    last_stage = getattr(e, "stage", "timeout")
-                    last_cls = "stall"
-                    company_logger.error(
-                        "[Timeout] company_id=%s attempt=%d/%d stage=%s error=%s",
-                        company.company_id,
-                        attempt + 1,
-                        max_attempts,
-                        last_stage,
-                        str(e),
-                    )
-                    if attempt + 1 < max_attempts:
-                        await asyncio.sleep(0.5)
-                        continue
-                except CrawlerFatalError as e:
-                    last_err = e
-                    last_stage = "crawler_fatal"
-                    last_cls = "net"
-                    company_logger.error(
-                        "[CrawlerFatalError] company_id=%s attempt=%d/%d error=%s",
-                        company.company_id,
-                        attempt + 1,
-                        max_attempts,
-                        str(e),
-                    )
-                    if attempt + 1 < max_attempts:
-                        await asyncio.sleep(0.5)
-                        continue
                 except Exception as e:
                     last_err = e
-                    last_stage = "unhandled_crawl"
-                    last_cls = "net"
-                    company_logger.exception(
-                        "[UnhandledCrawlError] company_id=%s attempt=%d/%d",
-                        company.company_id,
-                        attempt + 1,
-                        max_attempts,
+                    last_stage = getattr(e, "stage", "crawl")
+                    last_cls, last_nxdomain, last_status_code = (
+                        _classify_failure_for_retry(e, stage=last_stage)
                     )
+                    if last_cls == "net":
+                        guard.record_transport_error()
+
+                    if company_logger is not None:
+                        if isinstance(e, (CrawlerTimeoutError, asyncio.TimeoutError)):
+                            company_logger.error(
+                                "[CrawlTimeout] company_id=%s attempt=%d/%d stage=%s cls=%s error=%s",
+                                company.company_id,
+                                attempt + 1,
+                                max_attempts,
+                                last_stage,
+                                last_cls,
+                                str(e),
+                            )
+                        else:
+                            company_logger.exception(
+                                "[CrawlError] company_id=%s attempt=%d/%d stage=%s cls=%s",
+                                company.company_id,
+                                attempt + 1,
+                                max_attempts,
+                                last_stage,
+                                last_cls,
+                            )
+
                     if attempt + 1 < max_attempts:
                         await asyncio.sleep(0.5)
                         continue
@@ -991,10 +1147,10 @@ async def run_company_pipeline(
                         cls=last_cls,
                         error=str(last_err),
                         stage=last_stage,
-                        status_code=getattr(last_err, "status_code", None),
-                        nxdomain_like=RetryStateStore.classify_unreachable_error(
-                            str(last_err)
-                        ),
+                        status_code=last_status_code,
+                        nxdomain_like=last_nxdomain,
+                        max_attempts_net=6,
+                        max_attempts_stall=8,
                     )
                 except Exception:
                     pass
@@ -1022,31 +1178,68 @@ async def run_company_pipeline(
                         company.company_id,
                     )
 
+            llm_last_err: Optional[BaseException] = None
+            llm_last_stage = f"llm_{args.llm_mode}"
+            llm_last_cls = "stall"
+            llm_last_nxdomain = False
+            llm_last_status_code: Optional[int] = None
+
+            # small in-run retries; final failure always scheduled in retry_store
+            llm_attempts = 2
+
             try:
-                if args.llm_mode == "presence":
-                    await run_presence_pass_for_company(
-                        company, presence_strategy=presence_llm
-                    )
-                elif args.llm_mode == "full":
-                    await run_full_pass_for_company(company, full_strategy=full_llm)
-            except Exception as e:
-                if company_logger is not None:
-                    company_logger.exception(
-                        "[LLMError] company_id=%s", company.company_id
-                    )
-                try:
-                    retry_store.mark_failure(
-                        company.company_id,
-                        cls="net",
-                        error=str(e),
-                        stage=f"llm_{args.llm_mode}",
-                        nxdomain_like=RetryStateStore.classify_unreachable_error(
-                            str(e)
-                        ),
-                    )
-                except Exception:
-                    pass
-                return False
+                for attempt in range(llm_attempts):
+                    try:
+                        if args.llm_mode == "presence":
+                            await run_presence_pass_for_company(
+                                company, presence_strategy=presence_llm
+                            )
+                        elif args.llm_mode == "full":
+                            await run_full_pass_for_company(
+                                company, full_strategy=full_llm
+                            )
+
+                        llm_last_err = None
+                        break
+
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        llm_last_err = e
+                        llm_last_stage = f"llm_{args.llm_mode}"
+                        llm_last_cls, llm_last_nxdomain, llm_last_status_code = (
+                            _classify_failure_for_retry(e, stage=llm_last_stage)
+                        )
+
+                        if company_logger is not None:
+                            company_logger.exception(
+                                "[LLMError] company_id=%s attempt=%d/%d cls=%s",
+                                company.company_id,
+                                attempt + 1,
+                                llm_attempts,
+                                llm_last_cls,
+                            )
+
+                        # lightweight in-run delay; real backoff handled by RetryStateStore
+                        if attempt + 1 < llm_attempts:
+                            await asyncio.sleep(0.75)
+
+                if llm_last_err is not None:
+                    try:
+                        retry_store.mark_failure(
+                            company.company_id,
+                            cls=llm_last_cls,
+                            error=str(llm_last_err),
+                            stage=llm_last_stage,
+                            status_code=llm_last_status_code,
+                            nxdomain_like=llm_last_nxdomain,
+                            max_attempts_net=6,
+                            max_attempts_stall=8,
+                        )
+                    except Exception:
+                        pass
+                    return False
+
             finally:
                 if scheduler is not None:
                     try:
@@ -1075,12 +1268,16 @@ async def run_company_pipeline(
             "Unhandled error while processing company_id=%s", company.company_id
         )
         try:
+            cls, nxd, sc = _classify_failure_for_retry(e, stage="pipeline_unhandled")
             retry_store.mark_failure(
                 company.company_id,
-                cls="net",
+                cls=cls,
                 error=str(e),
                 stage="pipeline_unhandled",
-                nxdomain_like=RetryStateStore.classify_unreachable_error(str(e)),
+                status_code=sc,
+                nxdomain_like=nxd,
+                max_attempts_net=6,
+                max_attempts_stall=8,
             )
         except Exception:
             pass
@@ -1191,7 +1388,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--company-concurrency",
         type=int,
-        default=12,
+        default=8,
         help="Hard upper bound on concurrent companies.",
     )
     parser.add_argument("--max-pages", type=int, default=100)
@@ -1221,7 +1418,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--crawler-pool-size",
         type=int,
-        default=8,
+        default=4,
         help="Number of independent AsyncWebCrawler instances.",
     )
     parser.add_argument(
@@ -1377,7 +1574,6 @@ async def main_async(args: argparse.Namespace) -> None:
         return [cid for cid, t in inflight_by_cid.items() if not t.done()]
 
     crawler_pool: Optional[CrawlerPool] = None
-
     retry_store: Optional[RetryStateStore] = None
 
     async def request_recycle_idle(count: int, reason: str) -> int:
@@ -1409,6 +1605,8 @@ async def main_async(args: argparse.Namespace) -> None:
             if t is None or t.done():
                 continue
             logger.error("[AdaptiveScheduling] cancelling company_id=%s", cid)
+
+            # IMPORTANT: mark as mem cancellation; cancelled tasks are skipped later so no overwrite.
             if retry_store is not None:
                 try:
                     retry_store.mark_failure(
@@ -1416,6 +1614,8 @@ async def main_async(args: argparse.Namespace) -> None:
                         cls="mem",
                         error="cancelled by AdaptiveScheduler due to memory pressure/inactivity",
                         stage="scheduler_cancel",
+                        max_attempts_net=6,
+                        max_attempts_stall=8,
                     )
                 except Exception:
                     pass
@@ -1451,6 +1651,8 @@ async def main_async(args: argparse.Namespace) -> None:
                         cls="stall",
                         error=reason,
                         stage="shutdown_cancel",
+                        max_attempts_net=6,
+                        max_attempts_stall=8,
                     )
                 except Exception:
                     pass
@@ -1526,8 +1728,11 @@ async def main_async(args: argparse.Namespace) -> None:
         companies_by_id: Dict[str, Company] = {c.company_id: c for c in companies}
         company_ids_all: List[str] = [c.company_id for c in companies]
 
+        # FIX: CrawlState.start_run signature is start_run(pipeline, *, version, args_hash, run_id)
         run_id = await state.start_run(
-            pipeline="deep_crawl", version=None, args_hash=None
+            "deep_crawl",
+            version=None,
+            args_hash=None,
         )
         for c in companies:
             await state.upsert_company(c.company_id, name=None, root_url=c.domain_url)
@@ -1537,12 +1742,12 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception:
             logger.exception("Failed to recompute global crawl state at startup")
 
-        # -------------------- IMPORTANT FIX: filter DONE companies BEFORE queuing --------------------
+        # -------------------- IMPORTANT: filter DONE companies BEFORE queuing --------------------
         try:
             runnable_ids = await state.filter_runnable_company_ids(
                 company_ids_all,
                 llm_mode=str(getattr(args, "llm_mode", "none")),
-                refresh_pending=False,  # keep this fast for ongoing runs; DB already has status
+                refresh_pending=False,
                 chunk_size=500,
                 concurrency=32,
             )
@@ -1561,8 +1766,8 @@ async def main_async(args: argparse.Namespace) -> None:
             args.llm_mode,
         )
 
-        # Keep run totals as the original input list (for audit), but scheduling uses runnable only.
-        await state.update_run_totals(run_id, total_companies=len(companies))
+        # Prefer progress totals to reflect runnable work
+        await state.update_run_totals(run_id, total_companies=len(runnable_ids))
 
         dataset_externals: frozenset[str] = build_dataset_externals(
             args=args, companies=companies
@@ -1620,12 +1825,11 @@ async def main_async(args: argparse.Namespace) -> None:
         await scheduler.start()
 
         retry_store = scheduler.retry_store
-        _retry_store_instance = retry_store  # for exit-code computation in main()
+        _retry_store_instance = retry_store
 
         touch_cb = scheduler.touch_company
 
         async def is_company_runnable(cid: str) -> bool:
-            # Fast check using DB snapshot, with safe fallback.
             try:
                 snap = await state.get_company_snapshot(cid, recompute=False)
                 st = getattr(snap, "status", None) or COMPANY_STATUS_PENDING
@@ -1633,7 +1837,6 @@ async def main_async(args: argparse.Namespace) -> None:
             except Exception:
                 return True
 
-        # Clean retry-state entries that are already DONE (prevents restart loops)
         try:
             cleared = await scheduler.cleanup_completed_retry_ids(
                 is_company_runnable=is_company_runnable,
@@ -1648,7 +1851,6 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception:
             logger.exception("Failed cleaning completed retry IDs at startup")
 
-        # Seed scheduler with pre-filtered runnable worklist
         await scheduler.set_worklist(
             runnable_ids,
             retry_mode=str(getattr(args, "retry_mode", "all")),
@@ -1749,6 +1951,7 @@ async def main_async(args: argparse.Namespace) -> None:
                     if cid is not None:
                         inflight_by_cid.pop(cid, None)
 
+                    # IMPORTANT: cancelled tasks were already scheduled as "mem" (or "stall" on shutdown)
                     if t.cancelled():
                         continue
 
@@ -1763,6 +1966,8 @@ async def main_async(args: argparse.Namespace) -> None:
                                     cls="mem",
                                     error=str(e),
                                     stage="critical_memory_pressure",
+                                    max_attempts_net=6,
+                                    max_attempts_stall=8,
                                 )
                             except Exception:
                                 pass
@@ -1771,14 +1976,18 @@ async def main_async(args: argparse.Namespace) -> None:
                         logger.exception("Company task failed (company_id=%s)", cid)
                         if cid and retry_store is not None:
                             try:
+                                cls, nxd, sc = _classify_failure_for_retry(
+                                    e, stage="task_exception"
+                                )
                                 retry_store.mark_failure(
                                     cid,
-                                    cls="net",
+                                    cls=cls,
                                     error=str(e),
                                     stage="task_exception",
-                                    nxdomain_like=RetryStateStore.classify_unreachable_error(
-                                        str(e)
-                                    ),
+                                    status_code=sc,
+                                    nxdomain_like=nxd,
+                                    max_attempts_net=6,
+                                    max_attempts_stall=8,
                                 )
                             except Exception:
                                 pass
