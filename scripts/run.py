@@ -1378,7 +1378,6 @@ async def main_async(args: argparse.Namespace) -> None:
 
     crawler_pool: Optional[CrawlerPool] = None
 
-    # scheduler-owned retry store will be attached later
     retry_store: Optional[RetryStateStore] = None
 
     async def request_recycle_idle(count: int, reason: str) -> int:
@@ -1391,7 +1390,6 @@ async def main_async(args: argparse.Namespace) -> None:
             return 0
 
     def request_cancel_companies(ids: Sequence[str]) -> None:
-        # Execution-only: scheduler decides *when*; run.py just carries out cancellation.
         nonlocal retry_store
 
         if crawler_pool is not None and ids:
@@ -1539,6 +1537,31 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception:
             logger.exception("Failed to recompute global crawl state at startup")
 
+        # -------------------- IMPORTANT FIX: filter DONE companies BEFORE queuing --------------------
+        try:
+            runnable_ids = await state.filter_runnable_company_ids(
+                company_ids_all,
+                llm_mode=str(getattr(args, "llm_mode", "none")),
+                refresh_pending=False,  # keep this fast for ongoing runs; DB already has status
+                chunk_size=500,
+                concurrency=32,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to pre-filter runnable companies; falling back to full list."
+            )
+            runnable_ids = list(company_ids_all)
+
+        skipped = len(company_ids_all) - len(runnable_ids)
+        logger.info(
+            "Worklist filtering: total=%d runnable=%d skipped_done=%d llm_mode=%s",
+            len(company_ids_all),
+            len(runnable_ids),
+            skipped,
+            args.llm_mode,
+        )
+
+        # Keep run totals as the original input list (for audit), but scheduling uses runnable only.
         await state.update_run_totals(run_id, total_companies=len(companies))
 
         dataset_externals: frozenset[str] = build_dataset_externals(
@@ -1601,14 +1624,13 @@ async def main_async(args: argparse.Namespace) -> None:
 
         touch_cb = scheduler.touch_company
 
-        # Callback used by scheduler to avoid scheduling already-done companies
         async def is_company_runnable(cid: str) -> bool:
+            # Fast check using DB snapshot, with safe fallback.
             try:
-                snap = await state.get_company_snapshot(cid)
+                snap = await state.get_company_snapshot(cid, recompute=False)
                 st = getattr(snap, "status", None) or COMPANY_STATUS_PENDING
                 return not _should_skip_company(st, args.llm_mode)
             except Exception:
-                # If uncertain, allow it (pipeline will quickly no-op if truly done)
                 return True
 
         # Clean retry-state entries that are already DONE (prevents restart loops)
@@ -1626,9 +1648,9 @@ async def main_async(args: argparse.Namespace) -> None:
         except Exception:
             logger.exception("Failed cleaning completed retry IDs at startup")
 
-        # Seed scheduler with worklist. Scheduler applies retry-mode/quarantine/backoff.
+        # Seed scheduler with pre-filtered runnable worklist
         await scheduler.set_worklist(
-            company_ids_all,
+            runnable_ids,
             retry_mode=str(getattr(args, "retry_mode", "all")),
             is_company_runnable=is_company_runnable,
         )
