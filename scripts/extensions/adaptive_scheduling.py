@@ -130,22 +130,6 @@ class AdaptiveSchedulingConfig:
     mem_crit_raw_frac: float = 0.94
     mem_kill_raw_frac: float = 0.97  # restart recommended (+ optional kill)
 
-    # --- Smarter OOM prevention (available memory floors; RAW is what OOM cares about) ---
-    # Block admissions if raw available memory goes below this floor (MB).
-    min_available_raw_mb_block: float = 1536.0
-    # Prefer recycle-before-cancel when raw available goes below this (MB).
-    min_available_raw_mb_crit: float = 768.0
-    # Emergency zone: if raw available is below this (MB), cancel immediately (no grace).
-    min_available_raw_mb_emergency: float = 384.0
-
-    # When critical pressure is detected, give recycle/GC some time before cancelling.
-    pressure_sustain_sec: float = 2.0
-    recycle_before_emergency_cancel: bool = True
-    recycle_grace_sec: float = 6.0
-    max_recycle_attempts_per_pressure: int = 2
-    gc_on_pressure: bool = True
-    gc_pressure_interval_sec: float = 10.0
-
     # --- Memory ramp detection ---
     mem_ramp_window_sec: float = 3.0
     mem_ramp_high_frac_per_sec: float = 0.020
@@ -184,7 +168,7 @@ class AdaptiveSchedulingConfig:
     restart_gate_min_uptime_sec: float = 180.0
     restart_gate_min_completed: int = 3
 
-    # --- Stall detection / watchdog logic (gated by suspend/resume) ---
+    # --- Stall detection / aggressive watchdog logic (gated by suspend/resume) ---
     company_inactivity_timeout_sec: float = 240.0
     company_inactivity_cancel_max: int = 1
 
@@ -192,7 +176,7 @@ class AdaptiveSchedulingConfig:
     block_log_interval_sec: float = 30.0
 
     no_progress_timeout_sec: float = 240.0
-    kill_on_no_progress: bool = True  # stall-only; memory triggers never self-kill
+    kill_on_no_progress: bool = True
 
     # Optional heartbeat/logging
     heartbeat_path: Optional[Path] = None
@@ -226,9 +210,13 @@ class AdaptiveSchedulingConfig:
     max_idle_sleep_sec: float = 5.0
 
     # When the scheduler cancels a company (stall/mem), do not re-admit it immediately.
+    # We still rely on retry_state.py for the real backoff schedule; this is only a small
+    # "cancel grace" to avoid duplicate starts while cancellation is in-flight.
     cancel_requeue_min_delay_sec: float = 2.0
 
-    # Cancel spam guard
+    # Cancel spam guard:
+    # - If a cancel has been requested for a company, don't request it again for a short cooldown.
+    # - Also keep a bounded in-flight record so we can avoid churn even if active bookkeeping lags.
     company_cancel_repeat_cooldown_sec: float = 15.0
     company_cancel_inflight_timeout_sec: float = 600.0
 
@@ -330,15 +318,11 @@ class AdaptiveScheduler:
         self._restart_recommended: bool = False
         self._last_emergency_cancel_ts: float = 0.0
 
-        # Pressure tracking (smarter OOM prevention)
-        self._pressure_since_mono: float = 0.0
-        self._pressure_recycle_attempts: int = 0
-        self._last_pressure_gc_mono: float = 0.0
-
         # Stall detection suspension
         self._stall_suspensions: set[str] = set()
 
         # Cancel-in-flight guard
+        # cid -> monotonic timestamp when cancel requested
         self._cancel_inflight_mono: Dict[str, float] = {}
 
         # Async + optional thread watchdog
@@ -715,16 +699,6 @@ class AdaptiveScheduler:
     # ----------------------------
     # State snapshot
     # ----------------------------
-    def _available_raw_mb(self) -> float:
-        if self._total_mem_bytes <= 0:
-            return 0.0
-        return float(max(0, self._total_mem_bytes - self._used_bytes_raw)) / _MB
-
-    def _available_eff_mb(self) -> float:
-        if self._total_mem_bytes <= 0:
-            return 0.0
-        return float(max(0, self._total_mem_bytes - self._used_bytes_eff)) / _MB
-
     def get_state_snapshot(self) -> Dict[str, Any]:
         return {
             "total_mem_mb": float(self._total_mem_bytes) / _MB
@@ -738,8 +712,6 @@ class AdaptiveScheduler:
             if self._used_bytes_raw
             else 0.0,
             "used_frac_raw": self._used_frac_raw,
-            "avail_raw_mb": self._available_raw_mb(),
-            "avail_eff_mb": self._available_eff_mb(),
             "ramp_eff_frac_per_sec": self._ramp_eff_frac_per_sec,
             "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
             "proc_mem_mb": float(self._proc_rss_bytes) / _MB
@@ -780,24 +752,30 @@ class AdaptiveScheduler:
           If free_crawlers <= 0, we start NOTHING. This prevents a churn loop where
           tasks get admitted but cannot lease a crawler slot, then hit inactivity cancels.
         """
+        # Snapshot active early (also used to prevent duplicate starts)
         active_ids = list(self._get_active_company_ids())
         active_set = set(active_ids)
 
+        # 1) move deferred due
         async with self._lock:
             self._move_due_deferred_locked(time.time())
 
+        # 2) if nothing ready, nothing to start
         if not self._work_ready:
             return []
 
+        # 3) compute admissible slots
         slots = await self.admissible_slots(num_waiting=len(self._work_ready))
         if slots <= 0:
             return []
 
+        # 4) enforce hard capacity based on max_target and active
         active_n = len(active_ids)
         hard_capacity = max(0, int(self.cfg.max_target) - active_n)
         if hard_capacity <= 0:
             return []
 
+        # 5) crawler pressure (STRICT: 0 free crawlers => start 0)
         free = int(free_crawlers)
         if free <= 0:
             return []
@@ -808,6 +786,7 @@ class AdaptiveScheduler:
         if crawler_cap <= 0:
             return []
 
+        # 6) final plan size
         want = min(
             int(slots),
             int(hard_capacity),
@@ -818,6 +797,7 @@ class AdaptiveScheduler:
         if want <= 0:
             return []
 
+        # 7) pick from ready, lazily validate runnable
         picked: List[str] = []
         scanned = 0
         max_scan = max(want * 4, want + 8)
@@ -831,6 +811,8 @@ class AdaptiveScheduler:
             if cid is None:
                 break
 
+            # If it's still active (e.g., we re-queued after a cancel but cancel hasn't taken effect yet),
+            # defer a bit to avoid duplicate runs.
             if cid in active_set:
                 async with self._lock:
                     self._enqueue_deferred_locked(
@@ -842,6 +824,7 @@ class AdaptiveScheduler:
                 try:
                     runnable = await self._is_company_runnable(cid)
                     if not runnable:
+                        # treat as done: remove from retry state if present
                         try:
                             self.retry_store.mark_success(
                                 cid,
@@ -852,6 +835,7 @@ class AdaptiveScheduler:
                             pass
                         continue
                 except Exception:
+                    # if unsure, allow
                     pass
 
             picked.append(cid)
@@ -874,11 +858,10 @@ class AdaptiveScheduler:
             return
         self._last_block_log_mono = now_mono
         logger.warning(
-            "[AdaptiveScheduling] admission blocked reason=%s used_raw=%.3f used_eff=%.3f avail_raw_mb=%.0f ramp_raw=%.3f/s active=%d waiting=%d proc_mem_mb=%.1f target=%d",
+            "[AdaptiveScheduling] admission blocked reason=%s used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s active=%d waiting=%d proc_mem_mb=%.1f target=%d",
             reason,
             self._used_frac_raw,
             self._used_frac_eff,
-            self._available_raw_mb(),
             self._ramp_raw_frac_per_sec,
             active_n,
             waiting,
@@ -913,16 +896,7 @@ class AdaptiveScheduler:
             self._update_per_company_est_locked(active_n)
             self._update_target_parallel_locked(active_n)
 
-            # Block admissions if raw available memory floor is violated (smarter than fractions)
-            avail_raw_mb = self._available_raw_mb()
-            if (
-                float(self.cfg.min_available_raw_mb_block) > 0
-                and avail_raw_mb > 0
-                and avail_raw_mb < float(self.cfg.min_available_raw_mb_block)
-            ):
-                self._maybe_log_block("block_low_avail_raw", active_n, num_waiting)
-                return 0
-
+            # Block conditions
             if self._used_frac_raw >= float(self.cfg.mem_high_raw_frac):
                 self._maybe_log_block("block_mem_high_raw", active_n, num_waiting)
                 return 0
@@ -992,7 +966,6 @@ class AdaptiveScheduler:
                         "target_parallel": self._target_parallel,
                         "used_frac": self._used_frac_eff,
                         "used_frac_raw": self._used_frac_raw,
-                        "avail_raw_mb": avail_raw_mb,
                         "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
                         "per_company_est_mb": self._per_company_est_mb,
                         "proc_mem_mb": float(self._proc_rss_bytes) / _MB
@@ -1009,7 +982,7 @@ class AdaptiveScheduler:
             return slots
 
     # ----------------------------
-    # Cancel recording + re-queueing
+    # Cancel recording + re-queueing (uses retry_state.py schedule)
     # ----------------------------
     async def _record_cancels_and_schedule_retries(
         self,
@@ -1021,9 +994,14 @@ class AdaptiveScheduler:
         status_code: Optional[int] = None,
         permanent_reason: str = "",
     ) -> None:
+        """
+        Record cancellations in RetryStateStore AND re-queue them using the
+        retry_state.py computed next_eligible_at (scheduler does not implement backoff).
+        """
         if not cancel_ids:
             return
 
+        # 1) record failures (IO + store lock)
         for cid in cancel_ids:
             _mark_failure_compat(
                 self.retry_store,
@@ -1035,6 +1013,7 @@ class AdaptiveScheduler:
                 permanent_reason=str(permanent_reason or ""),
             )
 
+        # 2) build schedules (no lock held)
         now = time.time()
         active_set = set(self._get_active_company_ids())
         items: List[Tuple[str, float]] = []
@@ -1045,11 +1024,13 @@ class AdaptiveScheduler:
             except Exception:
                 pass
 
+            ts = 0.0
             try:
                 ts = float(self.retry_store.next_eligible_at(str(cid)))
             except Exception:
                 ts = 0.0
 
+            # enforce small cancel grace; also avoid re-admitting while still active
             grace = float(self.cfg.cancel_requeue_min_delay_sec)
             min_ts = now + grace
             if str(cid) in active_set:
@@ -1060,13 +1041,16 @@ class AdaptiveScheduler:
         if not items:
             return
 
+        # 3) enqueue (LOCKED)
         async with self._lock:
             for cid, ts in items:
+                # If already queued, just update deferred schedule if needed.
                 if cid in self._queued:
                     if cid in self._deferred_at:
                         self._enqueue_deferred_locked(cid, ts)
                     continue
 
+                # If eligible now (after grace), put ready; else deferred.
                 try:
                     if self.retry_store.is_eligible(cid, now=now) and ts <= now:
                         self._enqueue_ready_locked(cid)
@@ -1091,7 +1075,6 @@ class AdaptiveScheduler:
                 cancel_ids: List[str] = []
                 cancel_reason: str = ""
                 should_recycle_idle = False
-                force_recycle_idle = False
 
                 async with self._lock:
                     now = time.time()
@@ -1105,6 +1088,7 @@ class AdaptiveScheduler:
                     self._update_base_rss_locked(active_n)
                     self._update_per_company_est_locked(active_n)
 
+                    # Progress inference
                     if (
                         (active_n != self._last_obs_active_n)
                         or (self._last_num_waiting != self._last_obs_waiting_n)
@@ -1117,6 +1101,7 @@ class AdaptiveScheduler:
 
                     now_mono = time.monotonic()
 
+                    # Keep touch map tidy; seed active companies
                     active_set = set(active_ids)
                     for cid in list(self._company_last_touch_mono.keys()):
                         if cid not in active_set:
@@ -1124,6 +1109,8 @@ class AdaptiveScheduler:
                     for cid in active_ids:
                         self._company_last_touch_mono.setdefault(cid, now_mono)
 
+                    # Maintain cancel-inflight map:
+                    # - drop if no longer active, or too old (bounded memory / stale cleanup)
                     inflight_timeout = float(
                         self.cfg.company_cancel_inflight_timeout_sec
                     )
@@ -1146,41 +1133,6 @@ class AdaptiveScheduler:
 
                     stall_enabled = self.stall_detection_enabled
 
-                    # ---- Smarter pressure classification (prefer available-raw MB) ----
-                    avail_raw_mb = self._available_raw_mb()
-                    emergency_avail = float(self.cfg.min_available_raw_mb_emergency)
-                    crit_avail = float(self.cfg.min_available_raw_mb_crit)
-
-                    is_crit_pressure = (
-                        (self._used_frac_raw >= float(self.cfg.mem_crit_raw_frac))
-                        or (self._used_frac_eff >= float(self.cfg.mem_crit_frac))
-                        or (
-                            crit_avail > 0
-                            and avail_raw_mb > 0
-                            and avail_raw_mb <= crit_avail
-                        )
-                    )
-                    is_emergency_pressure = (
-                        emergency_avail > 0
-                        and avail_raw_mb > 0
-                        and avail_raw_mb <= emergency_avail
-                    ) or (self._used_frac_raw >= float(self.cfg.mem_kill_raw_frac))
-
-                    if is_crit_pressure:
-                        if self._pressure_since_mono <= 0:
-                            self._pressure_since_mono = now_mono
-                            self._pressure_recycle_attempts = 0
-                    else:
-                        self._pressure_since_mono = 0.0
-                        self._pressure_recycle_attempts = 0
-
-                    crit_sustained = (
-                        is_crit_pressure
-                        and self._pressure_since_mono > 0
-                        and (now_mono - self._pressure_since_mono)
-                        >= float(self.cfg.pressure_sustain_sec)
-                    )
-
                     # 1) Per-company inactivity cancel (gated)
                     if (
                         stall_enabled
@@ -1189,6 +1141,7 @@ class AdaptiveScheduler:
                     ):
                         stuck: List[str] = []
                         for cid in active_ids:
+                            # If we already asked to cancel it recently, don't spam-cancel.
                             if _recently_cancelled(cid):
                                 continue
                             last = self._company_last_touch_mono.get(cid, now_mono)
@@ -1266,84 +1219,65 @@ class AdaptiveScheduler:
                                             except Exception:
                                                 pass
 
-                    # 4) Memory danger -> recommend restart (NOT gated, but never self-kill here)
-                    if is_emergency_pressure and self._can_recommend_restart():
-                        if not self._restart_recommended:
-                            logger.critical(
-                                "[AdaptiveScheduling] emergency memory pressure (used_raw=%.3f avail_raw_mb=%.0f) -> restart recommended",
-                                self._used_frac_raw,
-                                avail_raw_mb,
-                            )
-                        self._restart_recommended = True
+                    # 4) Raw mem kill -> restart (NOT gated)
+                    if self._used_frac_raw >= float(self.cfg.mem_kill_raw_frac):
+                        if self._can_recommend_restart():
+                            if not self._restart_recommended:
+                                logger.critical(
+                                    "[AdaptiveScheduling] raw mem %.3f >= kill %.3f -> restart recommended",
+                                    self._used_frac_raw,
+                                    float(self.cfg.mem_kill_raw_frac),
+                                )
+                            self._restart_recommended = True
+                            if self.cfg.kill_on_no_progress:
+                                try:
+                                    os.kill(
+                                        os.getpid(),
+                                        int(self.cfg.hard_watchdog_kill_signal),
+                                    )
+                                except Exception:
+                                    pass
 
-                    # 5) Ramp kill -> recommend restart (NOT gated, never self-kill here)
+                    # 5) Ramp kill -> restart (NOT gated)
                     if self._ramp_raw_frac_per_sec >= float(
                         self.cfg.mem_ramp_kill_frac_per_sec
                     ) and self._used_frac_raw >= float(self.cfg.mem_high_raw_frac):
                         if self._can_recommend_restart():
                             if not self._restart_recommended:
                                 logger.critical(
-                                    "[AdaptiveScheduling] mem ramp raw=%.3f/s with used_raw=%.3f -> restart recommended",
+                                    "[AdaptiveScheduling] mem ramp raw=%.3f/s with used_raw=%.3f (>=high %.3f) -> restart recommended",
                                     self._ramp_raw_frac_per_sec,
                                     self._used_frac_raw,
+                                    float(self.cfg.mem_high_raw_frac),
                                 )
                             self._restart_recommended = True
+                            if self.cfg.kill_on_no_progress:
+                                try:
+                                    os.kill(
+                                        os.getpid(),
+                                        int(self.cfg.hard_watchdog_kill_signal),
+                                    )
+                                except Exception:
+                                    pass
 
-                    # 6) Reclaim-first under critical pressure (smarter OOM prevention)
-                    if (
-                        self._request_recycle_idle is not None
-                        and is_crit_pressure
-                        and active_n > 0
-                        and self.cfg.recycle_before_emergency_cancel
-                    ):
-                        # If we're in the emergency zone, we won't delay cancels.
-                        if not is_emergency_pressure:
-                            # Try recycle a couple times first.
-                            if self._pressure_recycle_attempts < int(
-                                self.cfg.max_recycle_attempts_per_pressure
-                            ):
-                                # allow faster recycle cadence while in pressure
-                                if (now_mono - self._last_idle_recycle_mono) >= min(
-                                    float(self.cfg.idle_recycle_interval_sec),
-                                    float(self.cfg.recycle_grace_sec),
-                                ):
-                                    force_recycle_idle = True
-                                    self._pressure_recycle_attempts += 1
+                    # 6) Emergency cancel (critical memory OR ramp critical) - NOT gated
+                    crit_trigger = (
+                        self._used_frac_raw >= float(self.cfg.mem_crit_raw_frac)
+                    ) or (self._used_frac_eff >= float(self.cfg.mem_crit_frac))
 
-                    # Optional GC under pressure (throttled)
-                    if self.cfg.gc_on_pressure and is_crit_pressure:
-                        if (now_mono - self._last_pressure_gc_mono) >= float(
-                            self.cfg.gc_pressure_interval_sec
-                        ):
-                            self._last_pressure_gc_mono = now_mono
-                            try:
-                                gc.collect()
-                            except Exception:
-                                pass
-
-                    # 7) Emergency cancel (only if sustained OR emergency floor hit) - NOT gated
-                    crit_trigger = is_crit_pressure
                     ramp_trigger = self._ramp_raw_frac_per_sec >= float(
                         self.cfg.mem_ramp_crit_frac_per_sec
                     ) and self._used_frac_raw >= float(self.cfg.mem_crit_raw_frac)
-
-                    may_cancel_now = (
-                        is_emergency_pressure or crit_sustained or ramp_trigger
-                    )
-
-                    # If we chose to recycle this tick (reclaim-first), do not also cancel (unless emergency).
-                    if force_recycle_idle and not is_emergency_pressure:
-                        may_cancel_now = False
 
                     if (
                         (crit_trigger or ramp_trigger)
                         and active_n > 0
                         and not cancel_ids
-                        and may_cancel_now
                     ):
                         if (now - self._last_emergency_cancel_ts) >= float(
                             self.cfg.emergency_cancel_cooldown_sec
                         ):
+                            # Don't repeatedly cancel the same companies.
                             cancelable = [
                                 cid
                                 for cid in active_ids
@@ -1370,12 +1304,13 @@ class AdaptiveScheduler:
                                 cancel_reason = "mem_heavy" if ramp_trigger else "mem"
 
                                 logger.error(
-                                    "[AdaptiveScheduling] EMERGENCY_CANCEL used_raw=%.3f used_eff=%.3f avail_raw_mb=%.0f ramp_raw=%.3f/s total_mb=%.1f proc_mem_mb=%.1f active=%d cancel=%s",
+                                    "[AdaptiveScheduling] EMERGENCY used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s total_mb=%.1f used_raw_mb=%.1f used_eff_mb=%.1f proc_mem_mb=%.1f active=%d cancel=%s",
                                     self._used_frac_raw,
                                     self._used_frac_eff,
-                                    avail_raw_mb,
                                     self._ramp_raw_frac_per_sec,
                                     float(self._total_mem_bytes) / _MB,
+                                    float(self._used_bytes_raw) / _MB,
+                                    float(self._used_bytes_eff) / _MB,
                                     float(self._proc_rss_bytes) / _MB
                                     if self._proc_rss_bytes
                                     else 0.0,
@@ -1389,40 +1324,34 @@ class AdaptiveScheduler:
                                         "cancel_ids": cancel_ids,
                                         "used_frac_raw": self._used_frac_raw,
                                         "used_frac": self._used_frac_eff,
-                                        "avail_raw_mb": avail_raw_mb,
                                         "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
                                         "stall_detection_enabled": stall_enabled,
                                         "stall_suspensions": len(
                                             self._stall_suspensions
                                         ),
                                         "cancel_reason": cancel_reason,
-                                        "crit_sustained": crit_sustained,
-                                        "force_recycle_idle": force_recycle_idle,
                                     },
                                 )
 
-                    # 8) Idle recycle request (memory pressure, throttled)
+                    # 7) Idle recycle request (memory pressure, throttled)
                     if self._request_recycle_idle is not None:
-                        # Forced recycle when in pressure (reclaim-first)
-                        if force_recycle_idle:
-                            should_recycle_idle = True
-                            self._last_idle_recycle_mono = now_mono
-                        else:
-                            if (now_mono - self._last_idle_recycle_mono) >= float(
-                                self.cfg.idle_recycle_interval_sec
+                        if (now_mono - self._last_idle_recycle_mono) >= float(
+                            self.cfg.idle_recycle_interval_sec
+                        ):
+                            if (
+                                self._used_frac_raw
+                                >= float(self.cfg.idle_recycle_raw_frac)
+                            ) or (
+                                self._used_frac_eff
+                                >= float(self.cfg.idle_recycle_eff_frac)
                             ):
-                                if (
-                                    self._used_frac_raw
-                                    >= float(self.cfg.idle_recycle_raw_frac)
-                                ) or (
-                                    self._used_frac_eff
-                                    >= float(self.cfg.idle_recycle_eff_frac)
-                                ):
-                                    should_recycle_idle = True
-                                    self._last_idle_recycle_mono = now_mono
+                                should_recycle_idle = True
+                                self._last_idle_recycle_mono = now_mono
 
                 # Outside lock: apply cancels and record+schedule retries via RetryStateStore
                 if cancel_ids:
+                    # Mark inflight BEFORE sending cancel to suppress repeat cancels.
+                    # If cancel request fails, we remove these inflight marks.
                     inflight_mark_ts = time.monotonic()
                     async with self._lock:
                         for cid in cancel_ids:
@@ -1435,6 +1364,7 @@ class AdaptiveScheduler:
                         logger.exception(
                             "[AdaptiveScheduling] request_cancel_companies failed"
                         )
+                        # undo inflight marks to allow retry next tick
                         async with self._lock:
                             for cid in cancel_ids:
                                 self._cancel_inflight_mono.pop(str(cid), None)
@@ -1446,7 +1376,6 @@ class AdaptiveScheduler:
                             err = (
                                 f"cancelled_by_scheduler:{cls_hint} "
                                 f"used_raw={self._used_frac_raw:.3f} used_eff={self._used_frac_eff:.3f} "
-                                f"avail_raw_mb={self._available_raw_mb():.0f} "
                                 f"ramp_raw={self._ramp_raw_frac_per_sec:.3f}/s "
                                 f"proc_mb={(float(self._proc_rss_bytes) / _MB) if self._proc_rss_bytes else 0.0:.1f}"
                             )
@@ -1459,6 +1388,7 @@ class AdaptiveScheduler:
                                 permanent_reason="",
                             )
                         elif cancel_reason == "stall":
+                            # REQUIRED: inactivity cancels are marked as "stall" in retry_state.py
                             err = (
                                 "cancelled_by_scheduler:stall "
                                 f"inactivity_timeout={float(self.cfg.company_inactivity_timeout_sec):.1f}s"
@@ -1479,12 +1409,7 @@ class AdaptiveScheduler:
 
                 if should_recycle_idle and self._request_recycle_idle is not None:
                     try:
-                        await self._request_recycle_idle(
-                            1,
-                            "mem_pressure_idle_recycle_force"
-                            if force_recycle_idle
-                            else "mem_pressure_idle_recycle",
-                        )
+                        await self._request_recycle_idle(1, "mem_pressure_idle_recycle")
                     except Exception:
                         logger.exception(
                             "[AdaptiveScheduling] request_recycle_idle failed"
@@ -1553,7 +1478,6 @@ class AdaptiveScheduler:
                 "restart_recommended": self._restart_recommended,
                 "used_frac": self._used_frac_eff,
                 "used_frac_raw": self._used_frac_raw,
-                "avail_raw_mb": self._available_raw_mb(),
                 "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
                 "target_parallel": self._target_parallel,
                 "proc_mem_mb": float(self._proc_rss_bytes) / _MB
@@ -1564,13 +1488,6 @@ class AdaptiveScheduler:
                 "cancel_inflight": len(self._cancel_inflight_mono),
                 "ready": len(self._work_ready),
                 "deferred": len(self._deferred_at),
-                "pressure_since_sec": max(
-                    0.0,
-                    (time.monotonic() - self._pressure_since_mono)
-                    if self._pressure_since_mono > 0
-                    else 0.0,
-                ),
-                "pressure_recycle_attempts": self._pressure_recycle_attempts,
             }
             tmp = path.with_suffix(path.suffix + ".tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -1818,12 +1735,11 @@ class AdaptiveScheduler:
 
         if self._target_parallel != old and logger.isEnabledFor(logging.INFO):
             logger.info(
-                "[AdaptiveScheduling] target_parallel %d -> %d (used_raw=%.3f used_eff=%.3f avail_raw_mb=%.0f ramp_raw=%.3f/s active=%d proc_mem_mb=%.1f)",
+                "[AdaptiveScheduling] target_parallel %d -> %d (used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s active=%d proc_mem_mb=%.1f)",
                 old,
                 self._target_parallel,
                 self._used_frac_raw,
                 self._used_frac_eff,
-                self._available_raw_mb(),
                 self._ramp_raw_frac_per_sec,
                 active_n,
                 float(self._proc_rss_bytes) / _MB if self._proc_rss_bytes else 0.0,
@@ -1913,8 +1829,6 @@ class AdaptiveScheduler:
             "used_frac_eff": self._used_frac_eff,
             "used_bytes_raw": self._used_bytes_raw,
             "used_frac_raw": self._used_frac_raw,
-            "avail_raw_mb": self._available_raw_mb(),
-            "avail_eff_mb": self._available_eff_mb(),
             "ramp_eff_frac_per_sec": self._ramp_eff_frac_per_sec,
             "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
             "proc_mem_bytes": self._proc_rss_bytes,
