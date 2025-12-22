@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from extensions import output_paths
 
@@ -18,10 +18,14 @@ from extensions import output_paths
 
 RetryClass = str  # "net" | "stall" | "mem" | "other" | "permanent"
 
-DEFAULT_MAX_ATTEMPTS_NET = 6
-DEFAULT_MAX_ATTEMPTS_STALL = 8
-DEFAULT_NXDOMAIN_CUTOFF = 2
-DEFAULT_JITTER_FRAC = 0.20
+# More unforgiving defaults (net/stall are LIMITED; mem/other unlimited)
+DEFAULT_MAX_ATTEMPTS_NET = 3
+DEFAULT_MAX_ATTEMPTS_STALL = 4
+DEFAULT_NXDOMAIN_CUTOFF = 1
+DEFAULT_JITTER_FRAC = 0.15
+
+# Reduce IO churn; keep store hot in memory.
+DEFAULT_FLUSH_MIN_INTERVAL_SEC = 1.0
 
 
 def _output_root() -> Path:
@@ -37,7 +41,7 @@ def _output_root() -> Path:
         return Path("outputs").resolve()
 
 
-def _retry_emfile(fn, attempts: int = 6, base_delay: float = 0.15):
+def _retry_emfile(fn, attempts: int = 6, base_delay: float = 0.12):
     for i in range(attempts):
         try:
             return fn()
@@ -91,16 +95,21 @@ def _json_load_nocache(path: Path) -> Any:
     return _retry_emfile(_read)
 
 
-def _append_jsonl(path: Path, obj: Dict[str, Any]) -> None:
+def _append_jsonl_many(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
     """
-    Append-only JSONL writer. Best-effort fsync to avoid loss on abrupt exit.
+    Append many JSONL rows in a single open() for speed.
+    Best-effort fsync.
     """
+    if not rows:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+    lines = "".join(
+        json.dumps(r, ensure_ascii=False, separators=(",", ":")) + "\n" for r in rows
+    )
 
     def _write() -> None:
         with open(path, "a", encoding="utf-8", newline="") as f:
-            f.write(line)
+            f.write(lines)
             try:
                 f.flush()
                 os.fsync(f.fileno())
@@ -123,20 +132,28 @@ def _jitter(seconds: float, frac: float = DEFAULT_JITTER_FRAC) -> float:
 
 
 def _backoff_schedule_seconds(attempts: int, *, kind: RetryClass) -> float:
+    """
+    Fast decisions:
+      - net/stall: retry quickly a few times, then quarantine
+      - mem/other: increasingly slow (unlimited)
+    """
     a = max(1, int(attempts))
 
     if kind == "net":
-        schedule = [60, 300, 1200, 3600, 10800, 28800]
+        # fast retries; limited attempts
+        schedule = [20, 60, 300]
     elif kind == "stall":
-        schedule = [600, 1800, 7200, 21600, 43200, 86400]
+        # usually rate-limit/robot checks: a bit longer, still limited
+        schedule = [60, 300, 1200, 3600]
     elif kind == "mem":
-        schedule = [900, 3600, 21600, 86400]
+        # memory pressure typically persists; slow it down
+        schedule = [300, 1800, 7200, 21600, 86400]
     elif kind == "other":
-        schedule = [300, 1200, 7200, 43200, 86400]
+        schedule = [60, 300, 1800, 7200, 21600, 86400]
     elif kind == "permanent":
         return 10**9
     else:
-        schedule = [300, 1200, 7200, 43200, 86400]
+        schedule = [60, 300, 1800, 7200, 21600, 86400]
 
     idx = min(a, len(schedule)) - 1
     return float(schedule[idx])
@@ -171,7 +188,6 @@ class CompanyRetryState:
         cls = str(d.get("cls") or "net")
         if cls == "mem_heavy":
             cls = "mem"
-
         return CompanyRetryState(
             cls=cls,
             attempts=int(d.get("attempts") or 0),
@@ -200,12 +216,17 @@ class RetryStateStore:
       - quarantine.json : terminal quarantines (small set)
 
     POLICY:
-      - net/stall are LIMITED retries
-      - mem/other are UNLIMITED retries
+      - net/stall are LIMITED retries (unforgiving; quick quarantine)
+      - mem/other are UNLIMITED retries (slow down under pressure)
       - permanent quarantines immediately
     """
 
-    def __init__(self, base_dir: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        base_dir: Optional[Path] = None,
+        *,
+        flush_min_interval_sec: float = DEFAULT_FLUSH_MIN_INTERVAL_SEC,
+    ) -> None:
         if base_dir is None:
             base_dir = _output_root() / "_retry"
         self.base_dir = Path(base_dir)
@@ -218,10 +239,14 @@ class RetryStateStore:
         self._lock = threading.Lock()
         self._state: Dict[str, CompanyRetryState] = {}
         self._quarantine: Dict[str, Dict[str, Any]] = {}
+        self._dirty_state = False
+        self._dirty_quarantine = False
+        self._last_flush_ts = 0.0
+        self._flush_min_interval_sec = max(0.0, float(flush_min_interval_sec))
 
         self._load()
         # Ensure files exist even if empty (reduces “missing file” ambiguity)
-        self.flush()
+        self.flush(force=True)
 
     # ------------------ persistence ------------------
 
@@ -245,10 +270,30 @@ class RetryStateStore:
             else:
                 self._quarantine = {}
 
-    def flush(self) -> None:
+            self._dirty_state = False
+            self._dirty_quarantine = False
+            self._last_flush_ts = _now_ts()
+
+    def flush(self, *, force: bool = False) -> None:
+        """
+        Flush only when dirty, and no more often than flush_min_interval_sec unless force=True.
+        """
+        now = _now_ts()
         with self._lock:
+            if not force:
+                if not (self._dirty_state or self._dirty_quarantine):
+                    return
+                if (
+                    self._flush_min_interval_sec > 0
+                    and (now - self._last_flush_ts) < self._flush_min_interval_sec
+                ):
+                    return
+
             snapshot = {cid: s.to_dict() for cid, s in self._state.items()}
             quarantine = dict(self._quarantine)
+            self._dirty_state = False
+            self._dirty_quarantine = False
+            self._last_flush_ts = now
 
         _atomic_write_json_compact(self.state_path, snapshot)
         _atomic_write_json_compact(self.quarantine_path, quarantine)
@@ -379,7 +424,15 @@ class RetryStateStore:
 
         return "other"
 
-    # ------------------ queries ------------------
+    # ------------------ fast queries ------------------
+
+    def pending_ids(self, *, exclude_quarantined: bool = True) -> List[str]:
+        with self._lock:
+            if not exclude_quarantined:
+                return list(self._state.keys())
+            if not self._quarantine:
+                return list(self._state.keys())
+            return [cid for cid in self._state.keys() if cid not in self._quarantine]
 
     def is_quarantined(self, company_id: str) -> bool:
         with self._lock:
@@ -406,29 +459,101 @@ class RetryStateStore:
                 return True
             return s.next_eligible_at <= now
 
+    def eligible_mask(
+        self, company_ids: Sequence[str], now: Optional[float] = None
+    ) -> Dict[str, bool]:
+        if now is None:
+            now = _now_ts()
+        out: Dict[str, bool] = {}
+        with self._lock:
+            q = self._quarantine
+            st = self._state
+            for cid in company_ids:
+                if cid in q:
+                    out[cid] = False
+                    continue
+                s = st.get(cid)
+                out[cid] = True if s is None else (s.next_eligible_at <= now)
+        return out
+
+    def next_eligible_at_many(self, company_ids: Sequence[str]) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        with self._lock:
+            st = self._state
+            for cid in company_ids:
+                s = st.get(cid)
+                out[cid] = float(s.next_eligible_at) if s is not None else 0.0
+        return out
+
     # ------------------ core transitions ------------------
 
-    def mark_success(self, company_id: str, *, stage: str = "", note: str = "") -> None:
+    def mark_success(
+        self, company_id: str, *, stage: str = "", note: str = "", flush: bool = True
+    ) -> None:
         now = _now_ts()
-        _append_jsonl(
+        _append_jsonl_many(
             self.ledger_path,
-            {
-                "ts": now,
-                "company_id": company_id,
-                "event": "success",
-                "stage": stage,
-                "note": note,
-            },
+            [
+                {
+                    "ts": now,
+                    "company_id": company_id,
+                    "event": "success",
+                    "stage": stage,
+                    "note": note,
+                }
+            ],
         )
 
         with self._lock:
             if company_id in self._state:
                 del self._state[company_id]
+                self._dirty_state = True
             if company_id in self._quarantine:
                 del self._quarantine[company_id]
+                self._dirty_quarantine = True
 
-        self.flush()
+        if flush:
+            self.flush()
         self._try_clear_terminal_done(company_id)
+
+    def mark_success_many(
+        self,
+        company_ids: Sequence[str],
+        *,
+        stage: str = "",
+        note: str = "",
+        flush: bool = True,
+    ) -> int:
+        if not company_ids:
+            return 0
+        now = _now_ts()
+        rows = [
+            {
+                "ts": now,
+                "company_id": cid,
+                "event": "success",
+                "stage": stage,
+                "note": note,
+            }
+            for cid in company_ids
+        ]
+        _append_jsonl_many(self.ledger_path, rows)
+
+        cleared = 0
+        with self._lock:
+            for cid in company_ids:
+                if cid in self._state:
+                    del self._state[cid]
+                    self._dirty_state = True
+                    cleared += 1
+                if cid in self._quarantine:
+                    del self._quarantine[cid]
+                    self._dirty_quarantine = True
+        if flush:
+            self.flush()
+        for cid in company_ids:
+            self._try_clear_terminal_done(cid)
+        return cleared
 
     def mark_failure(
         self,
@@ -443,9 +568,128 @@ class RetryStateStore:
         max_attempts_net: Optional[int] = None,
         max_attempts_stall: Optional[int] = None,
         nxdomain_cutoff: Optional[int] = None,
+        flush: bool = True,
     ) -> Tuple[CompanyRetryState, bool]:
-        now = _now_ts()
+        st, quarantined, ledger_row, terminal_row = self._apply_failure_one(
+            company_id=company_id,
+            cls=cls,
+            error=error,
+            stage=stage,
+            status_code=status_code,
+            permanent_reason=permanent_reason,
+            nxdomain_like=nxdomain_like,
+            max_attempts_net=max_attempts_net,
+            max_attempts_stall=max_attempts_stall,
+            nxdomain_cutoff=nxdomain_cutoff,
+        )
 
+        _append_jsonl_many(self.ledger_path, [ledger_row])
+        if flush:
+            self.flush()
+
+        if terminal_row is not None:
+            # only if we actually quarantined and we want to mark crawl_state terminal
+            self._try_mark_terminal_done(
+                company_id,
+                done_reason=terminal_row["done_reason"],
+                details=terminal_row["details"],
+                last_error=terminal_row["last_error"],
+            )
+        return st, quarantined
+
+    def mark_failure_many(
+        self,
+        events: Sequence[Dict[str, Any]],
+        *,
+        flush: bool = True,
+    ) -> Tuple[int, int]:
+        """
+        Batch failure application + single JSONL append + single flush.
+        events items must include:
+          - company_id, cls, error
+        optional:
+          - stage, status_code, permanent_reason, nxdomain_like, max_attempts_net,
+            max_attempts_stall, nxdomain_cutoff
+        Returns: (processed, quarantined_count)
+        """
+        if not events:
+            return 0, 0
+
+        ledger_rows: List[Dict[str, Any]] = []
+        terminal_rows: List[Dict[str, Any]] = []
+        quarantined_count = 0
+
+        for ev in events:
+            cid = str(ev.get("company_id") or "")
+            if not cid:
+                continue
+            cls = str(ev.get("cls") or "other")
+            error = str(ev.get("error") or "")
+            stage = str(ev.get("stage") or "")
+            status_code = ev.get("status_code", None)
+            try:
+                status_code = int(status_code) if status_code is not None else None
+            except Exception:
+                status_code = None
+            permanent_reason = str(ev.get("permanent_reason") or "")
+            nxdomain_like = bool(ev.get("nxdomain_like") or False)
+
+            max_attempts_net = ev.get("max_attempts_net", None)
+            max_attempts_stall = ev.get("max_attempts_stall", None)
+            nxdomain_cutoff = ev.get("nxdomain_cutoff", None)
+
+            st, quarantined, ledger_row, terminal_row = self._apply_failure_one(
+                company_id=cid,
+                cls=cls,
+                error=error,
+                stage=stage,
+                status_code=status_code,
+                permanent_reason=permanent_reason,
+                nxdomain_like=nxdomain_like,
+                max_attempts_net=max_attempts_net,
+                max_attempts_stall=max_attempts_stall,
+                nxdomain_cutoff=nxdomain_cutoff,
+            )
+            ledger_rows.append(ledger_row)
+            if quarantined:
+                quarantined_count += 1
+            if terminal_row is not None:
+                terminal_rows.append(terminal_row)
+
+        _append_jsonl_many(self.ledger_path, ledger_rows)
+        if flush:
+            self.flush()
+
+        for tr in terminal_rows:
+            try:
+                self._try_mark_terminal_done(
+                    tr["company_id"],
+                    done_reason=tr["done_reason"],
+                    details=tr["details"],
+                    last_error=tr["last_error"],
+                )
+            except Exception:
+                continue
+
+        return len(ledger_rows), quarantined_count
+
+    # ------------------ internal: apply one failure under lock ------------------
+
+    def _apply_failure_one(
+        self,
+        *,
+        company_id: str,
+        cls: RetryClass,
+        error: str,
+        stage: str,
+        status_code: Optional[int],
+        permanent_reason: str,
+        nxdomain_like: bool,
+        max_attempts_net: Optional[int],
+        max_attempts_stall: Optional[int],
+        nxdomain_cutoff: Optional[int],
+    ) -> Tuple[CompanyRetryState, bool, Dict[str, Any], Optional[Dict[str, Any]]]:
+        now = _now_ts()
         max_net = (
             int(max_attempts_net)
             if max_attempts_net is not None
@@ -471,6 +715,7 @@ class RetryStateStore:
 
         quarantined = False
         quarantine_meta: Dict[str, Any] = {}
+        terminal_row: Optional[Dict[str, Any]] = None
 
         with self._lock:
             prev = self._state.get(company_id) or CompanyRetryState()
@@ -510,6 +755,7 @@ class RetryStateStore:
                 inferred_nx = self.classify_unreachable_error(error or "")
                 nx = bool(nxdomain_like or inferred_nx)
 
+                # NXDOMAIN-like: super unforgiving
                 if (not quarantined) and nx and s.net_attempts >= nx_cutoff:
                     quarantined = True
                     quarantine_meta = {
@@ -521,6 +767,7 @@ class RetryStateStore:
                         "cutoff": nx_cutoff,
                     }
 
+                # net/stall: limited attempts
                 if (
                     (not quarantined)
                     and cls_canon == "net"
@@ -555,79 +802,73 @@ class RetryStateStore:
                 s.cls = "permanent"
                 s.next_eligible_at = 10**9
                 self._quarantine[company_id] = quarantine_meta
+                self._dirty_quarantine = True
             else:
                 base = _backoff_schedule_seconds(class_attempts, kind=cls_canon)
                 s.next_eligible_at = now + _jitter(base, frac=DEFAULT_JITTER_FRAC)
 
             self._state[company_id] = s
+            self._dirty_state = True
 
-        _append_jsonl(
-            self.ledger_path,
-            {
-                "ts": now,
-                "company_id": company_id,
-                "event": "failure",
-                "class_hint": str(cls or ""),
-                "class": cls_canon,
+        ledger_row = {
+            "ts": now,
+            "company_id": company_id,
+            "event": "failure",
+            "class_hint": str(cls or ""),
+            "class": cls_canon,
+            "attempts_total": s.attempts,
+            "net_attempts": s.net_attempts,
+            "stall_attempts": s.stall_attempts,
+            "mem_attempts": s.mem_attempts,
+            "other_attempts": s.other_attempts,
+            "next_eligible_at": s.next_eligible_at,
+            "stage": stage,
+            "status_code": status_code,
+            "error": (error or "")[:4000],
+            "quarantined": quarantined,
+            "permanent_reason": permanent_reason,
+            "mem_hits": s.mem_hits,
+            "policy": {
+                "max_attempts_net": max_net,
+                "max_attempts_stall": max_stall,
+                "nxdomain_cutoff": nx_cutoff,
+                "defaults": {
+                    "DEFAULT_MAX_ATTEMPTS_NET": DEFAULT_MAX_ATTEMPTS_NET,
+                    "DEFAULT_MAX_ATTEMPTS_STALL": DEFAULT_MAX_ATTEMPTS_STALL,
+                    "DEFAULT_NXDOMAIN_CUTOFF": DEFAULT_NXDOMAIN_CUTOFF,
+                },
+            },
+            "quarantine_meta": quarantine_meta if quarantined else None,
+        }
+
+        if quarantined:
+            done_reason = (
+                f"retry_quarantined:{(quarantine_meta.get('reason') or 'unknown')}"
+            )
+            details = {
+                "retry_class_hint": str(cls or ""),
+                "retry_class": cls_canon,
                 "attempts_total": s.attempts,
                 "net_attempts": s.net_attempts,
                 "stall_attempts": s.stall_attempts,
                 "mem_attempts": s.mem_attempts,
                 "other_attempts": s.other_attempts,
-                "next_eligible_at": s.next_eligible_at,
                 "stage": stage,
                 "status_code": status_code,
-                "error": (error or "")[:4000],
-                "quarantined": quarantined,
+                "quarantine_reason": quarantine_meta.get("reason"),
                 "permanent_reason": permanent_reason,
-                "mem_hits": s.mem_hits,
+                "next_eligible_at": s.next_eligible_at,
                 "policy": {
                     "max_attempts_net": max_net,
                     "max_attempts_stall": max_stall,
                     "nxdomain_cutoff": nx_cutoff,
-                    "defaults": {
-                        "DEFAULT_MAX_ATTEMPTS_NET": DEFAULT_MAX_ATTEMPTS_NET,
-                        "DEFAULT_MAX_ATTEMPTS_STALL": DEFAULT_MAX_ATTEMPTS_STALL,
-                        "DEFAULT_NXDOMAIN_CUTOFF": DEFAULT_NXDOMAIN_CUTOFF,
-                    },
                 },
-                "quarantine_meta": quarantine_meta if quarantined else None,
-            },
-        )
+            }
+            terminal_row = {
+                "company_id": company_id,
+                "done_reason": done_reason,
+                "details": details,
+                "last_error": s.last_error,
+            }
 
-        self.flush()
-
-        if quarantined:
-            # Avoid repeated DB writes if already quarantined
-            already_quarantined = self.is_quarantined(company_id)
-            if already_quarantined:
-                done_reason = (
-                    f"retry_quarantined:{(quarantine_meta.get('reason') or 'unknown')}"
-                )
-                details = {
-                    "retry_class_hint": str(cls or ""),
-                    "retry_class": cls_canon,
-                    "attempts_total": s.attempts,
-                    "net_attempts": s.net_attempts,
-                    "stall_attempts": s.stall_attempts,
-                    "mem_attempts": s.mem_attempts,
-                    "other_attempts": s.other_attempts,
-                    "stage": stage,
-                    "status_code": status_code,
-                    "quarantine_reason": quarantine_meta.get("reason"),
-                    "permanent_reason": permanent_reason,
-                    "next_eligible_at": s.next_eligible_at,
-                    "policy": {
-                        "max_attempts_net": max_net,
-                        "max_attempts_stall": max_stall,
-                        "nxdomain_cutoff": nx_cutoff,
-                    },
-                }
-                self._try_mark_terminal_done(
-                    company_id,
-                    done_reason=done_reason,
-                    details=details,
-                    last_error=s.last_error,
-                )
-
-        return s, quarantined
+        return s, quarantined, ledger_row, terminal_row
