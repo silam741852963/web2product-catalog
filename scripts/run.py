@@ -1466,10 +1466,10 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
 
     parser.add_argument("--page-result-concurrency", type=int, default=6)
-    parser.add_argument("--page-queue-maxsize", type=int, default=64)
-    parser.add_argument("--url-index-flush-every", type=int, default=24)
+    parser.add_argument("--page-queue-maxsize", type=int, default=32)
+    parser.add_argument("--url-index-flush-every", type=int, default=18)
     parser.add_argument("--url-index-flush-interval-sec", type=float, default=0.5)
-    parser.add_argument("--url-index-queue-maxsize", type=int, default=2048)
+    parser.add_argument("--url-index-queue-maxsize", type=int, default=1024)
 
     parser.add_argument(
         "--crawler-pool-size",
@@ -1480,7 +1480,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--crawler-recycle-after",
         type=int,
-        default=20,
+        default=12,
         help="Recycle a crawler instance after N companies.",
     )
 

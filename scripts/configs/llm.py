@@ -19,12 +19,17 @@ from typing import (
     Annotated,
 )
 
-from pydantic import BaseModel, Field, StringConstraints, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+)
 
 from crawl4ai import LLMConfig, LLMExtractionStrategy
 
 logger = logging.getLogger(__name__)
-
 
 # --------------------------------------------------------------------------- #
 # Constants / helpers
@@ -197,9 +202,26 @@ class Offering(BaseModel):
     @classmethod
     def _norm_type(cls, v: Any) -> str:
         s = _clean_ws(_to_text(v)).lower()
-        if s in {"product", "products", "prod", "goods", "good", "brand", "line", "hardware"}:
+        if s in {
+            "product",
+            "products",
+            "prod",
+            "goods",
+            "good",
+            "brand",
+            "line",
+            "hardware",
+        }:
             return "product"
-        if s in {"service", "services", "svc", "solution", "solutions", "capability", "capabilities"}:
+        if s in {
+            "service",
+            "services",
+            "svc",
+            "solution",
+            "solutions",
+            "capability",
+            "capabilities",
+        }:
             return "service"
         if "product" in s or "brand" in s or "goods" in s:
             return "product"
@@ -221,8 +243,21 @@ class Offering(BaseModel):
     @classmethod
     def _norm_tags(cls, v: Any) -> List[str]:
         items = _as_list(v)
-        normed = _dedup_norm_list((_clean_ws(_to_text(x))[:TAG_MAX] for x in items), max_items=10)
-        junk = {"home", "about", "contact", "privacy", "terms", "cookie", "careers", "news", "blog", "sitemap"}
+        normed = _dedup_norm_list(
+            (_clean_ws(_to_text(x))[:TAG_MAX] for x in items), max_items=10
+        )
+        junk = {
+            "home",
+            "about",
+            "contact",
+            "privacy",
+            "terms",
+            "cookie",
+            "careers",
+            "news",
+            "blog",
+            "sitemap",
+        }
         return [t for t in normed if t.lower() not in junk]
 
 
@@ -255,7 +290,9 @@ class OllamaProviderStrategy(LLMProviderStrategy):
             api_token=None,
             base_url=self.base_url,
         )
-        logger.debug("[llm] provider=ollama model=%s base_url=%s", self.model, self.base_url)
+        logger.debug(
+            "[llm] provider=ollama model=%s base_url=%s", self.model, self.base_url
+        )
         return cfg
 
 
@@ -267,8 +304,12 @@ class RemoteAPIProviderStrategy(LLMProviderStrategy):
 
     def build_config(self) -> LLMConfig:
         if not self.provider:
-            raise ValueError("RemoteAPIProviderStrategy requires non-empty provider string.")
-        cfg = LLMConfig(provider=self.provider, api_token=self.api_token, base_url=self.base_url)
+            raise ValueError(
+                "RemoteAPIProviderStrategy requires non-empty provider string."
+            )
+        cfg = LLMConfig(
+            provider=self.provider, api_token=self.api_token, base_url=self.base_url
+        )
         logger.debug("[llm] provider=%s base_url=%s", self.provider, self.base_url)
         return cfg
 
@@ -331,14 +372,20 @@ class LLMExtractionFactory:
     ) -> LLMExtractionStrategy:
         m = (mode or "schema").strip().lower()
         if m not in {"schema", "presence"}:
-            raise ValueError(f"Unsupported mode={mode!r}; expected 'schema' or 'presence'.")
+            raise ValueError(
+                f"Unsupported mode={mode!r}; expected 'schema' or 'presence'."
+            )
 
         llm_cfg = self.provider_strategy.build_config()
 
         used_instruction = (
             instruction
             if instruction is not None
-            else (self.default_presence_instruction if m == "presence" else self.default_full_instruction)
+            else (
+                self.default_presence_instruction
+                if m == "presence"
+                else self.default_full_instruction
+            )
         )
 
         if m == "presence":
@@ -352,10 +399,22 @@ class LLMExtractionFactory:
             temperature = self.default_schema_temperature
             max_tokens = self.default_schema_max_tokens
 
-        used_chunk_threshold = self.default_chunk_token_threshold if chunk_token_threshold is None else int(chunk_token_threshold)
-        used_overlap_rate = self.default_overlap_rate if overlap_rate is None else float(overlap_rate)
-        used_apply_chunking = self.default_apply_chunking if apply_chunking is None else bool(apply_chunking)
-        used_input_format = (input_format or self.default_input_format or "markdown").strip()
+        used_chunk_threshold = (
+            self.default_chunk_token_threshold
+            if chunk_token_threshold is None
+            else int(chunk_token_threshold)
+        )
+        used_overlap_rate = (
+            self.default_overlap_rate if overlap_rate is None else float(overlap_rate)
+        )
+        used_apply_chunking = (
+            self.default_apply_chunking
+            if apply_chunking is None
+            else bool(apply_chunking)
+        )
+        used_input_format = (
+            input_format or self.default_input_format or "markdown"
+        ).strip()
 
         _extra: Dict[str, Any] = {"temperature": temperature, "max_tokens": max_tokens}
         if extra_args:
@@ -392,6 +451,7 @@ class LLMExtractionFactory:
 # --------------------------------------------------------------------------- #
 # JSON salvage WITHOUT recursive regex (Python 3.13 safe)
 # --------------------------------------------------------------------------- #
+
 
 def _iter_balanced_json_blobs(s: str) -> Iterable[str]:
     """
@@ -471,14 +531,19 @@ def _extract_first_json_blob(s: str) -> Optional[str]:
         return None
 
     ss = s.strip()
-    if (ss.startswith("{") and ss.endswith("}")) or (ss.startswith("[") and ss.endswith("]")):
+    if (ss.startswith("{") and ss.endswith("}")) or (
+        ss.startswith("[") and ss.endswith("]")
+    ):
         return ss
 
     best_any: Optional[str] = None
     for blob in _iter_balanced_json_blobs(ss):
         if best_any is None:
             best_any = blob
-        if any(k in blob for k in ('"offerings"', '"items"', '"products"', '"services"', '"r"')):
+        if any(
+            k in blob
+            for k in ('"offerings"', '"items"', '"products"', '"services"', '"r"')
+        ):
             return blob
     return best_any
 
@@ -487,10 +552,15 @@ def _extract_first_json_blob(s: str) -> Optional[str]:
 # Parsing (robust, tolerant) – simplified schema but accepts legacy shapes
 # --------------------------------------------------------------------------- #
 
+
 def _looks_like_offering_dict(d: Dict[str, Any]) -> bool:
     name = _clean_ws(_to_text(d.get("name") or d.get("title") or d.get("label")))
-    desc = _clean_ws(_to_text(d.get("description") or d.get("summary") or d.get("details")))
-    typ = _clean_ws(_to_text(d.get("type") or d.get("kind") or d.get("category"))).lower()
+    desc = _clean_ws(
+        _to_text(d.get("description") or d.get("summary") or d.get("details"))
+    )
+    typ = _clean_ws(
+        _to_text(d.get("type") or d.get("kind") or d.get("category"))
+    ).lower()
     return bool(name) and (bool(desc) or bool(typ) or isinstance(d.get("tags"), list))
 
 
@@ -522,16 +592,32 @@ def _guess_type_from_text(name: str, desc: str, tags: List[str]) -> str:
 
 
 def _sanitize_offering(d: Dict[str, Any]) -> Dict[str, Any]:
-    name = _clean_ws(_to_text(d.get("name") or d.get("title") or d.get("label")))[:NAME_MAX]
-    desc = _clean_ws(_to_text(d.get("description") or d.get("summary") or d.get("details")))[:DESC_MAX]
-    typ = _clean_ws(_to_text(d.get("type") or d.get("kind") or d.get("category"))).lower()
+    name = _clean_ws(_to_text(d.get("name") or d.get("title") or d.get("label")))[
+        :NAME_MAX
+    ]
+    desc = _clean_ws(
+        _to_text(d.get("description") or d.get("summary") or d.get("details"))
+    )[:DESC_MAX]
+    typ = _clean_ws(
+        _to_text(d.get("type") or d.get("kind") or d.get("category"))
+    ).lower()
 
     tags = d.get("tags") or d.get("keywords") or d.get("key_terms") or d.get("tag")
-    tag_list = _dedup_norm_list((_clean_ws(_to_text(x))[:TAG_MAX] for x in _as_list(tags)), max_items=10)
+    tag_list = _dedup_norm_list(
+        (_clean_ws(_to_text(x))[:TAG_MAX] for x in _as_list(tags)), max_items=10
+    )
 
     if typ in {"products", "product", "prod", "brand", "line", "goods"}:
         typ = "product"
-    elif typ in {"services", "service", "svc", "solutions", "solution", "capabilities", "capability"}:
+    elif typ in {
+        "services",
+        "service",
+        "svc",
+        "solutions",
+        "solution",
+        "capabilities",
+        "capability",
+    }:
         typ = "service"
     elif typ not in {"product", "service"}:
         typ = _guess_type_from_text(name, desc, tag_list)
@@ -603,7 +689,11 @@ def parse_extracted_payload(
 
     raw_preview = _short_preview(extracted_content, max_chars=DEBUG_PREVIEW_CHARS)
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[llm.parse] raw_type=%s preview=%s", type(extracted_content).__name__, raw_preview)
+        logger.debug(
+            "[llm.parse] raw_type=%s preview=%s",
+            type(extracted_content).__name__,
+            raw_preview,
+        )
 
     data: Any = extracted_content
 
@@ -635,14 +725,20 @@ def parse_extracted_payload(
                 inner = _to_text(data[k]).strip()
                 try:
                     data = json.loads(inner)
-                    logger.debug("[llm.parse] unwrapped key=%s -> %s", k, type(data).__name__)
+                    logger.debug(
+                        "[llm.parse] unwrapped key=%s -> %s", k, type(data).__name__
+                    )
                     break
                 except Exception:
                     blob = _extract_first_json_blob(inner)
                     if blob:
                         try:
                             data = json.loads(blob)
-                            logger.debug("[llm.parse] unwrapped+salvaged key=%s -> %s", k, type(data).__name__)
+                            logger.debug(
+                                "[llm.parse] unwrapped+salvaged key=%s -> %s",
+                                k,
+                                type(data).__name__,
+                            )
                             break
                         except Exception:
                             pass
@@ -661,10 +757,20 @@ def parse_extracted_payload(
             cleaned = _sanitize_offering(c)
             off = Offering.model_validate(cleaned)
         except ValidationError as e:
-            logger.debug("[llm.parse] drop idx=%d validation_err=%s raw=%s", i, e.errors()[:2], _short_preview(c, max_chars=500))
+            logger.debug(
+                "[llm.parse] drop idx=%d validation_err=%s raw=%s",
+                i,
+                e.errors()[:2],
+                _short_preview(c, max_chars=500),
+            )
             continue
         except Exception as e:
-            logger.debug("[llm.parse] drop idx=%d unexpected=%s raw=%s", i, e, _short_preview(c, max_chars=500))
+            logger.debug(
+                "[llm.parse] drop idx=%d unexpected=%s raw=%s",
+                i,
+                e,
+                _short_preview(c, max_chars=500),
+            )
             continue
 
         key = (off.type, off.name.lower())
@@ -674,7 +780,9 @@ def parse_extracted_payload(
             pick = False
             if len(off.description) > len(cur.description):
                 pick = True
-            elif len(off.description) == len(cur.description) and len(off.tags) > len(cur.tags):
+            elif len(off.description) == len(cur.description) and len(off.tags) > len(
+                cur.tags
+            ):
                 pick = True
             if pick:
                 valid[j] = off
@@ -697,7 +805,11 @@ def parse_presence_result(
 ) -> Tuple[bool, Optional[float], Optional[str]]:
     preview = _short_preview(extracted_content, max_chars=DEBUG_PREVIEW_CHARS)
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[llm.presence.parse] raw_type=%s preview=%s", type(extracted_content).__name__, preview)
+        logger.debug(
+            "[llm.presence.parse] raw_type=%s preview=%s",
+            type(extracted_content).__name__,
+            preview,
+        )
 
     if extracted_content is None:
         return (default, None, preview)
@@ -758,7 +870,14 @@ def parse_presence_result(
             if r is not None:
                 return (bool(r), conf, preview)
 
-        for key in ("has_offering", "presence", "present", "classification", "result", "value"):
+        for key in (
+            "has_offering",
+            "presence",
+            "present",
+            "classification",
+            "result",
+            "value",
+        ):
             if key in loaded:
                 r = _scalar01(loaded[key])
                 if r is not None:
@@ -782,14 +901,54 @@ def parse_presence_result(
 # --------------------------------------------------------------------------- #
 
 _STOPWORDS = {
-    "the", "and", "or", "of", "to", "a", "an", "for", "in", "on", "with", "by", "at",
-    "from", "into", "our", "your", "their", "its", "is", "are", "be", "as", "this",
-    "that", "these", "those", "we", "you", "they",
+    "the",
+    "and",
+    "or",
+    "of",
+    "to",
+    "a",
+    "an",
+    "for",
+    "in",
+    "on",
+    "with",
+    "by",
+    "at",
+    "from",
+    "into",
+    "our",
+    "your",
+    "their",
+    "its",
+    "is",
+    "are",
+    "be",
+    "as",
+    "this",
+    "that",
+    "these",
+    "those",
+    "we",
+    "you",
+    "they",
 }
 
 _JUNK_NAMES = {
-    "home", "about", "contact", "privacy", "terms", "cookie", "cookies", "careers",
-    "news", "blog", "sitemap", "login", "sign in", "signin", "register",
+    "home",
+    "about",
+    "contact",
+    "privacy",
+    "terms",
+    "cookie",
+    "cookies",
+    "careers",
+    "news",
+    "blog",
+    "sitemap",
+    "login",
+    "sign in",
+    "signin",
+    "register",
 }
 
 _TRADEMARK_CHARS_RE = re.compile(r"[®™©]+")
@@ -853,7 +1012,9 @@ def _has_any_evidence_soft(off: Offering, source_text: str) -> bool:
         return False
 
     name2 = _strip_trademarks(name)
-    if _find_snippet(t, name) or (_find_snippet(t, name2) if name2 and name2 != name else None):
+    if _find_snippet(t, name) or (
+        _find_snippet(t, name2) if name2 and name2 != name else None
+    ):
         return True
 
     name_keys = _keyword_tokens(name2 or name)
@@ -928,7 +1089,9 @@ def _filter_offerings_soft(
             pick = False
             if len(off.description) > len(cur.description):
                 pick = True
-            elif len(off.description) == len(cur.description) and len(off.tags) > len(cur.tags):
+            elif len(off.description) == len(cur.description) and len(off.tags) > len(
+                cur.tags
+            ):
                 pick = True
             if pick:
                 out[j] = off
@@ -996,7 +1159,13 @@ def _build_call_args(
                 return ix
             if "fit_markdown" in name or ("fit" in name and "markdown" in name):
                 return text
-            if "markdown" in name or name in {"md", "text", "content", "document", "input"}:
+            if "markdown" in name or name in {
+                "md",
+                "text",
+                "content",
+                "document",
+                "input",
+            }:
                 return text
             if "html" in name:
                 return html if html else primary
@@ -1039,7 +1208,9 @@ def call_llm_extract(
 
     fn = getattr(strategy, "extract", None)
     if fn is None or not callable(fn):
-        raise TypeError(f"strategy has no callable extract(): {type(strategy).__name__}")
+        raise TypeError(
+            f"strategy has no callable extract(): {type(strategy).__name__}"
+        )
 
     sig_str = _signature_summary(fn)
     input_format = getattr(strategy, "input_format", "markdown") or "markdown"
@@ -1110,7 +1281,12 @@ def call_llm_extract(
                 strategy_input_format=str(input_format),
             )
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[llm.call] chunk_call ix=%d args_len=%d kwargs_keys=%s", ix, len(args), sorted(kwargs.keys()))
+                logger.debug(
+                    "[llm.call] chunk_call ix=%d args_len=%d kwargs_keys=%s",
+                    ix,
+                    len(args),
+                    sorted(kwargs.keys()),
+                )
             raw_results.append(fn(*args, **kwargs))
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -1151,7 +1327,11 @@ def call_llm_extract(
         out_dict = out_payload.model_dump()
 
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[llm.call] merged_offerings=%d final_offerings=%d", len(merged_payload.offerings), len(offerings))
+            logger.debug(
+                "[llm.call] merged_offerings=%d final_offerings=%d",
+                len(merged_payload.offerings),
+                len(offerings),
+            )
             _debug_dump_raw("llm.call.full.final", out_dict)
 
         return out_dict
@@ -1159,10 +1339,16 @@ def call_llm_extract(
     # ------------------------------------------------------------------ #
     # Single-call API path
     # ------------------------------------------------------------------ #
-    args, kwargs = _build_call_args(fn, url=url, text=text, html=html, ix=0, strategy_input_format=str(input_format))
+    args, kwargs = _build_call_args(
+        fn, url=url, text=text, html=html, ix=0, strategy_input_format=str(input_format)
+    )
 
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[llm.call] single_call args_len=%d kwargs_keys=%s", len(args), sorted(kwargs.keys()))
+        logger.debug(
+            "[llm.call] single_call args_len=%d kwargs_keys=%s",
+            len(args),
+            sorted(kwargs.keys()),
+        )
 
     try:
         raw = fn(*args, **kwargs)
@@ -1179,14 +1365,23 @@ def call_llm_extract(
 
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[llm.call] done single elapsed_ms=%.1f raw_type=%s raw_preview=%s", elapsed_ms, type(raw).__name__, _short_preview(raw))
+        logger.debug(
+            "[llm.call] done single elapsed_ms=%.1f raw_type=%s raw_preview=%s",
+            elapsed_ms,
+            type(raw).__name__,
+            _short_preview(raw),
+        )
         _debug_dump_raw("llm.call.raw", raw)
 
         try:
             total_usage = getattr(strategy, "total_usage", None)
             usages = getattr(strategy, "usages", None)
             if total_usage is not None or usages is not None:
-                logger.debug("[llm.call] usage total=%s usages_preview=%s", total_usage, (usages[:3] if isinstance(usages, list) else usages))
+                logger.debug(
+                    "[llm.call] usage total=%s usages_preview=%s",
+                    total_usage,
+                    (usages[:3] if isinstance(usages, list) else usages),
+                )
         except Exception:
             pass
 
@@ -1202,7 +1397,11 @@ def call_llm_extract(
     out_dict = out_payload.model_dump()
 
     if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("[llm.call] single_offerings=%d final_offerings=%d", len(payload.offerings), len(offerings))
+        logger.debug(
+            "[llm.call] single_offerings=%d final_offerings=%d",
+            len(payload.offerings),
+            len(offerings),
+        )
         _debug_dump_raw("llm.call.full.final", out_dict)
 
     return out_dict
