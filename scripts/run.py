@@ -101,6 +101,33 @@ _forced_exit_code: Optional[int] = None
 _retry_store_instance: Optional[RetryStateStore] = None
 
 
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+
+def _spawn_bg(coro: Any, *, name: str) -> asyncio.Task:
+    """
+    Fire-and-forget background task with exception logging.
+    Prevents "Task exception was never retrieved" noise.
+    """
+    t = asyncio.create_task(coro, name=name)
+
+    def _done_cb(task: asyncio.Task) -> None:
+        try:
+            _ = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Background task failed: %s", name)
+
+    try:
+        t.add_done_callback(_done_cb)
+    except Exception:
+        pass
+    return t
+
+
 class CriticalMemoryPressure(RuntimeError):
     """Kept for compatibility: other modules may raise/import this."""
 
@@ -142,7 +169,7 @@ async def _await_with_periodic_touch(
     """
     Await a coroutine while periodically touching the scheduler to avoid false inactivity cancels.
     """
-    t = asyncio.create_task(coro)
+    t = asyncio.create_task(coro, name=f"await-touch:{company_id}")
     try:
         while True:
             done, _ = await asyncio.wait({t}, timeout=max(0.25, float(interval_sec)))
@@ -167,7 +194,7 @@ async def _lease_with_touch(
     Avoids scheduler inactivity cancels when admission gets ahead of crawler leasing.
     """
     start = time.monotonic()
-    lease_task = asyncio.create_task(crawler_pool.lease())
+    lease_task = asyncio.create_task(crawler_pool.lease(), name=f"lease:{company_id}")
     try:
         while True:
             remaining = float(timeout_sec) - (time.monotonic() - start)
@@ -194,9 +221,13 @@ async def _run_cleanup_even_if_cancelled(coro: Any) -> None:
     t = asyncio.current_task()
     uncancel = getattr(t, "uncancel", None) if t is not None else None
 
+    # Python 3.11+ has Task.uncancel() to temporarily clear cancellation.
     if callable(uncancel):
         try:
-            uncancel()
+            try:
+                uncancel()
+            except Exception:
+                pass
             await coro
         finally:
             try:
@@ -215,7 +246,7 @@ async def _run_cleanup_even_if_cancelled(coro: Any) -> None:
             except Exception:
                 logger.exception("Background cleanup failed")
 
-        asyncio.create_task(_bg(), name="bg-cleanup")
+        _spawn_bg(_bg(), name="bg-cleanup")
         raise
 
 
@@ -996,7 +1027,13 @@ async def run_company_pipeline(
         if status == COMPANY_STATUS_PENDING:
             do_crawl = True
         elif status == COMPANY_STATUS_MD_NOT_DONE:
-            pending_md = await state.get_pending_urls_for_markdown(company.company_id)
+            # could be slow on big indexes -> touch while waiting
+            pending_md = await _await_with_periodic_touch(
+                state.get_pending_urls_for_markdown(company.company_id),
+                company_id=company.company_id,
+                touch_cb=touch_cb,
+                interval_sec=5.0,
+            )
             if pending_md:
                 do_crawl = True
                 resume_roots = pending_md
@@ -1070,7 +1107,9 @@ async def run_company_pipeline(
             # IMPORTANT:
             # If scheduler inactivity timeout is shorter than stream_no_yield_timeout,
             # the scheduler will cancel tasks mid-await -> cancellation storms + crawl4ai cancel weirdness.
-            if scheduler is not None and scheduler.stall_detection_enabled:
+            if scheduler is not None and getattr(
+                scheduler, "stall_detection_enabled", False
+            ):
                 try:
                     inact = float(scheduler.cfg.company_inactivity_timeout_sec)  # type: ignore[attr-defined]
                     if inact > 0:
@@ -1214,14 +1253,23 @@ async def run_company_pipeline(
                     pass
                 return False
 
-            await state.recompute_company_from_index(
-                company.company_id, name=None, root_url=company.domain_url
+            # This can be slow on big indexes -> touch while waiting
+            _touch(touch_cb, company.company_id)
+            await _await_with_periodic_touch(
+                state.recompute_company_from_index(
+                    company.company_id, name=None, root_url=company.domain_url
+                ),
+                company_id=company.company_id,
+                touch_cb=touch_cb,
+                interval_sec=5.0,
             )
+            _touch(touch_cb, company.company_id)
 
         # -------------------- LLM stage --------------------
         if will_run_llm:
             _touch(touch_cb, company.company_id)
 
+            # LLM stage: disable stall detection (long CPU/IO with few awaits)
             if scheduler is not None:
                 try:
                     await scheduler.suspend_stall_detection(
@@ -1654,11 +1702,12 @@ async def main_async(args: argparse.Namespace) -> None:
                 crawler_pool.request_recycle(
                     len(ids), reason="scheduler_cancel_recycle"
                 )
-                asyncio.create_task(
+                _spawn_bg(
                     crawler_pool.recycle_idle_now(
                         min(len(ids), crawler_pool.size),
                         reason="scheduler_cancel_idle_recycle",
-                    )
+                    ),
+                    name="scheduler_cancel_idle_recycle",
                 )
             except Exception:
                 logger.exception("[CrawlerPool] failed to schedule forced recycle")
@@ -1692,6 +1741,7 @@ async def main_async(args: argparse.Namespace) -> None:
         if inflight_by_cid:
             logger.error("%s (inflight=%d)", reason, len(inflight_by_cid))
 
+        # For non-scheduler-driven shutdown, mark inflight as stall so they are retried.
         if mark_timeout_like and retry_store is not None:
             for cid in list(inflight_by_cid.keys()):
                 try:
@@ -2065,6 +2115,13 @@ async def main_async(args: argparse.Namespace) -> None:
             _forced_exit_code = RETRY_EXIT_CODE
 
     finally:
+        # Stop scheduler early to stop background cancel/retry logic before tearing down other subsystems.
+        if scheduler is not None:
+            try:
+                await scheduler.stop()
+            except Exception:
+                logger.exception("Error while stopping AdaptiveScheduler")
+
         try:
             await guard.stop()
         except Exception:
@@ -2086,12 +2143,6 @@ async def main_async(args: argparse.Namespace) -> None:
                 resource_monitor.stop()
             except Exception:
                 logger.exception("Error while stopping ResourceMonitor")
-
-        if scheduler is not None:
-            try:
-                await scheduler.stop()
-            except Exception:
-                logger.exception("Error while stopping AdaptiveScheduler")
 
         try:
             gc.collect()
