@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -130,7 +131,6 @@ def _as_list(v: Any) -> List[Any]:
         s = _clean_ws(_to_text(v))
         if not s:
             return []
-        # split on common separators
         if "|" in s:
             return [x.strip() for x in s.split("|") if x.strip()]
         if ";" in s:
@@ -156,6 +156,30 @@ def _dedup_norm_list(items: Iterable[str], *, max_items: int) -> List[str]:
         if len(out) >= max_items:
             break
     return out
+
+
+def _provider_prefix(provider: str) -> str:
+    p = (provider or "").strip()
+    if "/" in p:
+        return p.split("/", 1)[0].strip().lower()
+    return p.lower()
+
+
+def _infer_api_token(provider: str) -> Optional[str]:
+    """
+    LiteLLM commonly supports provider-specific env vars.
+    We support both:
+      - gemini/<model>
+      - google/<model> (some setups pass this through LiteLLM)
+    """
+    pref = _provider_prefix(provider)
+    if pref in {"gemini", "google"}:
+        return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    return None
+
+
+def _is_gemini_like_provider(provider: Optional[str]) -> bool:
+    return _provider_prefix(provider or "") in {"gemini", "google"}
 
 
 # --------------------------------------------------------------------------- #
@@ -281,7 +305,8 @@ class LLMProviderStrategy(Protocol):
 
 @dataclass
 class OllamaProviderStrategy(LLMProviderStrategy):
-    model: str = "ministral-3:14b"
+    # Align default with repo flag help text
+    model: str = "mistral-3:14b"
     base_url: str = "http://localhost:11434"
 
     def build_config(self) -> LLMConfig:
@@ -298,6 +323,11 @@ class OllamaProviderStrategy(LLMProviderStrategy):
 
 @dataclass
 class RemoteAPIProviderStrategy(LLMProviderStrategy):
+    """
+    Generic LiteLLM remote provider.
+    provider is passed as-is (e.g. "gemini/gemini-2.0-flash" or "google/gemini-1.5-flash").
+    """
+
     provider: str
     api_token: Optional[str] = None
     base_url: Optional[str] = None
@@ -307,11 +337,51 @@ class RemoteAPIProviderStrategy(LLMProviderStrategy):
             raise ValueError(
                 "RemoteAPIProviderStrategy requires non-empty provider string."
             )
-        cfg = LLMConfig(
-            provider=self.provider, api_token=self.api_token, base_url=self.base_url
-        )
+
+        token = self.api_token
+        if token is None:
+            token = _infer_api_token(self.provider)
+            if token and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[llm] inferred api_token from env for provider=%s",
+                    self.provider,
+                )
+
+        cfg = LLMConfig(provider=self.provider, api_token=token, base_url=self.base_url)
         logger.debug("[llm] provider=%s base_url=%s", self.provider, self.base_url)
         return cfg
+
+
+def provider_strategy_from_llm_model_selector(
+    llm_model: Optional[str],
+    *,
+    ollama_base_url: str = "http://localhost:11434",
+    default_ollama_model: str = "mistral-3:14b",
+    api_token: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> LLMProviderStrategy:
+    """
+    Implements your repo convention:
+
+      - If llm_model contains "/": treat as remote provider/model (passed through to LiteLLM).
+        Example: "google/gemini-1.5-flash" or "gemini/gemini-2.0-flash".
+
+      - Else: treat as ollama model name (e.g. "mistral-3:14b").
+
+      - If omitted/None/empty: use default_ollama_model via Ollama.
+    """
+    s = (llm_model or "").strip()
+    if not s:
+        return OllamaProviderStrategy(
+            model=default_ollama_model, base_url=ollama_base_url
+        )
+
+    if "/" in s:
+        return RemoteAPIProviderStrategy(
+            provider=s, api_token=api_token, base_url=base_url
+        )
+
+    return OllamaProviderStrategy(model=s, base_url=ollama_base_url)
 
 
 # --------------------------------------------------------------------------- #
@@ -343,7 +413,6 @@ class LLMExtractionFactory:
     default_full_instruction: str = DEFAULT_FULL_INSTRUCTION
     default_presence_instruction: str = DEFAULT_PRESENCE_INSTRUCTION
 
-    # More room to avoid truncation
     default_chunk_token_threshold: int = 2200
     default_overlap_rate: float = 0.10
     default_apply_chunking: bool = True
@@ -352,7 +421,6 @@ class LLMExtractionFactory:
     default_schema_temperature: float = 0.2
     default_presence_temperature: float = 0.0
 
-    # Bigger output budget
     default_schema_max_tokens: int = 2200
     default_presence_max_tokens: int = 350
 
@@ -420,6 +488,10 @@ class LLMExtractionFactory:
         if extra_args:
             _extra.update(extra_args)
 
+        # Gemini-like models: force JSON object output for higher success rates.
+        if _is_gemini_like_provider(getattr(llm_cfg, "provider", None)):
+            _extra.setdefault("response_format", {"type": "json_object"})
+
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "[llm.factory] mode=%s provider=%s input_format=%s chunk=%s overlap=%s apply_chunking=%s temp=%s max_tokens=%s verbose=%s",
@@ -454,12 +526,6 @@ class LLMExtractionFactory:
 
 
 def _iter_balanced_json_blobs(s: str) -> Iterable[str]:
-    """
-    Yield balanced JSON object/array substrings from arbitrary text.
-
-    Handles braces inside strings and escaped quotes.
-    Works with Python's stdlib only (no regex recursion).
-    """
     if not s:
         return
 
@@ -495,7 +561,6 @@ def _iter_balanced_json_blobs(s: str) -> Iterable[str]:
                 i += 1
                 continue
 
-            # not in string
             if c == '"':
                 in_str = True
                 i += 1
@@ -509,7 +574,6 @@ def _iter_balanced_json_blobs(s: str) -> Iterable[str]:
                 if stack and c == stack[-1]:
                     stack.pop()
                 else:
-                    # mismatch -> abort this candidate
                     stack.clear()
                     break
 
@@ -518,15 +582,10 @@ def _iter_balanced_json_blobs(s: str) -> Iterable[str]:
         if not stack:
             blob = s[start:i]
             yield blob
-        # continue scanning from start+1 to find later blobs, even if aborted
         i = start + 1
 
 
 def _extract_first_json_blob(s: str) -> Optional[str]:
-    """
-    Salvage JSON if model prints extra text.
-    Preference: first object/array containing offerings-ish keys, else first balanced blob.
-    """
     if not s:
         return None
 
@@ -629,14 +688,6 @@ def _sanitize_offering(d: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _collect_offering_candidates(obj: Any) -> Iterable[Dict[str, Any]]:
-    """
-    Walk common shapes:
-      - {"offerings":[...]}
-      - {"items":[...]}
-      - {"products":[...], "services":[...]}
-      - [ ... ]
-      - single offering dict
-    """
     if obj is None:
         return
     if isinstance(obj, str):
@@ -697,7 +748,6 @@ def parse_extracted_payload(
 
     data: Any = extracted_content
 
-    # Load JSON if needed (with salvage)
     if isinstance(extracted_content, (str, bytes, bytearray)):
         s0 = _to_text(extracted_content).strip()
         try:
@@ -718,7 +768,6 @@ def parse_extracted_payload(
                 logger.debug("[llm.parse] json missing; preview=%s", raw_preview)
                 return ExtractionPayload(offerings=[])
 
-    # Unwrap common wrappers containing JSON strings
     if isinstance(data, dict):
         for k in ("extracted_content", "content", "data", "result", "output"):
             if isinstance(data.get(k), (str, bytes, bytearray)):
@@ -791,11 +840,6 @@ def parse_extracted_payload(
             valid.append(off)
 
     return ExtractionPayload(offerings=valid)
-
-
-# --------------------------------------------------------------------------- #
-# Presence parsing
-# --------------------------------------------------------------------------- #
 
 
 def parse_presence_result(
@@ -959,9 +1003,6 @@ def _strip_trademarks(s: str) -> str:
 
 
 def _mainish_text(text: str) -> str:
-    """
-    Heuristic: drop top boilerplate if an H1 exists; otherwise keep full.
-    """
     if not text:
         return ""
     lines = text.splitlines()
@@ -997,12 +1038,6 @@ def _find_snippet(haystack: str, needle: str) -> Optional[str]:
 
 
 def _has_any_evidence_soft(off: Offering, source_text: str) -> bool:
-    """
-    Soft evidence:
-      - accept if name appears
-      - OR if >=1 keyword token from name appears
-      - OR if >=2 keyword tokens from description appear
-    """
     t = _mainish_text(source_text)
     if not t:
         return True
@@ -1037,11 +1072,6 @@ def _has_any_evidence_soft(off: Offering, source_text: str) -> bool:
 def _filter_offerings_soft(
     offerings: List[Offering], *, source_text: str
 ) -> List[Offering]:
-    """
-    Only drop:
-      - obvious nav/junk names
-      - OR no evidence AND very weak/generic description
-    """
     kept: List[Offering] = []
     dropped = 0
 
@@ -1051,7 +1081,6 @@ def _filter_offerings_soft(
             dropped += 1
             continue
 
-        # tags => lenient
         if off.tags:
             kept.append(off)
             continue
@@ -1078,7 +1107,6 @@ def _filter_offerings_soft(
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("[llm.filter] kept=%d dropped=%d", len(kept), dropped)
 
-    # Dedup after filtering
     out: List[Offering] = []
     seen: Dict[Tuple[str, str], int] = {}
     for off in kept:
@@ -1131,13 +1159,6 @@ def _build_call_args(
     ix: int,
     strategy_input_format: str,
 ) -> Tuple[List[Any], Dict[str, Any]]:
-    """
-    Build positional args + kwargs in signature order.
-    - url-like param -> url
-    - ix/index-like param -> ix
-    - markdown/text/content-like param -> text
-    - html-like param -> html (fallback to text if html empty)
-    """
     sig = inspect.signature(fn)
     args: List[Any] = []
     kwargs: Dict[str, Any] = {}
@@ -1189,19 +1210,6 @@ def call_llm_extract(
     kind: str = "full",  # "full" | "presence"
     require_evidence: bool = True,
 ) -> Any:
-    """
-    Offline-safe extraction wrapper.
-
-    Supports Crawl4AI versions where:
-      - extract(url, text)
-      - extract(url, markdown, html)
-      - extract(url, html, markdown)
-      - extract(url, ix, html)   (per-chunk API)
-
-    Behavior:
-      - kind="presence": returns raw (or merged {"r":0/1} for per-chunk variants).
-      - kind="full": returns dict payload; by default applies *soft* evidence filtering.
-    """
     if text is None:
         text = ""
     text = _to_text(text)
@@ -1228,7 +1236,6 @@ def call_llm_extract(
         logger.debug("[llm.call] extract_signature=%s", sig_str)
         logger.debug("[llm.call] strategy_input_format=%s", input_format)
 
-    # Detect per-chunk API
     requires_ix = False
     try:
         sig = inspect.signature(fn)
@@ -1241,9 +1248,6 @@ def call_llm_extract(
 
     t0 = time.perf_counter()
 
-    # ------------------------------------------------------------------ #
-    # Per-chunk API path
-    # ------------------------------------------------------------------ #
     if requires_ix:
         apply_chunking = bool(getattr(strategy, "apply_chunking", True))
         chunk_threshold = int(getattr(strategy, "chunk_token_threshold", 2200))
@@ -1336,9 +1340,6 @@ def call_llm_extract(
 
         return out_dict
 
-    # ------------------------------------------------------------------ #
-    # Single-call API path
-    # ------------------------------------------------------------------ #
     args, kwargs = _build_call_args(
         fn, url=url, text=text, html=html, ix=0, strategy_input_format=str(input_format)
     )
@@ -1421,6 +1422,7 @@ __all__ = [
     "OllamaProviderStrategy",
     "RemoteAPIProviderStrategy",
     "LLMExtractionFactory",
+    "provider_strategy_from_llm_model_selector",
     "parse_extracted_payload",
     "parse_presence_result",
     "call_llm_extract",

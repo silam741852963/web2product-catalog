@@ -37,8 +37,7 @@ from configs.llm import (
     DEFAULT_FULL_INSTRUCTION,
     DEFAULT_PRESENCE_INSTRUCTION,
     LLMExtractionFactory,
-    RemoteAPIProviderStrategy,
-    default_ollama_provider_strategy,
+    provider_strategy_from_llm_model_selector,
 )
 from configs.md import default_md_factory
 
@@ -1027,7 +1026,6 @@ async def run_company_pipeline(
         if status == COMPANY_STATUS_PENDING:
             do_crawl = True
         elif status == COMPANY_STATUS_MD_NOT_DONE:
-            # could be slow on big indexes -> touch while waiting
             pending_md = await _await_with_periodic_touch(
                 state.get_pending_urls_for_markdown(company.company_id),
                 company_id=company.company_id,
@@ -1088,7 +1086,6 @@ async def run_company_pipeline(
 
         # -------------------- Crawl stage --------------------
         if do_crawl:
-            # Avoid false inactivity cancels while waiting for guard health
             await _await_with_periodic_touch(
                 guard.wait_until_healthy(),
                 company_id=company.company_id,
@@ -1104,9 +1101,6 @@ async def run_company_pipeline(
             )
             submit_timeout_sec = float(getattr(args, "submit_timeout_sec", 30.0))
 
-            # IMPORTANT:
-            # If scheduler inactivity timeout is shorter than stream_no_yield_timeout,
-            # the scheduler will cancel tasks mid-await -> cancellation storms + crawl4ai cancel weirdness.
             if scheduler is not None and getattr(
                 scheduler, "stall_detection_enabled", False
             ):
@@ -1253,7 +1247,6 @@ async def run_company_pipeline(
                     pass
                 return False
 
-            # This can be slow on big indexes -> touch while waiting
             _touch(touch_cb, company.company_id)
             await _await_with_periodic_touch(
                 state.recompute_company_from_index(
@@ -1473,13 +1466,48 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         choices=["bestfirst", "bfs_internal", "dfs"],
         default="bestfirst",
     )
+
     parser.add_argument(
         "--llm-mode", type=str, choices=["none", "presence", "full"], default="none"
     )
     parser.add_argument(
-        "--llm-provider", type=str, choices=["ollama", "api"], default="ollama"
+        "--llm-model",
+        type=str,
+        default=None,
+        help=(
+            "LLM selector.\n"
+            '  - Use "provider/model" for remote providers (e.g. "gemini/gemini-1.5-flash").\n'
+            '  - Use bare name for Ollama (e.g. "mistral-3:14b").\n'
+            "  - Omit to use defaults from configs/llm.py.\n"
+        ),
     )
-    parser.add_argument("--llm-api-provider", type=str, default="openai/gpt-4o-mini")
+
+    # Optional (won't affect existing scripts if omitted)
+    parser.add_argument(
+        "--llm-api-key",
+        type=str,
+        default=None,
+        help="API key/token for remote LLM providers (if required).",
+    )
+    parser.add_argument(
+        "--llm-base-url",
+        type=str,
+        default=None,
+        help="Override base_url for remote LLM providers (if applicable).",
+    )
+    parser.add_argument(
+        "--ollama-base-url",
+        type=str,
+        default="http://localhost:11434",
+        help="Ollama base URL (only used when llm-model selects Ollama).",
+    )
+    parser.add_argument(
+        "--ollama-default-model",
+        type=str,
+        default="mistral-3:14b",
+        help="Default Ollama model when --llm-model is omitted and llm-mode != none.",
+    )
+
     parser.add_argument(
         "--log-level",
         type=str,
@@ -1612,16 +1640,31 @@ async def main_async(args: argparse.Namespace) -> None:
 
     default_language_factory.set_language(args.lang)
 
+    # -------------------- LLM setup (FIXED) --------------------
     presence_llm = None
     full_llm = None
     if args.llm_mode != "none":
-        provider_strategy = (
-            default_ollama_provider_strategy
-            if args.llm_provider == "ollama"
-            else RemoteAPIProviderStrategy(
-                provider=args.llm_api_provider, api_token=None, base_url=None
-            )
+        # CRITICAL FIX:
+        # Use configs/llm.py selector so "gemini/gemini-1.5-flash" stays remote,
+        # and DOES NOT become "ollama/gemini-1.5-flash".
+        provider_strategy = provider_strategy_from_llm_model_selector(
+            getattr(args, "llm_model", None),
+            ollama_base_url=getattr(args, "ollama_base_url", "http://localhost:11434"),
+            default_ollama_model=getattr(args, "ollama_default_model", "mistral-3:14b"),
+            api_token=getattr(args, "llm_api_key", None),
+            base_url=getattr(args, "llm_base_url", None),
         )
+
+        llm_model_str = (getattr(args, "llm_model", None) or "").strip()
+        if not llm_model_str:
+            logger.info(
+                "[LLM] llm_mode=%s llm_model=<default from configs/llm.py> (ollama_default_model=%s)",
+                args.llm_mode,
+                getattr(args, "ollama_default_model", "mistral-3:14b"),
+            )
+        else:
+            logger.info("[LLM] llm_mode=%s llm_model=%s", args.llm_mode, llm_model_str)
+
         llm_factory = LLMExtractionFactory(
             provider_strategy=provider_strategy,
             default_full_instruction=DEFAULT_FULL_INSTRUCTION,
