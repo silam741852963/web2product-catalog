@@ -8,25 +8,49 @@ RETRY_EXIT_CODE="${RETRY_EXIT_CODE:-${DEEP_CRAWL_RETRY_EXIT_CODE:-17}}"
 export RETRY_EXIT_CODE
 export DEEP_CRAWL_RETRY_EXIT_CODE="$RETRY_EXIT_CODE"
 
-# Derive OUT_DIR from env or --out-dir argument (default: outputs)
+# ---- allocator / fragmentation mitigations (glibc) ----
+# Keep these as harmless environment-level knobs (not "OOM protection" logic).
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+# export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
+
+# Derive OUT_DIR from env or --out-dir/--output-dir argument (default: outputs)
 if [[ -n "${OUT_DIR:-}" ]]; then
   OUT_DIR="${OUT_DIR}"
 else
   OUT_DIR="outputs"
+
   for ((i=0; i<${#ARGS[@]}; i++)); do
-    if [[ "${ARGS[$i]}" == "--out-dir" && $((i+1)) -lt ${#ARGS[@]} ]]; then
-      OUT_DIR="${ARGS[$i+1]}"
+    a="${ARGS[$i]}"
+
+    # --out-dir VALUE / --output-dir VALUE
+    if [[ "$a" == "--out-dir" || "$a" == "--output-dir" ]]; then
+      if (( i + 1 < ${#ARGS[@]} )); then
+        OUT_DIR="${ARGS[$((i+1))]}"
+        break
+      fi
+    fi
+
+    # --out-dir=VALUE / --output-dir=VALUE
+    if [[ "$a" == --out-dir=* ]]; then
+      OUT_DIR="${a#--out-dir=}"
+      break
+    fi
+    if [[ "$a" == --output-dir=* ]]; then
+      OUT_DIR="${a#--output-dir=}"
       break
     fi
   done
 fi
 
-GLOBAL_STATE_FILE="${OUT_DIR}/crawl_global_state.json"
+# Resolve OUT_DIR to absolute path (matches run.py behavior)
+OUT_DIR="$(python3 - <<'PYEOF' "$OUT_DIR"
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]).expanduser().resolve()
+print(str(p))
+PYEOF
+)"
 
-# OOM auto restart config (SIGKILL -> exit 137)
-OOM_RESTART_LIMIT="${OOM_RESTART_LIMIT:-100}"
-OOM_RESTART_DELAY="${OOM_RESTART_DELAY:-10}"
-OOM_RESTART_COUNT=0
+GLOBAL_STATE_FILE="${OUT_DIR}/crawl_global_state.json"
 
 read_in_progress_count() {
   if [[ ! -f "$GLOBAL_STATE_FILE" ]]; then
@@ -48,16 +72,19 @@ PYEOF
 
 ITER=1
 while :; do
-  echo "[retry-wrapper] iteration=${ITER} out_dir=${OUT_DIR}"
-  python3 scripts/run.py "${ARGS[@]}"
+  echo "[retry-wrapper] iteration=${ITER} out_dir=${OUT_DIR} retry_exit_code=${RETRY_EXIT_CODE}"
+
+  # shellcheck disable=SC2068
+  python3 scripts/run.py ${ARGS[@]}
   EXIT_CODE=$?
 
-  # Clean exit
   if [[ "$EXIT_CODE" -eq 0 ]]; then
     inprog="$(read_in_progress_count)"
     if [[ "$inprog" -gt 0 ]]; then
       echo "[retry-wrapper] clean exit but in_progress_companies=${inprog}; running finalize pass (markdown only)."
-      python3 scripts/run.py "${ARGS[@]}" --finalize-in-progress-md --llm-mode none
+      # --finalize-in-progress-md forces --llm-mode none inside run.py, but we set it explicitly anyway.
+      # shellcheck disable=SC2068
+      python3 scripts/run.py ${ARGS[@]} --finalize-in-progress-md --llm-mode none
       FINALIZE_EXIT=$?
       if [[ "$FINALIZE_EXIT" -ne 0 ]]; then
         echo "[retry-wrapper] finalize pass failed exit_code=${FINALIZE_EXIT}; stopping."
@@ -70,31 +97,12 @@ while :; do
     exit 0
   fi
 
-  # OOM / SIGKILL handling (exit 128+9 = 137)
-  if (( EXIT_CODE >= 128 )); then
-    SIGNAL=$((EXIT_CODE - 128))
-    if (( SIGNAL == 9 )); then
-      if (( OOM_RESTART_COUNT < OOM_RESTART_LIMIT )); then
-        OOM_RESTART_COUNT=$((OOM_RESTART_COUNT + 1))
-        echo "[retry-wrapper] killed by signal 9 (likely OOM); restart ${OOM_RESTART_COUNT}/${OOM_RESTART_LIMIT} after ${OOM_RESTART_DELAY}s."
-        sleep "$OOM_RESTART_DELAY"
-        ITER=$((ITER + 1))
-        continue
-      else
-        echo "[retry-wrapper] repeated OOM; reached OOM_RESTART_LIMIT=${OOM_RESTART_LIMIT}; stopping."
-        exit "$EXIT_CODE"
-      fi
-    fi
-  fi
-
-  # Retry requested by scheduler (eligible retry-pending exists *now*)
   if [[ "$EXIT_CODE" -eq "$RETRY_EXIT_CODE" ]]; then
     echo "[retry-wrapper] retry exit_code=${EXIT_CODE}; restarting."
     ITER=$((ITER + 1))
     continue
   fi
 
-  # Anything else: stop
   echo "[retry-wrapper] run exited with code=${EXIT_CODE}; stopping."
   exit "$EXIT_CODE"
 done

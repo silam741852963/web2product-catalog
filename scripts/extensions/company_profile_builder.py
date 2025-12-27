@@ -25,11 +25,6 @@ PIPELINE_VERSION = "profile-v1"
 EMBED_MODEL = "BAAI/bge-m3"
 
 
-# ----------------------------
-# Models
-# ----------------------------
-
-
 @dataclass
 class PageRecord:
     url: str
@@ -79,11 +74,6 @@ class UnionFind:
         return True
 
 
-# ----------------------------
-# Logging setup per company
-# ----------------------------
-
-
 def _setup_company_logger(company_dir: Path) -> None:
     company_dir.mkdir(parents=True, exist_ok=True)
     log_dir = company_dir / "log"
@@ -115,11 +105,6 @@ def _setup_company_logger(company_dir: Path) -> None:
     lg.info("log_path=%s", str(log_path))
 
 
-# ----------------------------
-# Step 1: Load + link
-# ----------------------------
-
-
 def _load_json(path: Path) -> Optional[Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -133,6 +118,17 @@ def _domain_from_root(root_url: Optional[str]) -> Optional[str]:
     s = root_url.replace("https://", "").replace("http://", "")
     s = s.split("/")[0]
     return s or None
+
+
+def _resolve_maybe_relative(base: Path, p: str) -> Path:
+    """
+    url_index.json often stores:
+      - absolute paths (older runs)
+      - or relative paths like "product/xxx.json" / "markdown/xxx.md"
+    We accept both.
+    """
+    pp = Path(p)
+    return pp if pp.is_absolute() else (base / pp).resolve()
 
 
 def _load_inputs(
@@ -162,7 +158,7 @@ def _load_inputs(
         bool(url_index),
     )
 
-    # Primary linking: via url_index[*].product_path
+    # Primary linking: via url_index[*].product_path (absolute or relative)
     prod_map: Dict[str, Tuple[str, Optional[str]]] = {}
     for url, ent in url_index.items():
         if not isinstance(ent, dict):
@@ -170,7 +166,8 @@ def _load_inputs(
         pp = ent.get("product_path")
         mp = ent.get("markdown_path")
         if isinstance(pp, str):
-            prod_map[Path(pp).resolve().as_posix()] = (
+            resolved_pp = _resolve_maybe_relative(company_dir, pp)
+            prod_map[resolved_pp.as_posix()] = (
                 str(url),
                 mp if isinstance(mp, str) else None,
             )
@@ -195,23 +192,30 @@ def _load_inputs(
             for u, ent in url_index.items():
                 if isinstance(ent, dict):
                     pp = ent.get("product_path")
-                    if isinstance(pp, str) and Path(pp).name == pf.name:
-                        url = str(u)
-                        if md is None:
-                            mp = ent.get("markdown_path")
-                            if isinstance(mp, str):
-                                md = mp
-                        break
+                    if isinstance(pp, str):
+                        # Compare by filename too, in case stored as "product/x.json" etc
+                        try:
+                            if Path(pp).name == pf.name:
+                                url = str(u)
+                                if md is None:
+                                    mp = ent.get("markdown_path")
+                                    if isinstance(mp, str):
+                                        md = mp
+                                break
+                        except Exception:
+                            pass
 
         if url is None:
             unlinked.append(pf)
             continue
 
-        md_path = Path(md).resolve() if md else None
-        if md_path and not md_path.exists():
-            logger.warning(
-                "step1: markdown missing for url=%s md_path=%s", url, md_path
-            )
+        md_path: Optional[Path] = None
+        if md:
+            md_path = _resolve_maybe_relative(company_dir, md)
+            if not md_path.exists():
+                logger.warning(
+                    "step1: markdown missing for url=%s md_path=%s", url, md_path
+                )
 
         records.append(
             PageRecord(
@@ -232,11 +236,6 @@ def _load_inputs(
             logger.warning("step1: unlinked=%s", x)
 
     return company_dir, records, crawl_meta
-
-
-# ----------------------------
-# Step 2: Flatten mentions
-# ----------------------------
 
 
 def _flatten_mentions(records: List[PageRecord]) -> List[Mention]:
@@ -280,11 +279,6 @@ def _flatten_mentions(records: List[PageRecord]) -> List[Mention]:
         bad,
     )
     return mentions
-
-
-# ----------------------------
-# Step 3: Normalize + filter + evidence probe
-# ----------------------------
 
 
 def _load_markdown_cached(md_path: Optional[Path], cache: Dict[str, str]) -> str:
@@ -348,11 +342,6 @@ def _normalize_filter_mentions(
     return clean
 
 
-# ----------------------------
-# Step 4: Cluster by type with embeddings
-# ----------------------------
-
-
 def _cluster_mentions(
     mentions: List[Mention],
     *,
@@ -376,14 +365,12 @@ def _cluster_mentions(
 
         uf = UnionFind(len(items))
 
-        # exact-name unions
         for idxs in blocks.values():
             if len(idxs) >= 2:
                 base = idxs[0]
                 for j in idxs[1:]:
                     uf.union(base, j)
 
-        # embed only unique normalized names
         unique_names = sorted(blocks.keys())
         er = embedder.embed_texts(unique_names, normalize=True)
         vecs = er.vectors
@@ -398,8 +385,6 @@ def _cluster_mentions(
             er.elapsed_ms,
             name_merge_threshold,
         )
-
-        name_to_index = {n: i for i, n in enumerate(unique_names)}
 
         merges = 0
         comps = 0
@@ -434,11 +419,6 @@ def _cluster_mentions(
         )
 
     return clusters_by_type
-
-
-# ----------------------------
-# Step 5: Merge clusters
-# ----------------------------
 
 
 def _stable_offering_id(company_id: str, typ: str, best_name_norm: str) -> str:
@@ -487,7 +467,6 @@ def _dedup_descriptions(
 
     if not normed:
         return []
-
     if len(normed) == 1:
         return normed
 
@@ -552,8 +531,8 @@ def _merge_clusters_to_offerings(
                 {
                     "offering_id": oid,
                     "type": typ,
-                    "name": [best, others],  # required shape
-                    "description": descriptions,  # list
+                    "name": [best, others],
+                    "description": descriptions,
                     "sources": list(sources_map.values()),
                 }
             )
@@ -571,11 +550,6 @@ def _merge_clusters_to_offerings(
 
     logger.info("step5: canonical_offerings=%d", len(offerings))
     return offerings
-
-
-# ----------------------------
-# Step 6: Write company_profile.md
-# ----------------------------
 
 
 def _write_company_profile_md(
@@ -652,11 +626,6 @@ def _write_company_profile_md(
     return md_path
 
 
-# ----------------------------
-# Step 7: Embeddings
-# ----------------------------
-
-
 def _offering_embed_text(o: Dict[str, Any]) -> str:
     best = (o.get("name") or ["", []])[0]
     aliases = (o.get("name") or ["", []])[1] or []
@@ -712,7 +681,6 @@ def _embed_all(
     else:
         logger.info("step7: embedded_offerings=0")
 
-    # optional cache dump for debug/reuse
     cache_path = company_dir / "metadata" / "embed_cache.jsonl"
     try:
         embedder.persist_cache_jsonl(cache_path)
@@ -721,11 +689,6 @@ def _embed_all(
         logger.warning("step7: embed_cache_write_failed err=%s", e)
 
     return company_vec, offering_vecs
-
-
-# ----------------------------
-# Step 8: Write company_profile.json
-# ----------------------------
 
 
 def _write_company_profile_json(
@@ -766,11 +729,6 @@ def _write_company_profile_json(
     return out_path
 
 
-# ----------------------------
-# Public API (THIS is what your import expects)
-# ----------------------------
-
-
 def build_company_profile_for_company(
     *,
     outputs_dir: Path,
@@ -797,7 +755,6 @@ def build_company_profile_for_company(
             company_dir / "markdown",
         )
 
-        # Step 1
         company_dir, records, crawl_meta = _load_inputs(outputs_dir, company_id)
         if not records:
             logger.warning("no linked product records; writing empty profile")
@@ -821,10 +778,8 @@ def build_company_profile_for_company(
             )
             return True
 
-        # Step 2
         mentions = _flatten_mentions(records)
 
-        # Step 3
         clean = _normalize_filter_mentions(mentions)
         if not clean:
             logger.warning(
@@ -850,7 +805,6 @@ def build_company_profile_for_company(
             )
             return True
 
-        # embedder (used for clustering + sentence dedupe + final vectors)
         embedder = Embedder(EMBED_MODEL, device=embed_device)
         logger.info(
             "embedder_ready model=%s backend=%s dim=%d device=%s",
@@ -860,12 +814,10 @@ def build_company_profile_for_company(
             embed_device,
         )
 
-        # Step 4
         clusters_by_type = _cluster_mentions(
             clean, embedder=embedder, name_merge_threshold=name_merge_threshold
         )
 
-        # Step 5
         offerings = _merge_clusters_to_offerings(
             company_id,
             clusters_by_type,
@@ -874,17 +826,14 @@ def build_company_profile_for_company(
             max_desc_sentences=max_desc_sentences,
         )
 
-        # Step 6
         md_path = _write_company_profile_md(
             company_dir, company_id, crawl_meta.get("root_url"), offerings
         )
 
-        # Step 7
         company_vec, offering_vecs = _embed_all(
             company_dir, embedder, md_path, offerings
         )
 
-        # Step 8
         _write_company_profile_json(
             company_dir,
             company_id,

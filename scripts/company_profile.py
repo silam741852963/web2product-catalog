@@ -24,14 +24,19 @@ def _is_company_dir(p: Path) -> bool:
 
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="Build company_profile.json from outputs/<company_id>/product/*.json"
+        description="Build company_profile.json from <outputs_dir>/<company_id>/product/*.json"
     )
-    p.add_argument("--outputs-dir", type=str, default="outputs")
+    p.add_argument(
+        "--outputs-dir",
+        type=str,
+        default="outputs",
+        help="Directory that contains company folders (<company_id>/product, <company_id>/metadata, ...).",
+    )
 
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--company-id", type=str, help="Run for one company folder name")
     g.add_argument(
-        "--all", action="store_true", help="Run all company folders under outputs/"
+        "--all", action="store_true", help="Run all company folders under outputs_dir"
     )
 
     # The only embedding-related flag:

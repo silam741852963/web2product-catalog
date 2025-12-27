@@ -29,6 +29,7 @@ _JSON_CACHE_MAX = int(os.getenv("CRAWLSTATE_JSON_CACHE_SIZE", "2048"))
 _DIR_CACHE_MAX = int(os.getenv("CRAWLSTATE_DIR_CACHE_SIZE", "4096"))
 
 _JSON_CACHE: "OrderedDict[Path, Tuple[int, Any]]" = OrderedDict()
+# IMPORTANT: key includes output_root to avoid stale cache when OUTPUT_ROOT changes.
 _DIR_CACHE: "OrderedDict[str, Path]" = OrderedDict()
 _FILE_LOCKS: Dict[Path, threading.Lock] = {}
 
@@ -39,9 +40,17 @@ def _now_iso() -> str:
 
 def _output_root() -> Path:
     """
-    IMPORTANT: output_paths.OUTPUT_ROOT is mutated by run.py at runtime.
+    IMPORTANT: output_paths.OUTPUT_ROOT is a mutable proxy possibly mutated by run.py at runtime.
     Never capture it at import-time. Always resolve dynamically here.
     """
+    try:
+        fn = getattr(output_paths, "get_output_root", None)
+        if callable(fn):
+            root = fn()
+            return Path(root).resolve()
+    except Exception:
+        pass
+
     try:
         root = getattr(output_paths, "OUTPUT_ROOT", None)
         if root is None:
@@ -156,7 +165,28 @@ META_NAME = "crawl_meta.json"
 URL_INDEX_NAME = "url_index.json"
 GLOBAL_STATE_NAME = "crawl_global_state.json"
 
-DEFAULT_DB = default_db_path()
+
+class _DefaultDBPathProxy(os.PathLike):
+    """
+    Dynamic PathLike proxy for default DB path.
+    This prevents stale DEFAULT_DB paths when OUTPUT_ROOT changes at runtime.
+    """
+
+    def __fspath__(self) -> str:
+        return os.fspath(default_db_path())
+
+    def __str__(self) -> str:
+        return str(default_db_path())
+
+    def __repr__(self) -> str:
+        return f"_DefaultDBPathProxy({default_db_path()!r})"
+
+    @property
+    def path(self) -> Path:
+        return default_db_path()
+
+
+DEFAULT_DB = _DefaultDBPathProxy()
 
 CompanyStatus = Literal[
     "pending",
@@ -173,6 +203,42 @@ COMPANY_STATUS_MD_DONE: CompanyStatus = "markdown_done"
 COMPANY_STATUS_LLM_NOT_DONE: CompanyStatus = "llm_not_done"
 COMPANY_STATUS_LLM_DONE: CompanyStatus = "llm_done"
 COMPANY_STATUS_TERMINAL_DONE: CompanyStatus = "terminal_done"
+
+_KNOWN_COMPANY_STATUSES = {
+    COMPANY_STATUS_PENDING,
+    COMPANY_STATUS_MD_NOT_DONE,
+    COMPANY_STATUS_MD_DONE,
+    COMPANY_STATUS_LLM_NOT_DONE,
+    COMPANY_STATUS_LLM_DONE,
+    COMPANY_STATUS_TERMINAL_DONE,
+}
+
+# Sticky precedence: never downgrade; only allow upgrades.
+# terminal_done > llm_done > llm_not_done > markdown_done > markdown_not_done > pending
+_COMPANY_STATUS_RANK: Dict[str, int] = {
+    COMPANY_STATUS_PENDING: 0,
+    COMPANY_STATUS_MD_NOT_DONE: 1,
+    COMPANY_STATUS_MD_DONE: 2,
+    COMPANY_STATUS_LLM_NOT_DONE: 3,
+    COMPANY_STATUS_LLM_DONE: 4,
+    COMPANY_STATUS_TERMINAL_DONE: 5,
+}
+
+# Some legacy company-level statuses seen in older runs
+_LEGACY_COMPANY_STATUS_MAP: Dict[str, CompanyStatus] = {
+    "done": COMPANY_STATUS_LLM_DONE,
+    "completed": COMPANY_STATUS_LLM_DONE,
+    "complete": COMPANY_STATUS_LLM_DONE,
+    "llmcomplete": COMPANY_STATUS_LLM_DONE,
+    "llm_complete": COMPANY_STATUS_LLM_DONE,
+    "terminal": COMPANY_STATUS_TERMINAL_DONE,
+    "terminalized": COMPANY_STATUS_TERMINAL_DONE,
+    "terminated": COMPANY_STATUS_TERMINAL_DONE,
+    "md_done": COMPANY_STATUS_MD_DONE,
+    "markdown_saved": COMPANY_STATUS_MD_DONE,
+    "markdown_complete": COMPANY_STATUS_MD_DONE,
+    "markdowncomplete": COMPANY_STATUS_MD_DONE,
+}
 
 # Legacy/variant URL statuses we treat as "markdown complete"
 _MARKDOWN_COMPLETE_STATUSES = {
@@ -198,11 +264,43 @@ _LLM_COMPLETE_STATUSES = {
 }
 
 
+def _normalize_company_status(st: Optional[str]) -> str:
+    s = (st or "").strip().lower()
+    if not s:
+        return COMPANY_STATUS_PENDING
+    if s in _KNOWN_COMPANY_STATUSES:
+        return s
+    if s in _LEGACY_COMPANY_STATUS_MAP:
+        return _LEGACY_COMPANY_STATUS_MAP[s]
+    return s  # preserve unknown strings (DB may contain legacy values)
+
+
+def _status_rank(st: Optional[str]) -> int:
+    s = _normalize_company_status(st)
+    return _COMPANY_STATUS_RANK.get(s, -1)
+
+
+def _prefer_higher_status(current: Optional[str], derived: Optional[str]) -> str:
+    """
+    Choose the 'higher' status by rank, never downgrading.
+    Unknown current statuses are treated as rank=-1; derived wins if known.
+    """
+    c = _normalize_company_status(current)
+    d = _normalize_company_status(derived)
+    if _status_rank(c) >= _status_rank(d):
+        return c
+    return d
+
+
 def _company_metadata_dir(bvdid: str) -> Path:
+    # Cache key includes current output_root to avoid stale paths if OUTPUT_ROOT changes.
+    root = str(_output_root())
+    key = f"{root}::{bvdid}"
+
     with _DIR_CACHE_LOCK:
-        cached = _DIR_CACHE.get(bvdid)
+        cached = _DIR_CACHE.get(key)
         if cached is not None:
-            _DIR_CACHE.move_to_end(bvdid, last=True)
+            _DIR_CACHE.move_to_end(key, last=True)
             return cached
 
     dirs = ensure_company_dirs(bvdid)
@@ -216,8 +314,8 @@ def _company_metadata_dir(bvdid: str) -> Path:
         meta.mkdir(parents=True, exist_ok=True)
 
     with _DIR_CACHE_LOCK:
-        _DIR_CACHE[bvdid] = meta
-        _DIR_CACHE.move_to_end(bvdid, last=True)
+        _DIR_CACHE[key] = meta
+        _DIR_CACHE.move_to_end(key, last=True)
         while len(_DIR_CACHE) > _DIR_CACHE_MAX:
             _DIR_CACHE.popitem(last=False)
 
@@ -287,11 +385,15 @@ def _safe_json_load(s: Optional[str]) -> Optional[Dict[str, Any]]:
 
 
 def _row_to_company_snapshot(row: sqlite3.Row) -> CompanySnapshot:
+    st = _normalize_company_status(row["status"] if "status" in row.keys() else None)
+    if st not in _KNOWN_COMPANY_STATUSES:
+        st = COMPANY_STATUS_PENDING
+
     return CompanySnapshot(
         bvdid=row["bvdid"],
         name=row["name"],
         root_url=row["root_url"],
-        status=(row["status"] or COMPANY_STATUS_PENDING),
+        status=(st or COMPANY_STATUS_PENDING),  # type: ignore[assignment]
         urls_total=int(row["urls_total"] or 0),
         urls_markdown_done=int(row["urls_markdown_done"] or 0),
         urls_llm_done=int(row["urls_llm_done"] or 0),
@@ -349,7 +451,6 @@ def upsert_url_index_entry(bvdid: str, url: str, patch: Dict[str, Any]) -> None:
             ent_dict.update(patch)
             existing[url] = ent_dict
 
-            # compact; no cache for hot mutation
             payload = json.dumps(existing, ensure_ascii=False, separators=(",", ":"))
             _atomic_write_text(idx_path, payload, "utf-8")
 
@@ -363,15 +464,9 @@ def _status_has_any(s: str, needles: Tuple[str, ...]) -> bool:
 def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
     """
     Return (markdown_done, llm_done).
-
-    Be tolerant to:
-      - varying status strings
-      - different artifact field names
-      - presence-check-only entries
     """
     status = str(ent.get("status") or "").strip().lower()
 
-    # Artifacts (common field variants)
     has_md_path = bool(ent.get("markdown_path") or ent.get("md_path"))
     has_llm_artifact = bool(
         ent.get("json_path")
@@ -381,11 +476,9 @@ def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
         or ent.get("extraction_path")
     )
 
-    # Flags
     presence_checked = bool(ent.get("presence_checked") or ent.get("presence_done"))
     extracted_flag = bool(ent.get("extracted") or ent.get("llm_extracted"))
 
-    # Status heuristics
     status_md_done = (
         status in _MARKDOWN_COMPLETE_STATUSES
         or _status_has_any(
@@ -417,7 +510,6 @@ def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
 
     markdown_done = bool(has_md_path or status_md_done)
 
-    # If LLM artifacts exist, markdown is implicitly done in your pipeline
     if has_llm_artifact or extracted_flag or status_llm_done or presence_checked:
         markdown_done = True
 
@@ -478,49 +570,149 @@ def _pending_urls_for_stage(
 
 
 # ---------------------------------------------------------------------------
+# URL stats helpers (url_index.json is the source of truth)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class URLStats:
+    urls_total: int
+    urls_markdown_done: int
+    urls_llm_done: int
+
+
+def compute_url_stats_from_index_dict(index: Dict[str, Any]) -> URLStats:
+    _, total, md, llm = _compute_company_stage_from_index(index)
+    return URLStats(int(total), int(md), int(llm))
+
+
+def compute_url_stats_for_company(bvdid: str) -> URLStats:
+    """
+    Source of truth = url_index.json. Falls back to 0s if missing/unreadable.
+    """
+    idx = load_url_index(bvdid)
+    if not isinstance(idx, dict) or not idx:
+        return URLStats(0, 0, 0)
+    return compute_url_stats_from_index_dict(idx)
+
+
+# ---------------------------------------------------------------------------
 # SQLite-backed global state
 # ---------------------------------------------------------------------------
 
 
 class CrawlState:
+    """
+    Key fixes vs your current version:
+      1) DB path freshness: if OUTPUT_ROOT changes at runtime, the same CrawlState instance
+         will automatically reopen the connection to the new default DB (only when it was
+         originally created for the default DB).
+      2) Idempotent run completion accounting using run_company_done(run_id,bvdid).
+      3) crawl_global_state.json is written next to the DB to prevent OUTPUT_ROOT drift,
+         and latest_run totals are sanitized against reality.
+      4) url_index.json is treated as source of truth for URL counters where available
+         (global sums + terminal writes).
+      5) NEW: DB-backed in-progress APIs (has/count/list) + bulk recompute of in-progress.
+    """
+
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db_path = Path(db_path) if db_path is not None else default_db_path()
         self.db_path = self.db_path.resolve()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._conn = sqlite3.connect(
-            self.db_path,
+        # Dynamic only if initialized on the *current* default DB path.
+        try:
+            self._dynamic_db = self.db_path == default_db_path().resolve()
+        except Exception:
+            self._dynamic_db = False
+
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._conn = self._connect(self.db_path)
+        self._init_schema()
+
+    # -------------------- connection / schema --------------------
+
+    def _connect(self, path: Path) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            path,
             check_same_thread=False,
             isolation_level=None,
             timeout=5.0,
         )
-        self._conn.row_factory = sqlite3.Row
-        self._lock = threading.Lock()
-        self._init_schema()
-
-    def close(self) -> None:
+        conn.row_factory = sqlite3.Row
         with suppress(Exception):
-            with self._lock:
-                self._conn.close()
+            conn.execute("PRAGMA journal_mode=WAL")
+        with suppress(Exception):
+            conn.execute("PRAGMA synchronous=NORMAL")
+        with suppress(Exception):
+            conn.execute("PRAGMA busy_timeout=5000")
+        return conn
 
-    def _ensure_company_columns(self) -> None:
-        with self._lock:
+    def _ensure_company_columns_locked(self) -> None:
+        cols = set()
+        try:
+            rows = self._conn.execute("PRAGMA table_info(companies)").fetchall()
+            cols = {r["name"] for r in rows}
+        except Exception:
             cols = set()
-            try:
-                rows = self._conn.execute("PRAGMA table_info(companies)").fetchall()
-                cols = {r["name"] for r in rows}
-            except Exception:
-                cols = set()
 
-            def _add(col_ddl: str, col_name: str) -> None:
-                if col_name in cols:
-                    return
-                with suppress(Exception):
-                    self._conn.execute(f"ALTER TABLE companies ADD COLUMN {col_ddl}")
+        def _add(col_ddl: str, col_name: str) -> None:
+            if col_name in cols:
+                return
+            with suppress(Exception):
+                self._conn.execute(f"ALTER TABLE companies ADD COLUMN {col_ddl}")
 
-            _add("done_reason TEXT", "done_reason")
-            _add("done_details TEXT", "done_details")
-            _add("done_at TEXT", "done_at")
+        _add("done_reason TEXT", "done_reason")
+        _add("done_details TEXT", "done_details")
+        _add("done_at TEXT", "done_at")
+
+    def _init_schema_locked(self) -> None:
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS companies (
+                bvdid TEXT PRIMARY KEY,
+                name TEXT,
+                root_url TEXT,
+                status TEXT,
+                urls_total INTEGER DEFAULT 0,
+                urls_markdown_done INTEGER DEFAULT 0,
+                urls_llm_done INTEGER DEFAULT 0,
+                last_error TEXT,
+                done_reason TEXT,
+                done_details TEXT,
+                done_at TEXT,
+                created_at TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                pipeline TEXT,
+                version TEXT,
+                args_hash TEXT,
+                started_at TEXT,
+                total_companies INTEGER DEFAULT 0,
+                completed_companies INTEGER DEFAULT 0,
+                last_company_bvdid TEXT,
+                last_updated TEXT
+            )
+            """
+        )
+        # Idempotent run completion accounting
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS run_company_done (
+                run_id TEXT NOT NULL,
+                bvdid TEXT NOT NULL,
+                done_at TEXT,
+                PRIMARY KEY (run_id, bvdid)
+            )
+            """
+        )
+        self._ensure_company_columns_locked()
 
     def _init_schema(self) -> None:
         with self._lock:
@@ -530,47 +722,45 @@ class CrawlState:
                 self._conn.execute("PRAGMA synchronous=NORMAL")
             with suppress(Exception):
                 self._conn.execute("PRAGMA busy_timeout=5000")
+            self._init_schema_locked()
 
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS companies (
-                    bvdid TEXT PRIMARY KEY,
-                    name TEXT,
-                    root_url TEXT,
-                    status TEXT,
-                    urls_total INTEGER DEFAULT 0,
-                    urls_markdown_done INTEGER DEFAULT 0,
-                    urls_llm_done INTEGER DEFAULT 0,
-                    last_error TEXT,
-                    done_reason TEXT,
-                    done_details TEXT,
-                    done_at TEXT,
-                    created_at TEXT,
-                    updated_at TEXT
-                )
-                """
-            )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS runs (
-                    run_id TEXT PRIMARY KEY,
-                    pipeline TEXT,
-                    version TEXT,
-                    args_hash TEXT,
-                    started_at TEXT,
-                    total_companies INTEGER DEFAULT 0,
-                    completed_companies INTEGER DEFAULT 0,
-                    last_company_bvdid TEXT,
-                    last_updated TEXT
-                )
-                """
-            )
+    def _ensure_db_current_locked(self) -> None:
+        """
+        If this CrawlState instance was created for the default DB, and OUTPUT_ROOT changes,
+        automatically reopen the connection to the new default DB.
+        """
+        if not getattr(self, "_dynamic_db", False):
+            return
 
-        self._ensure_company_columns()
+        try:
+            want = default_db_path().resolve()
+        except Exception:
+            return
+
+        if want == self.db_path:
+            return
+
+        # Reopen
+        try:
+            with suppress(Exception):
+                self._conn.close()
+        finally:
+            self.db_path = want
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = self._connect(self.db_path)
+            self._init_schema_locked()
+
+    def close(self) -> None:
+        with suppress(Exception):
+            with self._lock:
+                self._conn.close()
+
+    # -------------------- basic async db helpers --------------------
 
     async def _exec(self, stmt: _Stmt) -> None:
         def _run() -> None:
             with self._lock:
+                self._ensure_db_current_locked()
                 self._conn.execute(stmt.sql, stmt.args)
 
         await asyncio.to_thread(_run)
@@ -580,6 +770,7 @@ class CrawlState:
     ) -> Optional[sqlite3.Row]:
         def _run() -> Optional[sqlite3.Row]:
             with self._lock:
+                self._ensure_db_current_locked()
                 return self._conn.execute(sql, args).fetchone()
 
         return await asyncio.to_thread(_run)
@@ -587,9 +778,86 @@ class CrawlState:
     async def _query_all(self, sql: str, args: Tuple[Any, ...]) -> List[sqlite3.Row]:
         def _run() -> List[sqlite3.Row]:
             with self._lock:
+                self._ensure_db_current_locked()
                 return self._conn.execute(sql, args).fetchall()
 
         return await asyncio.to_thread(_run)
+
+    # ---------- NEW: in-progress DB APIs (authoritative) ----------
+
+    @staticmethod
+    def _in_progress_statuses() -> Tuple[str, ...]:
+        """
+        Semantics for exit invariants:
+          - Treat pending as "in progress" so the main loop will not exit early
+            when there is still runnable work that hasn't been scheduled yet.
+          - Treat markdown_not_done and llm_not_done as in progress.
+        """
+        return (
+            COMPANY_STATUS_PENDING,
+            COMPANY_STATUS_MD_NOT_DONE,
+            COMPANY_STATUS_LLM_NOT_DONE,
+        )
+
+    async def has_in_progress_companies(self) -> bool:
+        sts = self._in_progress_statuses()
+        placeholders = ",".join("?" for _ in sts)
+        row = await self._query_one(
+            f"SELECT 1 AS x FROM companies WHERE status IN ({placeholders}) LIMIT 1",
+            tuple(sts),
+        )
+        return row is not None
+
+    async def count_in_progress_companies(self) -> int:
+        sts = self._in_progress_statuses()
+        placeholders = ",".join("?" for _ in sts)
+        row = await self._query_one(
+            f"SELECT COUNT(*) AS c FROM companies WHERE status IN ({placeholders})",
+            tuple(sts),
+        )
+        try:
+            return int(row["c"] or 0) if row is not None else 0
+        except Exception:
+            return 0
+
+    async def get_in_progress_company_ids(self, limit: int = 2000) -> List[str]:
+        limit = max(1, int(limit))
+        sts = self._in_progress_statuses()
+        placeholders = ",".join("?" for _ in sts)
+        rows = await self._query_all(
+            f"""
+            SELECT bvdid FROM companies
+             WHERE status IN ({placeholders})
+             ORDER BY updated_at DESC
+             LIMIT ?
+            """,
+            tuple(sts) + (limit,),
+        )
+        return [str(r["bvdid"]) for r in rows]
+
+    async def recompute_all_in_progress(self, *, concurrency: int = 32) -> None:
+        """
+        Best-effort bulk refresh of all in-progress companies from url_index.json.
+
+        - Does NOT downgrade statuses (recompute_company_from_index() uses sticky ranks).
+        - Uses bounded concurrency.
+        """
+        c = max(1, int(concurrency))
+        ids = await self.get_in_progress_company_ids(limit=1_000_000)
+        if not ids:
+            return
+
+        sem = asyncio.Semaphore(c)
+
+        async def _one(cid: str) -> None:
+            async with sem:
+                with suppress(Exception):
+                    await self.recompute_company_from_index(cid)
+
+        # Avoid creating an enormous task list that spikes memory
+        batch = max(64, c * 8)
+        for i in range(0, len(ids), batch):
+            await asyncio.gather(*(_one(cid) for cid in ids[i : i + batch]))
 
     # ---------- terminal "done" API ----------
 
@@ -611,7 +879,15 @@ class CrawlState:
         )
         last_error_trim = (last_error or "")[:4000] if last_error is not None else None
 
+        # IMPORTANT: preserve real counters from url_index.json if present
+        try:
+            stats = compute_url_stats_for_company(bvdid)
+        except Exception:
+            stats = URLStats(0, 0, 0)
+
         with self._lock:
+            self._ensure_db_current_locked()
+
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO companies (
@@ -631,6 +907,9 @@ class CrawlState:
                 "done_details=?",
                 "done_at=?",
                 "updated_at=?",
+                "urls_total=?",
+                "urls_markdown_done=?",
+                "urls_llm_done=?",
             ]
             args: List[Any] = [
                 COMPANY_STATUS_TERMINAL_DONE,
@@ -638,6 +917,9 @@ class CrawlState:
                 details_s,
                 now,
                 now,
+                int(stats.urls_total),
+                int(stats.urls_markdown_done),
+                int(stats.urls_llm_done),
             ]
 
             if last_error_trim is not None:
@@ -681,13 +963,12 @@ class CrawlState:
     ) -> None:
         """
         Remove terminal_done markers (done_reason/details/done_at).
-        Used when a quarantined company later succeeds or is manually re-enabled.
-
-        If keep_status=False (default), status is reset to 'pending' (and done fields cleared).
-        If keep_status=True, status is preserved but done fields are cleared.
+        If keep_status=False and current status is terminal_done, status is reset to pending.
         """
         now = _now_iso()
         with self._lock:
+            self._ensure_db_current_locked()
+
             row = self._conn.execute(
                 "SELECT status FROM companies WHERE bvdid=?",
                 (bvdid,),
@@ -695,9 +976,9 @@ class CrawlState:
             if row is None:
                 return
 
-            st = str(row["status"] or "")
+            st = _normalize_company_status(row["status"])
             new_status = st
-            if (not keep_status) and st.strip().lower() == COMPANY_STATUS_TERMINAL_DONE:
+            if (not keep_status) and st == COMPANY_STATUS_TERMINAL_DONE:
                 new_status = COMPANY_STATUS_PENDING
 
             self._conn.execute(
@@ -780,24 +1061,52 @@ class CrawlState:
         await self._exec(_Stmt(sql, tuple(args)))
 
     async def mark_company_completed(self, run_id: str, bvdid: str) -> None:
+        """
+        Idempotent per (run_id, bvdid).
+        Prevents completed_companies inflation when the same company is finalized twice.
+        """
         now = _now_iso()
-        await self._exec(
-            _Stmt(
-                """
-                UPDATE runs
-                   SET completed_companies = COALESCE(completed_companies, 0) + 1,
-                       last_company_bvdid = ?,
-                       last_updated = ?,
-                       total_companies = CASE
-                           WHEN total_companies < (COALESCE(completed_companies, 0) + 1)
-                               THEN (COALESCE(completed_companies, 0) + 1)
-                           ELSE total_companies
-                       END
-                 WHERE run_id = ?
-                """,
-                (bvdid, now, run_id),
-            )
-        )
+
+        def _run() -> None:
+            with self._lock:
+                self._ensure_db_current_locked()
+
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO run_company_done (run_id, bvdid, done_at) VALUES (?, ?, ?)",
+                    (run_id, bvdid, now),
+                )
+                try:
+                    inserted = int(
+                        (self._conn.execute("SELECT changes()").fetchone() or [0])[0]
+                    )
+                except Exception:
+                    inserted = 0
+
+                if inserted > 0:
+                    # Increment only once per (run_id,bvdid)
+                    self._conn.execute(
+                        """
+                        UPDATE runs
+                           SET completed_companies = COALESCE(completed_companies, 0) + 1,
+                               last_company_bvdid = ?,
+                               last_updated = ?,
+                               total_companies = CASE
+                                   WHEN total_companies < (COALESCE(completed_companies, 0) + 1)
+                                       THEN (COALESCE(completed_companies, 0) + 1)
+                                   ELSE total_companies
+                               END
+                         WHERE run_id = ?
+                        """,
+                        (bvdid, now, run_id),
+                    )
+                else:
+                    # Still update "last seen"
+                    self._conn.execute(
+                        "UPDATE runs SET last_company_bvdid=?, last_updated=? WHERE run_id=?",
+                        (bvdid, now, run_id),
+                    )
+
+        await asyncio.to_thread(_run)
 
     async def get_run_snapshot(self, run_id: str) -> Optional[RunSnapshot]:
         row = await self._query_one("SELECT * FROM runs WHERE run_id=?", (run_id,))
@@ -885,53 +1194,52 @@ class CrawlState:
         name: Optional[str] = None,
         root_url: Optional[str] = None,
     ) -> CompanySnapshot:
+        """
+        Recompute derived stage/counters from url_index.json.
+
+        Rules:
+          - terminal_done is sticky and never recomputed/downgraded.
+          - never downgrade status; only upgrades by rank.
+          - counters are protected against regression: max(existing, derived).
+        """
         cur = await self._query_one(
-            "SELECT status FROM companies WHERE bvdid=?",
+            "SELECT status, urls_total, urls_markdown_done, urls_llm_done FROM companies WHERE bvdid=?",
             (bvdid,),
         )
-        if cur is not None and (cur["status"] or "") == COMPANY_STATUS_TERMINAL_DONE:
+
+        cur_status = _normalize_company_status(cur["status"]) if cur is not None else ""
+        cur_total = int(cur["urls_total"] or 0) if cur is not None else 0
+        cur_md = int(cur["urls_markdown_done"] or 0) if cur is not None else 0
+        cur_llm = int(cur["urls_llm_done"] or 0) if cur is not None else 0
+
+        if cur_status == COMPANY_STATUS_TERMINAL_DONE:
             if name is not None or root_url is not None:
                 await self.upsert_company(bvdid, name=name, root_url=root_url)
             return await self.get_company_snapshot(bvdid, recompute=False)
 
         index = await asyncio.to_thread(load_url_index, bvdid)
-        status, urls_total, md_done, llm_done = _compute_company_stage_from_index(index)
-        now = _now_iso()
+        derived_status, urls_total, md_done, llm_done = (
+            _compute_company_stage_from_index(index)
+        )
 
-        await self._exec(
-            _Stmt(
-                """
-                INSERT INTO companies (
-                    bvdid, name, root_url, status,
-                    urls_total, urls_markdown_done, urls_llm_done,
-                    last_error, done_reason, done_details, done_at,
-                    created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
-                ON CONFLICT(bvdid) DO UPDATE SET
-                    name      = COALESCE(excluded.name, companies.name),
-                    root_url  = COALESCE(excluded.root_url, companies.root_url),
-                    status    = CASE
-                        WHEN companies.status = 'terminal_done' THEN companies.status
-                        ELSE excluded.status
-                    END,
-                    urls_total = excluded.urls_total,
-                    urls_markdown_done = excluded.urls_markdown_done,
-                    urls_llm_done = excluded.urls_llm_done,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    bvdid,
-                    name,
-                    root_url,
-                    status,
-                    urls_total,
-                    md_done,
-                    llm_done,
-                    now,
-                    now,
-                ),
-            )
+        new_status = _prefer_higher_status(cur_status, derived_status)
+
+        new_total = max(cur_total, int(urls_total))
+        new_md = max(cur_md, int(md_done))
+        new_llm = max(cur_llm, int(llm_done))
+
+        new_total = max(new_total, new_md, new_llm)
+        new_md = min(new_md, new_total)
+        new_llm = min(new_llm, new_total)
+
+        await self.upsert_company(
+            bvdid,
+            name=name,
+            root_url=root_url,
+            status=new_status if new_status in _KNOWN_COMPANY_STATUSES else None,
+            urls_total=new_total,
+            urls_markdown_done=new_md,
+            urls_llm_done=new_llm,
         )
         return await self.get_company_snapshot(bvdid, recompute=False)
 
@@ -940,7 +1248,7 @@ class CrawlState:
     ) -> CompanySnapshot:
         row = await self._query_one("SELECT * FROM companies WHERE bvdid=?", (bvdid,))
         if row is not None:
-            if (row["status"] or "") == COMPANY_STATUS_TERMINAL_DONE:
+            if _normalize_company_status(row["status"]) == COMPANY_STATUS_TERMINAL_DONE:
                 return _row_to_company_snapshot(row)
             if recompute:
                 return await self.recompute_company_from_index(bvdid)
@@ -962,18 +1270,23 @@ class CrawlState:
                 (bvdid, COMPANY_STATUS_PENDING, now, now),
             )
         )
-        row = await self._query_one("SELECT * FROM companies WHERE bvdid=?", (bvdid,))
-        return _row_to_company_snapshot(row)  # type: ignore[arg-type]
+        row2 = await self._query_one("SELECT * FROM companies WHERE bvdid=?", (bvdid,))
+        return _row_to_company_snapshot(row2)  # type: ignore[arg-type]
 
     async def recompute_global_state(self) -> Dict[str, Any]:
         """
-        Compute crawl_global_state.json from the DB only.
-        Robust to unknown/legacy statuses: they are preserved and counted under unknown_statuses.
+        Compute crawl_global_state.json from the DB only (for statuses), but URL sums are
+        derived from url_index.json whenever present (source of truth), otherwise DB fallback.
+
+        Also:
+          - Write the file next to the DB to avoid OUTPUT_ROOT drift.
+          - Sanitize latest_run totals (avoid showing 11/11 when DB contains 9 companies).
         """
-        path = _global_state_path()
 
         def _compute_and_write() -> Dict[str, Any]:
             with self._lock:
+                self._ensure_db_current_locked()
+
                 rows = self._conn.execute(
                     """
                     SELECT bvdid, status, urls_total, urls_markdown_done, urls_llm_done,
@@ -981,60 +1294,65 @@ class CrawlState:
                       FROM companies
                     """
                 ).fetchall()
+
                 run_row = self._conn.execute(
                     "SELECT * FROM runs ORDER BY started_at DESC LIMIT 1"
                 ).fetchone()
 
-            known_statuses = {
-                COMPANY_STATUS_PENDING,
-                COMPANY_STATUS_MD_NOT_DONE,
-                COMPANY_STATUS_MD_DONE,
-                COMPANY_STATUS_LLM_NOT_DONE,
-                COMPANY_STATUS_LLM_DONE,
-                COMPANY_STATUS_TERMINAL_DONE,
-            }
+                run_done_count: Optional[int] = None
+                if run_row is not None:
+                    try:
+                        rrid = run_row["run_id"]
+                        c = self._conn.execute(
+                            "SELECT COUNT(*) AS c FROM run_company_done WHERE run_id=?",
+                            (rrid,),
+                        ).fetchone()
+                        if c is not None:
+                            run_done_count = int(c["c"] or 0)
+                    except Exception:
+                        run_done_count = None
 
             total = len(rows)
-            by_status: Dict[str, int] = {k: 0 for k in known_statuses}
+            by_status: Dict[str, int] = {k: 0 for k in _KNOWN_COMPANY_STATUSES}
             unknown_statuses: Dict[str, int] = {}
 
             pending: List[str] = []
             in_progress: List[str] = []
             done: List[str] = []
             terminal_done: List[str] = []
-
             terminal_reasons: Dict[str, int] = {}
 
             urls_total_sum = 0
             urls_md_done_sum = 0
             urls_llm_done_sum = 0
 
+            # NOTE: do not hold DB lock while reading many json files.
+            # We compute sums outside lock and optionally "repair" counters inside lock per-company.
+            repair_updates: List[Tuple[int, int, int, str, str]] = []
+
             for r in rows:
                 raw_st = r["status"]
-                st = (
-                    str(raw_st).strip().lower() if raw_st is not None else ""
-                ) or COMPANY_STATUS_PENDING
+                st_norm = _normalize_company_status(raw_st)
                 b = str(r["bvdid"])
 
-                urls_total_sum += int(r["urls_total"] or 0)
-                urls_md_done_sum += int(r["urls_markdown_done"] or 0)
-                urls_llm_done_sum += int(r["urls_llm_done"] or 0)
-
-                if st in known_statuses:
-                    by_status[st] = by_status.get(st, 0) + 1
+                if st_norm in _KNOWN_COMPANY_STATUSES:
+                    by_status[st_norm] = by_status.get(st_norm, 0) + 1
+                    st_effective = st_norm
                 else:
-                    # Reflect DB "correctly": count what is actually stored
-                    unknown_statuses[st] = unknown_statuses.get(st, 0) + 1
-                    # For queue semantics, treat unknown as "in_progress" unless it looks done.
-                    # But we keep lists aligned with your known pipeline statuses.
-                    st = COMPANY_STATUS_PENDING
-                    by_status[st] = by_status.get(st, 0) + 1
+                    unknown_statuses[st_norm] = unknown_statuses.get(st_norm, 0) + 1
+                    by_status[COMPANY_STATUS_PENDING] = (
+                        by_status.get(COMPANY_STATUS_PENDING, 0) + 1
+                    )
+                    st_effective = COMPANY_STATUS_PENDING
 
-                if st == COMPANY_STATUS_PENDING:
+                if st_effective == COMPANY_STATUS_PENDING:
                     pending.append(b)
-                elif st in (COMPANY_STATUS_MD_NOT_DONE, COMPANY_STATUS_LLM_NOT_DONE):
+                elif st_effective in (
+                    COMPANY_STATUS_MD_NOT_DONE,
+                    COMPANY_STATUS_LLM_NOT_DONE,
+                ):
                     in_progress.append(b)
-                elif st == COMPANY_STATUS_TERMINAL_DONE:
+                elif st_effective == COMPANY_STATUS_TERMINAL_DONE:
                     done.append(b)
                     terminal_done.append(b)
                     dr = (r["done_reason"] or "unknown").strip()
@@ -1042,45 +1360,97 @@ class CrawlState:
                 else:
                     done.append(b)
 
+                # --- URL sums: prefer url_index.json when available ---
+                try:
+                    idx = load_url_index(b)
+                    if isinstance(idx, dict) and idx:
+                        _, t, md, llm = _compute_company_stage_from_index(idx)
+                        urls_total_sum += int(t)
+                        urls_md_done_sum += int(md)
+                        urls_llm_done_sum += int(llm)
+                        repair_updates.append(
+                            (int(t), int(md), int(llm), _now_iso(), b)
+                        )
+                    else:
+                        urls_total_sum += int(r["urls_total"] or 0)
+                        urls_md_done_sum += int(r["urls_markdown_done"] or 0)
+                        urls_llm_done_sum += int(r["urls_llm_done"] or 0)
+                except Exception:
+                    urls_total_sum += int(r["urls_total"] or 0)
+                    urls_md_done_sum += int(r["urls_markdown_done"] or 0)
+                    urls_llm_done_sum += int(r["urls_llm_done"] or 0)
+
+            # Opportunistic repair of DB counters (best-effort)
+            if repair_updates:
+                with self._lock:
+                    self._ensure_db_current_locked()
+                    for t, md, llm, nowiso, bvdid in repair_updates:
+                        with suppress(Exception):
+                            self._conn.execute(
+                                """
+                                UPDATE companies
+                                   SET urls_total=?,
+                                       urls_markdown_done=?,
+                                       urls_llm_done=?,
+                                       updated_at=?
+                                 WHERE bvdid=?
+                                """,
+                                (t, md, llm, nowiso, bvdid),
+                            )
+
             crawled = total - len(pending)
             completed = len(done)
             percentage_completed = (completed / total * 100.0) if total else 0.0
 
             latest_run: Optional[Dict[str, Any]] = None
             if run_row is not None:
+                run_total = int(run_row["total_companies"] or 0)
+                run_completed = int(run_row["completed_companies"] or 0)
+
+                # Prefer the idempotent truth if available
+                if run_done_count is not None and run_done_count > 0:
+                    run_completed = int(run_done_count)
+
+                # Keep it consistent with the DB state for display
+                if run_total <= 0 or run_total != total:
+                    run_total = total
+                run_completed = min(int(run_completed), int(run_total))
+
                 latest_run = {
                     "run_id": run_row["run_id"],
                     "pipeline": run_row["pipeline"],
                     "version": run_row["version"],
                     "started_at": run_row["started_at"],
-                    "total_companies": int(run_row["total_companies"] or 0),
-                    "completed_companies": int(run_row["completed_companies"] or 0),
+                    "total_companies": int(run_total),
+                    "completed_companies": int(run_completed),
                     "last_company_bvdid": run_row["last_company_bvdid"],
                     "last_updated": run_row["last_updated"],
                 }
 
             payload: Dict[str, Any] = {
                 "generated_at": _now_iso(),
-                "output_root": str(_output_root()),
+                # Bind to DB directory to prevent OUTPUT_ROOT drift.
+                "output_root": str(self.db_path.parent),
                 "db_path": str(self.db_path),
                 "total_companies": total,
                 "crawled_companies": crawled,
                 "completed_companies": completed,
                 "percentage_completed": percentage_completed,
                 "by_status": by_status,
-                "unknown_statuses": unknown_statuses,  # important for diagnosing legacy writes
+                "unknown_statuses": unknown_statuses,
                 "pending_companies": pending,
                 "in_progress_companies": in_progress,
                 "done_companies": done,
                 "terminal_done_companies": terminal_done,
                 "terminal_done_by_reason": terminal_reasons,
-                "urls_total_sum": urls_total_sum,
-                "urls_markdown_done_sum": urls_md_done_sum,
-                "urls_llm_done_sum": urls_llm_done_sum,
+                "urls_total_sum": int(urls_total_sum),
+                "urls_markdown_done_sum": int(urls_md_done_sum),
+                "urls_llm_done_sum": int(urls_llm_done_sum),
                 "latest_run": latest_run,
             }
 
-            _atomic_write_json(path, payload, cache=False, pretty=True)
+            out_path = self.db_path.parent / GLOBAL_STATE_NAME
+            _atomic_write_json(out_path, payload, cache=False, pretty=True)
             return payload
 
         return await asyncio.to_thread(_compute_and_write)
@@ -1109,7 +1479,9 @@ class CrawlState:
 
     @staticmethod
     def _should_skip_status_for_mode(status: str, llm_mode: str) -> bool:
-        st = (status or COMPANY_STATUS_PENDING).strip()
+        st = _normalize_company_status(status)
+        llm_mode = (llm_mode or "none").strip().lower()
+
         if llm_mode == "none":
             return st in (
                 COMPANY_STATUS_MD_DONE,
@@ -1132,14 +1504,12 @@ class CrawlState:
 
         - Uses DB status fast-path (chunked IN queries).
         - Optionally refreshes PENDING rows from url_index.json (refresh_pending=True).
-          Keep False for ongoing runs where DB already reflects state.
         - Preserves input order.
         """
         if not bvdids:
             return []
 
         llm_mode = (llm_mode or "none").strip().lower()
-
         chunk_size = max(50, int(chunk_size))
         concurrency = max(1, int(concurrency))
 
@@ -1159,7 +1529,9 @@ class CrawlState:
             sem = asyncio.Semaphore(concurrency)
 
             async def _refresh_one(cid: str) -> None:
-                st = status_map.get(cid, COMPANY_STATUS_PENDING)
+                st = _normalize_company_status(
+                    status_map.get(cid, COMPANY_STATUS_PENDING)
+                )
                 if st != COMPANY_STATUS_PENDING:
                     return
                 try:
@@ -1226,4 +1598,8 @@ __all__ = [
     "upsert_url_index_entry",
     "default_db_path",
     "DEFAULT_DB",
+    # url-index truth helpers
+    "URLStats",
+    "compute_url_stats_from_index_dict",
+    "compute_url_stats_for_company",
 ]

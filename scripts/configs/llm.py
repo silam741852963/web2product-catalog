@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Dict,
@@ -29,6 +29,15 @@ from pydantic import (
 )
 
 from crawl4ai import LLMConfig, LLMExtractionStrategy
+
+from configs.llm_industry import get_industry_profile, normalize_industry_code
+from configs.llm_industry.base import (
+    BASE_FULL_INSTRUCTION,
+    BASE_PRESENCE_INSTRUCTION,
+    compose_full_instruction,
+    compose_presence_instruction,
+    IndustryLLMProfile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +370,7 @@ def provider_strategy_from_llm_model_selector(
     base_url: Optional[str] = None,
 ) -> LLMProviderStrategy:
     """
-    Implements your repo convention:
+    Repo convention:
 
       - If llm_model contains "/": treat as remote provider/model (passed through to LiteLLM).
         Example: "google/gemini-1.5-flash" or "gemini/gemini-2.0-flash".
@@ -385,21 +394,11 @@ def provider_strategy_from_llm_model_selector(
 
 
 # --------------------------------------------------------------------------- #
-# Default instructions
+# Default instructions (DRY: sourced from configs/llm_industry/base.py)
 # --------------------------------------------------------------------------- #
 
-DEFAULT_PRESENCE_INSTRUCTION = (
-    "Classify if the page MAIN CONTENT includes any offerings (products/brands/product lines or services/solutions).\n"
-    "Ignore cookie/privacy banners, navigation/menus, and legal footers.\n"
-    'Return ONLY JSON: {"r":1} or {"r":0}.'
-)
-
-DEFAULT_FULL_INSTRUCTION = (
-    "Extract the company's offerings from the page MAIN CONTENT.\n"
-    "Ignore cookie/privacy banners, navigation/menus, and legal footers.\n"
-    "Do NOT invent offerings.\n"
-    "Return ONLY valid JSON matching the provided schema."
-)
+DEFAULT_PRESENCE_INSTRUCTION = BASE_PRESENCE_INSTRUCTION
+DEFAULT_FULL_INSTRUCTION = BASE_FULL_INSTRUCTION
 
 
 # --------------------------------------------------------------------------- #
@@ -518,6 +517,73 @@ class LLMExtractionFactory:
             extra_args=_extra,
             verbose=verbose,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Industry-aware strategy cache (build per-industry instructions DRY)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class IndustryStrategyCache:
+    """
+    Build + cache LLMExtractionStrategy per (mode, industry_code).
+
+    - Uses shared schema from llm.py
+    - Uses shared base instructions from configs/llm_industry/base.py
+    - Uses only industry addendums from configs/llm_industry/industry_XX_*.py
+    """
+
+    factory: LLMExtractionFactory
+    schema: Optional[Dict[str, Any]] = None
+    extraction_type: str = "schema"
+    input_format: Optional[str] = None
+    extra_args: Optional[Dict[str, Any]] = None
+    verbose: bool = False
+
+    _cache: Dict[Tuple[str, str], LLMExtractionStrategy] = field(default_factory=dict)
+
+    def get_profile(self, industry_code: object) -> IndustryLLMProfile:
+        return get_industry_profile(industry_code)
+
+    def get_strategy(
+        self, *, mode: str, industry_code: object
+    ) -> LLMExtractionStrategy:
+        m = (mode or "schema").strip().lower()
+        if m not in {"schema", "presence"}:
+            raise ValueError(f"mode must be 'schema' or 'presence', got {mode!r}")
+
+        code = normalize_industry_code(industry_code)
+        key = (m, code)
+
+        st = self._cache.get(key)
+        if st is not None:
+            return st
+
+        profile = self.get_profile(code)
+        if m == "presence":
+            instruction = compose_presence_instruction(profile)
+            st = self.factory.create(
+                mode="presence",
+                instruction=instruction,
+                input_format=self.input_format,
+                extra_args=self.extra_args,
+                verbose=self.verbose,
+            )
+        else:
+            instruction = compose_full_instruction(profile)
+            st = self.factory.create(
+                mode="schema",
+                schema=self.schema or ExtractionPayload.model_json_schema(),
+                instruction=instruction,
+                extraction_type=self.extraction_type,
+                input_format=self.input_format,
+                extra_args=self.extra_args,
+                verbose=self.verbose,
+            )
+
+        self._cache[key] = st
+        return st
 
 
 # --------------------------------------------------------------------------- #
@@ -1422,6 +1488,7 @@ __all__ = [
     "OllamaProviderStrategy",
     "RemoteAPIProviderStrategy",
     "LLMExtractionFactory",
+    "IndustryStrategyCache",
     "provider_strategy_from_llm_model_selector",
     "parse_extracted_payload",
     "parse_presence_result",
@@ -1429,4 +1496,8 @@ __all__ = [
     "default_ollama_provider_strategy",
     "DEFAULT_PRESENCE_INSTRUCTION",
     "DEFAULT_FULL_INSTRUCTION",
+    # re-export useful profile helpers
+    "IndustryLLMProfile",
+    "get_industry_profile",
+    "normalize_industry_code",
 ]
