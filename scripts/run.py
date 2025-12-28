@@ -911,7 +911,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--dataset-file", type=str, default=None)
 
-    p.add_argument("--company-concurrency", type=int, default=8)
+    p.add_argument("--company-concurrency", type=int, default=10)
     p.add_argument("--max-pages", type=int, default=100)
     p.add_argument("--page-timeout-ms", type=int, default=30000)
 
@@ -930,7 +930,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
 
     # crawl_runner knobs
-    p.add_argument("--page-result-concurrency", type=int, default=6)
+    p.add_argument("--page-result-concurrency", type=int, default=8)
     p.add_argument("--page-queue-maxsize", type=int, default=32)
     p.add_argument("--url-index-flush-every", type=int, default=18)
     p.add_argument("--url-index-flush-interval-sec", type=float, default=0.5)
