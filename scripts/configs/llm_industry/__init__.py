@@ -3,7 +3,7 @@ from .registry import get_industry_profile, normalize_industry_code
 import regex as re
 from typing import Any, Dict, Optional
 # ---------------------------------------------------------------------------
-# Industry normalization + label mapping (temporary: moved to configs later)
+# Industry normalization + label mapping
 # ---------------------------------------------------------------------------
 
 INDUSTRY_CODE_TO_LABEL: Dict[str, str] = {

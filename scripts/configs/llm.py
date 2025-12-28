@@ -191,6 +191,18 @@ def _is_gemini_like_provider(provider: Optional[str]) -> bool:
     return _provider_prefix(provider or "") in {"gemini", "google"}
 
 
+def _stable_json_sha1(obj: Any) -> str:
+    """
+    Stable hash for dict/list-like configs (schema, extra_args, etc.).
+    Keeps cache keys deterministic and avoids leaking secrets.
+    """
+    try:
+        s = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        s = _to_text(obj)
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
 # --------------------------------------------------------------------------- #
 # Pydantic schemas (SIMPLIFIED, higher recall)
 # --------------------------------------------------------------------------- #
@@ -520,18 +532,19 @@ class LLMExtractionFactory:
 
 
 # --------------------------------------------------------------------------- #
-# Industry-aware strategy cache (build per-industry instructions DRY)
+# Industry-aware strategy cache (cache key includes profile_id + model + schema)
 # --------------------------------------------------------------------------- #
 
 
 @dataclass
 class IndustryStrategyCache:
     """
-    Build + cache LLMExtractionStrategy per (mode, industry_code).
+    Build + cache LLMExtractionStrategy per industry profile and mode.
 
-    - Uses shared schema from llm.py
-    - Uses shared base instructions from configs/llm_industry/base.py
-    - Uses only industry addendums from configs/llm_industry/industry_XX_*.py
+    Key design goals:
+      - DRY: instructions come from configs/llm_industry/*
+      - Version-safe: cache key includes profile.profile_id
+      - Reproducible: cache key includes provider fingerprint and schema hash
     """
 
     factory: LLMExtractionFactory
@@ -541,10 +554,55 @@ class IndustryStrategyCache:
     extra_args: Optional[Dict[str, Any]] = None
     verbose: bool = False
 
-    _cache: Dict[Tuple[str, str], LLMExtractionStrategy] = field(default_factory=dict)
+    # key includes: (mode, profile_id, provider_fp, schema_hash, extraction_type, input_format, extra_args_hash, factory_fp, verbose)
+    _cache: Dict[
+        Tuple[str, str, str, str, str, str, str, str, bool], LLMExtractionStrategy
+    ] = field(default_factory=dict)
+
+    _provider_fp: Optional[str] = None
+    _factory_fp: Optional[str] = None
 
     def get_profile(self, industry_code: object) -> IndustryLLMProfile:
         return get_industry_profile(industry_code)
+
+    def _get_provider_fingerprint(self) -> str:
+        """
+        Fingerprint of model/provider settings WITHOUT secrets.
+        """
+        if self._provider_fp is not None:
+            return self._provider_fp
+
+        cfg = self.factory.provider_strategy.build_config()
+        provider = _clean_ws(_to_text(getattr(cfg, "provider", "")))
+        base_url = _clean_ws(_to_text(getattr(cfg, "base_url", "")))
+        # Avoid api_token entirely.
+        self._provider_fp = _stable_json_sha1(
+            {"provider": provider, "base_url": base_url}
+        )
+        return self._provider_fp
+
+    def _get_factory_fingerprint(self) -> str:
+        """
+        Fingerprint of factory knobs that materially affect strategy behavior.
+        """
+        if self._factory_fp is not None:
+            return self._factory_fp
+
+        f = self.factory
+        payload = {
+            "default_chunk_token_threshold": f.default_chunk_token_threshold,
+            "default_overlap_rate": f.default_overlap_rate,
+            "default_apply_chunking": f.default_apply_chunking,
+            "default_input_format": f.default_input_format,
+            "default_schema_temperature": f.default_schema_temperature,
+            "default_presence_temperature": f.default_presence_temperature,
+            "default_schema_max_tokens": f.default_schema_max_tokens,
+            "default_presence_max_tokens": f.default_presence_max_tokens,
+            # includes provider/base_url already (no token)
+            "provider_fp": self._get_provider_fingerprint(),
+        }
+        self._factory_fp = _stable_json_sha1(payload)
+        return self._factory_fp
 
     def get_strategy(
         self, *, mode: str, industry_code: object
@@ -554,19 +612,47 @@ class IndustryStrategyCache:
             raise ValueError(f"mode must be 'schema' or 'presence', got {mode!r}")
 
         code = normalize_industry_code(industry_code)
-        key = (m, code)
+        profile = self.get_profile(code)
+
+        used_input_format = (
+            (self.input_format or self.factory.default_input_format or "markdown")
+            .strip()
+            .lower()
+        )
+        used_extraction_type = (self.extraction_type or "schema").strip().lower()
+
+        if m == "presence":
+            used_schema = PresencePayload.model_json_schema()
+        else:
+            used_schema = self.schema or ExtractionPayload.model_json_schema()
+
+        schema_hash = _stable_json_sha1(used_schema)
+        extra_hash = _stable_json_sha1(self.extra_args or {})
+        provider_fp = self._get_provider_fingerprint()
+        factory_fp = self._get_factory_fingerprint()
+
+        key = (
+            m,
+            profile.profile_id,  # the *versioned* id is the source of truth
+            provider_fp,
+            schema_hash,
+            used_extraction_type,
+            used_input_format,
+            extra_hash,
+            factory_fp,
+            bool(self.verbose),
+        )
 
         st = self._cache.get(key)
         if st is not None:
             return st
 
-        profile = self.get_profile(code)
         if m == "presence":
             instruction = compose_presence_instruction(profile)
             st = self.factory.create(
                 mode="presence",
                 instruction=instruction,
-                input_format=self.input_format,
+                input_format=used_input_format,
                 extra_args=self.extra_args,
                 verbose=self.verbose,
             )
@@ -574,10 +660,10 @@ class IndustryStrategyCache:
             instruction = compose_full_instruction(profile)
             st = self.factory.create(
                 mode="schema",
-                schema=self.schema or ExtractionPayload.model_json_schema(),
+                schema=used_schema,
                 instruction=instruction,
-                extraction_type=self.extraction_type,
-                input_format=self.input_format,
+                extraction_type=used_extraction_type,
+                input_format=used_input_format,
                 extra_args=self.extra_args,
                 verbose=self.verbose,
             )

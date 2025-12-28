@@ -63,6 +63,89 @@ def _save_raw_stage(company_id: str, url: str, raw: Any, stage: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Metadata helpers (industry/profile + LLM provider/model)
+# ---------------------------------------------------------------------------
+
+
+def _industry_meta(company: Any) -> Dict[str, Any]:
+    """
+    Ensure every URL index entry knows which industry profile produced it.
+
+    Expected fields on company (from run.py integration):
+      - company.industry_code
+      - company.industry_profile_id
+      - company.industry_codes (optional, multi-code canonical "9|10|20")
+      - company.industry_label (optional)
+    """
+    out: Dict[str, Any] = {}
+
+    code = getattr(company, "industry_code", None)
+    prof = getattr(company, "industry_profile_id", None)
+
+    if code is not None:
+        out["industry_code"] = code
+    if prof is not None:
+        out["industry_profile_id"] = prof
+
+    # Optional but useful for analytics/debugging
+    codes = getattr(company, "industry_codes", None)
+    label = getattr(company, "industry_label", None)
+    if codes is not None:
+        out["industry_codes"] = codes
+    if label is not None:
+        out["industry_label"] = label
+
+    return out
+
+
+def _strategy_meta(strategy: Any, *, llm_mode: str) -> Dict[str, Any]:
+    """
+    Best-effort: capture model/provider + mode (presence/schema).
+    Safe across Crawl4AI/LiteLLM variations.
+    """
+    out: Dict[str, Any] = {"llm_mode": llm_mode}
+
+    llm_cfg = getattr(strategy, "llm_config", None)
+    provider = None
+    model = None
+
+    if llm_cfg is not None:
+        provider = getattr(llm_cfg, "provider", None)
+        # some configs expose model separately; most encode it in provider
+        model = getattr(llm_cfg, "model", None)
+
+    if provider is None:
+        provider = getattr(strategy, "provider", None) or getattr(
+            strategy, "model", None
+        )
+
+    if provider is not None:
+        out["llm_provider"] = str(provider)
+
+    if model is not None:
+        out["llm_model"] = str(model)
+
+    # Also helpful if you later rotate profiles/instructions
+    instr = getattr(strategy, "instruction", None)
+    if isinstance(instr, str) and instr:
+        # store hash only (keep url_index.json compact)
+        import hashlib
+
+        out["llm_instruction_sha1"] = hashlib.sha1(
+            instr.encode("utf-8", errors="ignore")
+        ).hexdigest()
+
+    return out
+
+
+def _patch_base(company: Any, strategy: Any, *, llm_mode: str) -> Dict[str, Any]:
+    p: Dict[str, Any] = {}
+    p.update(_industry_meta(company))
+    p.update(_strategy_meta(strategy, llm_mode=llm_mode))
+    return p
+
+
+# ---------------------------------------------------------------------------
 # Presence pass
 # ---------------------------------------------------------------------------
 
@@ -71,6 +154,8 @@ async def run_presence_pass_for_company(
     company: Any, *, presence_strategy: Any
 ) -> None:
     state = get_crawl_state()
+
+    base = _patch_base(company, presence_strategy, llm_mode="presence")
 
     # ---- SAFETY SWEEP (before pending_urls) ----
     index = load_url_index(company.company_id) or {}
@@ -84,17 +169,17 @@ async def run_presence_pass_for_company(
             continue
         if ent.get("markdown_path"):
             continue
-        upsert_url_index_entry(
-            company.company_id,
-            url,
-            {
-                "presence": 0,
-                "presence_checked": True,
-                "status": ent.get("status") or "llm_presence_skipped_no_markdown",
-                "llm_presence_reason": "no_markdown_path",
-            },
-        )
+
+        patch = {
+            **base,
+            "presence": 0,
+            "presence_checked": True,
+            "status": ent.get("status") or "llm_presence_skipped_no_markdown",
+            "llm_presence_reason": "no_markdown_path",
+        }
+        upsert_url_index_entry(company.company_id, url, patch)
         swept += 1
+
     if swept:
         logger.info(
             "LLM presence: swept %d no-markdown URLs (company_id=%s)",
@@ -108,7 +193,9 @@ async def run_presence_pass_for_company(
             "LLM presence: no pending URLs for company_id=%s", company.company_id
         )
         await state.recompute_company_from_index(
-            company.company_id, name=None, root_url=company.domain_url
+            company.company_id,
+            name=getattr(company, "name", None),
+            root_url=company.domain_url,
         )
         return
 
@@ -123,6 +210,7 @@ async def run_presence_pass_for_company(
     def _update(url: str, patch: Dict[str, Any], reason: str) -> None:
         nonlocal updated
         patch_full = {
+            **base,
             "presence": 0,
             "presence_checked": True,
             "status": "llm_presence_empty",
@@ -173,10 +261,14 @@ async def run_presence_pass_for_company(
                 elapsed_ms,
                 e,
             )
-            await state.mark_url_failed(
-                company.company_id, url, f"presence_error:{type(e).__name__}"
-            )
-            _update(url, {}, "presence_exception")
+            # if your CrawlState supports it
+            try:
+                await state.mark_url_failed(
+                    company.company_id, url, f"presence_error:{type(e).__name__}"
+                )
+            except Exception:
+                pass
+            _update(url, {"status": "llm_presence_exception"}, "presence_exception")
             continue
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -197,9 +289,11 @@ async def run_presence_pass_for_company(
             )
 
         patch: Dict[str, Any] = {
+            **base,
             "presence": 1 if has_offering else 0,
             "presence_checked": True,
             "status": "llm_presence_yes" if has_offering else "llm_presence_no",
+            "llm_presence_elapsed_ms": round(elapsed_ms, 1),
         }
         if confidence is not None:
             patch["llm_presence_confidence"] = confidence
@@ -213,7 +307,9 @@ async def run_presence_pass_for_company(
         "LLM presence: updated %d URLs for company_id=%s", updated, company.company_id
     )
     await state.recompute_company_from_index(
-        company.company_id, name=None, root_url=company.domain_url
+        company.company_id,
+        name=getattr(company, "name", None),
+        root_url=company.domain_url,
     )
 
 
@@ -224,6 +320,8 @@ async def run_presence_pass_for_company(
 
 async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None:
     state = get_crawl_state()
+
+    base = _patch_base(company, full_strategy, llm_mode="schema")
 
     # ---- SAFETY SWEEP (before pending_urls) ----
     index0 = load_url_index(company.company_id)
@@ -236,17 +334,16 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
             continue
         if ent.get("markdown_path"):
             continue
-        upsert_url_index_entry(
-            company.company_id,
-            url,
-            {
-                "extracted": 1,
-                "presence": 0,
-                "presence_checked": True,
-                "status": ent.get("status") or "llm_full_skipped_no_markdown",
-                "llm_full_reason": "no_markdown_path",
-            },
-        )
+
+        patch = {
+            **base,
+            "extracted": 1,
+            "presence": 0,
+            "presence_checked": True,
+            "status": ent.get("status") or "llm_full_skipped_no_markdown",
+            "llm_full_reason": "no_markdown_path",
+        }
+        upsert_url_index_entry(company.company_id, url, patch)
         swept += 1
 
     if swept:
@@ -260,7 +357,9 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
     if not pending_urls:
         logger.info("LLM full: no pending URLs for company_id=%s", company.company_id)
         await state.recompute_company_from_index(
-            company.company_id, name=None, root_url=company.domain_url
+            company.company_id,
+            name=getattr(company, "name", None),
+            root_url=company.domain_url,
         )
         return
 
@@ -279,17 +378,15 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
 
         # If presence pass already said "no offerings", mark extracted=1 immediately.
         if ent.get("presence_checked") is True and int(ent.get("presence") or 0) == 0:
-            upsert_url_index_entry(
-                company.company_id,
-                url,
-                {
-                    "extracted": 1,
-                    "presence": 0,
-                    "presence_checked": True,
-                    "status": ent.get("status") or "llm_full_skipped_presence_no",
-                    "llm_full_reason": "presence_no",
-                },
-            )
+            patch = {
+                **base,
+                "extracted": 1,
+                "presence": 0,
+                "presence_checked": True,
+                "status": ent.get("status") or "llm_full_skipped_presence_no",
+                "llm_full_reason": "presence_no",
+            }
+            upsert_url_index_entry(company.company_id, url, patch)
             updated += 1
             continue
 
@@ -297,7 +394,8 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
 
         # URLs can be markdown-complete but have no markdown_path.
         if not md_path:
-            patch: Dict[str, Any] = {
+            patch = {
+                **base,
                 "extracted": 1,
                 "presence": int(ent.get("presence") or 0),
                 "presence_checked": bool(ent.get("presence_checked") is True),
@@ -320,7 +418,12 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
             upsert_url_index_entry(
                 company.company_id,
                 url,
-                {"extracted": 0, "status": "llm_full_markdown_read_error"},
+                {
+                    **base,
+                    "extracted": 0,
+                    "status": "llm_full_markdown_read_error",
+                    "llm_full_reason": "markdown_read_error",
+                },
             )
             continue
 
@@ -329,10 +432,12 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
                 company.company_id,
                 url,
                 {
+                    **base,
                     "extracted": 1,
                     "presence": 0,
                     "presence_checked": True,
                     "status": "llm_full_empty_markdown",
+                    "llm_full_reason": "empty_markdown",
                 },
             )
             updated += 1
@@ -357,7 +462,13 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
             upsert_url_index_entry(
                 company.company_id,
                 url,
-                {"extracted": 0, "status": f"llm_full_error:{type(e).__name__}"},
+                {
+                    **base,
+                    "extracted": 0,
+                    "status": f"llm_full_error:{type(e).__name__}",
+                    "llm_full_reason": "extract_exception",
+                    "llm_full_elapsed_ms": round(elapsed_ms, 1),
+                },
             )
             continue
 
@@ -377,7 +488,13 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
             upsert_url_index_entry(
                 company.company_id,
                 url,
-                {"extracted": 0, "status": "llm_full_parse_error"},
+                {
+                    **base,
+                    "extracted": 0,
+                    "status": "llm_full_parse_error",
+                    "llm_full_reason": "parse_error",
+                    "llm_full_elapsed_ms": round(elapsed_ms, 1),
+                },
             )
             continue
 
@@ -389,12 +506,19 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
                 len(payload.offerings),
             )
 
+        # Embed context into saved product JSON
+        payload_dict_with_meta = dict(payload_dict)
+        payload_dict_with_meta.setdefault("company_id", company.company_id)
+        payload_dict_with_meta.setdefault("source_url", url)
+        payload_dict_with_meta.update(_industry_meta(company))
+        payload_dict_with_meta.update(_strategy_meta(full_strategy, llm_mode="schema"))
+
         product_path = None
         try:
             product_path = save_stage_output(
                 bvdid=company.company_id,
                 url=url,
-                data=json.dumps(payload_dict, ensure_ascii=False),
+                data=json.dumps(payload_dict_with_meta, ensure_ascii=False),
                 stage="product",
             )
         except Exception as e:
@@ -407,16 +531,24 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
             upsert_url_index_entry(
                 company.company_id,
                 url,
-                {"extracted": 0, "status": "llm_full_write_error"},
+                {
+                    **base,
+                    "extracted": 0,
+                    "status": "llm_full_write_error",
+                    "llm_full_reason": "write_error",
+                    "llm_full_elapsed_ms": round(elapsed_ms, 1),
+                },
             )
             continue
 
         presence_flag = 1 if payload.offerings else 0
         patch2: Dict[str, Any] = {
+            **base,
             "extracted": 1,
             "presence": presence_flag,
             "presence_checked": True,
             "status": "llm_full_extracted",
+            "llm_full_elapsed_ms": round(elapsed_ms, 1),
         }
         if product_path is not None:
             patch2["product_path"] = str(product_path)
@@ -428,5 +560,7 @@ async def run_full_pass_for_company(company: Any, *, full_strategy: Any) -> None
         "LLM full: updated %d URLs (company_id=%s)", updated, company.company_id
     )
     await state.recompute_company_from_index(
-        company.company_id, name=None, root_url=company.domain_url
+        company.company_id,
+        name=getattr(company, "name", None),
+        root_url=company.domain_url,
     )

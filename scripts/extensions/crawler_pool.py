@@ -8,7 +8,7 @@ from typing import Any, List
 
 from crawl4ai import AsyncWebCrawler
 
-from .retry_policy import (
+from .retry import (
     CriticalMemoryPressure,
     CrawlerFatalError,
     is_playwright_driver_disconnect,

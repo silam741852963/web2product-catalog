@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import gc
-import json
 import logging
+import os
 import signal
 import time
 from dataclasses import dataclass, field
@@ -29,7 +28,6 @@ from configs.js_injection import (
     PageInteractionPolicy,
     default_page_interaction_factory,
 )
-from configs.md import default_md_factory
 from configs.language import default_language_factory
 from configs.llm import (
     DEFAULT_FULL_INSTRUCTION,
@@ -38,6 +36,8 @@ from configs.llm import (
     LLMExtractionFactory,
     provider_strategy_from_llm_model_selector,
 )
+from configs.llm_industry import get_industry_profile
+from configs.md import default_md_factory
 
 # Extensions
 from extensions.load_source import CompanyInput, load_companies_from_source
@@ -46,7 +46,6 @@ from extensions import md_gating
 from extensions import output_paths
 from extensions.output_paths import ensure_company_dirs
 from extensions.resource_monitor import ResourceMonitor, ResourceMonitorConfig
-from extensions.retry_state import RetryStateStore
 from extensions.adaptive_scheduling import (
     AdaptiveScheduler,
     AdaptiveSchedulingConfig,
@@ -55,13 +54,13 @@ from extensions.adaptive_scheduling import (
 from extensions.connectivity_guard import ConnectivityGuard
 from extensions.crawl_state import (
     get_crawl_state,
+    normalize_company_industry_fields,
     COMPANY_STATUS_PENDING,
     COMPANY_STATUS_MD_NOT_DONE,
     COMPANY_STATUS_MD_DONE,
     COMPANY_STATUS_LLM_DONE,
     COMPANY_STATUS_TERMINAL_DONE,
 )
-
 from extensions.filtering import (
     FirstTimeURLFilter,
     HTMLContentFilter,
@@ -78,25 +77,20 @@ from extensions.llm_passes import (
     run_presence_pass_for_company,
     run_full_pass_for_company,
 )
-
 from extensions.crawler_pool import CrawlerPool
-from extensions.crawl_runner import CrawlRunnerConfig, run_company_crawl
-from extensions.retry_policy import (
-    RetryEvent,
-    classify_failure,
-    CriticalMemoryPressure,
-    CrawlerTimeoutError,
-    should_fail_fast_on_goto,
+from extensions.crawl_runner import (
+    CrawlRunnerConfig,
+    run_company_crawl,
 )
 from extensions.terminalization import decide_from_page_summary
 from extensions.oom_guard import OOMGuard, OOMGuardConfig
-
+from extensions import retry as retry_mod
 
 logger = logging.getLogger("deep_crawl_runner")
 
 RETRY_EXIT_CODE = 17
 _forced_exit_code: Optional[int] = None
-_retry_store_instance: Optional[RetryStateStore] = None
+_retry_store_instance: Optional[retry_mod.RetryStateStore] = None
 
 _HTTP_LANG_MAP: Dict[str, str] = {
     "en": "en-US",
@@ -105,18 +99,62 @@ _HTTP_LANG_MAP: Dict[str, str] = {
     "fr": "fr-FR",
 }
 
-_UNCLASSIFIED_INDUSTRY_LABEL = "unclassified"
+_TRACEBACK_ON_ATTEMPT_FAIL = os.getenv("RUN_TRACEBACK", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+} or os.getenv("RETRY_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _normalize_industry_code(x: Any) -> Optional[str]:
-    if x is None:
-        return None
-    s = str(x).strip()
-    return s if s else None
+def _short_exc(e: BaseException, limit: int = 900) -> str:
+    msg = f"{type(e).__name__}: {e}"
+    msg = " ".join((msg or "").split())
+    if len(msg) > limit:
+        return msg[: limit - 1] + "…"
+    return msg
 
 
-def _industry_label(code: Optional[str]) -> str:
-    return code or _UNCLASSIFIED_INDUSTRY_LABEL
+def _log_attempt_failure(
+    clog: logging.Logger,
+    *,
+    prefix: str,
+    attempt_index: int,
+    stage: str,
+    event: Optional[retry_mod.RetryEvent],
+    exc: BaseException,
+) -> None:
+    cls = getattr(event, "cls", None)
+    sk = getattr(event, "stall_kind", None)
+    sc = getattr(event, "status_code", None)
+    nx = getattr(event, "nxdomain_like", None)
+
+    if _TRACEBACK_ON_ATTEMPT_FAIL:
+        clog.exception(
+            "%s attempt=%d stage=%s cls=%s stall=%s status=%s nx=%s err=%s",
+            prefix,
+            attempt_index,
+            stage,
+            cls,
+            sk,
+            sc,
+            nx,
+            _short_exc(exc),
+        )
+        return
+
+    clog.error(
+        "%s attempt=%d stage=%s cls=%s stall=%s status=%s nx=%s err=%s",
+        prefix,
+        attempt_index,
+        stage,
+        cls,
+        sk,
+        sc,
+        nx,
+        _short_exc(exc),
+        exc_info=False,
+    )
 
 
 def _set_output_root(out_dir: str | Path) -> Path:
@@ -135,47 +173,36 @@ class Company:
     company_id: str
     domain_url: str
     name: Optional[str] = None
+
     industry_code: Optional[str] = None
-    industry_label: str = _UNCLASSIFIED_INDUSTRY_LABEL
+    industry_label: Optional[str] = None
+    industry_codes: Optional[str] = None
+    industry_profile_id: Optional[str] = None
+
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 def _company_from_input(ci: CompanyInput) -> Company:
     md = dict(ci.metadata or {})
-    raw_primary = md.get("industry_primary")
-    raw_industry = md.get("industry")
-    raw_code = md.get("industry_code") or md.get("industryCode")
-
-    code = _normalize_industry_code(
-        raw_primary if raw_primary is not None else raw_industry
+    industry_code, industry_label, industry_codes = normalize_company_industry_fields(
+        md.get("industry")
     )
-    if code is None:
-        code = _normalize_industry_code(raw_code)
+    prof = get_industry_profile(industry_code)
 
     return Company(
         company_id=str(ci.bvdid),
         domain_url=str(ci.url),
         name=(str(getattr(ci, "name", "")).strip() or None),
-        industry_code=code,
-        industry_label=_industry_label(code),
+        industry_code=industry_code,
+        industry_label=industry_label,
+        industry_codes=industry_codes,
+        industry_profile_id=getattr(prof, "profile_id", None),
         metadata=md,
     )
 
 
 def _companies_from_source(path: Path) -> List[Company]:
     return [_company_from_input(ci) for ci in load_companies_from_source(path)]
-
-
-def _read_in_progress_companies(out_dir: Path) -> List[str]:
-    p = out_dir / "crawl_global_state.json"
-    if not p.exists():
-        return []
-    data = json.loads(p.read_text(encoding="utf-8"))
-    return [
-        str(x).strip()
-        for x in (data.get("in_progress_companies") or [])
-        if str(x).strip()
-    ]
 
 
 def _build_filter_chain(
@@ -203,7 +230,6 @@ def _build_filter_chain(
 
 
 def _should_skip_company(status: str, llm_mode: str) -> bool:
-    # "skip" here means company is already in a terminal-enough state for this run mode.
     if llm_mode == "none":
         return status in (
             COMPANY_STATUS_MD_DONE,
@@ -215,11 +241,7 @@ def _should_skip_company(status: str, llm_mode: str) -> bool:
 
 def _crawl_meta_path(company_id: str) -> Path:
     dirs = ensure_company_dirs(company_id)
-    meta_dir = (
-        dirs.get("metadata")
-        or dirs.get("checkpoints")
-        or (_global_path(company_id) / "metadata")
-    )
+    meta_dir = dirs["metadata"] if "metadata" in dirs else dirs["checkpoints"]
     Path(meta_dir).mkdir(parents=True, exist_ok=True)
     return Path(meta_dir) / "crawl_meta.json"
 
@@ -231,163 +253,21 @@ def _write_crawl_meta(company: Company, snapshot: Any) -> None:
         "name": company.name,
         "industry_code": company.industry_code,
         "industry_label": company.industry_label,
+        "industry_codes": company.industry_codes,
         "root_url": company.domain_url,
-        "status": getattr(snapshot, "status", None),
-        "urls_total": getattr(snapshot, "urls_total", None),
-        "urls_markdown_done": getattr(snapshot, "urls_markdown_done", None),
-        "urls_llm_done": getattr(snapshot, "urls_llm_done", None),
-        "last_error": getattr(snapshot, "last_error", None),
+        "status": snapshot.status,
+        "urls_total": snapshot.urls_total,
+        "urls_markdown_done": snapshot.urls_markdown_done,
+        "urls_llm_done": snapshot.urls_llm_done,
+        "last_error": snapshot.last_error,
         "last_crawled_at": datetime.now(timezone.utc).isoformat(),
     }
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(
+        __import__("json").dumps(payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
     tmp.replace(path)
-
-
-def _scheduler_progress(scheduler: AdaptiveScheduler, cid: str, *, kind: str) -> None:
-    """
-    Best-effort progress signal wiring (works across small API drifts).
-    """
-    fn = getattr(scheduler, "progress_company", None)
-    if callable(fn):
-        try:
-            fn(cid)
-            return
-        except Exception:
-            pass
-
-    fn2 = getattr(scheduler, "touch_company", None)
-    if callable(fn2):
-        try:
-            fn2(cid, kind=kind)
-            return
-        except Exception:
-            pass
-
-
-def _scheduler_pending_total(scheduler: AdaptiveScheduler) -> int:
-    fn = getattr(scheduler, "pending_total", None)
-    if callable(fn):
-        try:
-            return int(fn() or 0)
-        except Exception:
-            return 0
-    try:
-        return 1 if bool(scheduler.has_pending()) else 0
-    except Exception:
-        return 0
-
-
-def _retry_pending_total(retry_store: RetryStateStore) -> int:
-    fn = getattr(retry_store, "pending_total", None)
-    if callable(fn):
-        try:
-            return int(fn(exclude_quarantined=True) or 0)
-        except TypeError:
-            try:
-                return int(fn() or 0)
-            except Exception:
-                return 0
-        except Exception:
-            return 0
-    return 0
-
-
-async def _db_in_progress(state: Any) -> bool:
-    """
-    Authoritative DB-backed check, relying on CrawlState.has_in_progress_companies().
-    """
-    fn = getattr(state, "has_in_progress_companies", None)
-    if not callable(fn):
-        return True
-    try:
-        v = fn(include_pending=True)
-        if asyncio.iscoroutine(v):
-            v = await v
-        return bool(v)
-    except TypeError:
-        try:
-            v2 = fn()
-            if asyncio.iscoroutine(v2):
-                v2 = await v2
-            return bool(v2)
-        except Exception:
-            return True
-    except Exception:
-        return True
-
-
-def _retry_has_pending_for_company_best_effort(
-    retry_store: RetryStateStore, cid: str
-) -> Optional[bool]:
-    for name in ("has_pending", "company_has_pending", "is_pending"):
-        fn = getattr(retry_store, name, None)
-        if callable(fn):
-            try:
-                return bool(fn(cid))
-            except Exception:
-                pass
-    for name in ("pending_ids", "get_pending_ids"):
-        fn = getattr(retry_store, name, None)
-        if callable(fn):
-            try:
-                ids = fn()
-                return cid in set(ids or [])
-            except Exception:
-                pass
-    return None
-
-
-def _best_effort_next_eligible_delay_sec(
-    retry_store: RetryStateStore, cid: str, *, default_delay_sec: float = 5.0
-) -> float:
-    """
-    If RetryStateStore exposes next eligible timestamp, return max(0, ts-now),
-    else default_delay_sec.
-    """
-    now = time.time()
-    for fn_name in ("next_eligible_at", "get_next_eligible_at", "next_eligible_ts"):
-        fn = getattr(retry_store, fn_name, None)
-        if callable(fn):
-            try:
-                ts = fn(cid)
-                if ts is None:
-                    break
-                ts_f = float(ts)
-                return max(0.0, ts_f - now)
-            except Exception:
-                break
-    return float(default_delay_sec)
-
-
-async def _best_effort_requeue_company(
-    scheduler: AdaptiveScheduler,
-    cid: str,
-    *,
-    delay_sec: float,
-    reason: str,
-) -> None:
-    """
-    Uses the new scheduler requeue API if present.
-    """
-    fn = getattr(scheduler, "requeue_company", None)
-    if callable(fn):
-        try:
-            v = fn(cid, delay_sec=delay_sec, reason=reason)
-            if asyncio.iscoroutine(v):
-                await v
-            return
-        except TypeError:
-            # signature drift fallback
-            try:
-                v2 = fn(cid)
-                if asyncio.iscoroutine(v2):
-                    await v2
-                return
-            except Exception:
-                return
-        except Exception:
-            return
 
 
 async def run_company_pipeline(
@@ -410,73 +290,117 @@ async def run_company_pipeline(
     crawler_base_cfg: Any,
     page_policy: PageInteractionPolicy,
     page_interaction_factory: PageInteractionFactory,
-    retry_store: RetryStateStore,
+    retry_store: retry_mod.RetryStateStore,
     scheduler: AdaptiveScheduler,
-    cancel_reason_by_cid: Optional[MutableMapping[str, str]] = None,
+    stop_event: asyncio.Event,
 ) -> bool:
     token = logging_ext.set_company_context(company.company_id)
     clog = logging_ext.get_company_logger(company.company_id)
 
-    # Throttled progress signal (avoid super-spam)
-    progress_throttle_sec = float(getattr(args, "company_progress_throttle_sec", 12.0))
+    progress_throttle_sec = float(args.company_progress_throttle_sec)
     last_progress_mono = 0.0
 
     def signal_progress(kind: str = "progress") -> None:
         nonlocal last_progress_mono
         now = time.monotonic()
-        if (now - last_progress_mono) < progress_throttle_sec and kind == "progress":
+        if kind == "progress" and (now - last_progress_mono) < progress_throttle_sec:
             return
         last_progress_mono = now
-        _scheduler_progress(scheduler, company.company_id, kind=kind)
+        scheduler.touch_company(company.company_id, kind=kind)
 
     async def _get_md_done(*, recompute: bool) -> int:
-        try:
-            snapx = await state.get_company_snapshot(
-                company.company_id, recompute=recompute
-            )
-            return int(getattr(snapx, "urls_markdown_done", 0) or 0)
-        except Exception:
-            return 0
+        snapx = await state.get_company_snapshot(
+            company.company_id, recompute=recompute
+        )
+        return int(snapx.urls_markdown_done or 0)
 
     async def _persist_last_error(err: str) -> None:
-        with contextlib.suppress(Exception):
-            await state.upsert_company(
-                company.company_id,
-                last_error=(err or "")[:4000],
-                name=company.name,
-                root_url=company.domain_url,
-            )
+        await state.upsert_company(
+            company.company_id,
+            last_error=(err or "")[:4000],
+            name=company.name,
+            root_url=company.domain_url,
+        )
 
-    completed_ok = False
+    outcome = retry_mod.AttemptOutcome(
+        ok=False,
+        stage="init",
+        event=None,
+        md_done=None,
+        terminalized=False,
+        terminal_reason=None,
+        terminal_last_error=None,
+        should_mark_success=False,
+    )
+
     watchdog_task: Optional[asyncio.Task] = None
 
     try:
-        snap = await state.get_company_snapshot(company.company_id)
-        status = snap.status or COMPANY_STATUS_PENDING
-        urls_md_done0 = int(getattr(snap, "urls_markdown_done", 0) or 0)
+        # Persist industry + basics at start (DB + crawl_meta.json via CrawlState)
+        if (
+            company.industry_code is None
+            and company.industry_label is None
+            and company.industry_codes is None
+        ):
+            industry_code, industry_label, industry_codes = (
+                normalize_company_industry_fields(
+                    company.metadata.get("industry")
+                    if isinstance(company.metadata, dict)
+                    else None
+                )
+            )
+            company.industry_code = industry_code
+            company.industry_label = industry_label
+            company.industry_codes = industry_codes
 
-        finalize_in_progress_md = bool(getattr(args, "finalize_in_progress_md", False))
+        if not company.industry_profile_id:
+            prof = get_industry_profile(company.industry_code)
+            company.industry_profile_id = getattr(prof, "profile_id", None)
+
+        await state.upsert_company(
+            company.company_id,
+            name=company.name,
+            root_url=company.domain_url,
+            industry_code=company.industry_code,
+            industry_label=company.industry_label,
+            industry_codes=company.industry_codes,
+            write_meta=True,
+        )
+
+        snap = await state.get_company_snapshot(company.company_id, recompute=False)
+        status = snap.status or COMPANY_STATUS_PENDING
+        urls_md_done0 = int(snap.urls_markdown_done or 0)
+
+        finalize_in_progress_md = bool(args.finalize_in_progress_md)
         will_llm = (
-            not finalize_in_progress_md
-            and args.llm_mode in ("presence", "full")
-            and industry_llm_cache is not None
+            (not finalize_in_progress_md)
+            and (args.llm_mode in ("presence", "full"))
+            and (industry_llm_cache is not None)
         )
 
         do_crawl = status in (COMPANY_STATUS_PENDING, COMPANY_STATUS_MD_NOT_DONE)
-        if not do_crawl and not will_llm:
-            completed_ok = True
+
+        if (not do_crawl) and (not will_llm):
+            outcome.ok = True
+            outcome.stage = "skip_already_done"
+            outcome.should_mark_success = True
+            retry_mod.record_attempt(
+                retry_store, company.company_id, outcome, flush=True
+            )
             return True
 
-        # Better counters: attempt is attempt_no; progress is done/total_unique
         done_now = int(done_counter.get("done", 0))
         clog.info(
-            "=== [done=%d/%d attempt=%d] company_id=%s url=%s industry=%s status=%s llm=%s ===",
+            "=== [done=%d/%d attempt=%d] company_id=%s url=%s industry=%s (code=%s codes=%s profile=%s) status=%s llm=%s ===",
             done_now,
             total_unique,
             attempt_no,
             company.company_id,
             company.domain_url,
             company.industry_label,
+            company.industry_code,
+            company.industry_codes,
+            company.industry_profile_id,
             status,
             args.llm_mode,
         )
@@ -509,10 +433,6 @@ async def run_company_pipeline(
                     resume_roots = pending_md
                     direct_fetch_urls = args.resume_md_mode == "direct"
 
-            lease_timeout = float(args.crawler_lease_timeout_sec)
-            company_crawl_timeout_sec = float(args.company_crawl_timeout_sec)
-            hard_max_pages = int(args.max_pages) if args.max_pages else None
-
             runner_cfg = CrawlRunnerConfig(
                 page_result_concurrency=int(args.page_result_concurrency),
                 page_queue_maxsize=int(args.page_queue_maxsize),
@@ -525,107 +445,85 @@ async def run_company_pipeline(
                 direct_fetch_total_timeout_sec=float(args.direct_fetch_url_timeout_sec),
                 processor_finish_timeout_sec=float(args.processor_finish_timeout_sec),
                 generator_close_timeout_sec=float(args.generator_close_timeout_sec),
-                hard_max_pages=hard_max_pages,
+                hard_max_pages=int(args.max_pages) if args.max_pages else None,
                 page_timeout_ms=int(args.page_timeout_ms)
                 if args.page_timeout_ms
                 else None,
                 direct_fetch_urls=bool(direct_fetch_urls),
             )
 
-            # Watchdog: emit *heartbeat* while crawl is alive.
-            # Heartbeat should NOT reset inactivity/progress timers; only real crawl events should.
-            heartbeat_sec = float(getattr(args, "company_progress_heartbeat_sec", 30.0))
+            heartbeat_sec = float(args.company_progress_heartbeat_sec)
 
             async def _watchdog() -> None:
-                try:
-                    while True:
-                        await asyncio.sleep(heartbeat_sec)
-                        signal_progress("heartbeat")
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    return
+                while True:
+                    await asyncio.sleep(heartbeat_sec)
+                    signal_progress("heartbeat")
 
             watchdog_task = asyncio.create_task(
                 _watchdog(), name=f"watchdog:{company.company_id}"
             )
 
             last_exc: Optional[BaseException] = None
-            last_event: Optional[RetryEvent] = None
+            last_event: Optional[retry_mod.RetryEvent] = None
+            last_page_dec: Optional[Any] = None
 
-            terminalize = False
-            terminal_reason = ""
-            terminal_last_error: Optional[str] = None
-
-            for attempt in range(2):
+            for attempt_index in range(2):
                 try:
-                    lease_task = asyncio.create_task(
-                        crawler_pool.lease(), name=f"lease:{company.company_id}"
+                    lease = await asyncio.wait_for(
+                        crawler_pool.lease(),
+                        timeout=float(args.crawler_lease_timeout_sec),
                     )
-                    lease = await asyncio.wait_for(lease_task, timeout=lease_timeout)
 
                     async with lease as crawler:
 
                         async def _do() -> Any:
-                            try:
-                                kwargs: Dict[str, Any] = {
-                                    "company": company,
-                                    "crawler": crawler,
-                                    "deep_strategy": deep_strategy,
-                                    "guard": guard,
-                                    "gating_cfg": md_gating.build_gating_config(),
-                                    "crawler_base_cfg": crawler_base_cfg,
-                                    "page_policy": page_policy,
-                                    "page_interaction_factory": page_interaction_factory,
-                                    "root_urls": resume_roots,
-                                    "cfg": runner_cfg,
-                                }
-
-                                # Only real crawl events should signal "progress"
-                                progress_cb = lambda: signal_progress("progress")
-
-                                try:
-                                    return await run_company_crawl(  # type: ignore[misc]
-                                        **kwargs,
-                                        on_progress=progress_cb,  # type: ignore[arg-type]
-                                    )
-                                except TypeError:
-                                    try:
-                                        return await run_company_crawl(  # type: ignore[misc]
-                                            **kwargs,
-                                            progress_cb=progress_cb,  # type: ignore[arg-type]
-                                        )
-                                    except TypeError:
-                                        try:
-                                            return await run_company_crawl(  # type: ignore[misc]
-                                                **kwargs,
-                                                heartbeat_cb=progress_cb,  # type: ignore[arg-type]
-                                            )
-                                        except TypeError:
-                                            return await run_company_crawl(**kwargs)
-                            except asyncio.CancelledError:
-                                raise
-
-                        summary = await asyncio.wait_for(
-                            _do(), timeout=company_crawl_timeout_sec
-                        )
-
-                        dec = decide_from_page_summary(summary)
-                        if dec.action == "mem":
-                            lease.mark_fatal("page_pipeline_mem")
-                            raise CriticalMemoryPressure(
-                                dec.reason, severity="critical"
+                            return await run_company_crawl(
+                                company=company,
+                                crawler=crawler,
+                                deep_strategy=deep_strategy,
+                                guard=guard,
+                                gating_cfg=md_gating.build_gating_config(),
+                                crawler_base_cfg=crawler_base_cfg,
+                                page_policy=page_policy,
+                                page_interaction_factory=page_interaction_factory,
+                                root_urls=resume_roots,
+                                cfg=runner_cfg,
+                                on_progress=lambda: signal_progress("progress"),
                             )
 
-                        if dec.action == "terminal" and urls_md_done0 == 0:
-                            terminalize = True
-                            terminal_reason = dec.reason
-                            terminal_last_error = dec.reason
+                        summary = await asyncio.wait_for(
+                            _do(),
+                            timeout=float(args.company_crawl_timeout_sec),
+                        )
+
+                        last_page_dec = decide_from_page_summary(summary)
+
+                        if getattr(last_page_dec, "action", None) == "mem":
+                            lease.mark_fatal("page_pipeline_mem")
+                            raise retry_mod.CriticalMemoryPressure(
+                                str(getattr(last_page_dec, "reason", "") or "mem"),
+                                severity="critical",
+                            )
+
+                        term_dec = retry_mod.decide_terminalization(
+                            page_summary_decision=last_page_dec,
+                            exception=None,
+                            stage="crawl",
+                            urls_md_done0=urls_md_done0,
+                            attempt_index=attempt_index,
+                        )
+                        if term_dec.should_terminalize:
+                            outcome.ok = True
+                            outcome.stage = "terminalize"
+                            outcome.terminalized = True
+                            outcome.terminal_reason = term_dec.reason
+                            outcome.terminal_last_error = term_dec.last_error
+                            outcome.should_mark_success = False
                             break
 
-                        if dec.action == "stall":
-                            raise CrawlerTimeoutError(
-                                dec.reason,
+                        if getattr(last_page_dec, "action", None) == "stall":
+                            raise retry_mod.CrawlerTimeoutError(
+                                str(getattr(last_page_dec, "reason", "") or "stall"),
                                 stage="page_pipeline_timeout_dominance",
                                 company_id=company.company_id,
                                 url=company.domain_url,
@@ -638,59 +536,74 @@ async def run_company_pipeline(
 
                 except asyncio.CancelledError:
                     raise
-
                 except Exception as e:
-                    stage = getattr(e, "stage", "crawl")
+                    last_exc = e
+                    stage = str(getattr(e, "stage", "crawl") or "crawl")
                     if stage == "crawl" and "goto" in str(e).lower():
                         stage = "goto"
 
-                    last_exc = e
-                    last_event = classify_failure(e, stage=stage)
+                    last_event = retry_mod.classify_failure(e, stage=stage)
+
                     if last_event.cls == "net":
                         guard.record_transport_error()
 
-                    if should_fail_fast_on_goto(e, stage=stage):
-                        if urls_md_done0 == 0:
-                            terminalize = True
-                            terminal_reason = f"goto_fail_fast: {e}"
-                            terminal_last_error = str(e)
-                        break
+                    if retry_mod.should_fail_fast_on_goto(e, stage=stage):
+                        term_dec = retry_mod.decide_terminalization(
+                            page_summary_decision=None,
+                            exception=e,
+                            stage=stage,
+                            urls_md_done0=urls_md_done0,
+                            attempt_index=attempt_index,
+                        )
+                        if term_dec.should_terminalize:
+                            outcome.ok = True
+                            outcome.stage = "terminalize"
+                            outcome.terminalized = True
+                            outcome.terminal_reason = term_dec.reason
+                            outcome.terminal_last_error = term_dec.last_error
+                            outcome.should_mark_success = False
+                            break
 
-                    if attempt == 0:
+                    _log_attempt_failure(
+                        clog,
+                        prefix="Crawl attempt failed",
+                        attempt_index=attempt_index,
+                        stage=stage,
+                        event=last_event,
+                        exc=e,
+                    )
+
+                    if attempt_index == 0:
                         await asyncio.sleep(0.5)
 
-            if terminalize:
-                with contextlib.suppress(Exception):
-                    await state.mark_company_terminal(
-                        company.company_id,
-                        reason="terminalize",
-                        details={
-                            "reason": terminal_reason,
-                            "industry_code": company.industry_code,
-                        },
-                        last_error=terminal_last_error,
-                        name=company.name,
-                        root_url=company.domain_url,
-                    )
-                with contextlib.suppress(Exception):
-                    retry_store.mark_success(
-                        company.company_id, stage="terminal_done", note="terminalize"
-                    )
-                completed_ok = True
+            if outcome.terminalized:
+                await state.mark_company_terminal(
+                    company.company_id,
+                    reason="terminalize",
+                    details={
+                        "reason": outcome.terminal_reason,
+                        "industry_code": company.industry_code,
+                        "industry_codes": company.industry_codes,
+                        "industry_profile_id": company.industry_profile_id,
+                    },
+                    last_error=outcome.terminal_last_error or outcome.terminal_reason,
+                    name=company.name,
+                    root_url=company.domain_url,
+                )
+                outcome.md_done = await _get_md_done(recompute=True)
+                retry_mod.record_attempt(
+                    retry_store, company.company_id, outcome, flush=True
+                )
                 return True
 
             if last_exc is not None and last_event is not None:
-                md_done = await _get_md_done(recompute=True)
-                with contextlib.suppress(Exception):
-                    retry_store.mark_failure(
-                        company.company_id,
-                        cls=last_event.cls,
-                        error=last_event.error,
-                        stage=last_event.stage,
-                        status_code=last_event.status_code,
-                        nxdomain_like=last_event.nxdomain_like,
-                        md_done=md_done,
-                    )
+                outcome.ok = False
+                outcome.stage = last_event.stage
+                outcome.event = last_event
+                outcome.md_done = await _get_md_done(recompute=True)
+                retry_mod.record_attempt(
+                    retry_store, company.company_id, outcome, flush=True
+                )
                 await _persist_last_error(str(last_exc))
                 return False
 
@@ -701,10 +614,10 @@ async def run_company_pipeline(
         # ---------------- LLM stage ----------------
         if will_llm:
             llm_exc: Optional[BaseException] = None
-            llm_event: Optional[RetryEvent] = None
+            llm_event: Optional[retry_mod.RetryEvent] = None
 
             llm_stage = f"llm_{args.llm_mode}"
-            for attempt in range(2):
+            for attempt_index in range(2):
                 try:
                     assert industry_llm_cache is not None
                     if args.llm_mode == "presence":
@@ -724,149 +637,168 @@ async def run_company_pipeline(
                     break
                 except Exception as e:
                     llm_exc = e
-                    llm_event = classify_failure(e, stage=llm_stage)
-                    if attempt == 0:
+                    llm_event = retry_mod.classify_failure(e, stage=llm_stage)
+
+                    _log_attempt_failure(
+                        clog,
+                        prefix="LLM attempt failed",
+                        attempt_index=attempt_index,
+                        stage=llm_stage,
+                        event=llm_event,
+                        exc=e,
+                    )
+
+                    if attempt_index == 0:
                         await asyncio.sleep(0.75)
 
             if llm_exc is not None and llm_event is not None:
-                md_done = await _get_md_done(recompute=True)
-                with contextlib.suppress(Exception):
-                    retry_store.mark_failure(
-                        company.company_id,
-                        cls=llm_event.cls,
-                        error=llm_event.error,
-                        stage=llm_event.stage,
-                        status_code=llm_event.status_code,
-                        nxdomain_like=llm_event.nxdomain_like,
-                        md_done=md_done,
-                    )
+                outcome.ok = False
+                outcome.stage = llm_event.stage
+                outcome.event = llm_event
+                outcome.md_done = await _get_md_done(recompute=True)
+                retry_mod.record_attempt(
+                    retry_store, company.company_id, outcome, flush=True
+                )
                 await _persist_last_error(str(llm_exc))
                 return False
 
-        # ---------------- Post-check: "done" means truly terminal for this run mode ----------------
-        snap_end = await state.get_company_snapshot(company.company_id, recompute=True)
-        st_end = getattr(snap_end, "status", None) or COMPANY_STATUS_PENDING
+        if stop_event.is_set():
+            clog.warning(
+                "Stop requested; skipping post-check and completion marking company_id=%s",
+                company.company_id,
+            )
+            return False
 
-        if args.llm_mode == "none" or bool(
-            getattr(args, "finalize_in_progress_md", False)
-        ):
+        snap_end = await state.get_company_snapshot(company.company_id, recompute=True)
+        st_end = snap_end.status or COMPANY_STATUS_PENDING
+        last_err = str(getattr(snap_end, "last_error", "") or "").strip()
+
+        clog.info(
+            "Post-check company=%s status=%s md_done=%s llm_done=%s last_error=%s",
+            company.company_id,
+            st_end,
+            snap_end.urls_markdown_done,
+            snap_end.urls_llm_done,
+            (last_err[:240] + "…") if len(last_err) > 240 else last_err,
+        )
+
+        def _postcheck_failure(stage_name: str) -> bool:
+            msg = f"incomplete_status={st_end}"
+            if last_err:
+                msg = f"{msg}; last_error={last_err}"
+
+            ev = retry_mod.classify_failure(
+                RuntimeError(last_err or msg), stage=stage_name
+            )
+
+            outcome.ok = False
+            outcome.stage = stage_name
+            outcome.event = retry_mod.RetryEvent(
+                cls=ev.cls,
+                stage=stage_name,
+                error=msg,
+                nxdomain_like=getattr(ev, "nxdomain_like", False),
+                status_code=getattr(ev, "status_code", None),
+                stall_kind=getattr(ev, "stall_kind", None),
+            )
+            outcome.md_done = int(snap_end.urls_markdown_done or 0)
+            retry_mod.record_attempt(
+                retry_store, company.company_id, outcome, flush=True
+            )
+            return False
+
+        if args.llm_mode == "none" or bool(args.finalize_in_progress_md):
             ok_statuses = (COMPANY_STATUS_MD_DONE, COMPANY_STATUS_TERMINAL_DONE)
             if st_end not in ok_statuses:
-                md_done = int(getattr(snap_end, "urls_markdown_done", 0) or 0)
-                with contextlib.suppress(Exception):
-                    retry_store.mark_failure(
-                        company.company_id,
-                        cls="partial",
-                        error=f"incomplete_status={st_end}",
-                        stage="postcheck_md",
-                        md_done=md_done,
-                    )
-                return False
+                await _persist_last_error(last_err or f"incomplete_status={st_end}")
+                return _postcheck_failure("postcheck_md")
         else:
             ok_statuses = (COMPANY_STATUS_LLM_DONE, COMPANY_STATUS_TERMINAL_DONE)
             if st_end not in ok_statuses:
-                md_done = int(getattr(snap_end, "urls_markdown_done", 0) or 0)
-                with contextlib.suppress(Exception):
-                    retry_store.mark_failure(
-                        company.company_id,
-                        cls="partial",
-                        error=f"incomplete_status={st_end}",
-                        stage="postcheck_llm",
-                        md_done=md_done,
-                    )
-                return False
+                await _persist_last_error(last_err or f"incomplete_status={st_end}")
+                return _postcheck_failure("postcheck_llm")
 
-        completed_ok = True
+        outcome.ok = True
+        outcome.stage = "completed"
+        outcome.should_mark_success = True
+        outcome.md_done = int(snap_end.urls_markdown_done or 0)
+        retry_mod.record_attempt(retry_store, company.company_id, outcome, flush=True)
         return True
 
     except asyncio.CancelledError:
-        is_sched_cancel = (
-            cancel_reason_by_cid is not None
-            and cancel_reason_by_cid.pop(company.company_id, None) == "scheduler_cancel"
+        clog.warning(
+            "Company task cancelled (no marking) company_id=%s", company.company_id
         )
-
-        if is_sched_cancel:
-            with contextlib.suppress(Exception):
-                await state.recompute_company_from_index(
-                    company.company_id, name=company.name, root_url=company.domain_url
-                )
-            md_done = await _get_md_done(recompute=False)
-            with contextlib.suppress(Exception):
-                retry_store.mark_transient_cancel(
-                    company.company_id,
-                    reason="cancelled by scheduler",
-                    stage="scheduler_cancel",
-                    md_done=md_done,
-                )
         raise
 
-    except CriticalMemoryPressure as e:
-        md_done = await _get_md_done(recompute=True)
-        with contextlib.suppress(Exception):
-            retry_store.mark_failure(
-                company.company_id,
-                cls="mem",
-                error=str(e),
-                stage="critical_memory_pressure",
-                md_done=md_done,
-            )
-        with contextlib.suppress(Exception):
-            await state.upsert_company(
-                company.company_id,
-                last_error=(str(e) or "")[:4000],
-                name=company.name,
-                root_url=company.domain_url,
-            )
+    except retry_mod.CriticalMemoryPressure as e:
+        outcome.ok = False
+        outcome.stage = "critical_memory_pressure"
+        outcome.event = retry_mod.RetryEvent(
+            cls="mem", stage="critical_memory_pressure", error=str(e)
+        )
+        outcome.md_done = await _get_md_done(recompute=True)
+        retry_mod.record_attempt(retry_store, company.company_id, outcome, flush=True)
+        await _persist_last_error(str(e))
         return False
 
     except Exception as e:
-        ev = classify_failure(e, stage="pipeline_unhandled")
-        md_done = await _get_md_done(recompute=True)
-        with contextlib.suppress(Exception):
-            retry_store.mark_failure(
-                company.company_id,
-                cls=ev.cls,
-                error=ev.error,
-                stage=ev.stage,
-                status_code=ev.status_code,
-                nxdomain_like=ev.nxdomain_like,
-                md_done=md_done,
+        ev = retry_mod.classify_failure(e, stage="pipeline_unhandled")
+        outcome.ok = False
+        outcome.stage = ev.stage
+        outcome.event = ev
+        outcome.md_done = await _get_md_done(recompute=True)
+
+        if _TRACEBACK_ON_ATTEMPT_FAIL:
+            clog.exception(
+                "Pipeline unhandled exception stage=%s err=%s", ev.stage, _short_exc(e)
             )
-        with contextlib.suppress(Exception):
-            await state.upsert_company(
-                company.company_id,
-                last_error=(str(e) or "")[:4000],
-                name=company.name,
-                root_url=company.domain_url,
+        else:
+            clog.error(
+                "Pipeline unhandled exception stage=%s cls=%s stall=%s status=%s nx=%s err=%s",
+                ev.stage,
+                getattr(ev, "cls", None),
+                getattr(ev, "stall_kind", None),
+                getattr(ev, "status_code", None),
+                getattr(ev, "nxdomain_like", None),
+                _short_exc(e),
+                exc_info=False,
             )
+
+        retry_mod.record_attempt(retry_store, company.company_id, outcome, flush=True)
+        await _persist_last_error(str(e))
         return False
 
     finally:
         if watchdog_task is not None:
             watchdog_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
+            try:
                 await watchdog_task
+            except asyncio.CancelledError:
+                pass
 
-        with contextlib.suppress(Exception):
-            snap2 = await state.get_company_snapshot(company.company_id)
-            _write_crawl_meta(company, snap2)
-
-        if run_id is not None and completed_ok:
-            with contextlib.suppress(Exception):
-                await state.mark_company_completed(run_id, company.company_id)
-
-        if completed_ok:
-            with contextlib.suppress(Exception):
-                retry_store.mark_success(
-                    company.company_id, stage="completed", note="ok"
-                )
-
-        with contextlib.suppress(Exception):
+        if stop_event.is_set():
             logging_ext.reset_company_context(token)
             logging_ext.close_company(company.company_id)
-
-        with contextlib.suppress(Exception):
             gc.collect()
+            return
+
+        snap2 = await state.get_company_snapshot(company.company_id, recompute=False)
+        _write_crawl_meta(company, snap2)
+
+        await state.recompute_company_from_index(
+            company.company_id,
+            name=company.name,
+            root_url=company.domain_url,
+        )
+
+        if run_id is not None:
+            if outcome.ok or outcome.terminalized:
+                await state.mark_company_completed(run_id, company.company_id)
+
+        logging_ext.reset_company_context(token)
+        logging_ext.close_company(company.company_id)
+        gc.collect()
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -906,7 +838,14 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     p.add_argument("--enable-resource-monitor", action="store_true")
     p.add_argument("--finalize-in-progress-md", action="store_true")
 
-    # page pipeline knobs
+    p.add_argument(
+        "--sync-industry-from-csv",
+        dest="sync_industry_from_csv",
+        action="store_true",
+        help="Update industry fields in DB for companies already present (no inserts). Also writes crawl_meta.json.",
+    )
+
+    # crawl_runner knobs
     p.add_argument("--page-result-concurrency", type=int, default=6)
     p.add_argument("--page-queue-maxsize", type=int, default=32)
     p.add_argument("--url-index-flush-every", type=int, default=18)
@@ -935,7 +874,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     p.add_argument("--generator-close-timeout-sec", type=float, default=60.0)
     p.add_argument("--company-crawl-timeout-sec", type=float, default=3600.0)
 
-    # progress/heartbeat (new)
+    # progress/heartbeat
     p.add_argument("--company-progress-heartbeat-sec", type=float, default=30.0)
     p.add_argument("--company-progress-throttle-sec", type=float, default=12.0)
 
@@ -944,6 +883,9 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     p.add_argument("--oom-hard-frac", type=float, default=0.95)
     p.add_argument("--oom-check-interval-sec", type=float, default=2.0)
     p.add_argument("--oom-soft-pause-sec", type=float, default=20.0)
+
+    # global state writer throttle
+    p.add_argument("--global-state-write-interval-sec", type=float, default=1.5)
 
     return p.parse_args(list(argv) if argv is not None else None)
 
@@ -1017,6 +959,14 @@ async def main_async(args: argparse.Namespace) -> None:
 
     state = get_crawl_state(db_path=_global_path("crawl_state.sqlite3"))
 
+    if bool(getattr(args, "sync_industry_from_csv", False)) and args.company_file:
+        await state.update_industry_from_csv(
+            csv_path=args.company_file,
+            bvdid_column="bvdid",
+            industry_column="industry",
+            write_meta=True,
+        )
+
     if args.company_file:
         companies = _companies_from_source(Path(args.company_file))
     else:
@@ -1026,19 +976,22 @@ async def main_async(args: argparse.Namespace) -> None:
         if not cid:
             parsed = urlparse(url)
             cid = (parsed.netloc or parsed.path or "company").replace(":", "_")
-        companies = [Company(company_id=cid, domain_url=url)]
 
-    if args.finalize_in_progress_md:
-        inprog = set(_read_in_progress_companies(out_dir))
-        if not inprog:
-            logger.info("--finalize-in-progress-md: no in_progress_companies; exiting.")
-            return
-        companies = [c for c in companies if c.company_id in inprog]
-        if not companies:
-            logger.info(
-                "--finalize-in-progress-md: none of in_progress IDs exist in input; exiting."
+        industry_code, industry_label, industry_codes = (
+            normalize_company_industry_fields(None)
+        )
+        prof = get_industry_profile(industry_code)
+        companies = [
+            Company(
+                company_id=cid,
+                domain_url=url,
+                industry_code=industry_code,
+                industry_label=industry_label,
+                industry_codes=industry_codes,
+                industry_profile_id=getattr(prof, "profile_id", None),
+                metadata={},
             )
-            return
+        ]
 
     companies_by_id = {c.company_id: c for c in companies}
     company_ids_all = [c.company_id for c in companies]
@@ -1046,18 +999,33 @@ async def main_async(args: argparse.Namespace) -> None:
     run_id = await state.start_run("deep_crawl", version=None, args_hash=None)
 
     for c in companies:
-        await state.upsert_company(c.company_id, name=c.name, root_url=c.domain_url)
+        await state.upsert_company(
+            c.company_id,
+            name=c.name,
+            root_url=c.domain_url,
+            industry_code=c.industry_code,
+            industry_label=c.industry_label,
+            industry_codes=c.industry_codes,
+            write_meta=True,
+        )
 
-    with contextlib.suppress(Exception):
-        await state.recompute_global_state()
+    # DB truth first: refresh in-progress snapshots based on url_index.json
+    await state.recompute_all_in_progress(concurrency=32)
 
-    runnable_ids = await state.filter_runnable_company_ids(
-        company_ids_all,
-        llm_mode=str(args.llm_mode),
-        refresh_pending=False,
-        chunk_size=500,
-        concurrency=32,
-    )
+    if args.finalize_in_progress_md:
+        inprog = set(await state.get_in_progress_company_ids(limit=1_000_000))
+        companies = [c for c in companies if c.company_id in inprog]
+        companies_by_id = {c.company_id: c for c in companies}
+        company_ids_all = [c.company_id for c in companies]
+
+    # Compute runnable_ids using new CrawlState snapshot semantics (no legacy filter API)
+    runnable_ids: List[str] = []
+    for cid in company_ids_all:
+        snap = await state.get_company_snapshot(cid, recompute=False)
+        st = snap.status or COMPANY_STATUS_PENDING
+        if not _should_skip_company(st, str(args.llm_mode)):
+            runnable_ids.append(cid)
+
     await state.update_run_totals(run_id, total_companies=len(runnable_ids))
 
     dataset_externals = build_dataset_externals(args=args, companies=companies)
@@ -1084,19 +1052,18 @@ async def main_async(args: argparse.Namespace) -> None:
 
     inflight_by_cid: Dict[str, asyncio.Task] = {}
     cid_by_task: Dict[asyncio.Task, str] = {}
-    cancel_reason_by_cid: Dict[str, str] = {}
 
     def get_active_company_ids() -> List[str]:
         return [cid for cid, t in inflight_by_cid.items() if not t.done()]
 
     def request_cancel_companies(ids: Sequence[str]) -> None:
         for cid in ids:
-            cancel_reason_by_cid[cid] = "scheduler_cancel"
             t = inflight_by_cid.get(cid)
             if t and not t.done():
                 t.cancel()
 
     async def request_recycle_idle(count: int, reason: str) -> int:
+        logger.info("request_recycle_idle count=%d reason=%s (noop)", count, reason)
         return 0
 
     scheduler_cfg = AdaptiveSchedulingConfig(
@@ -1120,20 +1087,21 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     await scheduler.start()
 
-    retry_store = scheduler.retry_store
+    retry_store: retry_mod.RetryStateStore = scheduler.retry_store
     _retry_store_instance = retry_store
 
     async def is_company_runnable(cid: str, *, recompute: bool = False) -> bool:
+        if retry_store.is_quarantined(cid):
+            return False
         snap = await state.get_company_snapshot(cid, recompute=recompute)
-        st = getattr(snap, "status", None) or COMPANY_STATUS_PENDING
+        st = snap.status or COMPANY_STATUS_PENDING
         return not _should_skip_company(st, args.llm_mode)
 
-    with contextlib.suppress(Exception):
-        await scheduler.cleanup_completed_retry_ids(
-            is_company_runnable=lambda cid: is_company_runnable(cid, recompute=False),
-            treat_non_runnable_as_done=True,
-            stage="startup_cleanup",
-        )
+    await scheduler.cleanup_completed_retry_ids(
+        is_company_runnable=lambda cid: is_company_runnable(cid, recompute=False),
+        treat_non_runnable_as_done=True,
+        stage="startup_cleanup",
+    )
 
     await scheduler.set_worklist(
         runnable_ids,
@@ -1142,19 +1110,36 @@ async def main_async(args: argparse.Namespace) -> None:
     )
 
     stop_event = asyncio.Event()
+    stop_reason: Optional[str] = None
+    stop_sig: Optional[str] = None
 
     def _on_stop(sig: str) -> None:
-        logger.warning("[Signal] %s received; stopping.", sig)
+        nonlocal stop_reason, stop_sig
+        logger.warning(
+            "[Signal] %s received; cancelling in-flight work and shutting down.", sig
+        )
+        stop_reason = "user_interrupt"
+        stop_sig = sig
         stop_event.set()
 
     loop = asyncio.get_running_loop()
-    with contextlib.suppress(NotImplementedError):
+    try:
         loop.add_signal_handler(signal.SIGTERM, lambda: _on_stop("SIGTERM"))
         loop.add_signal_handler(signal.SIGINT, lambda: _on_stop("SIGINT"))
+    except NotImplementedError:
+        logger.warning("Signal handlers not supported on this platform")
 
     def _on_oom_hard(used_frac: float) -> None:
         global _forced_exit_code
+        nonlocal stop_reason, stop_sig
+        logger.error(
+            "OOM hard triggered used_frac=%.4f forcing exit_code=%d",
+            used_frac,
+            RETRY_EXIT_CODE,
+        )
         _forced_exit_code = RETRY_EXIT_CODE
+        stop_reason = "oom_hard"
+        stop_sig = "OOM_HARD"
         stop_event.set()
 
     oom = OOMGuard(
@@ -1168,135 +1153,52 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     oom.start(stop_event)
 
+    global_writer_task: Optional[asyncio.Task] = None
+    global_write_interval = max(
+        0.2, float(getattr(args, "global_state_write_interval_sec", 1.5))
+    )
+
+    async def _global_writer() -> None:
+        while not stop_event.is_set():
+            await state.write_global_state_throttled(
+                min_interval_sec=global_write_interval
+            )
+            await asyncio.sleep(0.25)
+
+    global_writer_task = asyncio.create_task(
+        _global_writer(), name="global_state_writer"
+    )
+
     attempt_counter = 0
     total_unique = int(len(runnable_ids))
     done_counter: Dict[str, int] = {"done": 0}
 
-    async def _get_md_done_for(cid: str, *, recompute: bool) -> int:
-        try:
-            snapx = await state.get_company_snapshot(cid, recompute=recompute)
-            return int(getattr(snapx, "urls_markdown_done", 0) or 0)
-        except Exception:
-            return 0
-
-    async def _finalize_reconcile() -> None:
-        payload: Dict[str, Any] = {}
-        with contextlib.suppress(Exception):
-            payload = await state.recompute_global_state()
-
-        active_set = set(get_active_company_ids())
-        scheduler_pending_total = _scheduler_pending_total(scheduler)
-
-        for cid in runnable_ids:
-            if cid in active_set:
-                continue
-
-            c = companies_by_id.get(cid)
-            try:
-                snap = await state.get_company_snapshot(cid, recompute=True)
-                st = getattr(snap, "status", None) or COMPANY_STATUS_PENDING
-
-                if st in (
-                    COMPANY_STATUS_MD_DONE,
-                    COMPANY_STATUS_LLM_DONE,
-                    COMPANY_STATUS_TERMINAL_DONE,
-                ):
-                    continue
-
-                # Safety: if there is still markdown work, do NOT terminalize just because queues look empty.
-                with contextlib.suppress(Exception):
-                    pending_md = await state.get_pending_urls_for_markdown(cid)
-                    if pending_md:
-                        continue
-
-                is_quarantined = False
-                q_reason: Optional[str] = None
-                for fn_name in ("is_quarantined", "company_is_quarantined"):
-                    fn = getattr(retry_store, fn_name, None)
-                    if callable(fn):
-                        try:
-                            is_quarantined = bool(fn(cid))
-                            break
-                        except Exception:
-                            pass
-
-                if is_quarantined:
-                    for fn_name in ("get_quarantine_info", "quarantine_info"):
-                        fn = getattr(retry_store, fn_name, None)
-                        if callable(fn):
-                            try:
-                                info = fn(cid)
-                                if info is not None:
-                                    q_reason = str(info)
-                                    break
-                            except Exception:
-                                pass
-
-                    with contextlib.suppress(Exception):
-                        await state.mark_company_terminal(
-                            cid,
-                            reason="quarantined",
-                            details={"retry": q_reason or "quarantined"},
-                            last_error=q_reason or "quarantined",
-                            name=(c.name if c else None),
-                            root_url=(c.domain_url if c else None),
-                        )
-                    with contextlib.suppress(Exception):
-                        retry_store.mark_success(
-                            cid, stage="terminal_done", note="quarantined_finalize"
-                        )
-                    continue
-
-                retry_pending_total = _retry_pending_total(retry_store)
-                company_retry_pending = _retry_has_pending_for_company_best_effort(
-                    retry_store, cid
-                )
-
-                no_more_scheduler = scheduler_pending_total == 0
-                no_more_retry_global = retry_pending_total == 0
-                no_more_retry_for_company = company_retry_pending is False or (
-                    company_retry_pending is None and no_more_retry_global
-                )
-
-                if (
-                    no_more_scheduler
-                    and no_more_retry_for_company
-                    and no_more_retry_global
-                ):
-                    last_err = getattr(snap, "last_error", None)
-                    with contextlib.suppress(Exception):
-                        await state.mark_company_terminal(
-                            cid,
-                            reason="finalize_no_more_work",
-                            details={
-                                "status": st,
-                                "note": "in-progress but scheduler/retry empty at finalize",
-                            },
-                            last_error=last_err or "finalize_no_more_work",
-                            name=(c.name if c else None),
-                            root_url=(c.domain_url if c else None),
-                        )
-                    with contextlib.suppress(Exception):
-                        retry_store.mark_success(
-                            cid, stage="terminal_done", note="finalize_no_more_work"
-                        )
-                    continue
-
-            except Exception:
-                continue
-
-        with contextlib.suppress(Exception):
-            _ = await state.recompute_global_state()
-        _ = payload
-
     try:
-        while not stop_event.is_set():
-            active = [cid for cid, t in inflight_by_cid.items() if not t.done()]
-            active_n = len(active)
+        while True:
+            if stop_event.is_set():
+                for t in list(inflight_by_cid.values()):
+                    if not t.done():
+                        t.cancel()
 
-            pending_total = _scheduler_pending_total(scheduler)
-            retry_pending = _retry_pending_total(retry_store)
-            db_in_prog = await _db_in_progress(state)
+                if inflight_by_cid:
+                    await asyncio.gather(
+                        *list(inflight_by_cid.values()), return_exceptions=True
+                    )
+
+                logger.warning(
+                    "Shutdown requested reason=%s sig=%s active_before_cancel=%d",
+                    stop_reason,
+                    stop_sig,
+                    len(inflight_by_cid),
+                )
+
+                await state.write_global_state_from_db_only()
+                break
+
+            active_n = sum(1 for _cid, t in inflight_by_cid.items() if not t.done())
+            pending_total = scheduler.pending_total()
+            retry_pending = retry_store.pending_total(exclude_quarantined=True)
+            db_in_prog = await state.has_in_progress_companies()
 
             if (
                 active_n == 0
@@ -1304,10 +1206,8 @@ async def main_async(args: argparse.Namespace) -> None:
                 and retry_pending == 0
                 and not db_in_prog
             ):
-                payload: Dict[str, Any] = {}
-                with contextlib.suppress(Exception):
-                    payload = await state.recompute_global_state()
-                if payload and (payload.get("in_progress_companies") or []):
+                payload = await state.write_global_state_from_db_only()
+                if payload and (payload.get("in_progress_company_ids") or []):
                     await asyncio.sleep(0.5)
                     continue
                 break
@@ -1320,12 +1220,9 @@ async def main_async(args: argparse.Namespace) -> None:
             start_ids = await scheduler.plan_start_batch(free_crawlers=free_crawlers)
 
             for cid in start_ids:
-                c = companies_by_id.get(cid)
-                if not c:
-                    continue
-
+                c = companies_by_id[cid]
                 attempt_counter += 1
-                _scheduler_progress(scheduler, cid, kind="start")
+                scheduler.touch_company(cid, kind="start")
 
                 t = asyncio.create_task(
                     run_company_pipeline(
@@ -1349,7 +1246,7 @@ async def main_async(args: argparse.Namespace) -> None:
                         page_interaction_factory=page_interaction_factory,
                         retry_store=retry_store,
                         scheduler=scheduler,
-                        cancel_reason_by_cid=cancel_reason_by_cid,
+                        stop_event=stop_event,
                     ),
                     name=f"company-{cid}",
                 )
@@ -1357,26 +1254,8 @@ async def main_async(args: argparse.Namespace) -> None:
                 cid_by_task[t] = cid
 
             if not inflight_by_cid:
-                with contextlib.suppress(Exception):
-                    payload = await state.recompute_global_state()
-                    if payload and (payload.get("in_progress_companies") or []):
-                        await asyncio.sleep(1.0)
-                        continue
-
-                pending_total = _scheduler_pending_total(scheduler)
-                retry_pending = _retry_pending_total(retry_store)
-                db_in_prog = await _db_in_progress(state)
-
-                if pending_total > 0 or retry_pending > 0 or db_in_prog:
-                    sleep_hint_fn = getattr(scheduler, "sleep_hint_sec", None)
-                    sleep_hint = 1.0
-                    if callable(sleep_hint_fn):
-                        with contextlib.suppress(Exception):
-                            sleep_hint = float(sleep_hint_fn() or 1.0)
-                    await asyncio.sleep(max(0.25, sleep_hint))
-                    continue
-
-                break
+                await asyncio.sleep(max(0.25, float(retry_store.sleep_hint_sec())))
+                continue
 
             done, _ = await asyncio.wait(
                 list(inflight_by_cid.values()),
@@ -1385,123 +1264,82 @@ async def main_async(args: argparse.Namespace) -> None:
             )
 
             for t in done:
-                cid = cid_by_task.pop(t, None)
-                if cid:
-                    inflight_by_cid.pop(cid, None)
+                cid = cid_by_task.pop(t)
+                inflight_by_cid.pop(cid, None)
 
                 if t.cancelled():
-                    if (
-                        cid
-                        and cancel_reason_by_cid.pop(cid, None) == "scheduler_cancel"
-                    ):
-                        with contextlib.suppress(Exception):
-                            c = companies_by_id.get(cid)
-                            await state.recompute_company_from_index(
-                                cid,
-                                name=(c.name if c else None),
-                                root_url=(c.domain_url if c else None),
-                            )
-                        md_done = await _get_md_done_for(cid, recompute=False)
-                        with contextlib.suppress(Exception):
-                            retry_store.mark_transient_cancel(
-                                cid,
-                                reason="cancelled by scheduler",
-                                stage="scheduler_cancel",
-                                md_done=md_done,
-                            )
-                        _scheduler_progress(scheduler, cid, kind="cancel")
+                    logger.warning(
+                        "task cancelled cid=%s (NO marking in pipeline)", cid
+                    )
+                    scheduler.touch_company(cid, kind="cancel")
                     continue
 
-                ok = False
-                try:
-                    ok = bool(t.result())
-                except Exception as e:
-                    logger.exception("Company task failed (company_id=%s)", cid)
-                    if cid:
-                        ev = classify_failure(e, stage="task_exception")
-                        md_done = await _get_md_done_for(cid, recompute=True)
-                        with contextlib.suppress(Exception):
-                            retry_store.mark_failure(
-                                cid,
-                                cls=ev.cls,
-                                error=ev.error,
-                                stage=ev.stage,
-                                status_code=ev.status_code,
-                                nxdomain_like=ev.nxdomain_like,
-                                md_done=md_done,
-                            )
-                        with contextlib.suppress(Exception):
-                            await state.upsert_company(
-                                cid, last_error=(str(e) or "")[:4000]
-                            )
-                        _scheduler_progress(scheduler, cid, kind="fail")
-
-                if not cid:
-                    continue
-
-                # After each attempt, re-check runnable status and requeue if needed.
-                still_runnable = False
-                with contextlib.suppress(Exception):
-                    still_runnable = await is_company_runnable(cid, recompute=True)
+                ok = bool(t.result())
+                still_runnable = await is_company_runnable(cid, recompute=True)
 
                 if still_runnable and not stop_event.is_set():
-                    delay_sec = _best_effort_next_eligible_delay_sec(retry_store, cid)
-                    await _best_effort_requeue_company(
-                        scheduler,
-                        cid,
-                        delay_sec=delay_sec,
-                        reason="post_attempt_runnable",
+                    rq = retry_mod.decide_requeue(
+                        store=retry_store,
+                        company_id=cid,
+                        is_runnable=True,
+                        stop_requested=False,
                     )
-                    _scheduler_progress(scheduler, cid, kind="requeue")
-                    continue
+                    if rq.should_requeue:
+                        await scheduler.requeue_company(
+                            cid,
+                            delay_sec=float(rq.delay_sec),
+                            reason=str(rq.reason),
+                        )
+                        scheduler.touch_company(cid, kind="requeue")
+                        continue
 
-                # Only count as "done" if pipeline reported ok and DB is now non-runnable/terminal for this run mode.
                 if ok and not still_runnable:
                     done_counter["done"] = int(done_counter.get("done", 0)) + 1
-                    with contextlib.suppress(Exception):
-                        scheduler.register_company_completed()
-                    _scheduler_progress(scheduler, cid, kind="done")
+                    scheduler.register_company_completed()
+                    scheduler.touch_company(cid, kind="done")
                 else:
-                    # If not ok, retry store already has the failure; scheduler may also have its own retry work.
-                    _scheduler_progress(scheduler, cid, kind="fail")
+                    scheduler.touch_company(cid, kind="fail")
 
-        with contextlib.suppress(Exception):
-            await _finalize_reconcile()
+                await state.write_global_state_throttled(
+                    min_interval_sec=global_write_interval
+                )
 
-        payload: Dict[str, Any] = {}
-        with contextlib.suppress(Exception):
-            payload = await state.recompute_global_state()
-
-        retry_code = compute_retry_exit_code_from_store(retry_store, RETRY_EXIT_CODE)
-        pending_total = _scheduler_pending_total(scheduler)
-        retry_pending = _retry_pending_total(retry_store)
-        db_in_prog = await _db_in_progress(state)
-
+        pending_total = scheduler.pending_total()
+        retry_pending = retry_store.pending_total(exclude_quarantined=True)
+        db_in_prog = await state.has_in_progress_companies()
+        payload = await state.write_global_state_from_db_only()
         in_progress_payload = bool(
-            (payload.get("in_progress_companies") or []) if payload else False
+            (payload.get("in_progress_company_ids") or []) if payload else False
         )
 
-        if pending_total > 0 or retry_pending > 0 or db_in_prog or in_progress_payload:
-            _forced_exit_code = RETRY_EXIT_CODE
-        else:
-            _forced_exit_code = retry_code
+        _forced_exit_code = retry_mod.decide_exit_code(
+            forced_exit_code=_forced_exit_code,
+            retry_exit_code=RETRY_EXIT_CODE,
+            scheduler_pending_total=pending_total,
+            retry_pending_total=retry_pending,
+            db_in_progress=db_in_prog,
+            in_progress_payload=in_progress_payload,
+        )
 
     finally:
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await oom.stop()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await scheduler.stop()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await guard.stop()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await crawler_pool.stop()
-        with contextlib.suppress(Exception):
-            logging_ext.close()
+        if global_writer_task is not None:
+            global_writer_task.cancel()
+            try:
+                await global_writer_task
+            except asyncio.CancelledError:
+                pass
+
+        await oom.stop()
+        await scheduler.stop()
+        await guard.stop()
+        await crawler_pool.stop()
+        logging_ext.close()
+
         if resource_monitor:
-            with contextlib.suppress(Exception):
-                resource_monitor.stop()
-        with contextlib.suppress(Exception):
-            gc.collect()
+            resource_monitor.stop()
+
+        state.close()
+        gc.collect()
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
@@ -1511,7 +1349,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     try:
         asyncio.run(main_async(args))
     except KeyboardInterrupt:
-        logger.warning("KeyboardInterrupt; shutting down.")
+        logger.warning("KeyboardInterrupt; exiting.")
     finally:
         exit_code = 0
         if _retry_store_instance is not None:

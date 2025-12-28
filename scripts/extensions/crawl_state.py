@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import errno
 import json
 import os
@@ -12,10 +13,16 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 from extensions import output_paths
 from extensions.output_paths import ensure_company_dirs, sanitize_bvdid
+
+from configs.llm_industry import (
+    industry_label as _industry_label,
+    normalize_industry_all as _normalize_industry_all,
+    normalize_industry_code as _normalize_industry_code,
+)
 
 # ---------------------------------------------------------------------------
 # Atomic file I/O + bounded JSON cache + per-path locks
@@ -32,6 +39,19 @@ _JSON_CACHE: "OrderedDict[Path, Tuple[int, Any]]" = OrderedDict()
 # IMPORTANT: key includes output_root to avoid stale cache when OUTPUT_ROOT changes.
 _DIR_CACHE: "OrderedDict[str, Path]" = OrderedDict()
 _FILE_LOCKS: Dict[Path, threading.Lock] = {}
+
+# Reserved / meta keys inside url_index.json
+URL_INDEX_META_KEY = "__meta__"
+URL_INDEX_RESERVED_PREFIX = "__"
+
+# Files
+META_NAME = "crawl_meta.json"
+URL_INDEX_NAME = "url_index.json"
+GLOBAL_STATE_NAME = "crawl_global_state.json"
+
+# ---------------------------------------------------------------------------
+# Time / paths
+# ---------------------------------------------------------------------------
 
 
 def _now_iso() -> str:
@@ -62,6 +82,29 @@ def _output_root() -> Path:
 
 def default_db_path() -> Path:
     return _output_root() / "crawl_state.sqlite3"
+
+
+class _DefaultDBPathProxy(os.PathLike):
+    """
+    Dynamic PathLike proxy for default DB path.
+    This prevents stale DEFAULT_DB paths when OUTPUT_ROOT changes at runtime.
+    """
+
+    def __fspath__(self) -> str:
+        return os.fspath(default_db_path())
+
+    def __str__(self) -> str:
+        return str(default_db_path())
+
+    def __repr__(self) -> str:
+        return f"_DefaultDBPathProxy({default_db_path()!r})"
+
+    @property
+    def path(self) -> Path:
+        return default_db_path()
+
+
+DEFAULT_DB = _DefaultDBPathProxy()
 
 
 def _retry_emfile(fn, attempts: int = 6, base_delay: float = 0.15):
@@ -158,138 +201,8 @@ def _json_load_nocache(path: Path) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Paths / constants
+# Company dirs / paths
 # ---------------------------------------------------------------------------
-
-META_NAME = "crawl_meta.json"
-URL_INDEX_NAME = "url_index.json"
-GLOBAL_STATE_NAME = "crawl_global_state.json"
-
-
-class _DefaultDBPathProxy(os.PathLike):
-    """
-    Dynamic PathLike proxy for default DB path.
-    This prevents stale DEFAULT_DB paths when OUTPUT_ROOT changes at runtime.
-    """
-
-    def __fspath__(self) -> str:
-        return os.fspath(default_db_path())
-
-    def __str__(self) -> str:
-        return str(default_db_path())
-
-    def __repr__(self) -> str:
-        return f"_DefaultDBPathProxy({default_db_path()!r})"
-
-    @property
-    def path(self) -> Path:
-        return default_db_path()
-
-
-DEFAULT_DB = _DefaultDBPathProxy()
-
-CompanyStatus = Literal[
-    "pending",
-    "markdown_not_done",
-    "markdown_done",
-    "llm_not_done",
-    "llm_done",
-    "terminal_done",
-]
-
-COMPANY_STATUS_PENDING: CompanyStatus = "pending"
-COMPANY_STATUS_MD_NOT_DONE: CompanyStatus = "markdown_not_done"
-COMPANY_STATUS_MD_DONE: CompanyStatus = "markdown_done"
-COMPANY_STATUS_LLM_NOT_DONE: CompanyStatus = "llm_not_done"
-COMPANY_STATUS_LLM_DONE: CompanyStatus = "llm_done"
-COMPANY_STATUS_TERMINAL_DONE: CompanyStatus = "terminal_done"
-
-_KNOWN_COMPANY_STATUSES = {
-    COMPANY_STATUS_PENDING,
-    COMPANY_STATUS_MD_NOT_DONE,
-    COMPANY_STATUS_MD_DONE,
-    COMPANY_STATUS_LLM_NOT_DONE,
-    COMPANY_STATUS_LLM_DONE,
-    COMPANY_STATUS_TERMINAL_DONE,
-}
-
-# Sticky precedence: never downgrade; only allow upgrades.
-# terminal_done > llm_done > llm_not_done > markdown_done > markdown_not_done > pending
-_COMPANY_STATUS_RANK: Dict[str, int] = {
-    COMPANY_STATUS_PENDING: 0,
-    COMPANY_STATUS_MD_NOT_DONE: 1,
-    COMPANY_STATUS_MD_DONE: 2,
-    COMPANY_STATUS_LLM_NOT_DONE: 3,
-    COMPANY_STATUS_LLM_DONE: 4,
-    COMPANY_STATUS_TERMINAL_DONE: 5,
-}
-
-# Some legacy company-level statuses seen in older runs
-_LEGACY_COMPANY_STATUS_MAP: Dict[str, CompanyStatus] = {
-    "done": COMPANY_STATUS_LLM_DONE,
-    "completed": COMPANY_STATUS_LLM_DONE,
-    "complete": COMPANY_STATUS_LLM_DONE,
-    "llmcomplete": COMPANY_STATUS_LLM_DONE,
-    "llm_complete": COMPANY_STATUS_LLM_DONE,
-    "terminal": COMPANY_STATUS_TERMINAL_DONE,
-    "terminalized": COMPANY_STATUS_TERMINAL_DONE,
-    "terminated": COMPANY_STATUS_TERMINAL_DONE,
-    "md_done": COMPANY_STATUS_MD_DONE,
-    "markdown_saved": COMPANY_STATUS_MD_DONE,
-    "markdown_complete": COMPANY_STATUS_MD_DONE,
-    "markdowncomplete": COMPANY_STATUS_MD_DONE,
-}
-
-# Legacy/variant URL statuses we treat as "markdown complete"
-_MARKDOWN_COMPLETE_STATUSES = {
-    "markdown_saved",
-    "markdown_suppressed",
-    "markdown_done",
-    "md_done",
-    "md_saved",
-    "saved_markdown",
-}
-
-# Legacy/variant URL statuses we treat as "llm complete"
-_LLM_COMPLETE_STATUSES = {
-    "llm_extracted",
-    "llm_extracted_empty",
-    "llm_full_extracted",
-    "llm_done",
-    "extracted",
-    "product_saved",
-    "products_saved",
-    "json_saved",
-    "presence_done",
-}
-
-
-def _normalize_company_status(st: Optional[str]) -> str:
-    s = (st or "").strip().lower()
-    if not s:
-        return COMPANY_STATUS_PENDING
-    if s in _KNOWN_COMPANY_STATUSES:
-        return s
-    if s in _LEGACY_COMPANY_STATUS_MAP:
-        return _LEGACY_COMPANY_STATUS_MAP[s]
-    return s  # preserve unknown strings (DB may contain legacy values)
-
-
-def _status_rank(st: Optional[str]) -> int:
-    s = _normalize_company_status(st)
-    return _COMPANY_STATUS_RANK.get(s, -1)
-
-
-def _prefer_higher_status(current: Optional[str], derived: Optional[str]) -> str:
-    """
-    Choose the 'higher' status by rank, never downgrading.
-    Unknown current statuses are treated as rank=-1; derived wins if known.
-    """
-    c = _normalize_company_status(current)
-    d = _normalize_company_status(derived)
-    if _status_rank(c) >= _status_rank(d):
-        return c
-    return d
 
 
 def _company_metadata_dir(bvdid: str) -> Path:
@@ -335,95 +248,226 @@ def _global_state_path() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Dataclasses
+# Company status semantics (existing behavior preserved)
 # ---------------------------------------------------------------------------
 
+CompanyStatus = Literal[
+    "pending",
+    "markdown_not_done",
+    "markdown_done",
+    "llm_not_done",
+    "llm_done",
+    "terminal_done",
+]
 
-@dataclass(frozen=True)
-class CompanySnapshot:
-    bvdid: str
-    name: Optional[str] = None
-    root_url: Optional[str] = None
-    status: CompanyStatus = COMPANY_STATUS_PENDING
-    urls_total: int = 0
-    urls_markdown_done: int = 0
-    urls_llm_done: int = 0
-    last_error: Optional[str] = None
-    done_reason: Optional[str] = None
-    done_details: Optional[Dict[str, Any]] = None
-    done_at: Optional[str] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
+COMPANY_STATUS_PENDING: CompanyStatus = "pending"
+COMPANY_STATUS_MD_NOT_DONE: CompanyStatus = "markdown_not_done"
+COMPANY_STATUS_MD_DONE: CompanyStatus = "markdown_done"
+COMPANY_STATUS_LLM_NOT_DONE: CompanyStatus = "llm_not_done"
+COMPANY_STATUS_LLM_DONE: CompanyStatus = "llm_done"
+COMPANY_STATUS_TERMINAL_DONE: CompanyStatus = "terminal_done"
+
+_KNOWN_COMPANY_STATUSES = {
+    COMPANY_STATUS_PENDING,
+    COMPANY_STATUS_MD_NOT_DONE,
+    COMPANY_STATUS_MD_DONE,
+    COMPANY_STATUS_LLM_NOT_DONE,
+    COMPANY_STATUS_LLM_DONE,
+    COMPANY_STATUS_TERMINAL_DONE,
+}
+
+# Sticky precedence: never downgrade; only allow upgrades.
+_COMPANY_STATUS_RANK: Dict[str, int] = {
+    COMPANY_STATUS_PENDING: 0,
+    COMPANY_STATUS_MD_NOT_DONE: 1,
+    COMPANY_STATUS_MD_DONE: 2,
+    COMPANY_STATUS_LLM_NOT_DONE: 3,
+    COMPANY_STATUS_LLM_DONE: 4,
+    COMPANY_STATUS_TERMINAL_DONE: 5,
+}
+
+_LEGACY_COMPANY_STATUS_MAP: Dict[str, CompanyStatus] = {
+    "done": COMPANY_STATUS_LLM_DONE,
+    "completed": COMPANY_STATUS_LLM_DONE,
+    "complete": COMPANY_STATUS_LLM_DONE,
+    "llmcomplete": COMPANY_STATUS_LLM_DONE,
+    "llm_complete": COMPANY_STATUS_LLM_DONE,
+    "terminal": COMPANY_STATUS_TERMINAL_DONE,
+    "terminalized": COMPANY_STATUS_TERMINAL_DONE,
+    "terminated": COMPANY_STATUS_TERMINAL_DONE,
+    "md_done": COMPANY_STATUS_MD_DONE,
+    "markdown_saved": COMPANY_STATUS_MD_DONE,
+    "markdown_complete": COMPANY_STATUS_MD_DONE,
+    "markdowncomplete": COMPANY_STATUS_MD_DONE,
+}
+
+_MARKDOWN_COMPLETE_STATUSES = {
+    "markdown_saved",
+    "markdown_suppressed",
+    "markdown_done",
+    "md_done",
+    "md_saved",
+    "saved_markdown",
+}
+
+_LLM_COMPLETE_STATUSES = {
+    "llm_extracted",
+    "llm_extracted_empty",
+    "llm_full_extracted",
+    "llm_done",
+    "extracted",
+    "product_saved",
+    "products_saved",
+    "json_saved",
+    "presence_done",
+}
 
 
-@dataclass(frozen=True)
-class RunSnapshot:
-    run_id: str
-    pipeline: Optional[str]
-    version: Optional[str]
-    started_at: str
-    total_companies: int
-    completed_companies: int
-    last_company_bvdid: Optional[str]
-    last_updated: Optional[str]
-
-
-@dataclass(frozen=True)
-class _Stmt:
-    sql: str
-    args: Tuple[Any, ...] = tuple()
-
-
-def _safe_json_load(s: Optional[str]) -> Optional[Dict[str, Any]]:
+def _normalize_company_status(st: Optional[str]) -> str:
+    s = (st or "").strip().lower()
     if not s:
+        return COMPANY_STATUS_PENDING
+    if s in _KNOWN_COMPANY_STATUSES:
+        return s
+    if s in _LEGACY_COMPANY_STATUS_MAP:
+        return _LEGACY_COMPANY_STATUS_MAP[s]
+    return s
+
+
+def _status_rank(st: Optional[str]) -> int:
+    s = _normalize_company_status(st)
+    return _COMPANY_STATUS_RANK.get(s, -1)
+
+
+def _prefer_higher_status(current: Optional[str], derived: Optional[str]) -> str:
+    c = _normalize_company_status(current)
+    d = _normalize_company_status(derived)
+    if _status_rank(c) >= _status_rank(d):
+        return c
+    return d
+
+
+# ---------------------------------------------------------------------------
+# Industry helpers (canonicalization for meta + DB)
+# ---------------------------------------------------------------------------
+
+
+def _canon_industry_codes(raw: Any) -> Optional[str]:
+    """
+    Canonical multi-code string: "9|10|20" (sorted, unique) or None.
+    Uses configs.llm_industry.normalize_industry_all
+    """
+    return _normalize_industry_all(raw)
+
+
+def _primary_industry_code(raw_codes: Optional[str]) -> Optional[str]:
+    """
+    Primary code stored as industry_code:
+      - If codes is "9|10|20" => "9"
+      - If None => None
+    """
+    if not raw_codes:
         return None
+    parts = [p for p in str(raw_codes).split("|") if p]
+    return parts[0] if parts else None
+
+
+def normalize_company_industry_fields(
+    raw: Any,
+) -> Tuple[Optional[str], str, Optional[str]]:
+    """
+    Returns (industry_code, industry_label, industry_codes)
+
+    - industry_codes: canonical multi-code "a|b|c" or None
+    - industry_code: primary code (first in industry_codes) or None
+    - industry_label: label of industry_code or "Unclassified"
+    """
+    codes = _canon_industry_codes(raw)
+    code = _primary_industry_code(codes)
+    # if missing, also allow a single raw code to become primary
+    if code is None and raw is not None:
+        c2 = _normalize_industry_code(raw)
+        if c2 and c2 != "default":
+            code = c2
+            codes = c2  # single-code canonical
+    label = _industry_label(code)
+    return code, label, codes
+
+
+# ---------------------------------------------------------------------------
+# crawl_meta.json helpers (industry fields added)
+# ---------------------------------------------------------------------------
+
+
+def load_crawl_meta(bvdid: str) -> Dict[str, Any]:
+    p = _meta_path_for(bvdid)
+    if not p.exists():
+        return {}
+    obj = _json_load_nocache(p)
+    return obj if isinstance(obj, dict) else {}
+
+
+def patch_crawl_meta(
+    bvdid: str,
+    patch: Dict[str, Any],
+    *,
+    pretty: bool = True,
+) -> None:
+    """
+    Atomic patch of crawl_meta.json. Ensures the 3 industry fields exist if provided:
+      - industry_code
+      - industry_label
+      - industry_codes
+    """
+    p = _meta_path_for(bvdid)
+    lk = _get_file_lock(p)
+
+    def _update() -> None:
+        with lk:
+            base: Dict[str, Any] = {}
+            if p.exists():
+                loaded = _json_load_nocache(p)
+                if isinstance(loaded, dict):
+                    base = loaded
+            if isinstance(patch, dict):
+                base.update(patch)
+            _atomic_write_json(p, base, cache=False, pretty=pretty)
+
+    _update()
+
+
+def ensure_crawl_meta_has_industry(
+    bvdid: str,
+    *,
+    industry_code: Optional[str],
+    industry_label: Optional[str],
+    industry_codes: Optional[str],
+) -> None:
+    """
+    Write the 3 industry fields to crawl_meta.json (idempotent).
+    """
+    patch: Dict[str, Any] = {}
+    patch["industry_code"] = industry_code
+    patch["industry_label"] = industry_label or _industry_label(industry_code)
+    patch["industry_codes"] = industry_codes
+    patch_crawl_meta(bvdid, patch, pretty=True)
+
+
+# ---------------------------------------------------------------------------
+# url_index.json helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_reserved_url_index_key(k: Any) -> bool:
     try:
-        obj = json.loads(s)
-        return obj if isinstance(obj, dict) else None
+        return str(k).startswith(URL_INDEX_RESERVED_PREFIX)
     except Exception:
-        return None
+        return False
 
 
-def _row_to_company_snapshot(row: sqlite3.Row) -> CompanySnapshot:
-    st = _normalize_company_status(row["status"] if "status" in row.keys() else None)
-    if st not in _KNOWN_COMPANY_STATUSES:
-        st = COMPANY_STATUS_PENDING
-
-    return CompanySnapshot(
-        bvdid=row["bvdid"],
-        name=row["name"],
-        root_url=row["root_url"],
-        status=(st or COMPANY_STATUS_PENDING),  # type: ignore[assignment]
-        urls_total=int(row["urls_total"] or 0),
-        urls_markdown_done=int(row["urls_markdown_done"] or 0),
-        urls_llm_done=int(row["urls_llm_done"] or 0),
-        last_error=row["last_error"],
-        done_reason=row["done_reason"] if "done_reason" in row.keys() else None,
-        done_details=_safe_json_load(
-            row["done_details"] if "done_details" in row.keys() else None
-        ),
-        done_at=row["done_at"] if "done_at" in row.keys() else None,
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-    )
-
-
-def _row_to_run_snapshot(row: sqlite3.Row) -> RunSnapshot:
-    return RunSnapshot(
-        run_id=row["run_id"],
-        pipeline=row["pipeline"],
-        version=row["version"],
-        started_at=row["started_at"],
-        total_companies=int(row["total_companies"] or 0),
-        completed_companies=int(row["completed_companies"] or 0),
-        last_company_bvdid=row["last_company_bvdid"],
-        last_updated=row["last_updated"],
-    )
-
-
-# ---------------------------------------------------------------------------
-# URL-index helpers
-# ---------------------------------------------------------------------------
+def _index_crawl_finished(index: Dict[str, Any]) -> bool:
+    meta = index.get(URL_INDEX_META_KEY)
+    return bool(isinstance(meta, dict) and meta.get("crawl_finished"))
 
 
 def load_url_index(bvdid: str) -> Dict[str, Any]:
@@ -435,6 +479,9 @@ def load_url_index(bvdid: str) -> Dict[str, Any]:
 
 
 def upsert_url_index_entry(bvdid: str, url: str, patch: Dict[str, Any]) -> None:
+    """
+    Upsert a URL entry (non-meta). Does not touch __meta__.
+    """
     idx_path = _url_index_path_for(bvdid)
     lk = _get_file_lock(idx_path)
 
@@ -450,6 +497,33 @@ def upsert_url_index_entry(bvdid: str, url: str, patch: Dict[str, Any]) -> None:
             ent_dict = dict(ent) if isinstance(ent, dict) else {}
             ent_dict.update(patch)
             existing[url] = ent_dict
+
+            payload = json.dumps(existing, ensure_ascii=False, separators=(",", ":"))
+            _atomic_write_text(idx_path, payload, "utf-8")
+
+    _update()
+
+
+def patch_url_index_meta(bvdid: str, patch: Dict[str, Any]) -> None:
+    """
+    Safely patch url_index.json __meta__ dictionary atomically.
+    """
+    idx_path = _url_index_path_for(bvdid)
+    lk = _get_file_lock(idx_path)
+
+    def _update() -> None:
+        with lk:
+            existing: Dict[str, Any] = {}
+            if idx_path.exists():
+                loaded = _json_load_nocache(idx_path)
+                if isinstance(loaded, dict):
+                    existing = loaded
+
+            meta = existing.get(URL_INDEX_META_KEY)
+            meta_dict = dict(meta) if isinstance(meta, dict) else {}
+            if isinstance(patch, dict):
+                meta_dict.update(patch)
+            existing[URL_INDEX_META_KEY] = meta_dict
 
             payload = json.dumps(existing, ensure_ascii=False, separators=(",", ":"))
             _atomic_write_text(idx_path, payload, "utf-8")
@@ -509,7 +583,6 @@ def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
     )
 
     markdown_done = bool(has_md_path or status_md_done)
-
     if has_llm_artifact or extracted_flag or status_llm_done or presence_checked:
         markdown_done = True
 
@@ -522,14 +595,25 @@ def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
 def _compute_company_stage_from_index(
     index: Dict[str, Any],
 ) -> Tuple[CompanyStatus, int, int, int]:
+    """
+    IMPORTANT SEMANTICS FIX:
+
+    - url_index.json can contain __meta__ (reserved key).
+    - We NEVER conclude markdown_done / llm_done unless __meta__.crawl_finished == True.
+      This prevents Ctrl+C (partial discovery) from looking "done".
+    """
     if not index:
         return COMPANY_STATUS_PENDING, 0, 0, 0
+
+    crawl_finished = _index_crawl_finished(index)
 
     urls_total = 0
     md_done = 0
     llm_done = 0
 
-    for raw_ent in index.values():
+    for url, raw_ent in index.items():
+        if _is_reserved_url_index_key(url):
+            continue
         urls_total += 1
         if isinstance(raw_ent, dict):
             m_done, l_done = _classify_url_entry(raw_ent)
@@ -540,6 +624,14 @@ def _compute_company_stage_from_index(
 
     if urls_total == 0:
         return COMPANY_STATUS_PENDING, 0, 0, 0
+
+    # Crawl not finished => NEVER return *_done.
+    if not crawl_finished:
+        if llm_done > 0:
+            return COMPANY_STATUS_LLM_NOT_DONE, urls_total, md_done, llm_done
+        if md_done > 0:
+            return COMPANY_STATUS_MD_NOT_DONE, urls_total, md_done, llm_done
+        return COMPANY_STATUS_PENDING, urls_total, md_done, llm_done
 
     if llm_done == urls_total:
         status: CompanyStatus = COMPANY_STATUS_LLM_DONE
@@ -558,6 +650,8 @@ def _pending_urls_for_stage(
 ) -> List[str]:
     pending: List[str] = []
     for url, raw_ent in index.items():
+        if _is_reserved_url_index_key(url):
+            continue
         ent = raw_ent if isinstance(raw_ent, dict) else {}
         md_done, llm_done = _classify_url_entry(ent)
         if stage == "markdown":
@@ -567,11 +661,6 @@ def _pending_urls_for_stage(
             if md_done and not llm_done:
                 pending.append(url)
     return pending
-
-
-# ---------------------------------------------------------------------------
-# URL stats helpers (url_index.json is the source of truth)
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -587,13 +676,111 @@ def compute_url_stats_from_index_dict(index: Dict[str, Any]) -> URLStats:
 
 
 def compute_url_stats_for_company(bvdid: str) -> URLStats:
-    """
-    Source of truth = url_index.json. Falls back to 0s if missing/unreadable.
-    """
     idx = load_url_index(bvdid)
     if not isinstance(idx, dict) or not idx:
         return URLStats(0, 0, 0)
     return compute_url_stats_from_index_dict(idx)
+
+
+# ---------------------------------------------------------------------------
+# Snapshots / helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CompanySnapshot:
+    bvdid: str
+    name: Optional[str] = None
+    root_url: Optional[str] = None
+    status: CompanyStatus = COMPANY_STATUS_PENDING
+    urls_total: int = 0
+    urls_markdown_done: int = 0
+    urls_llm_done: int = 0
+    last_error: Optional[str] = None
+    done_reason: Optional[str] = None
+    done_details: Optional[Dict[str, Any]] = None
+    done_at: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    # NEW: industry fields persisted in DB (and mirrored in crawl_meta.json)
+    industry_code: Optional[str] = None
+    industry_label: Optional[str] = None
+    industry_codes: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RunSnapshot:
+    run_id: str
+    pipeline: Optional[str]
+    version: Optional[str]
+    started_at: str
+    total_companies: int
+    completed_companies: int
+    last_company_bvdid: Optional[str]
+    last_updated: Optional[str]
+
+
+@dataclass(frozen=True)
+class _Stmt:
+    sql: str
+    args: Tuple[Any, ...] = tuple()
+
+
+def _safe_json_load(s: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not s:
+        return None
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _row_to_company_snapshot(row: sqlite3.Row) -> CompanySnapshot:
+    st = _normalize_company_status(row["status"] if "status" in row.keys() else None)
+    if st not in _KNOWN_COMPANY_STATUSES:
+        st = COMPANY_STATUS_PENDING
+
+    def _col(name: str) -> Optional[str]:
+        if name not in row.keys():
+            return None
+        v = row[name]
+        return str(v) if v is not None else None
+
+    return CompanySnapshot(
+        bvdid=row["bvdid"],
+        name=row["name"],
+        root_url=row["root_url"],
+        status=(st or COMPANY_STATUS_PENDING),  # type: ignore[assignment]
+        urls_total=int(row["urls_total"] or 0),
+        urls_markdown_done=int(row["urls_markdown_done"] or 0),
+        urls_llm_done=int(row["urls_llm_done"] or 0),
+        last_error=row["last_error"],
+        done_reason=row["done_reason"] if "done_reason" in row.keys() else None,
+        done_details=_safe_json_load(
+            row["done_details"] if "done_details" in row.keys() else None
+        ),
+        done_at=row["done_at"] if "done_at" in row.keys() else None,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        industry_code=_col("industry_code"),
+        industry_label=_col("industry_label"),
+        industry_codes=_col("industry_codes"),
+    )
+
+
+def _row_to_run_snapshot(row: sqlite3.Row) -> RunSnapshot:
+    return RunSnapshot(
+        run_id=row["run_id"],
+        pipeline=row["pipeline"],
+        version=row["version"],
+        started_at=row["started_at"],
+        total_companies=int(row["total_companies"] or 0),
+        completed_companies=int(row["completed_companies"] or 0),
+        last_company_bvdid=row["last_company_bvdid"],
+        last_updated=row["last_updated"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -603,23 +790,21 @@ def compute_url_stats_for_company(bvdid: str) -> URLStats:
 
 class CrawlState:
     """
-    Key fixes vs your current version:
-      1) DB path freshness: if OUTPUT_ROOT changes at runtime, the same CrawlState instance
-         will automatically reopen the connection to the new default DB (only when it was
-         originally created for the default DB).
-      2) Idempotent run completion accounting using run_company_done(run_id,bvdid).
-      3) crawl_global_state.json is written next to the DB to prevent OUTPUT_ROOT drift,
-         and latest_run totals are sanitized against reality.
-      4) url_index.json is treated as source of truth for URL counters where available
-         (global sums + terminal writes).
-      5) NEW: DB-backed in-progress APIs (has/count/list) + bulk recompute of in-progress.
+    Adds industry persistence:
+
+      - DB columns: industry_code, industry_label, industry_codes
+      - crawl_meta.json fields: industry_code, industry_label, industry_codes
+
+    Canonical semantics:
+      - industry_codes: canonical multi-code "a|b|c" sorted unique (or None)
+      - industry_code: primary code = first element of industry_codes (or None)
+      - industry_label: label of industry_code (or "Unclassified")
     """
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db_path = Path(db_path) if db_path is not None else default_db_path()
         self.db_path = self.db_path.resolve()
 
-        # Dynamic only if initialized on the *current* default DB path.
         try:
             self._dynamic_db = self.db_path == default_db_path().resolve()
         except Exception:
@@ -629,6 +814,9 @@ class CrawlState:
         self._lock = threading.Lock()
         self._conn = self._connect(self.db_path)
         self._init_schema()
+
+        self._global_state_write_lock = asyncio.Lock()
+        self._last_db_only_global_write_ts = 0.0
 
     # -------------------- connection / schema --------------------
 
@@ -662,9 +850,15 @@ class CrawlState:
             with suppress(Exception):
                 self._conn.execute(f"ALTER TABLE companies ADD COLUMN {col_ddl}")
 
+        # existing migrations
         _add("done_reason TEXT", "done_reason")
         _add("done_details TEXT", "done_details")
         _add("done_at TEXT", "done_at")
+
+        # NEW: industry migrations
+        _add("industry_code TEXT", "industry_code")
+        _add("industry_label TEXT", "industry_label")
+        _add("industry_codes TEXT", "industry_codes")
 
     def _init_schema_locked(self) -> None:
         self._conn.execute(
@@ -682,7 +876,10 @@ class CrawlState:
                 done_details TEXT,
                 done_at TEXT,
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                industry_code TEXT,
+                industry_label TEXT,
+                industry_codes TEXT
             )
             """
         )
@@ -701,7 +898,6 @@ class CrawlState:
             )
             """
         )
-        # Idempotent run completion accounting
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS run_company_done (
@@ -725,10 +921,6 @@ class CrawlState:
             self._init_schema_locked()
 
     def _ensure_db_current_locked(self) -> None:
-        """
-        If this CrawlState instance was created for the default DB, and OUTPUT_ROOT changes,
-        automatically reopen the connection to the new default DB.
-        """
         if not getattr(self, "_dynamic_db", False):
             return
 
@@ -740,7 +932,6 @@ class CrawlState:
         if want == self.db_path:
             return
 
-        # Reopen
         try:
             with suppress(Exception):
                 self._conn.close()
@@ -783,16 +974,10 @@ class CrawlState:
 
         return await asyncio.to_thread(_run)
 
-    # ---------- NEW: in-progress DB APIs (authoritative) ----------
+    # ---------- in-progress DB APIs ----------
 
     @staticmethod
     def _in_progress_statuses() -> Tuple[str, ...]:
-        """
-        Semantics for exit invariants:
-          - Treat pending as "in progress" so the main loop will not exit early
-            when there is still runnable work that hasn't been scheduled yet.
-          - Treat markdown_not_done and llm_not_done as in progress.
-        """
         return (
             COMPANY_STATUS_PENDING,
             COMPANY_STATUS_MD_NOT_DONE,
@@ -836,12 +1021,6 @@ class CrawlState:
         return [str(r["bvdid"]) for r in rows]
 
     async def recompute_all_in_progress(self, *, concurrency: int = 32) -> None:
-        """
-        Best-effort bulk refresh of all in-progress companies from url_index.json.
-
-        - Does NOT downgrade statuses (recompute_company_from_index() uses sticky ranks).
-        - Uses bounded concurrency.
-        """
         c = max(1, int(concurrency))
         ids = await self.get_in_progress_company_ids(limit=1_000_000)
         if not ids:
@@ -854,7 +1033,6 @@ class CrawlState:
                 with suppress(Exception):
                     await self.recompute_company_from_index(cid)
 
-        # Avoid creating an enormous task list that spikes memory
         batch = max(64, c * 8)
         for i in range(0, len(ids), batch):
             await asyncio.gather(*(_one(cid) for cid in ids[i : i + batch]))
@@ -879,7 +1057,6 @@ class CrawlState:
         )
         last_error_trim = (last_error or "")[:4000] if last_error is not None else None
 
-        # IMPORTANT: preserve real counters from url_index.json if present
         try:
             stats = compute_url_stats_for_company(bvdid)
         except Exception:
@@ -894,9 +1071,10 @@ class CrawlState:
                     bvdid, name, root_url, status,
                     urls_total, urls_markdown_done, urls_llm_done,
                     last_error, done_reason, done_details, done_at,
-                    created_at, updated_at
+                    created_at, updated_at,
+                    industry_code, industry_label, industry_codes
                 )
-                VALUES (?, ?, ?, ?, 0, 0, 0, NULL, NULL, NULL, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, 0, 0, 0, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL, NULL)
                 """,
                 (bvdid, name, root_url, COMPANY_STATUS_PENDING, now, now),
             )
@@ -961,10 +1139,6 @@ class CrawlState:
     def clear_company_terminal_sync(
         self, bvdid: str, *, keep_status: bool = False
     ) -> None:
-        """
-        Remove terminal_done markers (done_reason/details/done_at).
-        If keep_status=False and current status is terminal_done, status is reset to pending.
-        """
         now = _now_iso()
         with self._lock:
             self._ensure_db_current_locked()
@@ -1061,10 +1235,6 @@ class CrawlState:
         await self._exec(_Stmt(sql, tuple(args)))
 
     async def mark_company_completed(self, run_id: str, bvdid: str) -> None:
-        """
-        Idempotent per (run_id, bvdid).
-        Prevents completed_companies inflation when the same company is finalized twice.
-        """
         now = _now_iso()
 
         def _run() -> None:
@@ -1083,7 +1253,6 @@ class CrawlState:
                     inserted = 0
 
                 if inserted > 0:
-                    # Increment only once per (run_id,bvdid)
                     self._conn.execute(
                         """
                         UPDATE runs
@@ -1100,7 +1269,6 @@ class CrawlState:
                         (bvdid, now, run_id),
                     )
                 else:
-                    # Still update "last seen"
                     self._conn.execute(
                         "UPDATE runs SET last_company_bvdid=?, last_updated=? WHERE run_id=?",
                         (bvdid, now, run_id),
@@ -1112,7 +1280,9 @@ class CrawlState:
         row = await self._query_one("SELECT * FROM runs WHERE run_id=?", (run_id,))
         return _row_to_run_snapshot(row) if row else None
 
-    # ---------- company-level API ----------
+    # -----------------------------------------------------------------------
+    # Company-level API (industry fields added)
+    # -----------------------------------------------------------------------
 
     async def upsert_company(
         self,
@@ -1128,6 +1298,12 @@ class CrawlState:
         done_reason: Optional[str] = None,
         done_details: Optional[Dict[str, Any]] = None,
         done_at: Optional[str] = None,
+        # NEW:
+        industry_code: Optional[str] = None,
+        industry_label: Optional[str] = None,
+        industry_codes: Optional[str] = None,
+        # If True, write crawl_meta.json too (industry + basics)
+        write_meta: bool = False,
     ) -> None:
         now = _now_iso()
 
@@ -1138,9 +1314,10 @@ class CrawlState:
                     bvdid, name, root_url, status,
                     urls_total, urls_markdown_done, urls_llm_done,
                     last_error, done_reason, done_details, done_at,
-                    created_at, updated_at
+                    created_at, updated_at,
+                    industry_code, industry_label, industry_codes
                 )
-                VALUES (?, ?, ?, ?, 0, 0, 0, NULL, NULL, NULL, NULL, ?, ?)
+                VALUES (?, ?, ?, ?, 0, 0, 0, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL, NULL)
                 """,
                 (bvdid, name, root_url, status or COMPANY_STATUS_PENDING, now, now),
             )
@@ -1182,10 +1359,110 @@ class CrawlState:
             sets.append("done_at=?")
             args.append(done_at)
 
+        # NEW: industry fields (normalize once here if caller gives raw)
+        if (
+            (industry_code is not None)
+            or (industry_label is not None)
+            or (industry_codes is not None)
+        ):
+            # Caller is expected to pass canonical values already.
+            # Still keep consistency: if label missing, derive; if codes missing but code exists, set codes=code.
+            c = industry_code
+            codes = industry_codes
+            if codes is None and c is not None:
+                codes = c
+            lbl = industry_label or _industry_label(c)
+            sets.append("industry_code=?")
+            args.append(c)
+            sets.append("industry_label=?")
+            args.append(lbl)
+            sets.append("industry_codes=?")
+            args.append(codes)
+
         args.append(bvdid)
         await self._exec(
             _Stmt(f"UPDATE companies SET {', '.join(sets)} WHERE bvdid=?", tuple(args))
         )
+
+        if write_meta:
+            patch: Dict[str, Any] = {}
+            if name is not None:
+                patch["company_name"] = name
+            if root_url is not None:
+                patch["root_url"] = root_url
+
+            if (
+                (industry_code is not None)
+                or (industry_label is not None)
+                or (industry_codes is not None)
+            ):
+                c = industry_code
+                codes = (
+                    industry_codes
+                    if industry_codes is not None
+                    else (c if c is not None else None)
+                )
+                lbl = industry_label or _industry_label(c)
+                patch["industry_code"] = c
+                patch["industry_label"] = lbl
+                patch["industry_codes"] = codes
+
+            if patch:
+                patch_crawl_meta(bvdid, patch, pretty=True)
+
+    async def set_company_industry(
+        self,
+        bvdid: str,
+        *,
+        raw_industry: Any,
+        name: Optional[str] = None,
+        root_url: Optional[str] = None,
+        write_meta: bool = True,
+    ) -> None:
+        """
+        Canonical, single entrypoint: set industry fields from any raw input.
+        Also updates crawl_meta.json by default.
+        """
+        code, label, codes = normalize_company_industry_fields(raw_industry)
+        await self.upsert_company(
+            bvdid,
+            name=name,
+            root_url=root_url,
+            industry_code=code,
+            industry_label=label,
+            industry_codes=codes,
+            write_meta=write_meta,
+        )
+
+    async def get_company_snapshot(
+        self, bvdid: str, *, recompute: bool = True
+    ) -> CompanySnapshot:
+        row = await self._query_one("SELECT * FROM companies WHERE bvdid=?", (bvdid,))
+        if row is not None:
+            if _normalize_company_status(row["status"]) == COMPANY_STATUS_TERMINAL_DONE:
+                return _row_to_company_snapshot(row)
+            if recompute:
+                return await self.recompute_company_from_index(bvdid)
+            return _row_to_company_snapshot(row)
+
+        if recompute:
+            return await self.recompute_company_from_index(bvdid)
+
+        now = _now_iso()
+        await self._exec(
+            _Stmt(
+                """
+                INSERT OR IGNORE INTO companies (
+                    bvdid, status, urls_total, urls_markdown_done,
+                    urls_llm_done, created_at, updated_at
+                )
+                VALUES (?, ?, 0, 0, 0, ?, ?)
+                """,
+                (bvdid, COMPANY_STATUS_PENDING, now, now),
+            )
+        )
+        row2 = await self._query_one("SELECT * FROM companies WHERE bvdid=?", (bvdid,))
+        return _row_to_company_snapshot(row2)  # type: ignore[arg-type]
 
     async def recompute_company_from_index(
         self,
@@ -1194,14 +1471,6 @@ class CrawlState:
         name: Optional[str] = None,
         root_url: Optional[str] = None,
     ) -> CompanySnapshot:
-        """
-        Recompute derived stage/counters from url_index.json.
-
-        Rules:
-          - terminal_done is sticky and never recomputed/downgraded.
-          - never downgrade status; only upgrades by rank.
-          - counters are protected against regression: max(existing, derived).
-        """
         cur = await self._query_one(
             "SELECT status, urls_total, urls_markdown_done, urls_llm_done FROM companies WHERE bvdid=?",
             (bvdid,),
@@ -1243,46 +1512,226 @@ class CrawlState:
         )
         return await self.get_company_snapshot(bvdid, recompute=False)
 
-    async def get_company_snapshot(
-        self, bvdid: str, *, recompute: bool = True
-    ) -> CompanySnapshot:
-        row = await self._query_one("SELECT * FROM companies WHERE bvdid=?", (bvdid,))
-        if row is not None:
-            if _normalize_company_status(row["status"]) == COMPANY_STATUS_TERMINAL_DONE:
-                return _row_to_company_snapshot(row)
-            if recompute:
-                return await self.recompute_company_from_index(bvdid)
-            return _row_to_company_snapshot(row)
+    # -----------------------------------------------------------------------
+    # LLM stage helpers (used by extensions/llm_passes.py)
+    # -----------------------------------------------------------------------
 
-        if recompute:
-            return await self.recompute_company_from_index(bvdid)
-
-        now = _now_iso()
-        await self._exec(
-            _Stmt(
-                """
-                INSERT OR IGNORE INTO companies (
-                    bvdid, status, urls_total, urls_markdown_done,
-                    urls_llm_done, created_at, updated_at
-                )
-                VALUES (?, ?, 0, 0, 0, ?, ?)
-                """,
-                (bvdid, COMPANY_STATUS_PENDING, now, now),
-            )
+    async def get_pending_urls_for_markdown(self, bvdid: str) -> List[str]:
+        index = await asyncio.to_thread(load_url_index, bvdid)
+        return _pending_urls_for_stage(
+            index if isinstance(index, dict) else {}, "markdown"
         )
-        row2 = await self._query_one("SELECT * FROM companies WHERE bvdid=?", (bvdid,))
-        return _row_to_company_snapshot(row2)  # type: ignore[arg-type]
 
-    async def recompute_global_state(self) -> Dict[str, Any]:
+    async def get_pending_urls_for_llm(self, bvdid: str) -> List[str]:
+        index = await asyncio.to_thread(load_url_index, bvdid)
+        return _pending_urls_for_stage(index if isinstance(index, dict) else {}, "llm")
+
+    async def mark_url_failed(self, bvdid: str, url: str, reason: str) -> None:
+        upsert_url_index_entry(
+            bvdid,
+            url,
+            {
+                "status": f"url_failed:{(reason or 'unknown')[:120]}",
+                "last_error": (reason or "unknown")[:4000],
+                "updated_at": _now_iso(),
+            },
+        )
+        await self.recompute_company_from_index(bvdid)
+
+    # -----------------------------------------------------------------------
+    # Industry bulk update utility (for run.py optional flag)
+    # -----------------------------------------------------------------------
+
+    async def update_industry_from_csv(
+        self,
+        csv_path: str | Path,
+        *,
+        bvdid_column: str = "bvdid",
+        industry_column: str = "industry",
+        # optional: sometimes the new csv might contain "industry_codes" already
+        industry_codes_column: Optional[str] = None,
+        name_column: Optional[str] = None,
+        root_url_column: Optional[str] = None,
+        strict_header: bool = True,
+        write_meta: bool = True,
+        batch_size: int = 500,
+    ) -> int:
         """
-        Compute crawl_global_state.json from the DB only (for statuses), but URL sums are
-        derived from url_index.json whenever present (source of truth), otherwise DB fallback.
+        Update DB industry fields for existing companies using a new CSV that contains the same bvdid.
 
-        Also:
-          - Write the file next to the DB to avoid OUTPUT_ROOT drift.
-          - Sanitize latest_run totals (avoid showing 11/11 when DB contains 9 companies).
+        Canonical behavior:
+          - prefer industry_codes_column if provided and present in csv
+          - else use industry_column
+          - normalize to (industry_code, industry_label, industry_codes)
+          - update only rows that exist in DB (INSERT OR IGNORE is not used here)
+
+        Returns: number of companies updated (attempted updates for existing rows).
         """
+        p = Path(csv_path)
+        if not p.exists():
+            raise FileNotFoundError(str(p))
 
+        def _read_rows() -> List[Dict[str, str]]:
+            with p.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames is None:
+                    raise ValueError("CSV has no header row.")
+                fields = [x.strip() for x in reader.fieldnames if x is not None]
+                have = set(fields)
+
+                need = {bvdid_column}
+                if industry_codes_column:
+                    need.add(industry_codes_column)
+                need.add(industry_column)
+                if name_column:
+                    need.add(name_column)
+                if root_url_column:
+                    need.add(root_url_column)
+
+                if strict_header:
+                    missing = [c for c in need if c not in have]
+                    if missing:
+                        raise ValueError(f"CSV missing required columns: {missing}")
+
+                out: List[Dict[str, str]] = []
+                for row in reader:
+                    if not isinstance(row, dict):
+                        continue
+                    out.append(
+                        {k: (v if v is not None else "") for k, v in row.items()}
+                    )
+                return out
+
+        rows = await asyncio.to_thread(_read_rows)
+        if not rows:
+            return 0
+
+        # Determine which industry source to use per-row
+        def _pick_industry_value(r: Dict[str, str]) -> Any:
+            if (
+                industry_codes_column
+                and industry_codes_column in r
+                and str(r.get(industry_codes_column) or "").strip()
+            ):
+                return r.get(industry_codes_column)
+            return r.get(industry_column)
+
+        # Fetch existing bvdids once (avoid per-row SELECT)
+        bvdids = [str(r.get(bvdid_column) or "").strip() for r in rows]
+        bvdids = [b for b in bvdids if b]
+        if not bvdids:
+            return 0
+
+        def _existing_set() -> set[str]:
+            with self._lock:
+                self._ensure_db_current_locked()
+                # chunk IN queries to avoid SQLite limits
+                exist: set[str] = set()
+                chunk = 900
+                for i in range(0, len(bvdids), chunk):
+                    part = bvdids[i : i + chunk]
+                    placeholders = ",".join("?" for _ in part)
+                    q = f"SELECT bvdid FROM companies WHERE bvdid IN ({placeholders})"
+                    for rr in self._conn.execute(q, tuple(part)).fetchall():
+                        exist.add(str(rr["bvdid"]))
+                return exist
+
+        existing = await asyncio.to_thread(_existing_set)
+        if not existing:
+            return 0
+
+        updates: List[
+            Tuple[str, Optional[str], str, Optional[str], Optional[str], Optional[str]]
+        ] = []
+        # tuple: (bvdid, industry_code, industry_label, industry_codes, name, root_url)
+        for r in rows:
+            b = str(r.get(bvdid_column) or "").strip()
+            if not b or b not in existing:
+                continue
+            raw_ind = _pick_industry_value(r)
+            code, label, codes = normalize_company_industry_fields(raw_ind)
+
+            nm = str(r.get(name_column) or "").strip() if name_column else None
+            ru = str(r.get(root_url_column) or "").strip() if root_url_column else None
+            nm = nm if nm else None
+            ru = ru if ru else None
+
+            updates.append((b, code, label, codes, nm, ru))
+
+        if not updates:
+            return 0
+
+        def _apply_batch(
+            batch: List[
+                Tuple[
+                    str, Optional[str], str, Optional[str], Optional[str], Optional[str]
+                ]
+            ],
+        ) -> int:
+            with self._lock:
+                self._ensure_db_current_locked()
+                n = 0
+                now = _now_iso()
+                for b, code, label, codes, nm, ru in batch:
+                    # keep codes consistent
+                    if codes is None and code is not None:
+                        codes = code
+                    label2 = label or _industry_label(code)
+
+                    sets = [
+                        "industry_code=?",
+                        "industry_label=?",
+                        "industry_codes=?",
+                        "updated_at=?",
+                    ]
+                    args: List[Any] = [code, label2, codes, now]
+
+                    if nm is not None:
+                        sets.append("name=?")
+                        args.append(nm)
+                    if ru is not None:
+                        sets.append("root_url=?")
+                        args.append(ru)
+
+                    args.append(b)
+                    self._conn.execute(
+                        f"UPDATE companies SET {', '.join(sets)} WHERE bvdid=?",
+                        tuple(args),
+                    )
+                    n += 1
+
+            # meta writes are outside DB lock
+            if write_meta:
+                for b, code, label, codes, nm, ru in batch:
+                    patch: Dict[str, Any] = {
+                        "industry_code": code,
+                        "industry_label": (label or _industry_label(code)),
+                        "industry_codes": (
+                            codes
+                            if codes is not None
+                            else (code if code is not None else None)
+                        ),
+                    }
+                    if nm is not None:
+                        patch["company_name"] = nm
+                    if ru is not None:
+                        patch["root_url"] = ru
+                    patch_crawl_meta(b, patch, pretty=True)
+
+            return n
+
+        total_updated = 0
+        bs = max(1, int(batch_size))
+        for i in range(0, len(updates), bs):
+            total_updated += await asyncio.to_thread(_apply_batch, updates[i : i + bs])
+
+        return total_updated
+
+    # -----------------------------------------------------------------------
+    # Global-state writer (DB-only) — kept (existing behavior)
+    # -----------------------------------------------------------------------
+
+    async def write_global_state_from_db_only(self) -> Dict[str, Any]:
         def _compute_and_write() -> Dict[str, Any]:
             with self._lock:
                 self._ensure_db_current_locked()
@@ -1326,10 +1775,6 @@ class CrawlState:
             urls_md_done_sum = 0
             urls_llm_done_sum = 0
 
-            # NOTE: do not hold DB lock while reading many json files.
-            # We compute sums outside lock and optionally "repair" counters inside lock per-company.
-            repair_updates: List[Tuple[int, int, int, str, str]] = []
-
             for r in rows:
                 raw_st = r["status"]
                 st_norm = _normalize_company_status(raw_st)
@@ -1360,43 +1805,9 @@ class CrawlState:
                 else:
                     done.append(b)
 
-                # --- URL sums: prefer url_index.json when available ---
-                try:
-                    idx = load_url_index(b)
-                    if isinstance(idx, dict) and idx:
-                        _, t, md, llm = _compute_company_stage_from_index(idx)
-                        urls_total_sum += int(t)
-                        urls_md_done_sum += int(md)
-                        urls_llm_done_sum += int(llm)
-                        repair_updates.append(
-                            (int(t), int(md), int(llm), _now_iso(), b)
-                        )
-                    else:
-                        urls_total_sum += int(r["urls_total"] or 0)
-                        urls_md_done_sum += int(r["urls_markdown_done"] or 0)
-                        urls_llm_done_sum += int(r["urls_llm_done"] or 0)
-                except Exception:
-                    urls_total_sum += int(r["urls_total"] or 0)
-                    urls_md_done_sum += int(r["urls_markdown_done"] or 0)
-                    urls_llm_done_sum += int(r["urls_llm_done"] or 0)
-
-            # Opportunistic repair of DB counters (best-effort)
-            if repair_updates:
-                with self._lock:
-                    self._ensure_db_current_locked()
-                    for t, md, llm, nowiso, bvdid in repair_updates:
-                        with suppress(Exception):
-                            self._conn.execute(
-                                """
-                                UPDATE companies
-                                   SET urls_total=?,
-                                       urls_markdown_done=?,
-                                       urls_llm_done=?,
-                                       updated_at=?
-                                 WHERE bvdid=?
-                                """,
-                                (t, md, llm, nowiso, bvdid),
-                            )
+                urls_total_sum += int(r["urls_total"] or 0)
+                urls_md_done_sum += int(r["urls_markdown_done"] or 0)
+                urls_llm_done_sum += int(r["urls_llm_done"] or 0)
 
             crawled = total - len(pending)
             completed = len(done)
@@ -1407,11 +1818,9 @@ class CrawlState:
                 run_total = int(run_row["total_companies"] or 0)
                 run_completed = int(run_row["completed_companies"] or 0)
 
-                # Prefer the idempotent truth if available
                 if run_done_count is not None and run_done_count > 0:
                     run_completed = int(run_done_count)
 
-                # Keep it consistent with the DB state for display
                 if run_total <= 0 or run_total != total:
                     run_total = total
                 run_completed = min(int(run_completed), int(run_total))
@@ -1421,185 +1830,84 @@ class CrawlState:
                     "pipeline": run_row["pipeline"],
                     "version": run_row["version"],
                     "started_at": run_row["started_at"],
-                    "total_companies": int(run_total),
-                    "completed_companies": int(run_completed),
+                    "total_companies": run_total,
+                    "completed_companies": run_completed,
                     "last_company_bvdid": run_row["last_company_bvdid"],
                     "last_updated": run_row["last_updated"],
                 }
 
             payload: Dict[str, Any] = {
-                "generated_at": _now_iso(),
-                # Bind to DB directory to prevent OUTPUT_ROOT drift.
-                "output_root": str(self.db_path.parent),
+                "output_root": str(_output_root()),
                 "db_path": str(self.db_path),
+                "updated_at": _now_iso(),
                 "total_companies": total,
-                "crawled_companies": crawled,
-                "completed_companies": completed,
-                "percentage_completed": percentage_completed,
+                "crawled_companies": int(crawled),
+                "completed_companies": int(completed),
+                "percentage_completed": round(percentage_completed, 2),
                 "by_status": by_status,
                 "unknown_statuses": unknown_statuses,
-                "pending_companies": pending,
-                "in_progress_companies": in_progress,
-                "done_companies": done,
-                "terminal_done_companies": terminal_done,
-                "terminal_done_by_reason": terminal_reasons,
+                "pending_company_ids": pending[:200],
+                "in_progress_company_ids": in_progress[:200],
+                "done_company_ids": done[:200],
+                "terminal_done_company_ids": terminal_done[:200],
+                "terminal_done_reasons": terminal_reasons,
                 "urls_total_sum": int(urls_total_sum),
                 "urls_markdown_done_sum": int(urls_md_done_sum),
                 "urls_llm_done_sum": int(urls_llm_done_sum),
                 "latest_run": latest_run,
             }
 
-            out_path = self.db_path.parent / GLOBAL_STATE_NAME
-            _atomic_write_json(out_path, payload, cache=False, pretty=True)
+            _atomic_write_json(_global_state_path(), payload, cache=False, pretty=True)
             return payload
 
         return await asyncio.to_thread(_compute_and_write)
 
-    async def get_pending_urls_for_markdown(self, bvdid: str) -> List[str]:
-        snap = await self.get_company_snapshot(bvdid, recompute=False)
-        if snap.status == COMPANY_STATUS_TERMINAL_DONE:
-            return []
-        index = await asyncio.to_thread(load_url_index, bvdid)
-        return (
-            _pending_urls_for_stage(index, "markdown")
-            if isinstance(index, dict)
-            else []
-        )
-
-    async def get_pending_urls_for_llm(self, bvdid: str) -> List[str]:
-        snap = await self.get_company_snapshot(bvdid, recompute=False)
-        if snap.status == COMPANY_STATUS_TERMINAL_DONE:
-            return []
-        index = await asyncio.to_thread(load_url_index, bvdid)
-        return _pending_urls_for_stage(index, "llm") if isinstance(index, dict) else []
-
-    # -----------------------------------------------------------------------
-    # IMPORTANT FIX: bulk filter runnable company IDs for queue seeding
-    # -----------------------------------------------------------------------
-
-    @staticmethod
-    def _should_skip_status_for_mode(status: str, llm_mode: str) -> bool:
-        st = _normalize_company_status(status)
-        llm_mode = (llm_mode or "none").strip().lower()
-
-        if llm_mode == "none":
-            return st in (
-                COMPANY_STATUS_MD_DONE,
-                COMPANY_STATUS_LLM_DONE,
-                COMPANY_STATUS_TERMINAL_DONE,
-            )
-        return st in (COMPANY_STATUS_LLM_DONE, COMPANY_STATUS_TERMINAL_DONE)
-
-    async def filter_runnable_company_ids(
-        self,
-        bvdids: List[str],
-        *,
-        llm_mode: str,
-        refresh_pending: bool = False,
-        chunk_size: int = 500,
-        concurrency: int = 32,
-    ) -> List[str]:
-        """
-        Return a filtered list of company IDs that still require work under llm_mode.
-
-        - Uses DB status fast-path (chunked IN queries).
-        - Optionally refreshes PENDING rows from url_index.json (refresh_pending=True).
-        - Preserves input order.
-        """
-        if not bvdids:
-            return []
-
-        llm_mode = (llm_mode or "none").strip().lower()
-        chunk_size = max(50, int(chunk_size))
-        concurrency = max(1, int(concurrency))
-
-        status_map: Dict[str, str] = {}
-
-        async def _fetch_chunk(chunk: List[str]) -> None:
-            placeholders = ",".join("?" for _ in chunk)
-            sql = f"SELECT bvdid, status FROM companies WHERE bvdid IN ({placeholders})"
-            rows = await self._query_all(sql, tuple(chunk))
-            for r in rows:
-                status_map[str(r["bvdid"])] = str(r["status"] or COMPANY_STATUS_PENDING)
-
-        for i in range(0, len(bvdids), chunk_size):
-            await _fetch_chunk(bvdids[i : i + chunk_size])
-
-        if refresh_pending:
-            sem = asyncio.Semaphore(concurrency)
-
-            async def _refresh_one(cid: str) -> None:
-                st = _normalize_company_status(
-                    status_map.get(cid, COMPANY_STATUS_PENDING)
-                )
-                if st != COMPANY_STATUS_PENDING:
-                    return
-                try:
-                    if _url_index_path_for(cid).exists():
-                        async with sem:
-                            snap = await self.recompute_company_from_index(cid)
-                        status_map[cid] = snap.status
-                except Exception:
-                    return
-
-            await asyncio.gather(*(_refresh_one(cid) for cid in bvdids))
-
-        runnable: List[str] = []
-        for cid in bvdids:
-            st = status_map.get(cid, COMPANY_STATUS_PENDING)
-            if not self._should_skip_status_for_mode(st, llm_mode):
-                runnable.append(cid)
-        return runnable
+    async def write_global_state_throttled(
+        self, min_interval_sec: float = 2.0
+    ) -> Dict[str, Any]:
+        mi = max(0.05, float(min_interval_sec))
+        async with self._global_state_write_lock:
+            now = time.time()
+            if (now - self._last_db_only_global_write_ts) < mi:
+                # return best-effort snapshot without rewriting
+                return await self.write_global_state_from_db_only()
+            payload = await self.write_global_state_from_db_only()
+            self._last_db_only_global_write_ts = time.time()
+            return payload
 
 
 # ---------------------------------------------------------------------------
-# Plugin-style accessor (singleton)
+# Singleton accessor (used across extensions)
 # ---------------------------------------------------------------------------
 
-_default_crawl_state: Optional[CrawlState] = None
+_STATE_LOCK = threading.Lock()
+_STATE: Optional[CrawlState] = None
 
 
 def get_crawl_state(db_path: Optional[Path] = None) -> CrawlState:
-    global _default_crawl_state
+    global _STATE
+    with _STATE_LOCK:
+        if _STATE is None:
+            _STATE = CrawlState(db_path=db_path)
+        return _STATE
 
-    want = Path(db_path) if db_path is not None else default_db_path()
-    want = want.resolve()
 
-    if _default_crawl_state is None:
-        _default_crawl_state = CrawlState(want)
-        return _default_crawl_state
-
-    try:
-        cur = Path(getattr(_default_crawl_state, "db_path", "")).resolve()
-    except Exception:
-        cur = want
-
-    if cur != want:
-        with suppress(Exception):
-            _default_crawl_state.close()
-        _default_crawl_state = CrawlState(want)
-
-    return _default_crawl_state
-
+# ---------------------------------------------------------------------------
+# Convenience exports
+# ---------------------------------------------------------------------------
 
 __all__ = [
+    "DEFAULT_DB",
     "CrawlState",
+    "get_crawl_state",
     "CompanySnapshot",
     "RunSnapshot",
-    "CompanyStatus",
-    "COMPANY_STATUS_PENDING",
-    "COMPANY_STATUS_MD_NOT_DONE",
-    "COMPANY_STATUS_MD_DONE",
-    "COMPANY_STATUS_LLM_NOT_DONE",
-    "COMPANY_STATUS_LLM_DONE",
-    "COMPANY_STATUS_TERMINAL_DONE",
-    "get_crawl_state",
+    "URLStats",
     "load_url_index",
     "upsert_url_index_entry",
-    "default_db_path",
-    "DEFAULT_DB",
-    # url-index truth helpers
-    "URLStats",
-    "compute_url_stats_from_index_dict",
-    "compute_url_stats_for_company",
+    "patch_url_index_meta",
+    "load_crawl_meta",
+    "patch_crawl_meta",
+    "ensure_crawl_meta_has_industry",
+    "normalize_company_industry_fields",
 ]

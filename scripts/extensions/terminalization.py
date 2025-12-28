@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from .page_pipeline import PagePipelineSummary
+from .crawl_runner import PagePipelineSummary
 
 
 @dataclass(frozen=True, slots=True)

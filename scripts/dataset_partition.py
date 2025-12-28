@@ -100,7 +100,7 @@ def cmd_merge_csv(args: argparse.Namespace) -> Dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Split/merge web2product-catalog run roots (outputs + crawl_state + retry_state) without leaving special traces."
+        description="Split/merge web2product-catalog run roots (outputs + crawl_state + retry) without leaving special traces."
     )
     p.add_argument(
         "--log-level",
