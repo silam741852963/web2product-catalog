@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import gc
 import heapq
-import json
 import logging
 import os
+import signal
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -53,7 +52,7 @@ def compute_retry_exit_code_from_store(
 # --------------------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------------------
-@dataclass
+@dataclass(slots=True)
 class AdaptiveSchedulingConfig:
     """
     Scheduler owns:
@@ -117,9 +116,12 @@ class AdaptiveSchedulingConfig:
     deadlock_restart_require_mem_high: bool = True
 
     # --- Stall detection (progress-based; heartbeat doesn't count) ---
-    company_inactivity_timeout_sec: float = 240.0
     company_inactivity_min_runtime_sec: float = 90.0
     company_inactivity_cancel_max: int = 1
+
+    # stage-aware inactivity timeouts
+    crawl_inactivity_timeout_sec: float = 240.0
+    llm_inactivity_timeout_sec: float = 1800.0
 
     admission_starvation_timeout_sec: float = 480.0
     block_log_interval_sec: float = 60.0
@@ -167,7 +169,6 @@ class AdaptiveSchedulingConfig:
 
     # Backoff sleep smoothing
     min_idle_sleep_sec: float = 0.25
-    # IMPORTANT: increase to reduce “loop tick active_n=0…” churn when only deferred remain
     max_idle_sleep_sec: float = 30.0
 
     # When the scheduler cancels a company (stall/mem), do not re-admit it immediately.
@@ -178,15 +179,12 @@ class AdaptiveSchedulingConfig:
     company_cancel_inflight_timeout_sec: float = 600.0
 
     # Signal used when recommending restart
-    restart_signal: int = 15  # SIGTERM
+    restart_signal: int = int(signal.SIGTERM)
 
     # --- Doomed repeat / GOTO-timeout convergence controls ---
-    # After N identical failures (tracked by retry store) of kind "goto", clamp admission with a long delay.
     doomed_goto_same_error_streak_threshold: int = 2
     doomed_goto_min_cooldown_sec: float = 1800.0  # 30 minutes
-    # If only 1 company remains and it is doomed, optionally quarantine it immediately (best-effort).
     last_one_standing_quarantine_enabled: bool = True
-    # Throttle deferred->ready log spam (especially when 1 item cycles)
     deferred_move_log_interval_sec: float = 30.0
 
 
@@ -205,7 +203,16 @@ class AdaptiveScheduler:
       - get_state_snapshot()
       - touch_company()/heartbeat_company()/progress_company()
       - await requeue_company(company_id, delay_sec=..., reason=...)
+
+    Stage API (explicit + strict; no best-effort fallbacks):
+      - await set_company_stage(company_id, stage, reset_timers=False, reason="")
+      - await clear_company_stage(company_id, reset_timers=False, reason="")
+      - get_company_stage(company_id) -> Optional[str]
     """
+
+    STAGE_CRAWL = "crawl"
+    STAGE_LLM = "llm"
+    STAGE_IDLE = "idle"
 
     def __init__(
         self,
@@ -215,7 +222,6 @@ class AdaptiveScheduler:
         request_recycle_idle: Optional[Callable[[int, str], Awaitable[int]]] = None,
     ) -> None:
         self.cfg = cfg
-
         self._get_active_company_ids = get_active_company_ids
         self._request_cancel_companies = request_cancel_companies
         self._request_recycle_idle = request_recycle_idle
@@ -227,14 +233,15 @@ class AdaptiveScheduler:
         # Worklist
         self._work_ready: Deque[str] = deque()
         self._work_deferred: List[Tuple[float, str]] = []  # heap (eligible_at_ts, cid)
-        self._deferred_at: Dict[str, float] = {}  # cid -> current eligible_at
-        self._queued: set[str] = set()  # cid present in ready or deferred
+        self._deferred_at: Dict[str, float] = {}  # cid -> eligible_at
+        self._queued: set[str] = set()  # present in ready or deferred
         self._work_seen: set[str] = set()
         self._work_total_hint: int = 0
         self._is_company_runnable: Optional[Callable[[str], Awaitable[bool]]] = None
 
         # log throttles
         self._last_deferred_move_log_mono: float = 0.0
+        self._last_block_log_mono: float = 0.0
 
         # Memory sampling cache
         self._total_mem_bytes: int = 0
@@ -264,16 +271,14 @@ class AdaptiveScheduler:
         self._company_last_heartbeat_mono: Dict[str, float] = {}
         self._company_last_progress_mono: Dict[str, float] = {}
         self._company_started_mono: Dict[str, float] = {}
-
-        self._last_admission_mono: float = time.monotonic()
-        self._last_block_log_mono: float = 0.0
+        self._company_stage: Dict[str, str] = {}
 
         # AIMD target
         self._target_parallel: int = max(
             cfg.min_target, min(cfg.initial_target, cfg.max_target)
         )
 
-        # Progress
+        # Progress/global counters
         self._completed_counter: int = 0
         self._last_num_waiting: int = 0
         self._ever_admitted: bool = False
@@ -281,9 +286,10 @@ class AdaptiveScheduler:
         self._started_ts: float = time.time()
         self._started_mono: float = time.monotonic()
 
-        # Heartbeats/progress (GLOBAL)
+        # Global timestamps
         self._last_heartbeat_mono: float = time.monotonic()
         self._last_progress_mono: float = time.monotonic()
+        self._last_admission_mono: float = time.monotonic()
 
         # Observations to infer progress
         self._last_obs_active_n: int = 0
@@ -317,149 +323,117 @@ class AdaptiveScheduler:
         self._last_idle_recycle_mono: float = 0.0
 
     # ----------------------------
-    # Retry state introspection (best-effort, backward compatible)
+    # Stage API (STRICT)
     # ----------------------------
-    def _get_retry_state(self, cid: str) -> Optional[Any]:
-        """
-        Best-effort getter for a per-company retry state.
-        We avoid disk reads; this assumes RetryStateStore keeps an in-memory index/cache.
-        If the store doesn't expose a getter, return None and skip doomed gating.
-        """
+    def _normalize_stage(self, stage: str) -> str:
+        s = (stage or "").strip().lower()
+        if not s:
+            return self.STAGE_CRAWL
+        if s in ("crawl", "crawling"):
+            return self.STAGE_CRAWL
+        if s in ("llm", "llm_stage", "model", "inference"):
+            return self.STAGE_LLM
+        if s in ("idle", "done", "completed"):
+            return self.STAGE_IDLE
+        return s
+
+    def get_company_stage(self, company_id: str) -> Optional[str]:
+        cid = (company_id or "").strip()
         if not cid:
             return None
+        return self._company_stage.get(cid)
 
-        # Common patterns across versions: get(), state(), get_state(), read()
-        for name in ("get", "get_state", "state", "read_state"):
-            fn = getattr(self.retry_store, name, None)
-            if callable(fn):
-                try:
-                    return fn(cid)  # type: ignore[misc]
-                except TypeError:
-                    try:
-                        return fn(company_id=cid)  # type: ignore[misc]
-                    except Exception:
-                        return None
-                except Exception:
-                    return None
-        return None
+    async def set_company_stage(
+        self,
+        company_id: str,
+        stage: str,
+        *,
+        reset_timers: bool = False,
+        reason: str = "",
+    ) -> None:
+        cid = (company_id or "").strip()
+        if not cid:
+            return
+        st = self._normalize_stage(stage)
+        async with self._lock:
+            prev = self._company_stage.get(cid)
+            self._company_stage[cid] = st
+            if reset_timers:
+                now_mono = time.monotonic()
+                self._company_last_heartbeat_mono[cid] = now_mono
+                self._company_last_progress_mono[cid] = now_mono
+                self._company_started_mono.setdefault(cid, now_mono)
+                self._last_heartbeat_mono = now_mono
+                self._last_progress_mono = now_mono
+                self._last_admission_mono = now_mono
 
-    def _is_doomed_repeat_goto(self, cid: str) -> Tuple[bool, str]:
-        """
-        Detect "doomed" companies (repeat identical goto timeouts) via retry store.
-        Prefer a canonical store helper if present (retry.py plan A3), else fall back to
-        best-effort field probing for backward compatibility.
-
-        Returns (is_doomed, details).
-        """
-        thr = max(1, int(self.cfg.doomed_goto_same_error_streak_threshold))
-
-        # Prefer canonical helper if available
-        helper = getattr(self.retry_store, "is_doomed_repeat_goto", None)
-        if callable(helper):
-            try:
-                ok = bool(helper(company_id=cid, threshold=thr))  # type: ignore[misc]
-                return (ok, f"store_helper thr={thr}") if ok else (False, "")
-            except TypeError:
-                # maybe positional
-                try:
-                    ok = bool(helper(cid, thr))  # type: ignore[misc]
-                    return (ok, f"store_helper thr={thr}") if ok else (False, "")
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-        st = self._get_retry_state(cid)
-        if st is None:
-            return False, ""
-
-        same_streak = int(getattr(st, "same_error_streak", 0) or 0)
-        last_kind = (
-            getattr(st, "last_stall_kind", None)
-            or getattr(st, "stall_kind", None)
-            or getattr(st, "stall_kind_hint", None)
-        )
-
-        # If retry.py A2 is implemented, this will be stable:
-        last_sig = (
-            getattr(st, "last_error_sig", None)
-            or getattr(st, "error_sig", None)
-            or getattr(st, "last_sig", None)
-        )
-
-        try:
-            last_kind_s = (
-                (str(last_kind) if last_kind is not None else "").strip().lower()
+        if prev != st:
+            logger.info(
+                "[AdaptiveScheduling] company stage set cid=%s stage=%s prev=%s reason=%s",
+                cid,
+                st,
+                prev or "none",
+                reason or "unspecified",
             )
-        except Exception:
-            last_kind_s = ""
 
-        try:
-            last_sig_s = (str(last_sig) if last_sig is not None else "").strip().lower()
-        except Exception:
-            last_sig_s = ""
+    async def clear_company_stage(
+        self,
+        company_id: str,
+        *,
+        reset_timers: bool = False,
+        reason: str = "",
+    ) -> None:
+        cid = (company_id or "").strip()
+        if not cid:
+            return
+        async with self._lock:
+            prev = self._company_stage.pop(cid, None)
+            if reset_timers:
+                now_mono = time.monotonic()
+                self._company_last_heartbeat_mono[cid] = now_mono
+                self._company_last_progress_mono[cid] = now_mono
+                self._company_started_mono.setdefault(cid, now_mono)
+                self._last_heartbeat_mono = now_mono
+                self._last_progress_mono = now_mono
+                self._last_admission_mono = now_mono
 
-        if same_streak >= thr and last_kind_s == "goto":
-            # Prefer signature match if available; otherwise allow older stores that don’t have sig
-            if (not last_sig_s) or (last_sig_s == "goto_timeout"):
-                return (
-                    True,
-                    f"repeat_goto_timeout same_error_streak={same_streak} thr={thr} sig={last_sig_s or 'unknown'}",
-                )
-        return False, ""
+        if prev is not None:
+            logger.info(
+                "[AdaptiveScheduling] company stage cleared cid=%s prev=%s reason=%s",
+                cid,
+                prev,
+                reason or "unspecified",
+            )
 
-    def _try_quarantine_company(self, cid: str, *, reason: str) -> bool:
-        """
-        Best-effort quarantine call.
+    def _stage_inactivity_timeout_sec_locked(self, cid: str) -> float:
+        st = self._normalize_stage(self._company_stage.get(cid) or self.STAGE_CRAWL)
+        if st == self.STAGE_LLM:
+            return max(0.0, float(self.cfg.llm_inactivity_timeout_sec))
+        return max(0.0, float(self.cfg.crawl_inactivity_timeout_sec))
 
-        IMPORTANT FIX (B1):
-          RetryStateStore.quarantine_company() requires a richer signature in newer versions:
-            quarantine_company(company_id, reason, stage, error, ...)
-          Adaptive previously called it with the WRONG signature and silently failed.
-        """
-        fn = getattr(self.retry_store, "quarantine_company", None)
-        if not callable(fn):
-            return False
+    # ----------------------------
+    # Doomed repeat-goto (STRICT, store API only)
+    # ----------------------------
+    def _is_doomed_repeat_goto(self, cid: str) -> bool:
+        thr = max(1, int(self.cfg.doomed_goto_same_error_streak_threshold))
+        return bool(self.retry_store.is_doomed_repeat_goto(cid, threshold=thr))
 
-        # best-effort; satisfy required args
-        try:
-            fn(
-                company_id=cid,
-                reason=str(reason),
-                stage="scheduler_doomed",
-                error=str(reason),
-                cls="permanent",
-                also_mark_terminal_done=True,
-                flush=True,
-            )  # type: ignore[misc]
-            return True
-        except TypeError:
-            # Try a minimal keyword set (some versions don’t accept extras)
-            try:
-                fn(
-                    company_id=cid,
-                    reason=str(reason),
-                    stage="scheduler_doomed",
-                    error=str(reason),
-                    flush=True,
-                )  # type: ignore[misc]
-                return True
-            except TypeError:
-                # Try positional legacy variants
-                try:
-                    fn(cid, str(reason), "scheduler_doomed", str(reason))  # type: ignore[misc]
-                    return True
-                except Exception:
-                    return False
-            except Exception:
-                return False
-        except Exception:
-            return False
+    def _quarantine_last_one_standing(self, cid: str, *, reason: str) -> None:
+        # concrete API: quarantine_company(company_id, reason, stage, error, ...)
+        self.retry_store.quarantine_company(
+            company_id=cid,
+            reason=reason,
+            stage="scheduler_last_one_standing",
+            error=reason,
+            cls="permanent",
+            status_code=None,
+            nxdomain_like=False,
+            md_done=None,
+            flush=True,
+            also_mark_terminal_done=True,
+        )
 
     def _only_one_left_now(self) -> bool:
-        """
-        Helper for "last one standing": no active, and (ready+deferred) <= 1.
-        """
         try:
             active_n = len(self._get_active_company_ids())
         except Exception:
@@ -520,7 +494,6 @@ class AdaptiveScheduler:
         self._work_total_hint = len(ids)
 
         pending_retry = set(self.retry_store.pending_ids(exclude_quarantined=True))
-
         rm = (retry_mode or "all").strip().lower()
         if rm == "skip-retry":
             ids = [cid for cid in ids if cid not in pending_retry]
@@ -583,12 +556,6 @@ class AdaptiveScheduler:
         reason: str = "",
         force: bool = False,
     ) -> bool:
-        """
-        IMPORTANT (B2):
-          Gate *every* re-admission path against doomed repeat-goto.
-          - If last-one-standing -> quarantine immediately (best-effort).
-          - Else -> push into deferred with big cooldown and NEVER into ready on this call.
-        """
         cid = (company_id or "").strip()
         if not cid:
             return False
@@ -598,47 +565,33 @@ class AdaptiveScheduler:
         now = time.time()
         ts = now + max(0.0, float(delay_sec))
 
-        # Doomed gating (early)
-        doomed, details = self._is_doomed_repeat_goto(cid)
-        if doomed:
+        # Doomed repeat-goto gating (STRICT)
+        if self._is_doomed_repeat_goto(cid):
             if (
-                bool(self.cfg.last_one_standing_quarantine_enabled)
+                self.cfg.last_one_standing_quarantine_enabled
                 and self._only_one_left_now()
             ):
-                quarantined = self._try_quarantine_company(
-                    cid,
-                    reason=f"scheduler_last_one_standing_{details or 'repeat_goto_timeout'}",
+                self._quarantine_last_one_standing(
+                    cid, reason="scheduler_last_one_standing_repeat_goto_timeout"
                 )
-                if quarantined:
-                    logger.warning(
-                        "[AdaptiveScheduling] quarantined last-one-standing on requeue cid=%s (%s)",
-                        cid,
-                        details or "repeat_goto_timeout",
-                    )
-                    return True
+                logger.warning(
+                    "[AdaptiveScheduling] quarantined last-one-standing on requeue cid=%s",
+                    cid,
+                )
+                return True
+
             cooldown = max(0.0, float(self.cfg.doomed_goto_min_cooldown_sec))
             ts = max(
-                ts,
-                now + cooldown,
-                float(self.retry_store.next_eligible_at(cid) or 0.0),
+                ts, now + cooldown, float(self.retry_store.next_eligible_at(cid) or 0.0)
             )
             async with self._lock:
                 self._enqueue_deferred_locked(cid, ts)
-            if reason:
-                logger.warning(
-                    "[AdaptiveScheduling] requeue deferred doomed cid=%s delay=%.0fs reason=%s (%s)",
-                    cid,
-                    max(0.0, ts - now),
-                    reason,
-                    details or "repeat_goto_timeout",
-                )
-            else:
-                logger.warning(
-                    "[AdaptiveScheduling] requeue deferred doomed cid=%s delay=%.0fs (%s)",
-                    cid,
-                    max(0.0, ts - now),
-                    details or "repeat_goto_timeout",
-                )
+            logger.warning(
+                "[AdaptiveScheduling] requeue deferred doomed cid=%s delay=%.0fs reason=%s",
+                cid,
+                max(0.0, ts - now),
+                reason or "doomed_repeat_goto",
+            )
             self._mark_progress()
             return True
 
@@ -705,11 +658,6 @@ class AdaptiveScheduler:
         return None
 
     def _move_due_deferred_locked(self, now: float) -> None:
-        """
-        IMPORTANT:
-          Also apply doomed repeat-goto gating here so that "eligible_at reached"
-          doesn't immediately move a doomed company into ready again.
-        """
         moved = 0
         while self._work_deferred:
             ts, cid = self._work_deferred[0]
@@ -727,31 +675,27 @@ class AdaptiveScheduler:
                 self._queued.discard(cid)
                 continue
 
-            # Still not eligible? push back.
             if not self.retry_store.is_eligible(cid, now=now):
                 ts2 = float(self.retry_store.next_eligible_at(cid))
                 self._enqueue_deferred_locked(cid, ts2)
                 continue
 
-            # Doomed gating on deferred->ready move
-            doomed, details = self._is_doomed_repeat_goto(cid)
-            if doomed:
+            # Doomed repeat-goto gating (STRICT)
+            if self._is_doomed_repeat_goto(cid):
                 if (
-                    bool(self.cfg.last_one_standing_quarantine_enabled)
+                    self.cfg.last_one_standing_quarantine_enabled
                     and self._only_one_left_now()
                 ):
-                    quarantined = self._try_quarantine_company(
-                        cid,
-                        reason=f"scheduler_last_one_standing_{details or 'repeat_goto_timeout'}",
+                    self._quarantine_last_one_standing(
+                        cid, reason="scheduler_last_one_standing_repeat_goto_timeout"
                     )
-                    if quarantined:
-                        logger.warning(
-                            "[AdaptiveScheduling] quarantined last-one-standing on deferred->ready cid=%s (%s)",
-                            cid,
-                            details or "repeat_goto_timeout",
-                        )
-                        self._queued.discard(cid)
-                        continue
+                    logger.warning(
+                        "[AdaptiveScheduling] quarantined last-one-standing on deferred->ready cid=%s",
+                        cid,
+                    )
+                    self._queued.discard(cid)
+                    continue
+
                 cooldown = max(0.0, float(self.cfg.doomed_goto_min_cooldown_sec))
                 ts3 = max(
                     float(now) + cooldown,
@@ -759,10 +703,9 @@ class AdaptiveScheduler:
                 )
                 self._enqueue_deferred_locked(cid, ts3)
                 logger.warning(
-                    "[AdaptiveScheduling] deferred doomed on move cid=%s delay=%.0fs (%s)",
+                    "[AdaptiveScheduling] deferred doomed on move cid=%s delay=%.0fs",
                     cid,
                     max(0.0, ts3 - float(now)),
-                    details or "repeat_goto_timeout",
                 )
                 continue
 
@@ -935,10 +878,6 @@ class AdaptiveScheduler:
         )
 
     async def stop(self) -> None:
-        """
-        IMPORTANT (B4):
-          Stop must not raise CancelledError.
-        """
         t = self._watchdog_task
         self._watchdog_task = None
         if t is not None:
@@ -953,6 +892,12 @@ class AdaptiveScheduler:
         now_mono = time.monotonic()
         stall_window = float(self.cfg.stall_storm_window_sec)
         stall_cnt = self._count_stall_cancels_since(now_mono - stall_window)
+
+        stage_counts: Dict[str, int] = {}
+        for _cid, st in self._company_stage.items():
+            st2 = self._normalize_stage(st)
+            stage_counts[st2] = stage_counts.get(st2, 0) + 1
+
         return {
             "total_mem_mb": float(self._total_mem_bytes) / _MB
             if self._total_mem_bytes
@@ -994,6 +939,11 @@ class AdaptiveScheduler:
             "deferred": len(self._deferred_at),
             "stall_cancels_window": stall_cnt,
             "pause_starts_for_sec": max(0.0, self._pause_starts_until_mono - now_mono),
+            "company_stage_counts": stage_counts,
+            "llm_inactivity_timeout_sec": float(self.cfg.llm_inactivity_timeout_sec),
+            "crawl_inactivity_timeout_sec": float(
+                self.cfg.crawl_inactivity_timeout_sec
+            ),
         }
 
     # ----------------------------
@@ -1082,25 +1032,17 @@ class AdaptiveScheduler:
                     )
                     continue
 
-            # --- Doomed repeat-goto gating (prevents re-admitting the same doomed company immediately) ---
-            doomed, details = self._is_doomed_repeat_goto(cid)
-            if doomed:
+            # Doomed repeat-goto gating (STRICT)
+            if self._is_doomed_repeat_goto(cid):
                 only_one_left = (active_n == 0) and (self.pending_total() <= 1)
-                if (
-                    bool(self.cfg.last_one_standing_quarantine_enabled)
-                    and only_one_left
-                ):
-                    quarantined = self._try_quarantine_company(
-                        cid,
-                        reason=f"scheduler_last_one_standing_{details or 'repeat_goto_timeout'}",
+                if self.cfg.last_one_standing_quarantine_enabled and only_one_left:
+                    self._quarantine_last_one_standing(
+                        cid, reason="scheduler_last_one_standing_repeat_goto_timeout"
                     )
-                    if quarantined:
-                        logger.warning(
-                            "[AdaptiveScheduling] quarantined last-one-standing cid=%s (%s)",
-                            cid,
-                            details or "repeat_goto_timeout",
-                        )
-                        continue  # do not pick
+                    logger.warning(
+                        "[AdaptiveScheduling] quarantined last-one-standing cid=%s", cid
+                    )
+                    continue
 
                 cooldown = max(0.0, float(self.cfg.doomed_goto_min_cooldown_sec))
                 ts = max(
@@ -1109,10 +1051,9 @@ class AdaptiveScheduler:
                 async with self._lock:
                     self._enqueue_deferred_locked(cid, ts)
                 logger.warning(
-                    "[AdaptiveScheduling] deferred doomed cid=%s delay=%.0fs (%s)",
+                    "[AdaptiveScheduling] deferred doomed cid=%s delay=%.0fs",
                     cid,
                     max(0.0, ts - now),
-                    details or "repeat_goto_timeout",
                 )
                 continue
 
@@ -1128,7 +1069,7 @@ class AdaptiveScheduler:
                 for cid in picked:
                     self._company_started_mono.setdefault(cid, now_mono2)
                     self._company_last_heartbeat_mono.setdefault(cid, now_mono2)
-                    # DO NOT set last_progress here.
+                    self._company_stage.setdefault(cid, self.STAGE_CRAWL)
 
         return picked
 
@@ -1209,8 +1150,8 @@ class AdaptiveScheduler:
             headroom = cap_bytes - self._used_bytes_eff
 
             if headroom <= 0:
-                slots = 0
                 self._maybe_log_block("block_mem_cap", active_n, num_waiting)
+                slots = 0
             else:
                 per_company_bytes = self._per_company_reservation_bytes_locked()
                 slots_by_mem = (
@@ -1235,89 +1176,6 @@ class AdaptiveScheduler:
                 self._last_admission_mono = time.monotonic()
 
             return slots
-
-    # ----------------------------
-    # Retry scheduling
-    # ----------------------------
-    async def _schedule_retries(
-        self,
-        company_ids: Sequence[str],
-        *,
-        record_failure: bool,
-        cls_hint: str,
-        error: str,
-        stage: str,
-        status_code: Optional[int] = None,
-        permanent_reason: str = "",
-    ) -> None:
-        if not company_ids:
-            return
-
-        if record_failure:
-            for cid in company_ids:
-                self.retry_store.mark_failure(
-                    company_id=str(cid),
-                    cls=str(cls_hint),
-                    error=str(error),
-                    stage=str(stage),
-                    status_code=status_code,
-                    nxdomain_like=False,
-                    stall_kind_hint=None,
-                    md_done=None,
-                    override_allow=False,
-                    flush=True,
-                )
-
-        now = time.time()
-        now_mono = time.monotonic()
-        active_set = set(self._get_active_company_ids())
-        items: List[Tuple[str, float]] = []
-
-        grace = float(self.cfg.cancel_requeue_min_delay_sec)
-        repeat_cooldown = float(self.cfg.company_cancel_repeat_cooldown_sec)
-
-        for cid in company_ids:
-            cid = str(cid)
-            if self.retry_store.is_quarantined(cid):
-                continue
-
-            ts = float(self.retry_store.next_eligible_at(cid))
-            min_ts = now + max(0.0, grace)
-
-            if cid in active_set:
-                min_ts = max(min_ts, now + max(0.0, grace))
-
-            last_cancel_mono = self._cancel_inflight_mono.get(cid)
-            if last_cancel_mono is not None and repeat_cooldown > 0:
-                age = max(0.0, now_mono - float(last_cancel_mono))
-                remaining = max(0.0, repeat_cooldown - age)
-                min_ts = max(min_ts, now + remaining)
-
-            ts = max(float(ts or 0.0), float(min_ts))
-
-            # clamp for doomed repeat-goto (if state exists)
-            doomed, _details = self._is_doomed_repeat_goto(cid)
-            if doomed:
-                ts = max(
-                    ts, now + max(0.0, float(self.cfg.doomed_goto_min_cooldown_sec))
-                )
-
-            items.append((cid, ts))
-
-        if not items:
-            return
-
-        async with self._lock:
-            for cid, ts in items:
-                if cid in self._queued:
-                    if cid in self._deferred_at:
-                        self._enqueue_deferred_locked(cid, ts)
-                    continue
-
-                if self.retry_store.is_eligible(cid, now=now) and ts <= now:
-                    self._enqueue_ready_locked(cid)
-                else:
-                    self._enqueue_deferred_locked(cid, ts)
 
     # ----------------------------
     # Stall storm helpers (LOCKED)
@@ -1421,10 +1279,14 @@ class AdaptiveScheduler:
                 for cid in list(self._company_started_mono.keys()):
                     if cid not in active_set:
                         self._company_started_mono.pop(cid, None)
+                for cid in list(self._company_stage.keys()):
+                    if cid not in active_set:
+                        self._company_stage.pop(cid, None)
 
                 for cid in active_ids:
                     self._company_started_mono.setdefault(cid, now_mono)
                     self._company_last_heartbeat_mono.setdefault(cid, now_mono)
+                    self._company_stage.setdefault(cid, self.STAGE_CRAWL)
 
                 inflight_timeout = float(self.cfg.company_cancel_inflight_timeout_sec)
                 for cid, ts in list(self._cancel_inflight_mono.items()):
@@ -1446,41 +1308,53 @@ class AdaptiveScheduler:
 
                 stall_enabled = self.stall_detection_enabled
 
-                # 1) Progress-based inactivity cancel
-                if (
-                    stall_enabled
-                    and float(self.cfg.company_inactivity_timeout_sec) > 0
-                    and active_n > 0
-                ):
-                    stuck: List[str] = []
-                    timeout = float(self.cfg.company_inactivity_timeout_sec)
+                # 1) Progress-based inactivity cancel (STAGE-AWARE)
+                if stall_enabled and active_n > 0:
                     min_run = max(
                         0.0, float(self.cfg.company_inactivity_min_runtime_sec)
                     )
+                    stuck: List[Tuple[str, float]] = []
+
                     for cid in active_ids:
                         if _recently_cancelled(cid):
                             continue
+
                         started = self._company_started_mono.get(cid, now_mono)
                         if min_run > 0 and (now_mono - started) < min_run:
                             continue
 
+                        timeout = float(self._stage_inactivity_timeout_sec_locked(cid))
+                        if timeout <= 0:
+                            continue
+
                         last_prog = self._company_last_progress_mono.get(cid, started)
-                        if (now_mono - last_prog) >= timeout:
-                            stuck.append(cid)
+                        age = float(now_mono - last_prog)
+                        if age >= timeout:
+                            stuck.append((cid, age))
 
                     if stuck:
-                        stuck = stuck[: int(self.cfg.company_inactivity_cancel_max)]
-                        cancel_ids = list(stuck)
+                        stuck.sort(key=lambda x: x[1], reverse=True)
+                        cancel_ids = [cid for (cid, _age) in stuck][
+                            : int(self.cfg.company_inactivity_cancel_max)
+                        ]
                         cancel_reason = "stall_inactivity"
 
                         for cid in cancel_ids:
+                            started = self._company_started_mono.get(cid, now_mono)
                             last_prog = self._company_last_progress_mono.get(
-                                cid, self._company_started_mono.get(cid, now_mono)
+                                cid, started
                             )
                             age = max(0.0, now_mono - float(last_prog))
-                            err = f"no progress for {age:.1f}s (timeout={timeout:.1f}s)"
+                            timeout = float(
+                                self._stage_inactivity_timeout_sec_locked(cid)
+                            )
+                            stage = self._normalize_stage(
+                                self._company_stage.get(cid) or self.STAGE_CRAWL
+                            )
 
-                            # transient audit + real failure (stall) for backoff escalation
+                            err = f"no progress for {age:.1f}s (timeout={timeout:.1f}s stage={stage})"
+
+                            # record: transient cancel + failure escalation (stall/no_yield)
                             self.retry_store.record_scheduler_cancel(
                                 company_id=str(cid),
                                 reason="scheduler_inactivity",
@@ -1491,7 +1365,7 @@ class AdaptiveScheduler:
                             self.retry_store.mark_failure(
                                 company_id=str(cid),
                                 cls="stall",
-                                error=str(err),
+                                error=err,
                                 stage="scheduler_inactivity",
                                 status_code=None,
                                 nxdomain_like=False,
@@ -1503,575 +1377,517 @@ class AdaptiveScheduler:
                             self._note_stall_cancel_locked(now_mono)
 
                         logger.error(
-                            "[AdaptiveScheduling] progress inactivity timeout=%.1fs -> cancelling %s",
-                            timeout,
+                            "[AdaptiveScheduling] inactivity -> cancelling %s",
                             cancel_ids,
                         )
-
                         if self._request_recycle_idle is not None:
                             recycle_count = max(recycle_count, 1)
                             recycle_reason = "stall_inactivity_recycle"
 
-                # 1b) Stall-storm restart (optional) when no progress for long
-                if self.cfg.stall_storm_restart_enabled and (
-                    not self._restart_recommended
-                ):
-                    uptime = max(0.0, now_mono - self._started_mono)
-                    window = max(1.0, float(self.cfg.stall_storm_window_sec))
-                    storm_n = self._count_stall_cancels_since(now_mono - window)
+                # 2) Emergency memory cancel
+                if active_n > 0:
+                    now_ts = time.time()
+                    cooldown = float(self.cfg.emergency_cancel_cooldown_sec)
+                    can_cancel = (
+                        now_ts - float(self._last_emergency_cancel_ts)
+                    ) >= max(0.0, cooldown)
 
-                    need_waiting = bool(self.cfg.stall_storm_restart_require_waiting)
-                    has_work = (self._last_num_waiting > 0) or self.has_pending()
-
-                    no_prog_sec = max(
-                        0.0, float(self.cfg.stall_storm_restart_no_progress_sec)
-                    )
-                    prog_age = max(0.0, now_mono - self._last_progress_mono)
-
-                    if (
-                        storm_n >= int(self.cfg.stall_storm_restart_threshold)
-                        and uptime >= float(self.cfg.stall_storm_restart_min_uptime_sec)
-                        and prog_age >= no_prog_sec
-                        and ((not need_waiting) or has_work)
+                    if can_cancel and (
+                        self._used_frac_raw >= float(self.cfg.mem_crit_raw_frac)
+                        or self._used_frac_eff >= float(self.cfg.mem_crit_frac)
+                        or self._ramp_raw_frac_per_sec
+                        >= float(self.cfg.mem_ramp_crit_frac_per_sec)
                     ):
-                        self._recommend_restart_locked(
-                            reason=(
-                                f"stall_storm_restart storm_n={storm_n} window={window:.0f}s "
-                                f"no_progress_for={prog_age:.0f}s waiting={self._last_num_waiting} "
-                                f"used_raw={self._used_frac_raw:.3f} used_eff={self._used_frac_eff:.3f} "
-                                f"proc_mb={(float(self._proc_rss_bytes) / _MB if self._proc_rss_bytes else 0.0):.1f}"
-                            )
-                        )
-
-                # 2) Deadlock restart
-                if (
-                    self.cfg.deadlock_restart_enabled
-                    and (not self._restart_recommended)
-                    and active_n == 0
-                    and (self._last_num_waiting > 0 or self.has_pending())
-                ):
-                    mem_high = (
-                        self._used_frac_raw >= float(self.cfg.mem_high_raw_frac)
-                    ) or (self._used_frac_eff >= float(self.cfg.mem_high_frac))
-                    if (not self.cfg.deadlock_restart_require_mem_high) or mem_high:
-                        if self._deadlock_since_mono is None:
-                            self._deadlock_since_mono = now_mono
-                        dead_age = now_mono - self._deadlock_since_mono
-                        if dead_age >= float(self.cfg.deadlock_restart_timeout_sec):
-                            self._recommend_restart_locked(
-                                reason=(
-                                    f"deadlock_restart dead_age={dead_age:.1f}s mem_high={mem_high} "
-                                    f"used_raw={self._used_frac_raw:.3f} used_eff={self._used_frac_eff:.3f} "
-                                    f"proc_mb={(float(self._proc_rss_bytes) / _MB if self._proc_rss_bytes else 0.0):.1f}"
+                        keep = max(0, int(self.cfg.min_active_keep))
+                        budget = max(0, int(self.cfg.emergency_cancel_max))
+                        cancellable = max(0, active_n - keep)
+                        n_cancel = min(budget, cancellable)
+                        if n_cancel > 0:
+                            # cancel the "oldest no-progress" first
+                            ranked: List[Tuple[float, str]] = []
+                            for cid in active_ids:
+                                last_prog = self._company_last_progress_mono.get(
+                                    cid, self._company_started_mono.get(cid, now_mono)
                                 )
-                            )
-                    else:
-                        self._deadlock_since_mono = None
-                else:
-                    if not (
-                        active_n == 0
-                        and (self._last_num_waiting > 0 or self.has_pending())
-                    ):
-                        self._deadlock_since_mono = None
+                                ranked.append((float(last_prog), cid))
+                            ranked.sort(key=lambda x: x[0])  # oldest progress first
+                            cancel_ids = [cid for (_ts, cid) in ranked[:n_cancel]]
+                            cancel_reason = "mem_critical"
+                            self._last_emergency_cancel_ts = now_ts
 
-                # 3) Raw mem kill -> restart
-                if (not self._restart_recommended) and self._used_frac_raw >= float(
-                    self.cfg.mem_kill_raw_frac
-                ):
-                    self._recommend_restart_locked(
-                        reason=f"raw_mem_kill used_raw={self._used_frac_raw:.3f} kill={float(self.cfg.mem_kill_raw_frac):.3f}"
-                    )
-
-                # 4) Emergency cancel (critical memory) - not gated
-                crit_trigger = (
-                    self._used_frac_raw >= float(self.cfg.mem_crit_raw_frac)
-                ) or (self._used_frac_eff >= float(self.cfg.mem_crit_frac))
-                ramp_trigger = self._ramp_raw_frac_per_sec >= float(
-                    self.cfg.mem_ramp_crit_frac_per_sec
-                ) and (self._used_frac_raw >= float(self.cfg.mem_crit_raw_frac))
-
-                if (crit_trigger or ramp_trigger) and active_n > 0 and not cancel_ids:
-                    if (now - self._last_emergency_cancel_ts) >= float(
-                        self.cfg.emergency_cancel_cooldown_sec
-                    ):
-                        cancelable = [
-                            cid for cid in active_ids if not _recently_cancelled(cid)
-                        ]
-                        inflight_active = sum(
-                            1 for cid in active_ids if cid in self._cancel_inflight_mono
-                        )
-                        max_cancelable = max(
-                            0,
-                            (active_n - inflight_active)
-                            - int(self.cfg.min_active_keep),
-                        )
-                        to_cancel = min(
-                            int(self.cfg.emergency_cancel_max), max_cancelable
-                        )
-                        if to_cancel > 0 and cancelable:
-                            cancel_ids = self._select_cancel_ids(cancelable, to_cancel)
-                            self._last_emergency_cancel_ts = now
-                            cancel_reason = "mem_heavy" if ramp_trigger else "mem"
+                            for cid in cancel_ids:
+                                self.retry_store.record_scheduler_cancel(
+                                    company_id=str(cid),
+                                    reason="scheduler_mem_critical",
+                                    stage="scheduler_mem_critical",
+                                    md_done=None,
+                                    flush=True,
+                                )
+                                self.retry_store.mark_failure(
+                                    company_id=str(cid),
+                                    cls="mem",
+                                    error=(
+                                        f"mem critical used_raw={self._used_frac_raw:.3f} used_eff={self._used_frac_eff:.3f} "
+                                        f"ramp_raw={self._ramp_raw_frac_per_sec:.3f}/s"
+                                    ),
+                                    stage="scheduler_mem_critical",
+                                    status_code=None,
+                                    nxdomain_like=False,
+                                    stall_kind_hint=None,
+                                    md_done=None,
+                                    override_allow=False,
+                                    flush=True,
+                                )
 
                             logger.error(
-                                "[AdaptiveScheduling] EMERGENCY used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s "
-                                "total_mb=%.1f used_raw_mb=%.1f used_eff_mb=%.1f proc_mem_mb=%.1f active=%d cancel=%s",
-                                self._used_frac_raw,
-                                self._used_frac_eff,
-                                self._ramp_raw_frac_per_sec,
-                                float(self._total_mem_bytes) / _MB,
-                                float(self._used_bytes_raw) / _MB,
-                                float(self._used_bytes_eff) / _MB,
-                                float(self._proc_rss_bytes) / _MB
-                                if self._proc_rss_bytes
-                                else 0.0,
-                                active_n,
+                                "[AdaptiveScheduling] mem critical -> cancelling %s",
                                 cancel_ids,
                             )
+                            self._note_stall_cancel_locked(now_mono)
 
-                # 5) Idle recycle request
-                if self._request_recycle_idle is not None:
-                    recycle_interval = float(self.cfg.idle_recycle_interval_sec) or 1.0
-                    half = recycle_interval * 0.5
-                    storm_active = now_mono < float(self._pause_starts_until_mono)
-                    interval_used = half if storm_active else recycle_interval
+                # 3) Restart recommendations
+                if not self._restart_recommended:
+                    uptime = max(0.0, now_mono - self._started_mono)
 
-                    if (now_mono - self._last_idle_recycle_mono) >= interval_used:
-                        mem_pressure = (
-                            self._used_frac_raw >= float(self.cfg.idle_recycle_raw_frac)
-                        ) or (
-                            self._used_frac_eff >= float(self.cfg.idle_recycle_eff_frac)
+                    if self._used_frac_raw >= float(
+                        self.cfg.mem_kill_raw_frac
+                    ) or self._ramp_raw_frac_per_sec >= float(
+                        self.cfg.mem_ramp_kill_frac_per_sec
+                    ):
+                        if uptime >= float(
+                            self.cfg.restart_gate_min_uptime_sec
+                        ) and self._completed_counter >= int(
+                            self.cfg.restart_gate_min_completed
+                        ):
+                            self._recommend_restart_locked(
+                                reason=(
+                                    f"mem_kill used_raw={self._used_frac_raw:.3f} used_eff={self._used_frac_eff:.3f} "
+                                    f"ramp_raw={self._ramp_raw_frac_per_sec:.3f}/s proc_mb={float(self._proc_rss_bytes) / _MB:.1f}"
+                                )
+                            )
+
+                    # stall-storm restart if no progress long enough
+                    if self.cfg.stall_storm_restart_enabled and (
+                        not self._restart_recommended
+                    ):
+                        window = max(1.0, float(self.cfg.stall_storm_window_sec))
+                        storm_n = self._count_stall_cancels_since(now_mono - window)
+                        need_waiting = bool(
+                            self.cfg.stall_storm_restart_require_waiting
                         )
-                        if mem_pressure or storm_active:
-                            max_n = max(1, int(self.cfg.idle_recycle_max_per_interval))
-                            if storm_active:
-                                recycle_count = max(recycle_count, 1)
-                                recycle_reason = "stall_storm_idle_recycle"
-                            else:
-                                if active_n == 0 and (
-                                    self._last_num_waiting > 0 or self.has_pending()
+                        has_work = (self._last_num_waiting > 0) or self.has_pending()
+                        no_prog_sec = max(
+                            0.0, float(self.cfg.stall_storm_restart_no_progress_sec)
+                        )
+                        prog_age = max(0.0, now_mono - self._last_progress_mono)
+
+                        if (
+                            storm_n >= int(self.cfg.stall_storm_restart_threshold)
+                            and uptime
+                            >= float(self.cfg.stall_storm_restart_min_uptime_sec)
+                            and prog_age >= no_prog_sec
+                            and ((not need_waiting) or has_work)
+                        ):
+                            self._recommend_restart_locked(
+                                reason=(
+                                    f"stall_storm storm_n={storm_n} window={window:.0f}s no_progress_for={prog_age:.0f}s "
+                                    f"waiting={self._last_num_waiting} used_raw={self._used_frac_raw:.3f} used_eff={self._used_frac_eff:.3f} "
+                                    f"proc_mb={float(self._proc_rss_bytes) / _MB:.1f}"
+                                )
+                            )
+
+                    # deadlock restart: active==0, waiting>0, and stuck for long
+                    if self.cfg.deadlock_restart_enabled and (
+                        not self._restart_recommended
+                    ):
+                        waiting_like = self._last_num_waiting > 0 or self.has_pending()
+                        if active_n == 0 and waiting_like:
+                            if self._deadlock_since_mono is None:
+                                self._deadlock_since_mono = now_mono
+                            dead_age = max(0.0, now_mono - self._deadlock_since_mono)
+                            if dead_age >= float(self.cfg.deadlock_restart_timeout_sec):
+                                if (not self.cfg.deadlock_restart_require_mem_high) or (
+                                    self._used_frac_raw
+                                    >= float(self.cfg.mem_high_raw_frac)
+                                    or self._used_frac_eff
+                                    >= float(self.cfg.mem_high_frac)
                                 ):
-                                    recycle_count = max(recycle_count, max_n)
-                                else:
-                                    recycle_count = max(recycle_count, 1)
-                                recycle_reason = "mem_pressure_idle_recycle"
-                            self._last_idle_recycle_mono = now_mono
+                                    self._recommend_restart_locked(
+                                        reason=(
+                                            f"deadlock active=0 waiting=1 dead_for={dead_age:.0f}s "
+                                            f"used_raw={self._used_frac_raw:.3f} used_eff={self._used_frac_eff:.3f}"
+                                        )
+                                    )
+                        else:
+                            self._deadlock_since_mono = None
 
-                # 6) Restart signal management
-                if self._restart_recommended:
-                    self._maybe_send_restart_signals_locked(now_mono)
+                # 4) idle recycle under moderate pressure
+                if self._request_recycle_idle is not None:
+                    interval2 = max(1.0, float(self.cfg.idle_recycle_interval_sec))
+                    raw_thr = float(self.cfg.idle_recycle_raw_frac)
+                    eff_thr = float(self.cfg.idle_recycle_eff_frac)
+                    if (now_mono - self._last_idle_recycle_mono) >= interval2 and (
+                        self._used_frac_raw >= raw_thr or self._used_frac_eff >= eff_thr
+                    ):
+                        recycle_count = max(
+                            recycle_count, int(self.cfg.idle_recycle_max_per_interval)
+                        )
+                        self._last_idle_recycle_mono = now_mono
 
-            # Outside lock: apply cancels and schedule retries
+            # execute cancels / recycle outside lock
             if cancel_ids:
-                inflight_mark_ts = time.monotonic()
-                async with self._lock:
-                    for cid in cancel_ids:
-                        self._cancel_inflight_mono[str(cid)] = inflight_mark_ts
-
+                self._cancel_inflight_mono.update(
+                    {cid: time.monotonic() for cid in cancel_ids}
+                )
                 self._request_cancel_companies(cancel_ids)
-                self._mark_progress()
-
-                if cancel_reason in ("mem", "mem_heavy"):
-                    cls_hint = "mem_heavy" if cancel_reason == "mem_heavy" else "mem"
-                    err = (
-                        f"cancelled_by_scheduler:{cls_hint} "
-                        f"used_raw={self._used_frac_raw:.3f} used_eff={self._used_frac_eff:.3f} "
-                        f"ramp_raw={self._ramp_raw_frac_per_sec:.3f}/s "
-                        f"proc_mb={(float(self._proc_rss_bytes) / _MB if self._proc_rss_bytes else 0.0):.1f}"
-                    )
-                    await self._schedule_retries(
-                        cancel_ids,
-                        record_failure=True,
-                        cls_hint=cls_hint,
-                        error=err,
-                        stage="scheduler_mem_cancel",
-                        status_code=None,
-                        permanent_reason="",
-                    )
-                elif cancel_reason == "stall_inactivity":
-                    await self._schedule_retries(
-                        cancel_ids,
-                        record_failure=False,
-                        cls_hint="stall",
-                        error="",
-                        stage="scheduler_inactivity",
-                        status_code=None,
-                        permanent_reason="",
-                    )
-
-                gc.collect()
-
-                if (
-                    cancel_reason == "stall_inactivity"
-                    and self._request_recycle_idle is not None
-                ):
-                    await self._request_recycle_idle(1, "stall_inactivity_recycle")
 
             if recycle_count > 0 and self._request_recycle_idle is not None:
-                await self._request_recycle_idle(
-                    int(recycle_count), str(recycle_reason)
-                )
+                with contextlib.suppress(Exception):
+                    await self._request_recycle_idle(int(recycle_count), recycle_reason)
+
+            # restart escalation (signals)
+            self._restart_escalation_tick()
 
     # ----------------------------
-    # Restart gating / restart action
+    # Restart escalation (signals)
     # ----------------------------
     def _recommend_restart_locked(self, *, reason: str) -> None:
         if self._restart_recommended:
             return
         self._restart_recommended = True
-        self._restart_reason = reason or "unspecified"
+        self._restart_reason = str(reason or "restart_recommended")
         self._restart_recommended_mono = time.monotonic()
-        logger.critical(
-            "[AdaptiveScheduling] restart recommended reason=%s", self._restart_reason
+        logger.error(
+            "[AdaptiveScheduling] RESTART RECOMMENDED: %s", self._restart_reason
         )
 
-        os.kill(os.getpid(), int(self.cfg.restart_signal))
-        self._restart_sigterm_sent_mono = time.monotonic()
+    def _restart_escalation_tick(self) -> None:
+        if not self._restart_recommended:
+            return
+        # Scheduler “recommends”; escalation sends signals to current process (same behavior as legacy).
+        now_mono = time.monotonic()
+        if self._restart_recommended_mono is None:
+            self._restart_recommended_mono = now_mono
 
-    def _maybe_send_restart_signals_locked(self, now_mono: float) -> None:
-        repeat = float(self.cfg.restart_sigterm_repeat_interval_sec)
+        sig = int(self.cfg.restart_signal)
+        repeat = max(1.0, float(self.cfg.restart_sigterm_repeat_interval_sec))
+        kill_after = max(0.0, float(self.cfg.restart_escalate_sigkill_after_sec))
+
+        # First SIGTERM
         if self._restart_sigterm_sent_mono is None:
             self._restart_sigterm_sent_mono = now_mono
-            os.kill(os.getpid(), int(self.cfg.restart_signal))
+            try:
+                os.kill(os.getpid(), sig)
+            except Exception as e:
+                logger.error(
+                    "[AdaptiveScheduling] failed to send restart signal=%s: %r", sig, e
+                )
             return
 
-        if repeat > 0 and (now_mono - self._restart_sigterm_sent_mono) >= repeat:
+        # Repeat SIGTERM
+        if (now_mono - self._restart_sigterm_sent_mono) >= repeat and (
+            now_mono - self._restart_recommended_mono
+        ) < kill_after:
             self._restart_sigterm_sent_mono = now_mono
-            os.kill(os.getpid(), int(self.cfg.restart_signal))
-
-        esc = float(self.cfg.restart_escalate_sigkill_after_sec)
-        if esc > 0 and self._restart_recommended_mono is not None:
-            if (now_mono - self._restart_recommended_mono) >= esc:
-                os.kill(os.getpid(), 9)  # SIGKILL
-
-    # ----------------------------
-    # Cancel selection
-    # ----------------------------
-    def _select_cancel_ids(self, active_ids: Sequence[str], count: int) -> List[str]:
-        if count <= 0 or not active_ids:
-            return []
-        weighted: List[Tuple[str, float]] = []
-        for cid in active_ids:
-            mb = self._company_peak_mb.get(cid)
-            if mb is not None:
-                weighted.append((cid, mb))
-        if weighted:
-            weighted.sort(key=lambda kv: kv[1], reverse=True)
-            return [cid for (cid, _) in weighted[:count]]
-        return list(active_ids)[-count:]
-
-    # ----------------------------
-    # Heartbeat/progress (GLOBAL)
-    # ----------------------------
-    def _mark_heartbeat(self) -> None:
-        self._last_heartbeat_mono = time.monotonic()
-        self._write_heartbeat_file_if_enabled()
-
-    def _mark_progress(self) -> None:
-        self._last_progress_mono = time.monotonic()
-        self._write_heartbeat_file_if_enabled()
-
-    def _write_heartbeat_file_if_enabled(self) -> None:
-        path = self.cfg.heartbeat_path
-        if path is None:
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        now_mono = time.monotonic()
-        payload = {
-            "ts": time.time(),
-            "mono": now_mono,
-            "completed": self._completed_counter,
-            "waiting": self._last_num_waiting,
-            "ever_admitted": self._ever_admitted,
-            "ever_had_active": self._ever_had_active,
-            "restart_recommended": self._restart_recommended,
-            "restart_reason": self._restart_reason,
-            "used_frac": self._used_frac_eff,
-            "used_frac_raw": self._used_frac_raw,
-            "ramp_raw_frac_per_sec": self._ramp_raw_frac_per_sec,
-            "target_parallel": self._target_parallel,
-            "proc_mem_mb": float(self._proc_rss_bytes) / _MB
-            if self._proc_rss_bytes
-            else 0.0,
-            "stall_detection_enabled": self.stall_detection_enabled,
-            "stall_suspensions": len(self._stall_suspensions),
-            "cancel_inflight": len(self._cancel_inflight_mono),
-            "ready": len(self._work_ready),
-            "deferred": len(self._deferred_at),
-            "pause_starts_for_sec": max(0.0, self._pause_starts_until_mono - now_mono),
-        }
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
-
-    # ----------------------------
-    # Memory reading helpers
-    # ----------------------------
-    def _parse_kv_lines(self, text: str) -> Dict[str, int]:
-        out: Dict[str, int] = {}
-        for line in text.splitlines():
-            parts = line.strip().split()
-            if len(parts) != 2:
-                continue
-            k, v = parts
-            out[k] = int(v)
-        return out
-
-    def _read_cgroup_memory_bytes(self) -> Tuple[int, int, int]:
-        """
-        Returns (limit_bytes, used_effective_bytes, used_raw_bytes).
-        Reads cgroup v2 first, then v1 if present. If not present, returns (0,0,0).
-        """
-        base = Path("/sys/fs/cgroup")
-
-        # cgroup v2
-        max_path = base / "memory.max"
-        cur_path = base / "memory.current"
-        stat_path = base / "memory.stat"
-        if max_path.exists() and cur_path.exists():
-            max_raw = max_path.read_text(encoding="utf-8").strip()
-            cur_raw = cur_path.read_text(encoding="utf-8").strip()
-            current = int(cur_raw) if cur_raw else 0
-
-            inactive_file = 0
-            if self.cfg.cgroup_subtract_inactive_file and stat_path.exists():
-                st = self._parse_kv_lines(stat_path.read_text(encoding="utf-8"))
-                inactive_file = int(st.get("inactive_file", 0))
-
-            used_effective = max(0, current - inactive_file)
-            used_raw_bytes = current
-
-            if not max_raw or max_raw == "max":
-                return 0, used_effective, used_raw_bytes
-            limit = int(max_raw)
-            return limit, used_effective, used_raw_bytes
-
-        # cgroup v1
-        max_path = base / "memory" / "memory.limit_in_bytes"
-        cur_path = base / "memory" / "memory.usage_in_bytes"
-        stat_path = base / "memory" / "memory.stat"
-        if max_path.exists() and cur_path.exists():
-            limit = int(max_path.read_text(encoding="utf-8").strip() or "0")
-            usage = int(cur_path.read_text(encoding="utf-8").strip() or "0")
-
-            inactive_file = 0
-            if self.cfg.cgroup_subtract_inactive_file and stat_path.exists():
-                st = self._parse_kv_lines(stat_path.read_text(encoding="utf-8"))
-                inactive_file = int(
-                    st.get("total_inactive_file", st.get("inactive_file", 0))
+            try:
+                os.kill(os.getpid(), sig)
+            except Exception as e:
+                logger.error(
+                    "[AdaptiveScheduling] failed to re-send restart signal=%s: %r",
+                    sig,
+                    e,
                 )
 
-            used_effective = max(0, usage - inactive_file)
-            used_raw_bytes = usage
-            return limit, used_effective, used_raw_bytes
-
-        return 0, 0, 0
-
-    def _read_psutil_memory_bytes(self) -> Tuple[int, int, int]:
-        vm = psutil.virtual_memory()
-        total = int(getattr(vm, "total", 0) or 0)
-        available = int(getattr(vm, "available", 0) or 0)
-        used = max(0, total - available)
-        return total, used, used
-
-    def _read_memory_usage_bytes(self) -> Tuple[int, int, int]:
-        if self.cfg.prefer_cgroup_limits:
-            limit, used_eff, used_raw = self._read_cgroup_memory_bytes()
-            if limit <= 0:
-                total, _, _ = self._read_psutil_memory_bytes()
-                return total, used_eff, used_raw
-            return limit, used_eff, used_raw
-        return self._read_psutil_memory_bytes()
-
-    def _read_process_tree_rss_bytes(self) -> int:
-        """
-        IMPORTANT (B5):
-          psutil.NoSuchProcess is normal while walking a live process tree.
-          Return best-effort sum.
-        """
-        try:
-            p = psutil.Process(os.getpid())
-        except (psutil.NoSuchProcess, ProcessLookupError):
-            return 0
-        except Exception:
-            return 0
-
-        rss = 0
-        try:
-            rss += int(p.memory_info().rss)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
-            pass
-        except Exception:
-            pass
-
-        if not self.cfg.use_process_tree_rss_for_estimate:
-            return max(0, int(rss))
-
-        try:
-            children = p.children(recursive=True)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
-            children = []
-        except Exception:
-            children = []
-
-        for ch in children:
+        # Escalate SIGKILL
+        if kill_after > 0 and (now_mono - self._restart_recommended_mono) >= kill_after:
             try:
-                rss += int(ch.memory_info().rss)
-            except (psutil.NoSuchProcess, psutil.AccessDenied, ProcessLookupError):
-                continue
-            except Exception:
-                continue
+                os.kill(os.getpid(), int(signal.SIGKILL))
+            except Exception as e:
+                logger.error("[AdaptiveScheduling] failed to send SIGKILL: %r", e)
 
-        return max(0, int(rss))
-
+    # ----------------------------
+    # Memory sampling / estimation
+    # ----------------------------
     def _sample_memory_locked(self, now_ts: float) -> None:
         total, used_eff, used_raw = self._read_memory_usage_bytes()
-        if total > 0:
-            self._total_mem_bytes = int(total)
-        self._used_bytes_eff = int(used_eff)
-        self._used_bytes_raw = int(used_raw)
-
-        total2 = float(self._total_mem_bytes) if self._total_mem_bytes > 0 else 0.0
-        self._used_frac_eff = (
-            (float(self._used_bytes_eff) / total2) if total2 > 0 else 0.0
+        self._total_mem_bytes = total
+        self._used_bytes_eff = used_eff
+        self._used_bytes_raw = used_raw
+        self._used_frac_eff = (float(used_eff) / float(total)) if total > 0 else 0.0
+        self._used_frac_raw = (float(used_raw) / float(total)) if total > 0 else 0.0
+        self._proc_rss_bytes = (
+            self._read_process_tree_rss_bytes()
+            if self.cfg.use_process_tree_rss_for_estimate
+            else 0
         )
-        self._used_frac_raw = (
-            (float(self._used_bytes_raw) / total2) if total2 > 0 else 0.0
-        )
-
-        # Best-effort; never raise out of sampling.
-        try:
-            self._proc_rss_bytes = self._read_process_tree_rss_bytes()
-        except Exception:
-            # keep previous self._proc_rss_bytes
-            pass
-
         self._last_sample_ts = float(now_ts)
 
-        self._update_ramp_locked(
-            time.monotonic(), self._used_frac_eff, self._used_frac_raw
-        )
+        now_mono = time.monotonic()
+        self._update_ramp_locked(now_mono, self._used_frac_eff, self._used_frac_raw)
 
     def _update_ramp_locked(
         self, now_mono: float, frac_eff: float, frac_raw: float
     ) -> None:
-        self._mem_frac_hist.append((now_mono, float(frac_eff), float(frac_raw)))
-        window = float(self.cfg.mem_ramp_window_sec)
-        if window <= 0:
+        self._mem_frac_hist.append((float(now_mono), float(frac_eff), float(frac_raw)))
+        window = max(0.5, float(self.cfg.mem_ramp_window_sec))
+        cutoff = float(now_mono) - window
+        while self._mem_frac_hist and self._mem_frac_hist[0][0] < cutoff:
+            self._mem_frac_hist.popleft()
+
+        if len(self._mem_frac_hist) < 2:
             self._ramp_eff_frac_per_sec = 0.0
             self._ramp_raw_frac_per_sec = 0.0
             return
 
-        t0: Optional[float] = None
-        fe0: Optional[float] = None
-        fr0: Optional[float] = None
-        for t, fe, fr in reversed(self._mem_frac_hist):
-            if (now_mono - t) >= window:
-                t0, fe0, fr0 = t, fe, fr
-                break
-
-        if t0 is None or fe0 is None or fr0 is None:
-            self._ramp_eff_frac_per_sec = 0.0
-            self._ramp_raw_frac_per_sec = 0.0
-            return
-
-        dt = max(1e-6, float(now_mono - t0))
-        self._ramp_eff_frac_per_sec = float(frac_eff - float(fe0)) / dt
-        self._ramp_raw_frac_per_sec = float(frac_raw - float(fr0)) / dt
+        t0, e0, r0 = self._mem_frac_hist[0]
+        t1, e1, r1 = self._mem_frac_hist[-1]
+        dt = max(1e-6, float(t1 - t0))
+        self._ramp_eff_frac_per_sec = float((e1 - e0) / dt)
+        self._ramp_raw_frac_per_sec = float((r1 - r0) / dt)
 
     def _update_base_rss_locked(self, active_n: int) -> None:
-        if active_n != 0:
+        # Track baseline rss when idle-ish (active small) to help estimate overhead.
+        if not self.cfg.use_process_tree_rss_for_estimate:
+            return
+        if active_n > 1:
             return
         rss = float(self._proc_rss_bytes)
         if rss <= 0:
             return
-        if self._base_rss_samples <= 0 or self._base_rss_bytes <= 0:
-            self._base_rss_bytes = rss
-            self._base_rss_samples = 1
-            return
-        alpha = 0.10 if rss >= self._base_rss_bytes else 0.25
-        self._base_rss_bytes = (1.0 - alpha) * self._base_rss_bytes + alpha * rss
         self._base_rss_samples += 1
+        # EWMA-ish: keep it stable
+        if self._base_rss_bytes <= 0:
+            self._base_rss_bytes = rss
+        else:
+            alpha = 0.15
+            self._base_rss_bytes = (1 - alpha) * self._base_rss_bytes + alpha * rss
 
     def _update_per_company_est_locked(self, active_n: int) -> None:
-        min_mb = float(self.cfg.per_company_min_mb)
-        max_mb = float(self.cfg.per_company_max_mb)
-
-        if active_n <= 0:
-            self._per_company_est_mb = max(
-                min_mb, min(self._per_company_est_mb, max_mb)
-            )
+        # Estimate per-company memory from process rss (if enabled)
+        lo = float(self.cfg.per_company_min_mb)
+        hi = float(self.cfg.per_company_max_mb)
+        if not self.cfg.use_process_tree_rss_for_estimate:
+            self._per_company_est_mb = max(lo, min(self._per_company_est_mb, hi))
             return
 
         rss = float(self._proc_rss_bytes)
-        base = float(self._base_rss_bytes) if self._base_rss_bytes > 0 else 0.0
-        extra = max(0.0, rss - base)
-        per = (extra / float(active_n)) / _MB
-        per = max(min_mb, min(per, max_mb))
-        self._per_company_est_mb = per
+        base = float(self._base_rss_bytes)
+        if rss <= 0:
+            return
 
-    def _per_company_reservation_bytes_locked(self) -> int:
-        sf = max(1.0, float(self.cfg.per_company_safety_factor))
-        mb = max(1.0, float(self._per_company_est_mb))
-        return int(mb * sf * _MB)
+        if active_n <= 0:
+            # keep estimate stable
+            self._per_company_est_mb = max(lo, min(self._per_company_est_mb, hi))
+            return
+
+        per = max(0.0, (rss - base) / max(1, active_n))
+        per_mb = per / _MB
+        per_mb *= float(self.cfg.per_company_safety_factor)
+        per_mb = max(lo, min(per_mb, hi))
+
+        # smooth
+        alpha = 0.20
+        self._per_company_est_mb = (1 - alpha) * float(
+            self._per_company_est_mb
+        ) + alpha * float(per_mb)
 
     def _update_target_parallel_locked(self, active_n: int, *, now_mono: float) -> None:
-        old = int(self._target_parallel)
-        tgt = old
+        # AIMD:
+        #  - Additive increase when safe
+        #  - Multiplicative decrease when high pressure
+        min_t = int(self.cfg.min_target)
+        max_t = int(self.cfg.max_target)
 
-        used_raw = float(self._used_frac_raw)
-        used_eff = float(self._used_frac_eff)
-        ramp_raw = float(self._ramp_raw_frac_per_sec)
+        target = int(self._target_parallel)
 
-        storm_window = max(1.0, float(self.cfg.stall_storm_window_sec))
-        rising_window = max(1.0, float(self.cfg.stall_rising_window_sec))
-        storm_n = self._count_stall_cancels_since(now_mono - storm_window)
-        rising_n = self._count_stall_cancels_since(now_mono - rising_window)
-        storm_active = (storm_n >= int(self.cfg.stall_storm_cancel_threshold)) or (
-            now_mono < float(self._pause_starts_until_mono)
+        high = (self._used_frac_eff >= float(self.cfg.mem_high_frac)) or (
+            self._used_frac_raw >= float(self.cfg.mem_high_raw_frac)
         )
-        rising_active = rising_n >= int(self.cfg.stall_rising_cancel_threshold)
-
-        should_decrease = (
-            used_raw >= float(self.cfg.mem_high_raw_frac)
-            or used_eff >= float(self.cfg.mem_high_frac)
-            or (active_n > 0 and ramp_raw >= float(self.cfg.mem_ramp_high_frac_per_sec))
-            or storm_active
-            or rising_active
+        crit = (self._used_frac_eff >= float(self.cfg.mem_crit_frac)) or (
+            self._used_frac_raw >= float(self.cfg.mem_crit_raw_frac)
+        )
+        ramp_high = self._ramp_raw_frac_per_sec >= float(
+            self.cfg.mem_ramp_high_frac_per_sec
+        )
+        ramp_crit = self._ramp_raw_frac_per_sec >= float(
+            self.cfg.mem_ramp_crit_frac_per_sec
         )
 
-        if should_decrease and tgt > int(self.cfg.min_target):
-            md = float(self.cfg.md_factor)
-            if storm_active:
-                md = min(md, 0.45)
-            elif rising_active:
-                md = min(md, 0.55)
-            tgt = max(int(self.cfg.min_target), int(max(1, int(tgt * md))))
+        if crit or ramp_crit:
+            target = max(min_t, int(target * float(self.cfg.md_factor)))
+        elif high or ramp_high:
+            target = max(min_t, int(target * float(self.cfg.md_factor)))
         else:
-            comfortable = (
-                used_eff < float(self.cfg.mem_cap_frac)
-                and used_raw < float(self.cfg.mem_high_raw_frac) * 0.98
-                and ramp_raw < float(self.cfg.ramp_admit_guard_frac_per_sec)
-                and (not storm_active)
-            )
-            if comfortable and tgt < int(self.cfg.max_target):
-                tgt = min(int(self.cfg.max_target), tgt + int(self.cfg.ai_step))
+            target = min(max_t, target + int(self.cfg.ai_step))
 
-        self._target_parallel = max(
-            int(self.cfg.min_target), min(int(tgt), int(self.cfg.max_target))
-        )
+        self._target_parallel = max(min_t, min(max_t, int(target)))
 
-        if self._target_parallel != old:
-            logger.info(
-                "[AdaptiveScheduling] target_parallel %d -> %d (used_raw=%.3f used_eff=%.3f ramp_raw=%.3f/s active=%d "
-                "stall_rising=%s stall_storm=%s proc_mem_mb=%.1f)",
-                old,
-                self._target_parallel,
-                used_raw,
-                used_eff,
-                ramp_raw,
-                int(active_n),
-                bool(rising_active),
-                bool(storm_active),
-                float(self._proc_rss_bytes) / _MB if self._proc_rss_bytes else 0.0,
-            )
+    def _per_company_reservation_bytes_locked(self) -> int:
+        mb = float(self._per_company_est_mb)
+        return int(max(1.0, mb) * _MB)
+
+    # ----------------------------
+    # Memory reading (host or cgroup v2)
+    # ----------------------------
+    def _read_memory_usage_bytes(self) -> Tuple[int, int, int]:
+        """
+        Returns (total_bytes, used_effective_bytes, used_raw_bytes).
+
+        - If prefer_cgroup_limits and cgroup v2 files exist, use them.
+        - Otherwise use psutil.virtual_memory.
+        """
+        if self.cfg.prefer_cgroup_limits:
+            cg = self._read_cgroup_v2_memory()
+            if cg is not None:
+                total, used_raw, inactive_file = cg
+                used_eff = used_raw
+                if self.cfg.cgroup_subtract_inactive_file and inactive_file is not None:
+                    used_eff = max(0, used_raw - int(inactive_file))
+                return int(total), int(used_eff), int(used_raw)
+
+        vm = psutil.virtual_memory()
+        total = int(vm.total)
+        used_raw = int(total - vm.available)
+        used_eff = int(used_raw)
+        return total, used_eff, used_raw
+
+    def _read_cgroup_v2_memory(self) -> Optional[Tuple[int, int, Optional[int]]]:
+        """
+        cgroup v2:
+          - memory.current
+          - memory.max  (or "max")
+          - memory.stat (inactive_file)
+        """
+        base = Path("/sys/fs/cgroup")
+        cur_p = base / "memory.current"
+        max_p = base / "memory.max"
+        stat_p = base / "memory.stat"
+        if not (cur_p.exists() and max_p.exists()):
+            return None
+
+        try:
+            cur = int(cur_p.read_text().strip())
+            max_raw = max_p.read_text().strip()
+            if max_raw == "max":
+                # no explicit limit; treat as host total
+                vm = psutil.virtual_memory()
+                total = int(vm.total)
+            else:
+                total = int(max_raw)
+            inactive_file: Optional[int] = None
+            if stat_p.exists():
+                for line in stat_p.read_text().splitlines():
+                    if line.startswith("inactive_file "):
+                        inactive_file = int(line.split()[1])
+                        break
+            return total, cur, inactive_file
+        except Exception:
+            return None
+
+    def _read_process_tree_rss_bytes(self) -> int:
+        try:
+            p = psutil.Process()
+            rss = 0
+            with contextlib.suppress(Exception):
+                rss += int(p.memory_info().rss)
+            with contextlib.suppress(Exception):
+                for ch in p.children(recursive=True):
+                    with contextlib.suppress(Exception):
+                        rss += int(ch.memory_info().rss)
+            return int(rss)
+        except Exception:
+            return 0
+
+    # ----------------------------
+    # Progress markers
+    # ----------------------------
+    def _mark_heartbeat(self) -> None:
+        self._last_heartbeat_mono = time.monotonic()
+
+    def _mark_progress(self) -> None:
+        self._last_progress_mono = time.monotonic()
+
+    # ----------------------------
+    # (Optional) scheduler-level retry scheduling helper
+    # ----------------------------
+    async def _schedule_retries(
+        self,
+        company_ids: Sequence[str],
+        *,
+        record_failure: bool,
+        cls_hint: str,
+        error: str,
+        stage: str,
+        status_code: Optional[int] = None,
+    ) -> None:
+        """
+        Scheduler-side helper (STRICT):
+          - uses retry_store APIs only
+          - no fabricated / inferred stall kinds
+          - doomed gating uses store.is_doomed_repeat_goto
+        """
+        if not company_ids:
+            return
+
+        if record_failure:
+            for cid in company_ids:
+                self.retry_store.mark_failure(
+                    company_id=str(cid),
+                    cls=str(cls_hint),
+                    error=str(error),
+                    stage=str(stage),
+                    status_code=status_code,
+                    nxdomain_like=False,
+                    stall_kind_hint=None,
+                    md_done=None,
+                    override_allow=False,
+                    flush=True,
+                )
+
+        now = time.time()
+        now_mono = time.monotonic()
+        active_set = set(self._get_active_company_ids())
+
+        grace = float(self.cfg.cancel_requeue_min_delay_sec)
+        repeat_cooldown = float(self.cfg.company_cancel_repeat_cooldown_sec)
+
+        items: List[Tuple[str, float]] = []
+        for cid in company_ids:
+            cid = str(cid)
+            if self.retry_store.is_quarantined(cid):
+                continue
+
+            ts = float(self.retry_store.next_eligible_at(cid))
+            min_ts = now + max(0.0, grace)
+            if cid in active_set:
+                min_ts = max(min_ts, now + max(0.0, grace))
+
+            last_cancel_mono = self._cancel_inflight_mono.get(cid)
+            if last_cancel_mono is not None and repeat_cooldown > 0:
+                age = max(0.0, now_mono - float(last_cancel_mono))
+                remaining = max(0.0, repeat_cooldown - age)
+                min_ts = max(min_ts, now + remaining)
+
+            ts = max(float(ts or 0.0), float(min_ts))
+
+            if self._is_doomed_repeat_goto(cid):
+                ts = max(
+                    ts, now + max(0.0, float(self.cfg.doomed_goto_min_cooldown_sec))
+                )
+
+            items.append((cid, ts))
+
+        if not items:
+            return
+
+        async with self._lock:
+            for cid, ts in items:
+                if cid in self._queued:
+                    if cid in self._deferred_at:
+                        self._enqueue_deferred_locked(cid, ts)
+                    continue
+
+                if self.retry_store.is_eligible(cid, now=now) and ts <= now:
+                    self._enqueue_ready_locked(cid)
+                else:
+                    self._enqueue_deferred_locked(cid, ts)

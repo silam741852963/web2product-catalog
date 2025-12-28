@@ -32,7 +32,7 @@ except Exception:
 
 
 # --------------------------------------------------------------------------- #
-# UTC timestamp helper (fixes datetime.utcnow() deprecation warning)
+# UTC timestamp helper
 # --------------------------------------------------------------------------- #
 
 
@@ -43,14 +43,12 @@ def _utc_iso_z() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Config (env-overridable, no CLI flags for optional analysis)
+# Config
 # --------------------------------------------------------------------------- #
 
-# IMPORTANT: Pricing is per 1M tokens (NOT per 1K).
-# User-provided defaults:
-#   1M INPUT TOKENS (CACHE HIT)  $0.028
-#   1M INPUT TOKENS (CACHE MISS) $0.28
-#   1M OUTPUT TOKENS             $0.42
+# 1M INPUT TOKENS (CACHE HIT)  $0.028
+# 1M INPUT TOKENS (CACHE MISS) $0.28
+# 1M OUTPUT TOKENS             $0.42
 DEFAULT_INPUT_COST_PER_1M_CACHE_HIT = 0.028
 DEFAULT_INPUT_COST_PER_1M_CACHE_MISS = 0.28
 DEFAULT_OUTPUT_COST_PER_1M = 0.42
@@ -65,6 +63,10 @@ DEFAULT_TOKENIZER_MODE = "tiktoken" if TIKTOKEN_AVAILABLE else "approx"
 
 # Approx token estimation ratio: ~4 chars/token is a common rough heuristic.
 APPROX_CHARS_PER_TOKEN = 4.0
+
+# Labels
+STATUS_MISSING = "missing_status"
+META_MISSING = "missing_crawl_meta"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -102,7 +104,37 @@ def _load_json(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def _safe_div(n: float, d: float) -> float:
-    return float(n) / float(d) if d not in (0, 0.0, None) else 0.0
+    try:
+        if d in (0, 0.0, None):
+            return 0.0
+        return float(n) / float(d)
+    except Exception:
+        return 0.0
+
+
+def _is_nat_number(x: Any) -> bool:
+    try:
+        if x is None:
+            return False
+        if isinstance(x, bool):
+            return False
+        if isinstance(x, int):
+            return True
+        if isinstance(x, float):
+            return float(x).is_integer()
+        if isinstance(x, str):
+            s = x.strip()
+            if not s:
+                return False
+            f = float(s)
+            return float(f).is_integer()
+        return False
+    except Exception:
+        return False
+
+
+def _to_int_if_nat(x: Any) -> Any:
+    return int(float(x)) if _is_nat_number(x) else x
 
 
 # --------------------------------------------------------------------------- #
@@ -289,6 +321,52 @@ def _categorize_status_code(code: Optional[int]) -> Tuple[str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# Industry normalization
+# --------------------------------------------------------------------------- #
+
+
+def _norm_industry(crawl: Dict[str, Any]) -> Tuple[str, str, str]:
+    """
+    Returns (industry_code, industry_label, industry_codes) as strings.
+
+    - Treat None/"__NA__"/"" as Unclassified.
+    - Prefer explicit industry_label; fallback to "Unclassified".
+    """
+    raw_code = crawl.get("industry_code")
+    raw_codes = crawl.get("industry_codes")
+    raw_label = crawl.get("industry_label")
+
+    def s(v: Any) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return str(_to_int_if_nat(v))
+        return str(v)
+
+    code = s(raw_code).strip()
+    codes = s(raw_codes).strip()
+    label = s(raw_label).strip()
+
+    def is_na(x: str) -> bool:
+        xx = x.strip()
+        return (
+            (not xx)
+            or (xx.upper() == "__NA__")
+            or (xx.lower() == "na")
+            or (xx.lower() == "none")
+        )
+
+    if is_na(label):
+        label = "Unclassified"
+    if is_na(code):
+        code = "__NA__"
+    if is_na(codes):
+        codes = "__NA__"
+
+    return code, label, codes
+
+
+# --------------------------------------------------------------------------- #
 # Company profile parsing (outputs/<company_id>/company_profile.json + metadata/company_profile.md)
 # --------------------------------------------------------------------------- #
 
@@ -329,18 +407,18 @@ def _analyze_company_profile(
 
     if json_path.exists():
         try:
-            prof.profile_json_bytes = json_path.stat().st_size
+            prof.profile_json_bytes = int(json_path.stat().st_size)
         except Exception:
             prof.profile_json_bytes = 0
 
-        prof.profile_json_tokens = tc.count_file(json_path)
+        prof.profile_json_tokens = int(tc.count_file(json_path))
 
         obj = _load_json(json_path)
         if isinstance(obj, dict):
             prof.pipeline_version = str(obj.get("pipeline_version") or "")
             offerings = obj.get("offerings")
             if isinstance(offerings, list):
-                prof.offerings_total = len(offerings)
+                prof.offerings_total = int(len(offerings))
                 for o in offerings:
                     if not isinstance(o, dict):
                         continue
@@ -352,12 +430,12 @@ def _analyze_company_profile(
 
                     srcs = o.get("sources")
                     if isinstance(srcs, list):
-                        prof.sources_total += len(srcs)
+                        prof.sources_total += int(len(srcs))
 
                     descs = o.get("description")
                     if isinstance(descs, list):
-                        prof.desc_sentences_total += len(
-                            [x for x in descs if isinstance(x, str) and x.strip()]
+                        prof.desc_sentences_total += int(
+                            len([x for x in descs if isinstance(x, str) and x.strip()])
                         )
 
                     name_field = o.get("name")
@@ -365,8 +443,14 @@ def _analyze_company_profile(
                     if isinstance(name_field, list) and len(name_field) >= 2:
                         aliases = name_field[1]
                         if isinstance(aliases, list):
-                            prof.alias_total += len(
-                                [x for x in aliases if isinstance(x, str) and x.strip()]
+                            prof.alias_total += int(
+                                len(
+                                    [
+                                        x
+                                        for x in aliases
+                                        if isinstance(x, str) and x.strip()
+                                    ]
+                                )
                             )
 
             emb = obj.get("embeddings")
@@ -378,14 +462,14 @@ def _analyze_company_profile(
                     prof.embedding_dim = 0
                 off_vecs = emb.get("embedding_offerings")
                 if isinstance(off_vecs, dict):
-                    prof.embedding_offerings_vecs = len(off_vecs)
+                    prof.embedding_offerings_vecs = int(len(off_vecs))
 
     if md_path.exists():
         try:
-            prof.profile_md_bytes = md_path.stat().st_size
+            prof.profile_md_bytes = int(md_path.stat().st_size)
         except Exception:
             prof.profile_md_bytes = 0
-        prof.profile_md_tokens = tc.count_file(md_path)
+        prof.profile_md_tokens = int(tc.count_file(md_path))
 
     return prof
 
@@ -400,6 +484,11 @@ class CompanyRow:
     company_id: str
     root_url: str
     status: str
+
+    # industry
+    industry_code: str
+    industry_label: str
+    industry_codes: str
 
     urls_total: int
     urls_markdown_done: int
@@ -475,6 +564,11 @@ class CompanyRow:
 
 
 def discover_company_dirs(outputs_root: Path) -> List[Path]:
+    """
+    Keep profile-only dirs discoverable, but they will get:
+      status=missing_crawl_meta
+    instead of empty status (fixes confusing "(empty)" bucket).
+    """
     if not outputs_root.exists():
         return []
     out: List[Path] = []
@@ -523,13 +617,24 @@ def _row_from_company_dir(
     crawl = _load_crawl_meta(company_dir)
     url_index = _load_url_index(company_dir)
 
+    meta_present = bool(crawl)
     company_id = str(crawl.get("company_id") or company_dir.name)
     root_url = str(crawl.get("root_url") or "")
-    status = str(crawl.get("status") or "")
 
-    urls_total = int(crawl.get("urls_total") or 0)
-    urls_markdown_done = int(crawl.get("urls_markdown_done") or 0)
-    urls_llm_done = int(crawl.get("urls_llm_done") or 0)
+    raw_status = crawl.get("status")
+    status = str(raw_status or "").strip()
+    if not meta_present:
+        status = META_MISSING
+    elif not status:
+        status = STATUS_MISSING
+
+    industry_code, industry_label, industry_codes = (
+        _norm_industry(crawl) if meta_present else ("__NA__", "Unclassified", "__NA__")
+    )
+
+    urls_total = int(_to_int_if_nat(crawl.get("urls_total") or 0))
+    urls_markdown_done = int(_to_int_if_nat(crawl.get("urls_markdown_done") or 0))
+    urls_llm_done = int(_to_int_if_nat(crawl.get("urls_llm_done") or 0))
 
     # URL index aggregates
     url_count = 0
@@ -657,7 +762,7 @@ def _row_from_company_dir(
                 if md_done:
                     llm_pending_pages += 1
 
-    md_words_files = len(md_word_vals)
+    md_words_files = int(len(md_word_vals))
     md_words_total = int(sum(md_word_vals)) if md_word_vals else 0
     md_words_mean_per_file = (
         float(md_words_total / md_words_files) if md_word_vals else 0.0
@@ -669,7 +774,7 @@ def _row_from_company_dir(
     md_dir = company_dir / "markdown"
     if md_dir.exists() and md_dir.is_dir():
         for p in md_dir.glob("*.md"):
-            md_tokens_all += tc.count_file(p)
+            md_tokens_all += int(tc.count_file(p))
 
     # Dedup paths
     md_paths_unique = list(
@@ -679,15 +784,15 @@ def _row_from_company_dir(
         {p.resolve().as_posix(): p for p in product_paths_for_llm_done}.values()
     )
 
-    llm_input_tokens_done = sum(tc.count_file(p) for p in md_paths_unique)
-    llm_output_tokens_done = sum(tc.count_file(p) for p in prod_paths_unique)
+    llm_input_tokens_done = int(sum(tc.count_file(p) for p in md_paths_unique))
+    llm_output_tokens_done = int(sum(tc.count_file(p) for p in prod_paths_unique))
 
     # product directory totals
     product_dir = company_dir / "product"
     product_files_total = 0
     if product_dir.exists() and product_dir.is_dir():
-        product_files_total = len(list(product_dir.glob("*.json")))
-    product_files_used_done = len(prod_paths_unique)
+        product_files_total = int(len(list(product_dir.glob("*.json"))))
+    product_files_used_done = int(len(prod_paths_unique))
 
     # Cost model (per 1M tokens)
     cache_hit_rate = float(min(max(cache_hit_rate, 0.0), 1.0))
@@ -714,6 +819,9 @@ def _row_from_company_dir(
         company_id=company_id,
         root_url=root_url,
         status=status,
+        industry_code=industry_code,
+        industry_label=industry_label,
+        industry_codes=industry_codes,
         urls_total=urls_total,
         urls_markdown_done=urls_markdown_done,
         urls_llm_done=urls_llm_done,
@@ -751,19 +859,19 @@ def _row_from_company_dir(
         cost_total_usd_expected=cost_total_usd_expected,
         profile_present=bool(prof.present),
         profile_pipeline_version=prof.pipeline_version,
-        profile_offerings_total=prof.offerings_total,
-        profile_offerings_products=prof.offerings_products,
-        profile_offerings_services=prof.offerings_services,
-        profile_sources_total=prof.sources_total,
-        profile_desc_sentences_total=prof.desc_sentences_total,
-        profile_alias_total=prof.alias_total,
+        profile_offerings_total=int(prof.offerings_total),
+        profile_offerings_products=int(prof.offerings_products),
+        profile_offerings_services=int(prof.offerings_services),
+        profile_sources_total=int(prof.sources_total),
+        profile_desc_sentences_total=int(prof.desc_sentences_total),
+        profile_alias_total=int(prof.alias_total),
         profile_embedding_model=prof.embedding_model,
-        profile_embedding_dim=prof.embedding_dim,
-        profile_embedding_offerings_vecs=prof.embedding_offerings_vecs,
-        profile_json_tokens=prof.profile_json_tokens,
-        profile_json_bytes=prof.profile_json_bytes,
-        profile_md_tokens=prof.profile_md_tokens,
-        profile_md_bytes=prof.profile_md_bytes,
+        profile_embedding_dim=int(prof.embedding_dim),
+        profile_embedding_offerings_vecs=int(prof.embedding_offerings_vecs),
+        profile_json_tokens=int(prof.profile_json_tokens),
+        profile_json_bytes=int(prof.profile_json_bytes),
+        profile_md_tokens=int(prof.profile_md_tokens),
+        profile_md_bytes=int(prof.profile_md_bytes),
         _company_dir=str(company_dir.resolve()),
         _meta_path=str((company_dir / "metadata" / "crawl_meta.json").resolve()),
         _url_index_path=str((company_dir / "metadata" / "url_index.json").resolve()),
@@ -835,6 +943,9 @@ def collect_dataframe(
                     "company_id": cdir.name,
                     "root_url": "",
                     "status": "analyze_error",
+                    "industry_code": "__NA__",
+                    "industry_label": "Unclassified",
+                    "industry_codes": "__NA__",
                     "_company_dir": str(cdir.resolve()),
                     "_error": str(e),
                 }
@@ -842,14 +953,13 @@ def collect_dataframe(
 
     df = pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    # Fix FutureWarning: avoid errors="ignore". Convert only where truly numeric.
+    # Convert numeric columns robustly (avoid FutureWarning)
     numeric_candidates = [
         c
         for c in df.columns
         if c.startswith(("url_", "md_", "llm_", "product_", "cost_", "profile_"))
         or c in ("urls_total", "urls_markdown_done", "urls_llm_done", "url_count")
     ]
-
     for c in numeric_candidates:
         try:
             converted = pd.to_numeric(df[c])  # may raise on non-numeric values
@@ -867,13 +977,14 @@ def collect_dataframe(
 
 def _percentiles(
     series: pd.Series, cuts=(50, 75, 80, 90, 95, 97, 99)
-) -> Dict[str, float]:
-    out: Dict[str, float] = {}
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
     clean = series.dropna()
     if clean.empty:
-        return {f"p{p}": 0.0 for p in cuts}
+        return {f"p{p}": 0 for p in cuts}
     for p in cuts:
-        out[f"p{p}"] = float(np.percentile(clean, p))
+        v = np.percentile(clean, p)
+        out[f"p{p}"] = int(v) if float(v).is_integer() else float(v)
     return out
 
 
@@ -884,29 +995,38 @@ def compute_summary(df: pd.DataFrame, run_cfg: Dict[str, Any]) -> Dict[str, Any]
         if col not in df or df[col].dropna().empty:
             return {
                 "count": 0,
-                "mean": 0.0,
-                "median": 0.0,
-                "sum": 0.0,
-                **{f"p{p}": 0.0 for p in (50, 75, 80, 90, 95, 97, 99)},
+                "mean": 0,
+                "median": 0,
+                "sum": 0,
+                **{f"p{p}": 0 for p in (50, 75, 80, 90, 95, 97, 99)},
             }
         s = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+        sm = float(s.sum())
+        mn = float(s.mean())
+        md = float(s.median())
+
+        # If these are natural numbers (common for tokens/counts), store as int.
+        sm_out: Any = int(sm) if sm.is_integer() else sm
+        mn_out: Any = int(mn) if mn.is_integer() else mn
+        md_out: Any = int(md) if md.is_integer() else md
+
         return {
             "count": int(s.count()),
-            "mean": float(s.mean()),
-            "median": float(s.median()),
-            "sum": float(s.sum()),
+            "mean": mn_out,
+            "median": md_out,
+            "sum": sm_out,
             **_percentiles(s),
         }
 
-    # Totals
-    input_tokens_sum = float(
+    input_tokens_sum = int(
         pd.to_numeric(
             df.get("llm_input_tokens_done", pd.Series(dtype=float)), errors="coerce"
         )
         .fillna(0)
         .sum()
     )
-    output_tokens_sum = float(
+    output_tokens_sum = int(
         pd.to_numeric(
             df.get("llm_output_tokens_done", pd.Series(dtype=float)), errors="coerce"
         )
@@ -947,7 +1067,7 @@ def compute_summary(df: pd.DataFrame, run_cfg: Dict[str, Any]) -> Dict[str, Any]
         "generated_at": run_cfg.get("generated_at"),
         "outputs_root": run_cfg.get("outputs_root"),
         "tokenizer_mode": run_cfg.get("tokenizer_mode"),
-        "companies_count": n,
+        "companies_count": int(n),
         "pricing_usd_per_1m": {
             "input_cache_hit": in_hit,
             "input_cache_miss": in_miss,
@@ -964,9 +1084,9 @@ def compute_summary(df: pd.DataFrame, run_cfg: Dict[str, Any]) -> Dict[str, Any]
             "profile_offerings_total": stat("profile_offerings_total"),
         },
         "totals": {
-            "llm_input_tokens_done_sum": input_tokens_sum,
-            "llm_output_tokens_done_sum": output_tokens_sum,
-            "cost_total_usd_expected_sum": cost_sum,
+            "llm_input_tokens_done_sum": int(input_tokens_sum),
+            "llm_output_tokens_done_sum": int(output_tokens_sum),
+            "cost_total_usd_expected_sum": float(cost_sum),
         },
         "cost_breakdown_expected": {
             "input_cost_expected_usd": float(total_input_cost_expected),
@@ -978,12 +1098,8 @@ def compute_summary(df: pd.DataFrame, run_cfg: Dict[str, Any]) -> Dict[str, Any]
         "notes": {
             "input_cost_expected_per_1m_usd": float(expected_input_cost_per_1m),
             "pricing_units": "USD per 1M tokens",
-            "llm_input_tokens_done_definition": (
-                "sum of tokens in markdown files referenced by url_index entries classified as llm_done"
-            ),
-            "llm_output_tokens_done_definition": (
-                "sum of tokens in product/json files referenced by url_index entries classified as llm_done"
-            ),
+            "llm_input_tokens_done_definition": "sum of tokens in markdown files referenced by url_index entries classified as llm_done",
+            "llm_output_tokens_done_definition": "sum of tokens in product/json files referenced by url_index entries classified as llm_done",
         },
     }
     return summary
@@ -1038,7 +1154,8 @@ def _plot_hist(
     for p in (50, 75, 90, 95, 97, 99):
         v = float(np.percentile(s, p)) if len(s) else 0.0
         ax.axvline(v, linestyle="--")
-        ax.text(v, ax.get_ylim()[1] * 0.9, f"p{p}={v:.0f}", rotation=90, va="top")
+        label = f"p{p}={int(v) if v.is_integer() else v:.0f}"
+        ax.text(v, ax.get_ylim()[1] * 0.9, label, rotation=90, va="top")
     _savefig(fig, out)
 
 
@@ -1075,15 +1192,15 @@ def _print_global_state(outputs_root: Path) -> None:
     print("=" * 80)
     print("Global crawl state (from crawl_global_state.json):")
     print(f"  generated_at:         {gs.get('generated_at')}")
-    print(f"  total_companies:      {gs.get('total_companies')}")
-    print(f"  crawled_companies:    {gs.get('crawled_companies')}")
-    print(f"  completed_companies:  {gs.get('completed_companies')}")
-    print(f"  percentage_completed: {gs.get('percentage_completed')}")
+    print(f"  total_companies:      {_to_int_if_nat(gs.get('total_companies'))}")
+    print(f"  crawled_companies:    {_to_int_if_nat(gs.get('crawled_companies'))}")
+    print(f"  completed_companies:  {_to_int_if_nat(gs.get('completed_companies'))}")
+    print(f"  percentage_completed: {_to_int_if_nat(gs.get('percentage_completed'))}")
     by_status = gs.get("by_status") or {}
     if isinstance(by_status, dict) and by_status:
         print("  by_status:")
         for k, v in by_status.items():
-            print(f"    {k}: {v}")
+            print(f"    {k}: {_to_int_if_nat(v)}")
     print()
 
 
@@ -1094,6 +1211,8 @@ def _print_global_state(outputs_root: Path) -> None:
 
 def _fmt_int(n: Any) -> str:
     try:
+        if isinstance(n, float) and n.is_integer():
+            n = int(n)
         return f"{int(n):,}"
     except Exception:
         return str(n)
@@ -1125,15 +1244,15 @@ def _print_basic_run_info(
 
     print("=" * 80)
     print("Analyze configuration:")
-    print(f"  outputs_root:                 {str(outputs_root.resolve())}")
-    print(f"  out_dir:                      {str(out_dir.resolve())}")
-    print(f"  tokenizer_mode:               {run_cfg.get('tokenizer_mode')}")
-    print(f"  cache_hit_rate_assumed:       {cache_hit_rate:.2%}")
+    print(f"  outputs_root:                  {str(outputs_root.resolve())}")
+    print(f"  out_dir:                       {str(out_dir.resolve())}")
+    print(f"  tokenizer_mode:                {run_cfg.get('tokenizer_mode')}")
+    print(f"  cache_hit_rate_assumed:        {cache_hit_rate:.2%}")
     print("  pricing (USD per 1M tokens):")
-    print(f"    input_cache_hit_per_1m:     {in_hit}")
-    print(f"    input_cache_miss_per_1m:    {in_miss}")
-    print(f"    output_per_1m:              {out_cost}")
-    print(f"  implied_input_expected_per_1m:{expected_input_cost_per_1m}")
+    print(f"    input_cache_hit_per_1m:      {in_hit}")
+    print(f"    input_cache_miss_per_1m:     {in_miss}")
+    print(f"    output_per_1m:               {out_cost}")
+    print(f"  implied_input_expected_per_1m: {expected_input_cost_per_1m}")
     env_overrides = run_cfg.get("env_overrides") or {}
     if isinstance(env_overrides, dict):
         active = {k: v for k, v in env_overrides.items() if v is not None}
@@ -1162,12 +1281,12 @@ def _print_basic_run_info(
         pd.to_numeric(df.get("urls_llm_done", 0), errors="coerce").fillna(0).sum()
     )
 
-    llm_input_tokens_sum = float(
+    llm_input_tokens_sum = int(
         pd.to_numeric(df.get("llm_input_tokens_done", 0), errors="coerce")
         .fillna(0)
         .sum()
     )
-    llm_output_tokens_sum = float(
+    llm_output_tokens_sum = int(
         pd.to_numeric(df.get("llm_output_tokens_done", 0), errors="coerce")
         .fillna(0)
         .sum()
@@ -1225,59 +1344,69 @@ def _print_basic_run_info(
 
     print("=" * 80)
     print("Dataset overview:")
-    print(f"  companies:                    {_fmt_int(n_companies)}")
+    print(f"  companies:                     {_fmt_int(n_companies)}")
     if urls_total_sum:
-        print(f"  urls_total (sum):             {_fmt_int(urls_total_sum)}")
+        print(f"  urls_total (sum):              {_fmt_int(urls_total_sum)}")
     if url_count_sum:
-        print(f"  url_index entries (sum):      {_fmt_int(url_count_sum)}")
-    print(f"  markdown_done (sum):          {_fmt_int(md_done_sum)}  ({md_rate:.2%})")
-    print(f"  llm_done (sum):               {_fmt_int(llm_done_sum)}  ({llm_rate:.2%})")
-    print(f"  llm_done_pages (sum):         {_fmt_int(llm_done_pages_sum)}")
-    print(f"  llm_pending_pages (sum):      {_fmt_int(llm_pending_pages_sum)}")
+        print(f"  url_index entries (sum):       {_fmt_int(url_count_sum)}")
+    print(f"  markdown_done (sum):           {_fmt_int(md_done_sum)}  ({md_rate:.2%})")
+    print(
+        f"  llm_done (sum):                {_fmt_int(llm_done_sum)}  ({llm_rate:.2%})"
+    )
+    print(f"  llm_done_pages (sum):          {_fmt_int(llm_done_pages_sum)}")
+    print(f"  llm_pending_pages (sum):       {_fmt_int(llm_pending_pages_sum)}")
 
     print("  HTTP status buckets (sum from url_index):")
     total_status = ok_sum + redir_sum + c4_sum + c5_sum + other_sum
     if total_status:
         print(
-            f"    ok:                         {_fmt_int(ok_sum)}   ({_safe_div(ok_sum, total_status):.2%})"
+            f"    ok:                          {_fmt_int(ok_sum)}   ({_safe_div(ok_sum, total_status):.2%})"
         )
         print(
-            f"    redirect:                   {_fmt_int(redir_sum)} ({_safe_div(redir_sum, total_status):.2%})"
+            f"    redirect:                    {_fmt_int(redir_sum)} ({_safe_div(redir_sum, total_status):.2%})"
         )
         print(
-            f"    4xx:                        {_fmt_int(c4_sum)}   ({_safe_div(c4_sum, total_status):.2%})"
+            f"    4xx:                         {_fmt_int(c4_sum)}   ({_safe_div(c4_sum, total_status):.2%})"
         )
         print(
-            f"    5xx:                        {_fmt_int(c5_sum)}   ({_safe_div(c5_sum, total_status):.2%})"
+            f"    5xx:                         {_fmt_int(c5_sum)}   ({_safe_div(c5_sum, total_status):.2%})"
         )
         print(
-            f"    other:                      {_fmt_int(other_sum)} ({_safe_div(other_sum, total_status):.2%})"
+            f"    other:                       {_fmt_int(other_sum)} ({_safe_div(other_sum, total_status):.2%})"
         )
-    print(f"  url_error_count (sum):        {_fmt_int(err_sum)}")
+    print(f"  url_error_count (sum):         {_fmt_int(err_sum)}")
 
     print("=" * 80)
     print("Token + cost (based on llm_done pages only):")
     print(
-        f"  llm_input_tokens_done (sum):  {_fmt_int(llm_input_tokens_sum)}  ({llm_input_tokens_sum / 1_000_000.0:.3f}M)"
+        f"  llm_input_tokens_done (sum):   {_fmt_int(llm_input_tokens_sum)}  ({llm_input_tokens_sum / 1_000_000.0:.3f}M)"
     )
     print(
-        f"  llm_output_tokens_done (sum): {_fmt_int(llm_output_tokens_sum)}  ({llm_output_tokens_sum / 1_000_000.0:.3f}M)"
+        f"  llm_output_tokens_done (sum):  {_fmt_int(llm_output_tokens_sum)}  ({llm_output_tokens_sum / 1_000_000.0:.3f}M)"
     )
     print("  cost bounds + expected (USD):")
-    print(f"    input_all_hit:              {_fmt_float(total_input_cost_all_hit, 6)}")
-    print(f"    input_all_miss:             {_fmt_float(total_input_cost_all_miss, 6)}")
+    print(f"    input_all_hit:               {_fmt_float(total_input_cost_all_hit, 6)}")
+    print(
+        f"    input_all_miss:              {_fmt_float(total_input_cost_all_miss, 6)}"
+    )
     print(
         f"    input_expected (@{cache_hit_rate:.0%} hit): {_fmt_float(total_input_cost_expected, 6)}"
     )
-    print(f"    output:                     {_fmt_float(total_output_cost, 6)}")
-    print(f"    total_expected:             {_fmt_float(total_cost_expected, 6)}")
+    print(f"    output:                      {_fmt_float(total_output_cost, 6)}")
+    print(f"    total_expected:              {_fmt_float(total_cost_expected, 6)}")
     print()
 
 
 def _print_status_distribution(df: pd.DataFrame, top_k: int = 12) -> None:
+    """
+    Fix: don't show "(empty)" bucket. We now ensure status is never empty:
+      - missing crawl_meta -> "missing_crawl_meta"
+      - empty status field -> "missing_status"
+    """
     if df is None or df.empty or "status" not in df:
         return
-    vc = df["status"].fillna("").astype(str).value_counts()
+    vc = df["status"].fillna(STATUS_MISSING).astype(str)
+    vc = vc.replace("", STATUS_MISSING).value_counts()
     if vc.empty:
         return
     print("=" * 80)
@@ -1285,9 +1414,9 @@ def _print_status_distribution(df: pd.DataFrame, top_k: int = 12) -> None:
     for i, (k, v) in enumerate(vc.items()):
         if i >= top_k:
             break
-        print(f"  {k or '(empty)'}: {int(v)}")
+        print(f"  {k}: {int(v)}")
     if len(vc) > top_k:
-        print(f"  ... ({len(vc) - top_k} more)")
+        print(f"  ... ({int(len(vc) - top_k)} more)")
     print()
 
 
@@ -1330,6 +1459,165 @@ def _print_analyze_errors(df: pd.DataFrame, top_k: int = 10) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Industry reporting (default)
+# --------------------------------------------------------------------------- #
+
+
+def _industry_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      - industry_summary: per-industry aggregates (counts, rates, tokens, cost)
+      - industry_status:  per-industry status distribution (wide table)
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    tmp = df.copy()
+
+    # Normalize industry fields defensively in case older rows exist
+    for c in ("industry_label", "industry_code", "industry_codes"):
+        if c not in tmp.columns:
+            tmp[c] = "__NA__" if c != "industry_label" else "Unclassified"
+    tmp["industry_label"] = tmp["industry_label"].fillna("Unclassified").astype(str)
+    tmp["industry_label"] = tmp["industry_label"].replace("", "Unclassified")
+
+    # Ensure numeric
+    for c in (
+        "urls_total",
+        "urls_markdown_done",
+        "urls_llm_done",
+        "llm_input_tokens_done",
+        "llm_output_tokens_done",
+        "cost_total_usd_expected",
+        "llm_done_pages",
+        "llm_pending_pages",
+        "url_error_count",
+    ):
+        if c in tmp.columns:
+            tmp[c] = pd.to_numeric(tmp[c], errors="coerce").fillna(0)
+
+    g = tmp.groupby("industry_label", dropna=False)
+
+    industry_summary = pd.DataFrame(
+        {
+            "industry_label": g.size().index,
+            "companies": g.size().astype(int).values,
+            "urls_total_sum": g["urls_total"].sum().astype(int).values
+            if "urls_total" in tmp
+            else 0,
+            "urls_markdown_done_sum": g["urls_markdown_done"].sum().astype(int).values
+            if "urls_markdown_done" in tmp
+            else 0,
+            "urls_llm_done_sum": g["urls_llm_done"].sum().astype(int).values
+            if "urls_llm_done" in tmp
+            else 0,
+            "llm_done_pages_sum": g["llm_done_pages"].sum().astype(int).values
+            if "llm_done_pages" in tmp
+            else 0,
+            "llm_pending_pages_sum": g["llm_pending_pages"].sum().astype(int).values
+            if "llm_pending_pages" in tmp
+            else 0,
+            "llm_input_tokens_done_sum": g["llm_input_tokens_done"]
+            .sum()
+            .astype(int)
+            .values
+            if "llm_input_tokens_done" in tmp
+            else 0,
+            "llm_output_tokens_done_sum": g["llm_output_tokens_done"]
+            .sum()
+            .astype(int)
+            .values
+            if "llm_output_tokens_done" in tmp
+            else 0,
+            "url_error_count_sum": g["url_error_count"].sum().astype(int).values
+            if "url_error_count" in tmp
+            else 0,
+            "cost_total_usd_expected_sum": g["cost_total_usd_expected"]
+            .sum()
+            .astype(float)
+            .values
+            if "cost_total_usd_expected" in tmp
+            else 0.0,
+        }
+    )
+
+    # Rates (use urls_total if present & >0, else use urls_total_sum fallback handled row-wise)
+    def _rate(num: pd.Series, den: pd.Series) -> pd.Series:
+        den2 = den.replace(0, np.nan)
+        r = (num / den2).fillna(0.0)
+        return r
+
+    if "urls_total_sum" in industry_summary.columns:
+        industry_summary["markdown_done_rate"] = _rate(
+            industry_summary["urls_markdown_done_sum"],
+            industry_summary["urls_total_sum"],
+        )
+        industry_summary["llm_done_rate"] = _rate(
+            industry_summary["urls_llm_done_sum"], industry_summary["urls_total_sum"]
+        )
+
+    industry_summary = industry_summary.sort_values(
+        ["companies", "cost_total_usd_expected_sum"], ascending=[False, False]
+    )
+
+    # Status distribution per industry (wide)
+    if "status" in tmp.columns:
+        st = tmp.copy()
+        st["status"] = (
+            st["status"].fillna(STATUS_MISSING).astype(str).replace("", STATUS_MISSING)
+        )
+        piv = st.pivot_table(
+            index="industry_label",
+            columns="status",
+            values="company_id",
+            aggfunc="count",
+            fill_value=0,
+        ).reset_index()
+        piv_cols = [c for c in piv.columns if c != "industry_label"]
+        piv[piv_cols] = piv[piv_cols].astype(int)
+        industry_status = piv
+    else:
+        industry_status = pd.DataFrame()
+
+    return industry_summary, industry_status
+
+
+def _print_industry_overview(industry_summary: pd.DataFrame, top_k: int = 12) -> None:
+    if industry_summary is None or industry_summary.empty:
+        return
+    print("=" * 80)
+    print(f"Industry overview (top {top_k} by companies):")
+    tmp = industry_summary.sort_values("companies", ascending=False).head(top_k)
+    for _, r in tmp.iterrows():
+        label = str(r.get("industry_label"))
+        companies = int(r.get("companies") or 0)
+        cost = float(r.get("cost_total_usd_expected_sum") or 0.0)
+        md_rate = float(r.get("markdown_done_rate") or 0.0)
+        llm_rate = float(r.get("llm_done_rate") or 0.0)
+        pending = int(r.get("llm_pending_pages_sum") or 0)
+        print(
+            f"  {label}: companies={companies}  llm_done_rate={llm_rate:.2%}  md_done_rate={md_rate:.2%}  pending_pages={pending}  cost_sum={cost:.6f}"
+        )
+    print()
+
+    print("=" * 80)
+    print(f"Industry cost (top {top_k} by expected cost sum):")
+    tmp = industry_summary.sort_values(
+        "cost_total_usd_expected_sum", ascending=False
+    ).head(top_k)
+    for _, r in tmp.iterrows():
+        label = str(r.get("industry_label"))
+        companies = int(r.get("companies") or 0)
+        cost = float(r.get("cost_total_usd_expected_sum") or 0.0)
+        in_tok = int(r.get("llm_input_tokens_done_sum") or 0)
+        out_tok = int(r.get("llm_output_tokens_done_sum") or 0)
+        print(
+            f"  {label}: cost_sum={cost:.6f}  companies={companies}  in_tokens={in_tok:,}  out_tokens={out_tok:,}"
+        )
+    print()
+
+
+# --------------------------------------------------------------------------- #
 # Orchestrator (always comprehensive)
 # --------------------------------------------------------------------------- #
 
@@ -1356,6 +1644,20 @@ def run_analysis(
 
     summary = compute_summary(df, run_cfg)
     _write_json(out_dir / "summary.json", summary)
+
+    # Industry analysis (always)
+    industry_summary, industry_status = _industry_tables(df)
+    if not industry_summary.empty:
+        _write_csv(out_dir / "industry_summary.csv", industry_summary)
+        _write_json(
+            out_dir / "industry_summary.json",
+            industry_summary.to_dict(orient="records"),
+        )
+    if not industry_status.empty:
+        _write_csv(out_dir / "industry_status.csv", industry_status)
+        _write_json(
+            out_dir / "industry_status.json", industry_status.to_dict(orient="records")
+        )
 
     # Plots (always)
     _plot_hist(
@@ -1420,6 +1722,14 @@ def run_analysis(
     summary["companies_csv"] = str((out_dir / "companies.csv").resolve())
     summary["companies_jsonl"] = str((out_dir / "companies.jsonl").resolve())
     summary["summary_json"] = str((out_dir / "summary.json").resolve())
+    summary["industry"] = {
+        "industry_summary_csv": str((out_dir / "industry_summary.csv").resolve())
+        if not industry_summary.empty
+        else None,
+        "industry_status_csv": str((out_dir / "industry_status.csv").resolve())
+        if not industry_status.empty
+        else None,
+    }
     summary["plots"] = {
         "hist_urls_total_png": str((out_dir / "hist_urls_total.png").resolve()),
         "hist_llm_input_tokens_done_png": str(
@@ -1437,10 +1747,14 @@ def run_analysis(
     }
     _write_json(out_dir / "summary.json", summary)
 
-    # Terminal prints: more useful basic info
+    # Terminal prints
     _print_basic_run_info(outputs_root, out_dir, run_cfg, df)
     _print_status_distribution(df)
     _print_analyze_errors(df)
+
+    if not industry_summary.empty:
+        _print_industry_overview(industry_summary, top_k=12)
+
     _print_top_companies(
         df,
         col="llm_pending_pages",
@@ -1475,6 +1789,7 @@ def _parse_args() -> argparse.Namespace:
             "- crawl_meta.json + url_index.json aggregates\n"
             "- token accounting (LLM input from markdown/, LLM output from product/*.json)\n"
             "- company_profile.json + metadata/company_profile.md stats\n"
+            "- industry grouping (always on)\n"
             "- CSV/JSONL + summary + plots (+ interactive HTML if plotly installed)\n\n"
             "No optional analysis flags; everything runs by default.\n\n"
             "Cost model:\n"
@@ -1531,6 +1846,9 @@ def main() -> None:
     if isinstance(plots, dict):
         if plots.get("interactive_dir"):
             print(f"Interactive plots:   {plots.get('interactive_dir')}")
+    ind = summary.get("industry") or {}
+    if isinstance(ind, dict) and ind.get("industry_summary_csv"):
+        print(f"Industry summary:    {ind.get('industry_summary_csv')}")
     print("=" * 80)
 
 

@@ -333,9 +333,17 @@ async def run_company_pipeline(
         should_mark_success=False,
     )
 
-    watchdog_task: Optional[asyncio.Task] = None
+    crawl_watchdog_task: Optional[asyncio.Task] = None
+    llm_watchdog_task: Optional[asyncio.Task] = None
 
     try:
+        await scheduler.set_company_stage(
+            company.company_id,
+            AdaptiveScheduler.STAGE_CRAWL,
+            reset_timers=True,
+            reason="pipeline_enter",
+        )
+
         # Persist industry + basics at start (DB + crawl_meta.json via CrawlState)
         if (
             company.industry_code is None
@@ -421,6 +429,12 @@ async def run_company_pipeline(
 
         # ---------------- Crawl stage ----------------
         if do_crawl:
+            await scheduler.set_company_stage(
+                company.company_id,
+                AdaptiveScheduler.STAGE_CRAWL,
+                reset_timers=True,
+                reason="enter_crawl",
+            )
             await guard.wait_until_healthy()
 
             resume_roots: Optional[List[str]] = None
@@ -454,13 +468,13 @@ async def run_company_pipeline(
 
             heartbeat_sec = float(args.company_progress_heartbeat_sec)
 
-            async def _watchdog() -> None:
+            async def _crawl_watchdog() -> None:
                 while True:
                     await asyncio.sleep(heartbeat_sec)
                     signal_progress("heartbeat")
 
-            watchdog_task = asyncio.create_task(
-                _watchdog(), name=f"watchdog:{company.company_id}"
+            crawl_watchdog_task = asyncio.create_task(
+                _crawl_watchdog(), name=f"watchdog:crawl:{company.company_id}"
             )
 
             last_exc: Optional[BaseException] = None
@@ -534,8 +548,8 @@ async def run_company_pipeline(
                     last_event = None
                     break
 
-                except asyncio.CancelledError:
-                    raise
+                except asyncio.CancelledError as e:
+                    raise e
                 except Exception as e:
                     last_exc = e
                     stage = str(getattr(e, "stage", "crawl") or "crawl")
@@ -613,6 +627,31 @@ async def run_company_pipeline(
 
         # ---------------- LLM stage ----------------
         if will_llm:
+            await scheduler.set_company_stage(
+                company.company_id,
+                AdaptiveScheduler.STAGE_LLM,
+                reset_timers=True,
+                reason="enter_llm",
+            )
+
+            heartbeat_sec = float(args.company_progress_heartbeat_sec)
+            llm_timeout = float(getattr(scheduler.cfg, "llm_inactivity_timeout_sec"))
+            llm_progress_interval = max(60.0, min(300.0, llm_timeout / 3.0))
+
+            async def _llm_watchdog() -> None:
+                last_prog = time.monotonic()
+                while True:
+                    await asyncio.sleep(heartbeat_sec)
+                    signal_progress("heartbeat")
+                    now = time.monotonic()
+                    if (now - last_prog) >= llm_progress_interval:
+                        signal_progress("progress")
+                        last_prog = now
+
+            llm_watchdog_task = asyncio.create_task(
+                _llm_watchdog(), name=f"watchdog:llm:{company.company_id}"
+            )
+
             llm_exc: Optional[BaseException] = None
             llm_event: Optional[retry_mod.RetryEvent] = None
 
@@ -632,9 +671,14 @@ async def run_company_pipeline(
                             mode="schema", industry_code=company.industry_code
                         )
                         await run_full_pass_for_company(company, full_strategy=strat)
+
+                    signal_progress("progress")
                     llm_exc = None
                     llm_event = None
                     break
+
+                except asyncio.CancelledError as e:
+                    raise e
                 except Exception as e:
                     llm_exc = e
                     llm_event = retry_mod.classify_failure(e, stage=llm_stage)
@@ -661,6 +705,13 @@ async def run_company_pipeline(
                 )
                 await _persist_last_error(str(llm_exc))
                 return False
+
+            await scheduler.set_company_stage(
+                company.company_id,
+                AdaptiveScheduler.STAGE_CRAWL,
+                reset_timers=True,
+                reason="exit_llm",
+            )
 
         if stop_event.is_set():
             clog.warning(
@@ -725,7 +776,32 @@ async def run_company_pipeline(
         retry_mod.record_attempt(retry_store, company.company_id, outcome, flush=True)
         return True
 
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as e:
+        msg = str(e) or ""
+        if "scheduler:" in msg:
+            err = f"cancelled_by_scheduler:{msg}"
+            clog.warning(
+                "Company cancelled by scheduler company_id=%s msg=%s",
+                company.company_id,
+                msg,
+            )
+            outcome.ok = False
+            outcome.stage = "scheduler_cancel"
+            outcome.event = retry_mod.RetryEvent(
+                cls="stall",
+                stage="scheduler_cancel",
+                error=err,
+                nxdomain_like=False,
+                status_code=None,
+                stall_kind="scheduler",
+            )
+            outcome.md_done = await _get_md_done(recompute=True)
+            retry_mod.record_attempt(
+                retry_store, company.company_id, outcome, flush=True
+            )
+            await _persist_last_error(err)
+            return False
+
         clog.warning(
             "Company task cancelled (no marking) company_id=%s", company.company_id
         )
@@ -770,12 +846,13 @@ async def run_company_pipeline(
         return False
 
     finally:
-        if watchdog_task is not None:
-            watchdog_task.cancel()
-            try:
-                await watchdog_task
-            except asyncio.CancelledError:
-                pass
+        for t in (llm_watchdog_task, crawl_watchdog_task):
+            if t is not None:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
 
         if stop_event.is_set():
             logging_ext.reset_company_context(token)
@@ -795,6 +872,13 @@ async def run_company_pipeline(
         if run_id is not None:
             if outcome.ok or outcome.terminalized:
                 await state.mark_company_completed(run_id, company.company_id)
+
+        await scheduler.set_company_stage(
+            company.company_id,
+            AdaptiveScheduler.STAGE_IDLE,
+            reset_timers=False,
+            reason="pipeline_exit",
+        )
 
         logging_ext.reset_company_context(token)
         logging_ext.close_company(company.company_id)
@@ -1009,7 +1093,6 @@ async def main_async(args: argparse.Namespace) -> None:
             write_meta=True,
         )
 
-    # DB truth first: refresh in-progress snapshots based on url_index.json
     await state.recompute_all_in_progress(concurrency=32)
 
     if args.finalize_in_progress_md:
@@ -1018,7 +1101,6 @@ async def main_async(args: argparse.Namespace) -> None:
         companies_by_id = {c.company_id: c for c in companies}
         company_ids_all = [c.company_id for c in companies]
 
-    # Compute runnable_ids using new CrawlState snapshot semantics (no legacy filter API)
     runnable_ids: List[str] = []
     for cid in company_ids_all:
         snap = await state.get_company_snapshot(cid, recompute=False)
@@ -1060,7 +1142,7 @@ async def main_async(args: argparse.Namespace) -> None:
         for cid in ids:
             t = inflight_by_cid.get(cid)
             if t and not t.done():
-                t.cancel()
+                t.cancel("scheduler:cancel")
 
     async def request_recycle_idle(count: int, reason: str) -> int:
         logger.info("request_recycle_idle count=%d reason=%s (noop)", count, reason)
@@ -1268,9 +1350,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 inflight_by_cid.pop(cid, None)
 
                 if t.cancelled():
-                    logger.warning(
-                        "task cancelled cid=%s (NO marking in pipeline)", cid
-                    )
+                    logger.warning("task cancelled cid=%s", cid)
                     scheduler.touch_company(cid, kind="cancel")
                     continue
 
