@@ -7,13 +7,13 @@ import logging
 import os
 import signal
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 from urllib.parse import urlparse
 
-from crawl4ai.deep_crawling.filters import FilterChain
+from crawl4ai import CacheMode
 
 # Repo config factories
 from configs.browser import default_browser_factory
@@ -21,6 +21,7 @@ from configs.crawler import default_crawler_factory
 from configs.deep_crawl import (
     DFSDeepCrawlStrategyProvider,
     DeepCrawlStrategyFactory,
+    DeepCrawlStrategyFactory as DeepCrawlStrategyFactoryType,
     build_deep_strategy,
 )
 from configs.js_injection import (
@@ -30,61 +31,72 @@ from configs.js_injection import (
 )
 from configs.language import default_language_factory
 from configs.llm import (
-    DEFAULT_FULL_INSTRUCTION,
-    DEFAULT_PRESENCE_INSTRUCTION,
-    IndustryStrategyCache,
+    BASE_FULL_INSTRUCTION,
+    BASE_PRESENCE_INSTRUCTION,
+    IndustryAwareStrategyCache,
     LLMExtractionFactory,
     provider_strategy_from_llm_model_selector,
 )
-from configs.llm_industry import get_industry_profile
 from configs.md import default_md_factory
+from configs.models import (
+    Company,
+    COMPANY_STATUS_LLM_DONE,
+    COMPANY_STATUS_MD_DONE,
+    COMPANY_STATUS_MD_NOT_DONE,
+    COMPANY_STATUS_PENDING,
+    COMPANY_STATUS_TERMINAL_DONE,
+)
 
 # Extensions
-from extensions.load_source import CompanyInput, load_companies_from_source
-from extensions.logging import LoggingExtension
-from extensions import md_gating
-from extensions import output_paths
-from extensions.output_paths import ensure_company_dirs
-from extensions.resource_monitor import ResourceMonitor, ResourceMonitorConfig
-from extensions.adaptive_scheduling import (
+from extensions.filter import md_gating
+from extensions.filter.core import build_filter_chain
+from extensions.filter.dataset_external import build_dataset_externals
+from extensions.filter.dual_bm25 import (
+    DualBM25Filter,
+    DualBM25Scorer,
+    build_dual_bm25_components,
+)
+from extensions.guard.connectivity import ConnectivityGuard
+from extensions.io import output_paths
+from extensions.io.load_source import (
+    IndustryEnrichmentConfig,
+    load_companies_from_source_with_industry,
+)
+from extensions.schedule import retry as retry_mod
+from extensions.schedule.adaptive import (
     AdaptiveScheduler,
     AdaptiveSchedulingConfig,
     compute_retry_exit_code_from_store,
 )
-from extensions.connectivity_guard import ConnectivityGuard
-from extensions.crawl_state import (
+from extensions.schedule.crawler_pool import CrawlerPool
+from extensions.schedule.terminalization import (
+    decide_from_page_summary,
+    safe_mark_terminal,
+    stall_sanity_override_if_crawl_finished,
+    terminal_sanity_gate_if_crawl_finished,
+)
+from extensions.utils.logging import LoggingExtension
+from extensions.utils.resource_monitor import ResourceMonitor, ResourceMonitorConfig
+
+from extensions.crawl.recrawl_policy import apply_recrawl_policy
+from extensions.crawl.runner import CrawlRunnerConfig, run_company_crawl
+from extensions.crawl.state import (
+    CrawlState,
+    crawl_runner_done_ok,
     get_crawl_state,
-    normalize_company_industry_fields,
-    COMPANY_STATUS_PENDING,
-    COMPANY_STATUS_MD_NOT_DONE,
-    COMPANY_STATUS_MD_DONE,
-    COMPANY_STATUS_LLM_DONE,
-    COMPANY_STATUS_TERMINAL_DONE,
+    log_snapshot,
+    md_ready_for_llm,
+    snap_last_error,
+    urls_md_done,
 )
-from extensions.filtering import (
-    FirstTimeURLFilter,
-    HTMLContentFilter,
-    LanguageAwareURLFilter,
-    UniversalExternalFilter,
-)
-from extensions.dataset_external import build_dataset_externals
-from extensions.dual_bm25 import (
-    build_dual_bm25_components,
-    DualBM25Scorer,
-    DualBM25Filter,
-)
-from extensions.llm_passes import (
-    run_presence_pass_for_company,
+
+from extensions.pipeline.llm_passes import (
+    build_industry_context,
+    has_industry_context,
+    llm_requested,
     run_full_pass_for_company,
+    run_presence_pass_for_company,
 )
-from extensions.crawler_pool import CrawlerPool
-from extensions.crawl_runner import (
-    CrawlRunnerConfig,
-    run_company_crawl,
-)
-from extensions.terminalization import decide_from_page_summary
-from extensions.oom_guard import OOMGuard, OOMGuardConfig
-from extensions import retry as retry_mod
 
 logger = logging.getLogger("deep_crawl_runner")
 
@@ -99,175 +111,13 @@ _HTTP_LANG_MAP: Dict[str, str] = {
     "fr": "fr-FR",
 }
 
-_TRACEBACK_ON_ATTEMPT_FAIL = os.getenv("RUN_TRACEBACK", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-} or os.getenv("RETRY_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _short_exc(e: BaseException, limit: int = 900) -> str:
-    msg = f"{type(e).__name__}: {e}"
-    msg = " ".join((msg or "").split())
-    if len(msg) > limit:
-        return msg[: limit - 1] + "…"
-    return msg
-
-
-def _log_attempt_failure(
-    clog: logging.Logger,
-    *,
-    prefix: str,
-    attempt_index: int,
-    stage: str,
-    event: Optional[retry_mod.RetryEvent],
-    exc: BaseException,
-) -> None:
-    cls = getattr(event, "cls", None)
-    sk = getattr(event, "stall_kind", None)
-    sc = getattr(event, "status_code", None)
-    nx = getattr(event, "nxdomain_like", None)
-
-    if _TRACEBACK_ON_ATTEMPT_FAIL:
-        clog.exception(
-            "%s attempt=%d stage=%s cls=%s stall=%s status=%s nx=%s err=%s",
-            prefix,
-            attempt_index,
-            stage,
-            cls,
-            sk,
-            sc,
-            nx,
-            _short_exc(exc),
-        )
-        return
-
-    clog.error(
-        "%s attempt=%d stage=%s cls=%s stall=%s status=%s nx=%s err=%s",
-        prefix,
-        attempt_index,
-        stage,
-        cls,
-        sk,
-        sc,
-        nx,
-        _short_exc(exc),
-        exc_info=False,
-    )
-
-
-def _set_output_root(out_dir: str | Path) -> Path:
-    p = Path(out_dir).expanduser().resolve()
-    p.mkdir(parents=True, exist_ok=True)
-    output_paths.set_output_root(str(p))
-    return p
-
-
-def _global_path(name: str) -> Path:
-    return Path(output_paths.global_path(name))
-
-
-@dataclass(slots=True)
-class Company:
-    company_id: str
-    domain_url: str
-    name: Optional[str] = None
-
-    industry_code: Optional[str] = None
-    industry_label: Optional[str] = None
-    industry_codes: Optional[str] = None
-    industry_profile_id: Optional[str] = None
-
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-def _company_from_input(ci: CompanyInput) -> Company:
-    md = dict(ci.metadata or {})
-    industry_code, industry_label, industry_codes = normalize_company_industry_fields(
-        md.get("industry")
-    )
-    prof = get_industry_profile(industry_code)
-
-    return Company(
-        company_id=str(ci.bvdid),
-        domain_url=str(ci.url),
-        name=(str(getattr(ci, "name", "")).strip() or None),
-        industry_code=industry_code,
-        industry_label=industry_label,
-        industry_codes=industry_codes,
-        industry_profile_id=getattr(prof, "profile_id", None),
-        metadata=md,
-    )
-
-
-def _companies_from_source(path: Path) -> List[Company]:
-    return [_company_from_input(ci) for ci in load_companies_from_source(path)]
-
-
-def _build_filter_chain(
-    company: Company,
-    *,
-    lang: str,
-    dataset_externals: frozenset[str],
-    bm25_filter: Optional[DualBM25Filter],
-) -> FilterChain:
-    universal = UniversalExternalFilter(
-        dataset_externals=sorted(dataset_externals),
-        name=f"UniversalExternalFilter[{company.company_id}]",
-    )
-    universal.set_company_url(company.domain_url)
-
-    filters = [
-        HTMLContentFilter(),
-        FirstTimeURLFilter(),
-        universal,
-        LanguageAwareURLFilter(lang_code=lang),
-    ]
-    if bm25_filter is not None:
-        filters.append(bm25_filter)
-    return FilterChain(filters)
-
-
-def _should_skip_company(status: str, llm_mode: str) -> bool:
-    if llm_mode == "none":
-        return status in (
-            COMPANY_STATUS_MD_DONE,
-            COMPANY_STATUS_LLM_DONE,
-            COMPANY_STATUS_TERMINAL_DONE,
-        )
-    return status in (COMPANY_STATUS_LLM_DONE, COMPANY_STATUS_TERMINAL_DONE)
-
-
-def _crawl_meta_path(company_id: str) -> Path:
-    dirs = ensure_company_dirs(company_id)
-    meta_dir = dirs["metadata"] if "metadata" in dirs else dirs["checkpoints"]
-    Path(meta_dir).mkdir(parents=True, exist_ok=True)
-    return Path(meta_dir) / "crawl_meta.json"
-
-
-def _write_crawl_meta(company: Company, snapshot: Any) -> None:
-    path = _crawl_meta_path(company.company_id)
-    payload = {
-        "company_id": company.company_id,
-        "name": company.name,
-        "industry_code": company.industry_code,
-        "industry_label": company.industry_label,
-        "industry_codes": company.industry_codes,
-        "root_url": company.domain_url,
-        "status": snapshot.status,
-        "urls_total": snapshot.urls_total,
-        "urls_markdown_done": snapshot.urls_markdown_done,
-        "urls_llm_done": snapshot.urls_llm_done,
-        "last_error": snapshot.last_error,
-        "last_crawled_at": datetime.now(timezone.utc).isoformat(),
-    }
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(
-        __import__("json").dumps(payload, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    tmp.replace(path)
+_CACHE_MODE_MAP: Dict[str, CacheMode] = {
+    "enabled": CacheMode.ENABLED,
+    "disabled": CacheMode.DISABLED,
+    "read_only": CacheMode.READ_ONLY,
+    "write_only": CacheMode.WRITE_ONLY,
+    "bypass": CacheMode.BYPASS,
+}
 
 
 async def run_company_pipeline(
@@ -277,7 +127,7 @@ async def run_company_pipeline(
     total_unique: int,
     done_counter: MutableMapping[str, int],
     logging_ext: LoggingExtension,
-    state: Any,
+    state: CrawlState,
     guard: ConnectivityGuard,
     crawler_pool: CrawlerPool,
     args: argparse.Namespace,
@@ -285,14 +135,16 @@ async def run_company_pipeline(
     url_scorer: Optional[DualBM25Scorer],
     bm25_filter: Optional[DualBM25Filter],
     run_id: Optional[str],
-    industry_llm_cache: Optional[IndustryStrategyCache],
-    dfs_factory: Optional[DeepCrawlStrategyFactory],
+    industry_llm_cache: Optional[IndustryAwareStrategyCache],
+    dfs_factory: Optional[DeepCrawlStrategyFactoryType],
     crawler_base_cfg: Any,
     page_policy: PageInteractionPolicy,
     page_interaction_factory: PageInteractionFactory,
     retry_store: retry_mod.RetryStateStore,
     scheduler: AdaptiveScheduler,
     stop_event: asyncio.Event,
+    llm_sem: asyncio.Semaphore,
+    repo_root: Path,
 ) -> bool:
     token = logging_ext.set_company_context(company.company_id)
     clog = logging_ext.get_company_logger(company.company_id)
@@ -306,13 +158,17 @@ async def run_company_pipeline(
         if kind == "progress" and (now - last_progress_mono) < progress_throttle_sec:
             return
         last_progress_mono = now
-        scheduler.touch_company(company.company_id, kind=kind)
+        if kind == "heartbeat":
+            scheduler.heartbeat_company(company.company_id)
+        else:
+            scheduler.progress_company(company.company_id)
 
     async def _get_md_done(*, recompute: bool) -> int:
         snapx = await state.get_company_snapshot(
             company.company_id, recompute=recompute
         )
-        return int(snapx.urls_markdown_done or 0)
+        log_snapshot(clog, label=f"_get_md_done(recompute={recompute})", snap=snapx)
+        return int(snapx.urls_markdown_done)
 
     async def _persist_last_error(err: str) -> None:
         await state.upsert_company(
@@ -339,82 +195,66 @@ async def run_company_pipeline(
     try:
         await scheduler.set_company_stage(
             company.company_id,
-            AdaptiveScheduler.STAGE_CRAWL,
+            "crawl",
             reset_timers=True,
             reason="pipeline_enter",
         )
-
-        # Persist industry + basics at start (DB + crawl_meta.json via CrawlState)
-        if (
-            company.industry_code is None
-            and company.industry_label is None
-            and company.industry_codes is None
-        ):
-            industry_code, industry_label, industry_codes = (
-                normalize_company_industry_fields(
-                    company.metadata.get("industry")
-                    if isinstance(company.metadata, dict)
-                    else None
-                )
-            )
-            company.industry_code = industry_code
-            company.industry_label = industry_label
-            company.industry_codes = industry_codes
-
-        if not company.industry_profile_id:
-            prof = get_industry_profile(company.industry_code)
-            company.industry_profile_id = getattr(prof, "profile_id", None)
 
         await state.upsert_company(
             company.company_id,
             name=company.name,
             root_url=company.domain_url,
-            industry_code=company.industry_code,
             industry_label=company.industry_label,
-            industry_codes=company.industry_codes,
+            industry=company.industry,
+            nace=company.nace,
+            industry_source=company.industry_source,
             write_meta=True,
         )
 
         snap = await state.get_company_snapshot(company.company_id, recompute=False)
-        status = snap.status or COMPANY_STATUS_PENDING
-        urls_md_done0 = int(snap.urls_markdown_done or 0)
+        log_snapshot(clog, label="pipeline_enter(recompute=False)", snap=snap)
 
-        finalize_in_progress_md = bool(args.finalize_in_progress_md)
-        will_llm = (
-            (not finalize_in_progress_md)
-            and (args.llm_mode in ("presence", "full"))
-            and (industry_llm_cache is not None)
+        status = snap.status or COMPANY_STATUS_PENDING
+        md_done_enter = int(snap.urls_markdown_done)
+        clog.debug(
+            "pipeline_enter parsed snapshot company_id=%s status=%s urls_md_done=%d",
+            company.company_id,
+            status,
+            md_done_enter,
         )
 
+        do_llm_requested = llm_requested(args, industry_llm_cache)
         do_crawl = status in (COMPANY_STATUS_PENDING, COMPANY_STATUS_MD_NOT_DONE)
 
-        if (not do_crawl) and (not will_llm):
+        if (not do_crawl) and (not do_llm_requested):
             outcome.ok = True
-            outcome.stage = "skip_already_done"
+            outcome.stage = "skip_already_done_or_llm_disabled"
             outcome.should_mark_success = True
-            retry_mod.record_attempt(
+            await retry_mod.record_attempt(
                 retry_store, company.company_id, outcome, flush=True
             )
             return True
 
         done_now = int(done_counter.get("done", 0))
         clog.info(
-            "=== [done=%d/%d attempt=%d] company_id=%s url=%s industry=%s (code=%s codes=%s profile=%s) status=%s llm=%s ===",
+            "=== [done=%d/%d attempt=%d] company_id=%s url=%s industry_label=%s industry=%s nace=%s status=%s llm=%s llm_requested=%s has_ctx=%s ===",
             done_now,
             total_unique,
             attempt_no,
             company.company_id,
             company.domain_url,
             company.industry_label,
-            company.industry_code,
-            company.industry_codes,
-            company.industry_profile_id,
+            company.industry,
+            company.nace,
             status,
             args.llm_mode,
+            do_llm_requested,
+            has_industry_context(company),
         )
 
-        filter_chain = _build_filter_chain(
-            company,
+        filter_chain = build_filter_chain(
+            company_url=company.domain_url,
+            company_id=company.company_id,
             lang=args.lang,
             dataset_externals=dataset_externals,
             bm25_filter=bm25_filter,
@@ -427,11 +267,10 @@ async def run_company_pipeline(
             max_pages=int(args.max_pages) if args.max_pages else None,
         )
 
-        # ---------------- Crawl stage ----------------
         if do_crawl:
             await scheduler.set_company_stage(
                 company.company_id,
-                AdaptiveScheduler.STAGE_CRAWL,
+                "crawl",
                 reset_timers=True,
                 reason="enter_crawl",
             )
@@ -447,11 +286,11 @@ async def run_company_pipeline(
                     resume_roots = pending_md
                     direct_fetch_urls = args.resume_md_mode == "direct"
 
+            cache_mode = _CACHE_MODE_MAP[str(args.crawl4ai_cache_mode)]
+
             runner_cfg = CrawlRunnerConfig(
                 page_result_concurrency=int(args.page_result_concurrency),
                 page_queue_maxsize=int(args.page_queue_maxsize),
-                url_index_flush_every=int(args.url_index_flush_every),
-                url_index_flush_interval_sec=float(args.url_index_flush_interval_sec),
                 url_index_queue_maxsize=int(args.url_index_queue_maxsize),
                 arun_init_timeout_sec=float(args.arun_init_timeout_sec),
                 stream_no_yield_timeout_sec=float(args.stream_no_yield_timeout_sec),
@@ -464,6 +303,7 @@ async def run_company_pipeline(
                 if args.page_timeout_ms
                 else None,
                 direct_fetch_urls=bool(direct_fetch_urls),
+                crawl4ai_cache_mode=cache_mode,
             )
 
             heartbeat_sec = float(args.company_progress_heartbeat_sec)
@@ -480,6 +320,7 @@ async def run_company_pipeline(
             last_exc: Optional[BaseException] = None
             last_event: Optional[retry_mod.RetryEvent] = None
             last_page_dec: Optional[Any] = None
+            last_term_stage: str = "crawl"
 
             for attempt_index in range(2):
                 try:
@@ -519,21 +360,31 @@ async def run_company_pipeline(
                                 severity="critical",
                             )
 
+                        _ = await stall_sanity_override_if_crawl_finished(
+                            state, company, last_page_dec, clog
+                        )
+
                         term_dec = retry_mod.decide_terminalization(
                             page_summary_decision=last_page_dec,
                             exception=None,
                             stage="crawl",
-                            urls_md_done0=urls_md_done0,
+                            urls_md_done=md_done_enter,
                             attempt_index=attempt_index,
                         )
-                        if term_dec.should_terminalize:
-                            outcome.ok = True
-                            outcome.stage = "terminalize"
-                            outcome.terminalized = True
-                            outcome.terminal_reason = term_dec.reason
-                            outcome.terminal_last_error = term_dec.last_error
-                            outcome.should_mark_success = False
-                            break
+
+                        if term_dec.should_terminalize and last_page_dec is not None:
+                            ignore_term = await terminal_sanity_gate_if_crawl_finished(
+                                state, company, term_dec, last_page_dec, clog
+                            )
+                            if not ignore_term:
+                                outcome.ok = True
+                                outcome.stage = "terminalize"
+                                outcome.terminalized = True
+                                outcome.terminal_reason = term_dec.reason
+                                outcome.terminal_last_error = term_dec.last_error
+                                outcome.should_mark_success = False
+                                last_term_stage = "crawl"
+                                break
 
                         if getattr(last_page_dec, "action", None) == "stall":
                             raise retry_mod.CrawlerTimeoutError(
@@ -548,8 +399,8 @@ async def run_company_pipeline(
                     last_event = None
                     break
 
-                except asyncio.CancelledError as e:
-                    raise e
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     last_exc = e
                     stage = str(getattr(e, "stage", "crawl") or "crawl")
@@ -566,56 +417,76 @@ async def run_company_pipeline(
                             page_summary_decision=None,
                             exception=e,
                             stage=stage,
-                            urls_md_done0=urls_md_done0,
+                            urls_md_done=md_done_enter,
                             attempt_index=attempt_index,
                         )
                         if term_dec.should_terminalize:
                             outcome.ok = True
-                            outcome.stage = "terminalize"
+                            outcome.stage = "terminalize_fail_fast"
                             outcome.terminalized = True
                             outcome.terminal_reason = term_dec.reason
                             outcome.terminal_last_error = term_dec.last_error
                             outcome.should_mark_success = False
+                            last_term_stage = stage
                             break
 
-                    _log_attempt_failure(
+                    retry_mod.log_attempt_failure(
                         clog,
                         prefix="Crawl attempt failed",
                         attempt_index=attempt_index,
                         stage=stage,
                         event=last_event,
                         exc=e,
+                        traceback_enabled=retry_mod.TRACEBACK_ENABLED,
                     )
 
                     if attempt_index == 0:
                         await asyncio.sleep(0.5)
 
             if outcome.terminalized:
-                await state.mark_company_terminal(
-                    company.company_id,
-                    reason="terminalize",
+                wrote = await safe_mark_terminal(
+                    state,
+                    company,
+                    reason=str(outcome.stage or "terminalize"),
                     details={
                         "reason": outcome.terminal_reason,
-                        "industry_code": company.industry_code,
-                        "industry_codes": company.industry_codes,
-                        "industry_profile_id": company.industry_profile_id,
+                        "industry_label": company.industry_label,
+                        "industry": company.industry,
+                        "nace": company.nace,
+                        "term_stage": last_term_stage,
                     },
-                    last_error=outcome.terminal_last_error or outcome.terminal_reason,
-                    name=company.name,
-                    root_url=company.domain_url,
+                    last_error=outcome.terminal_last_error
+                    or outcome.terminal_reason
+                    or str(outcome.stage or "terminalize"),
+                    stage=last_term_stage,
+                    logger=clog,
                 )
-                outcome.md_done = await _get_md_done(recompute=True)
-                retry_mod.record_attempt(
-                    retry_store, company.company_id, outcome, flush=True
+
+                if wrote:
+                    outcome.md_done = await _get_md_done(recompute=True)
+                    await retry_mod.record_attempt(
+                        retry_store, company.company_id, outcome, flush=True
+                    )
+                    return True
+
+                clog.info(
+                    "safe_terminal refused; continuing pipeline as non-terminal company=%s stage=%s",
+                    company.company_id,
+                    last_term_stage,
                 )
-                return True
+                outcome.terminalized = False
+                outcome.terminal_reason = None
+                outcome.terminal_last_error = None
+                outcome.stage = "terminalize_refused_crawl_finished_ok"
+                last_exc = None
+                last_event = None
 
             if last_exc is not None and last_event is not None:
                 outcome.ok = False
                 outcome.stage = last_event.stage
                 outcome.event = last_event
                 outcome.md_done = await _get_md_done(recompute=True)
-                retry_mod.record_attempt(
+                await retry_mod.record_attempt(
                     retry_store, company.company_id, outcome, flush=True
                 )
                 await _persist_last_error(str(last_exc))
@@ -625,28 +496,71 @@ async def run_company_pipeline(
                 company.company_id, name=company.name, root_url=company.domain_url
             )
 
-        # ---------------- LLM stage ----------------
-        if will_llm:
+            snap_after_crawl = await state.get_company_snapshot(
+                company.company_id, recompute=True
+            )
+            log_snapshot(
+                clog, label="after_crawl(recompute=True)", snap=snap_after_crawl
+            )
+
+            if crawl_runner_done_ok(snap_after_crawl):
+                with suppress(Exception):
+                    await state.upsert_company(
+                        company.company_id,
+                        status=COMPANY_STATUS_MD_DONE,
+                        last_error=None,
+                        name=company.name,
+                        root_url=company.domain_url,
+                    )
+            else:
+                msg = snap_last_error(snap_after_crawl) or "crawl_not_finished_or_error"
+                await _persist_last_error(msg)
+                outcome.ok = False
+                outcome.stage = "crawl_not_done"
+                outcome.event = retry_mod.classify_failure(
+                    RuntimeError(msg), stage="crawl_not_done"
+                )
+                outcome.md_done = urls_md_done(snap_after_crawl)
+                await retry_mod.record_attempt(
+                    retry_store, company.company_id, outcome, flush=True
+                )
+                return False
+
+        if do_llm_requested:
+            assert industry_llm_cache is not None
+
+            snap_md = await state.get_company_snapshot(
+                company.company_id, recompute=True
+            )
+            log_snapshot(clog, label="pre_llm(recompute=True)", snap=snap_md)
+
+            if not md_ready_for_llm(snap_md):
+                await _persist_last_error("llm_requested_but_crawl_not_done_ok")
+                outcome.ok = False
+                outcome.stage = "precheck_llm_crawl_not_done_ok"
+                outcome.event = retry_mod.classify_failure(
+                    RuntimeError("llm_requested_but_crawl_not_done_ok"),
+                    stage="precheck_llm_crawl_not_done_ok",
+                )
+                outcome.md_done = urls_md_done(snap_md)
+                await retry_mod.record_attempt(
+                    retry_store, company.company_id, outcome, flush=True
+                )
+                return False
+
             await scheduler.set_company_stage(
                 company.company_id,
-                AdaptiveScheduler.STAGE_LLM,
+                "llm",
                 reset_timers=True,
                 reason="enter_llm",
             )
 
             heartbeat_sec = float(args.company_progress_heartbeat_sec)
-            llm_timeout = float(getattr(scheduler.cfg, "llm_inactivity_timeout_sec"))
-            llm_progress_interval = max(60.0, min(300.0, llm_timeout / 3.0))
 
             async def _llm_watchdog() -> None:
-                last_prog = time.monotonic()
                 while True:
                     await asyncio.sleep(heartbeat_sec)
                     signal_progress("heartbeat")
-                    now = time.monotonic()
-                    if (now - last_prog) >= llm_progress_interval:
-                        signal_progress("progress")
-                        last_prog = now
 
             llm_watchdog_task = asyncio.create_task(
                 _llm_watchdog(), name=f"watchdog:llm:{company.company_id}"
@@ -658,38 +572,47 @@ async def run_company_pipeline(
             llm_stage = f"llm_{args.llm_mode}"
             for attempt_index in range(2):
                 try:
-                    assert industry_llm_cache is not None
-                    if args.llm_mode == "presence":
-                        strat = industry_llm_cache.get_strategy(
-                            mode="presence", industry_code=company.industry_code
-                        )
-                        await run_presence_pass_for_company(
-                            company, presence_strategy=strat
-                        )
-                    elif args.llm_mode == "full":
-                        strat = industry_llm_cache.get_strategy(
-                            mode="schema", industry_code=company.industry_code
-                        )
-                        await run_full_pass_for_company(company, full_strategy=strat)
+                    ctx = build_industry_context(company)
+
+                    async with llm_sem:
+                        if args.llm_mode == "presence":
+                            strat = industry_llm_cache.get_strategy(
+                                mode="presence", ctx=ctx
+                            )
+                            await run_presence_pass_for_company(
+                                company,
+                                presence_strategy=strat,
+                                repo_root=repo_root,
+                            )
+                        elif args.llm_mode == "full":
+                            strat = industry_llm_cache.get_strategy(
+                                mode="schema", ctx=ctx
+                            )
+                            await run_full_pass_for_company(
+                                company,
+                                full_strategy=strat,
+                                repo_root=repo_root,
+                            )
 
                     signal_progress("progress")
                     llm_exc = None
                     llm_event = None
                     break
 
-                except asyncio.CancelledError as e:
-                    raise e
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     llm_exc = e
                     llm_event = retry_mod.classify_failure(e, stage=llm_stage)
 
-                    _log_attempt_failure(
+                    retry_mod.log_attempt_failure(
                         clog,
                         prefix="LLM attempt failed",
                         attempt_index=attempt_index,
                         stage=llm_stage,
                         event=llm_event,
                         exc=e,
+                        traceback_enabled=retry_mod.TRACEBACK_ENABLED,
                     )
 
                     if attempt_index == 0:
@@ -700,84 +623,143 @@ async def run_company_pipeline(
                 outcome.stage = llm_event.stage
                 outcome.event = llm_event
                 outcome.md_done = await _get_md_done(recompute=True)
-                retry_mod.record_attempt(
+                await retry_mod.record_attempt(
                     retry_store, company.company_id, outcome, flush=True
                 )
                 await _persist_last_error(str(llm_exc))
                 return False
 
+            with suppress(Exception):
+                await state.upsert_company(
+                    company.company_id,
+                    status=COMPANY_STATUS_LLM_DONE,
+                    last_error=None,
+                    name=company.name,
+                    root_url=company.domain_url,
+                )
+
             await scheduler.set_company_stage(
                 company.company_id,
-                AdaptiveScheduler.STAGE_CRAWL,
+                "crawl",
                 reset_timers=True,
                 reason="exit_llm",
             )
 
         if stop_event.is_set():
             clog.warning(
-                "Stop requested; skipping post-check and completion marking company_id=%s",
+                "Stop requested; skipping completion marking company_id=%s",
                 company.company_id,
             )
             return False
 
         snap_end = await state.get_company_snapshot(company.company_id, recompute=True)
+        log_snapshot(clog, label="pipeline_end(recompute=True)", snap=snap_end)
+
         st_end = snap_end.status or COMPANY_STATUS_PENDING
-        last_err = str(getattr(snap_end, "last_error", "") or "").strip()
+        last_err = snap_last_error(snap_end)
 
-        clog.info(
-            "Post-check company=%s status=%s md_done=%s llm_done=%s last_error=%s",
-            company.company_id,
-            st_end,
-            snap_end.urls_markdown_done,
-            snap_end.urls_llm_done,
-            (last_err[:240] + "…") if len(last_err) > 240 else last_err,
-        )
-
-        def _postcheck_failure(stage_name: str) -> bool:
-            msg = f"incomplete_status={st_end}"
-            if last_err:
-                msg = f"{msg}; last_error={last_err}"
-
-            ev = retry_mod.classify_failure(
-                RuntimeError(last_err or msg), stage=stage_name
+        if st_end == COMPANY_STATUS_TERMINAL_DONE:
+            outcome.ok = True
+            outcome.stage = "completed_terminal"
+            outcome.should_mark_success = False
+            outcome.md_done = urls_md_done(snap_end)
+            await retry_mod.record_attempt(
+                retry_store, company.company_id, outcome, flush=True
             )
+            return True
 
+        if not crawl_runner_done_ok(snap_end):
+            msg = last_err or "incomplete_crawl_runner_not_done_ok"
+            await _persist_last_error(msg)
             outcome.ok = False
-            outcome.stage = stage_name
-            outcome.event = retry_mod.RetryEvent(
-                cls=ev.cls,
-                stage=stage_name,
-                error=msg,
-                nxdomain_like=getattr(ev, "nxdomain_like", False),
-                status_code=getattr(ev, "status_code", None),
-                stall_kind=getattr(ev, "stall_kind", None),
+            outcome.stage = "incomplete_crawl"
+            outcome.event = retry_mod.classify_failure(
+                RuntimeError(msg), stage="incomplete_crawl"
             )
-            outcome.md_done = int(snap_end.urls_markdown_done or 0)
-            retry_mod.record_attempt(
+            outcome.md_done = urls_md_done(snap_end)
+            await retry_mod.record_attempt(
                 retry_store, company.company_id, outcome, flush=True
             )
             return False
 
-        if args.llm_mode == "none" or bool(args.finalize_in_progress_md):
-            ok_statuses = (COMPANY_STATUS_MD_DONE, COMPANY_STATUS_TERMINAL_DONE)
-            if st_end not in ok_statuses:
-                await _persist_last_error(last_err or f"incomplete_status={st_end}")
-                return _postcheck_failure("postcheck_md")
-        else:
-            ok_statuses = (COMPANY_STATUS_LLM_DONE, COMPANY_STATUS_TERMINAL_DONE)
-            if st_end not in ok_statuses:
-                await _persist_last_error(last_err or f"incomplete_status={st_end}")
-                return _postcheck_failure("postcheck_llm")
+        if do_llm_requested and st_end != COMPANY_STATUS_LLM_DONE:
+            msg = last_err or f"llm_requested_but_not_llm_done status={st_end}"
+            await _persist_last_error(msg)
+            outcome.ok = False
+            outcome.stage = "incomplete_llm"
+            outcome.event = retry_mod.classify_failure(
+                RuntimeError(msg), stage="incomplete_llm"
+            )
+            outcome.md_done = urls_md_done(snap_end)
+            await retry_mod.record_attempt(
+                retry_store, company.company_id, outcome, flush=True
+            )
+            return False
+
+        if (not do_llm_requested) and st_end != COMPANY_STATUS_MD_DONE:
+            with suppress(Exception):
+                await state.upsert_company(
+                    company.company_id,
+                    status=COMPANY_STATUS_MD_DONE,
+                    last_error=None,
+                    name=company.name,
+                    root_url=company.domain_url,
+                )
 
         outcome.ok = True
         outcome.stage = "completed"
         outcome.should_mark_success = True
-        outcome.md_done = int(snap_end.urls_markdown_done or 0)
-        retry_mod.record_attempt(retry_store, company.company_id, outcome, flush=True)
+        outcome.md_done = urls_md_done(snap_end)
+        await retry_mod.record_attempt(
+            retry_store, company.company_id, outcome, flush=True
+        )
         return True
 
     except asyncio.CancelledError as e:
         msg = str(e) or ""
+
+        if "stop:user" in msg:
+            err = "cancelled_by_user"
+            clog.warning("Company cancelled by user company_id=%s", company.company_id)
+            outcome.ok = False
+            outcome.stage = "user_cancel"
+            outcome.event = retry_mod.RetryEvent(
+                cls="cancel",
+                stage="user_cancel",
+                error=err,
+                nxdomain_like=False,
+                status_code=None,
+                stall_kind="user",
+            )
+            outcome.md_done = await _get_md_done(recompute=True)
+            await retry_mod.record_attempt(
+                retry_store, company.company_id, outcome, flush=True
+            )
+            await _persist_last_error(err)
+            return False
+
+        if "stop:term" in msg:
+            err = "cancelled_by_sigterm"
+            clog.warning(
+                "Company cancelled by sigterm company_id=%s", company.company_id
+            )
+            outcome.ok = False
+            outcome.stage = "sigterm_cancel"
+            outcome.event = retry_mod.RetryEvent(
+                cls="cancel",
+                stage="sigterm_cancel",
+                error=err,
+                nxdomain_like=False,
+                status_code=None,
+                stall_kind="sigterm",
+            )
+            outcome.md_done = await _get_md_done(recompute=True)
+            await retry_mod.record_attempt(
+                retry_store, company.company_id, outcome, flush=True
+            )
+            await _persist_last_error(err)
+            return False
+
         if "scheduler:" in msg:
             err = f"cancelled_by_scheduler:{msg}"
             clog.warning(
@@ -796,14 +778,16 @@ async def run_company_pipeline(
                 stall_kind="scheduler",
             )
             outcome.md_done = await _get_md_done(recompute=True)
-            retry_mod.record_attempt(
+            await retry_mod.record_attempt(
                 retry_store, company.company_id, outcome, flush=True
             )
             await _persist_last_error(err)
             return False
 
         clog.warning(
-            "Company task cancelled (no marking) company_id=%s", company.company_id
+            "Company task cancelled (propagate) company_id=%s msg=%s",
+            company.company_id,
+            msg,
         )
         raise
 
@@ -814,7 +798,9 @@ async def run_company_pipeline(
             cls="mem", stage="critical_memory_pressure", error=str(e)
         )
         outcome.md_done = await _get_md_done(recompute=True)
-        retry_mod.record_attempt(retry_store, company.company_id, outcome, flush=True)
+        await retry_mod.record_attempt(
+            retry_store, company.company_id, outcome, flush=True
+        )
         await _persist_last_error(str(e))
         return False
 
@@ -825,9 +811,11 @@ async def run_company_pipeline(
         outcome.event = ev
         outcome.md_done = await _get_md_done(recompute=True)
 
-        if _TRACEBACK_ON_ATTEMPT_FAIL:
+        if retry_mod.TRACEBACK_ENABLED:
             clog.exception(
-                "Pipeline unhandled exception stage=%s err=%s", ev.stage, _short_exc(e)
+                "Pipeline unhandled exception stage=%s err=%s",
+                ev.stage,
+                retry_mod.short_exc(e),
             )
         else:
             clog.error(
@@ -837,11 +825,13 @@ async def run_company_pipeline(
                 getattr(ev, "stall_kind", None),
                 getattr(ev, "status_code", None),
                 getattr(ev, "nxdomain_like", None),
-                _short_exc(e),
+                retry_mod.short_exc(e),
                 exc_info=False,
             )
 
-        retry_mod.record_attempt(retry_store, company.company_id, outcome, flush=True)
+        await retry_mod.record_attempt(
+            retry_store, company.company_id, outcome, flush=True
+        )
         await _persist_last_error(str(e))
         return False
 
@@ -849,36 +839,43 @@ async def run_company_pipeline(
         for t in (llm_watchdog_task, crawl_watchdog_task):
             if t is not None:
                 t.cancel()
-                try:
+                with suppress(asyncio.CancelledError):
                     await t
-                except asyncio.CancelledError:
-                    pass
 
-        if stop_event.is_set():
-            logging_ext.reset_company_context(token)
-            logging_ext.close_company(company.company_id)
-            gc.collect()
-            return
+        try:
+            snap2 = await state.get_company_snapshot(
+                company.company_id, recompute=False
+            )
+            await state.write_company_meta_snapshot(
+                company.company_id,
+                snap2,
+                pretty=True,
+                company_ctx=None,
+                set_last_crawled_at=True,
+            )
+        except Exception:
+            pass
 
-        snap2 = await state.get_company_snapshot(company.company_id, recompute=False)
-        _write_crawl_meta(company, snap2)
-
-        await state.recompute_company_from_index(
-            company.company_id,
-            name=company.name,
-            root_url=company.domain_url,
-        )
+        try:
+            await state.recompute_company_from_index(
+                company.company_id,
+                name=company.name,
+                root_url=company.domain_url,
+            )
+        except Exception:
+            pass
 
         if run_id is not None:
             if outcome.ok or outcome.terminalized:
-                await state.mark_company_completed(run_id, company.company_id)
+                with suppress(Exception):
+                    await state.mark_company_completed(run_id, company.company_id)
 
-        await scheduler.set_company_stage(
-            company.company_id,
-            AdaptiveScheduler.STAGE_IDLE,
-            reset_timers=False,
-            reason="pipeline_exit",
-        )
+        with suppress(Exception):
+            await scheduler.clear_company_stage(
+                company.company_id,
+                reset_timers=False,
+                reason="pipeline_exit",
+            )
 
         logging_ext.reset_company_context(token)
         logging_ext.close_company(company.company_id)
@@ -902,8 +899,17 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--strategy", choices=["bestfirst", "bfs_internal", "dfs"], default="bestfirst"
     )
+
     p.add_argument("--llm-mode", choices=["none", "presence", "full"], default="none")
     p.add_argument("--llm-model", type=str, default=None)
+
+    p.add_argument(
+        "--repo-root",
+        type=str,
+        default=".",
+        help="Repository root path (used for git metadata in LLM patching).",
+    )
+
     p.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -911,43 +917,74 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--dataset-file", type=str, default=None)
 
-    p.add_argument("--company-concurrency", type=int, default=10)
+    p.add_argument("--company-concurrency", type=int, default=8)
+    p.add_argument("--llm-concurrency", type=int, default=4)
     p.add_argument("--max-pages", type=int, default=100)
     p.add_argument("--page-timeout-ms", type=int, default=30000)
 
+    p.add_argument("--crawl4ai-cache-dir", type=str, default=None)
+    p.add_argument(
+        "--crawl4ai-cache-mode",
+        choices=["enabled", "disabled", "read_only", "write_only", "bypass"],
+        default="bypass",
+    )
+
+    p.add_argument(
+        "--force-recrawl",
+        action="store_true",
+        help="Force full recrawl of all non-terminal companies (keeps Crawl4AI cache; skips pages==max_pages check).",
+    )
+
     p.add_argument(
         "--retry-mode", choices=["all", "skip-retry", "only-retry"], default="all"
+    )
+    p.add_argument(
+        "--retry-exit-code",
+        type=int,
+        default=RETRY_EXIT_CODE,
+        help="Exit code used when retry is recommended/required.",
     )
     p.add_argument("--enable-session-log", action="store_true")
     p.add_argument("--enable-resource-monitor", action="store_true")
     p.add_argument("--finalize-in-progress-md", action="store_true")
 
     p.add_argument(
-        "--sync-industry-from-csv",
-        dest="sync_industry_from_csv",
+        "--industry-enrichment",
         action="store_true",
-        help="Update industry fields in DB for companies already present (no inserts). Also writes crawl_meta.json.",
+        help="Enable industry label enrichment.",
     )
+    p.add_argument(
+        "--no-industry-enrichment",
+        action="store_true",
+        help="Disable industry label enrichment even if LLM is enabled (overrides auto-enable).",
+    )
+    p.add_argument(
+        "--industry-nace-path", type=str, default=None, help="Override nace.ods path."
+    )
+    p.add_argument(
+        "--industry-fallback-path",
+        type=str,
+        default=None,
+        help="Override industry.ods path.",
+    )
+    p.add_argument("--source-encoding", type=str, default="utf-8")
+    p.add_argument("--source-limit", type=int, default=None)
+    p.add_argument("--source-no-aggregate-same-url", action="store_true")
+    p.add_argument("--source-no-interleave-domains", action="store_true")
 
-    # crawl_runner knobs
     p.add_argument("--page-result-concurrency", type=int, default=8)
     p.add_argument("--page-queue-maxsize", type=int, default=32)
-    p.add_argument("--url-index-flush-every", type=int, default=18)
-    p.add_argument("--url-index-flush-interval-sec", type=float, default=0.5)
     p.add_argument("--url-index-queue-maxsize", type=int, default=1024)
 
-    # crawler pool
-    p.add_argument("--crawler-pool-size", type=int, default=6)
+    p.add_argument("--crawler-pool-size", type=int, default=4)
     p.add_argument("--crawler-recycle-after", type=int, default=12)
 
-    # scheduler
     p.add_argument("--max-start-per-tick", type=int, default=3)
     p.add_argument("--crawler-capacity-multiplier", type=int, default=3)
     p.add_argument("--idle-recycle-interval-sec", type=float, default=25.0)
     p.add_argument("--idle-recycle-raw-frac", type=float, default=0.88)
     p.add_argument("--idle-recycle-eff-frac", type=float, default=0.83)
 
-    # timeouts / hang prevention
     p.add_argument("--crawler-lease-timeout-sec", type=float, default=240.0)
     p.add_argument("--arun-init-timeout-sec", type=float, default=180.0)
     p.add_argument("--stream-no-yield-timeout-sec", type=float, default=600.0)
@@ -958,30 +995,29 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     p.add_argument("--generator-close-timeout-sec", type=float, default=60.0)
     p.add_argument("--company-crawl-timeout-sec", type=float, default=3600.0)
 
-    # progress/heartbeat
     p.add_argument("--company-progress-heartbeat-sec", type=float, default=30.0)
     p.add_argument("--company-progress-throttle-sec", type=float, default=12.0)
 
-    # OOM guard
-    p.add_argument("--oom-soft-frac", type=float, default=0.90)
-    p.add_argument("--oom-hard-frac", type=float, default=0.95)
-    p.add_argument("--oom-check-interval-sec", type=float, default=2.0)
-    p.add_argument("--oom-soft-pause-sec", type=float, default=20.0)
-
-    # global state writer throttle
     p.add_argument("--global-state-write-interval-sec", type=float, default=1.5)
 
     return p.parse_args(list(argv) if argv is not None else None)
 
 
+@dataclass(slots=True)
+class _StopState:
+    reason: str
+    sigint_count: int
+
+
 async def main_async(args: argparse.Namespace) -> None:
     global _forced_exit_code, _retry_store_instance
 
-    out_dir = _set_output_root(args.out_dir)
+    out_dir = output_paths.ensure_output_root(args.out_dir)
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(
-        level=log_level, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+        level=log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
     )
     logger.setLevel(log_level)
 
@@ -989,12 +1025,24 @@ async def main_async(args: argparse.Namespace) -> None:
         logger.warning("--finalize-in-progress-md forces --llm-mode none")
         args.llm_mode = "none"
 
+    if args.llm_mode != "none" and (not bool(args.no_industry_enrichment)):
+        if not bool(args.industry_enrichment):
+            logger.info(
+                "Auto-enabling --industry-enrichment because --llm-mode != none (override with --no-industry-enrichment)."
+            )
+            args.industry_enrichment = True
+
+    repo_root = Path(str(args.repo_root)).expanduser().resolve()
+
+    llm_conc = max(1, int(getattr(args, "llm_concurrency", 2)))
+    llm_sem = asyncio.Semaphore(llm_conc)
+
     logging_ext = LoggingExtension(
         global_level=log_level,
         per_company_level=log_level,
         max_open_company_logs=128,
         enable_session_log=bool(args.enable_session_log),
-        session_log_path=_global_path("session.log")
+        session_log_path=output_paths.global_path_obj("session.log")
         if args.enable_session_log
         else None,
     )
@@ -1002,23 +1050,28 @@ async def main_async(args: argparse.Namespace) -> None:
     resource_monitor: Optional[ResourceMonitor] = None
     if args.enable_resource_monitor:
         resource_monitor = ResourceMonitor(
-            output_path=_global_path("resource_usage.json"),
+            output_path=output_paths.global_path_obj("resource_usage.json"),
             config=ResourceMonitorConfig(),
         )
         resource_monitor.start()
 
     default_language_factory.set_language(args.lang)
 
-    industry_llm_cache: Optional[IndustryStrategyCache] = None
+    cache_mode = _CACHE_MODE_MAP[str(args.crawl4ai_cache_mode)]
+    cache_dir = args.crawl4ai_cache_dir
+
+    industry_llm_cache: Optional[IndustryAwareStrategyCache] = None
     if args.llm_mode != "none":
         provider_strategy = provider_strategy_from_llm_model_selector(args.llm_model)
-        llm_factory = LLMExtractionFactory(
-            provider_strategy=provider_strategy,
-            default_full_instruction=DEFAULT_FULL_INSTRUCTION,
-            default_presence_instruction=DEFAULT_PRESENCE_INSTRUCTION,
-        )
-        industry_llm_cache = IndustryStrategyCache(
-            factory=llm_factory, schema=None, extraction_type="schema"
+        llm_factory = LLMExtractionFactory(provider_strategy=provider_strategy)
+        _ = (BASE_FULL_INSTRUCTION, BASE_PRESENCE_INSTRUCTION)
+        industry_llm_cache = IndustryAwareStrategyCache(
+            factory=llm_factory,
+            schema=None,
+            extraction_type="schema",
+            input_format=None,
+            extra_args=None,
+            verbose=False,
         )
 
     guard = ConnectivityGuard()
@@ -1036,23 +1089,40 @@ async def main_async(args: argparse.Namespace) -> None:
     crawler_base_cfg = default_crawler_factory.create(
         markdown_generator=markdown_generator,
         page_timeout=int(args.page_timeout_ms) if args.page_timeout_ms else None,
+        cache_mode=cache_mode,
+        cache_base_dir=cache_dir,
     )
 
     page_policy = PageInteractionPolicy(wait_timeout_ms=int(args.page_timeout_ms))
     page_interaction_factory = default_page_interaction_factory
 
-    state = get_crawl_state(db_path=_global_path("crawl_state.sqlite3"))
+    state = get_crawl_state()
 
-    if bool(getattr(args, "sync_industry_from_csv", False)) and args.company_file:
-        await state.update_industry_from_csv(
-            csv_path=args.company_file,
-            bvdid_column="bvdid",
-            industry_column="industry",
-            write_meta=True,
-        )
-
+    # ---------------------------------------------------------------------
+    # Load companies (canonical: configs.models.Company)
+    # ---------------------------------------------------------------------
+    companies: List[Company]
     if args.company_file:
-        companies = _companies_from_source(Path(args.company_file))
+        industry_enabled = bool(args.industry_enrichment) and (
+            not bool(args.no_industry_enrichment)
+        )
+        cfg = IndustryEnrichmentConfig(
+            enabled=industry_enabled,
+            nace_path=Path(args.industry_nace_path)
+            if args.industry_nace_path
+            else None,
+            fallback_path=Path(args.industry_fallback_path)
+            if args.industry_fallback_path
+            else None,
+        )
+        companies = load_companies_from_source_with_industry(
+            Path(args.company_file),
+            industry_config=cfg,
+            encoding=str(args.source_encoding),
+            limit=args.source_limit,
+            aggregate_same_url=not bool(args.source_no_aggregate_same_url),
+            interleave_domains=not bool(args.source_no_interleave_domains),
+        )
     else:
         url = args.url
         assert url is not None
@@ -1060,38 +1130,61 @@ async def main_async(args: argparse.Namespace) -> None:
         if not cid:
             parsed = urlparse(url)
             cid = (parsed.netloc or parsed.path or "company").replace(":", "_")
-
-        industry_code, industry_label, industry_codes = (
-            normalize_company_industry_fields(None)
-        )
-        prof = get_industry_profile(industry_code)
         companies = [
-            Company(
-                company_id=cid,
-                domain_url=url,
-                industry_code=industry_code,
-                industry_label=industry_label,
-                industry_codes=industry_codes,
-                industry_profile_id=getattr(prof, "profile_id", None),
-                metadata={},
-            )
+            Company.from_input(company_id=cid, root_url=url, name=None, metadata={})
         ]
 
-    companies_by_id = {c.company_id: c for c in companies}
-    company_ids_all = [c.company_id for c in companies]
+    companies_by_id: Dict[str, Company] = {c.company_id: c for c in companies}
+    company_ids_all: List[str] = [c.company_id for c in companies]
+    company_id_set = set(company_ids_all)
 
-    run_id = await state.start_run("deep_crawl", version=None, args_hash=None)
+    prev_run_max_pages = await state.get_latest_run_max_pages()
+    current_max_pages = int(args.max_pages)
+
+    run_id = await state.start_run(
+        "deep_crawl",
+        version=None,
+        args_hash=f"max_pages={current_max_pages}",
+        crawl4ai_cache_base_dir=str(Path(cache_dir).expanduser().resolve())
+        if cache_dir
+        else None,
+        crawl4ai_cache_mode=str(args.crawl4ai_cache_mode),
+    )
 
     for c in companies:
         await state.upsert_company(
             c.company_id,
             name=c.name,
             root_url=c.domain_url,
-            industry_code=c.industry_code,
             industry_label=c.industry_label,
-            industry_codes=c.industry_codes,
+            industry=c.industry,
+            nace=c.nace,
+            industry_source=c.industry_source,
             write_meta=True,
         )
+
+    touched = int(
+        await apply_recrawl_policy(
+            state=state,
+            companies=companies,
+            current_max_pages=current_max_pages,
+            prev_run_max_pages=prev_run_max_pages,
+            force_full_recrawl=bool(args.force_recrawl),
+        )
+    )
+    if bool(args.force_recrawl):
+        logger.warning(
+            "Force recrawl enabled: marked %d companies markdown_not_done (cache kept).",
+            touched,
+        )
+    else:
+        if prev_run_max_pages is not None and current_max_pages > prev_run_max_pages:
+            logger.warning(
+                "max_pages increased %s -> %s; re-queued %d companies where urls_total==old_cap (cache kept).",
+                prev_run_max_pages,
+                current_max_pages,
+                touched,
+            )
 
     await state.recompute_all_in_progress(concurrency=32)
 
@@ -1100,15 +1193,7 @@ async def main_async(args: argparse.Namespace) -> None:
         companies = [c for c in companies if c.company_id in inprog]
         companies_by_id = {c.company_id: c for c in companies}
         company_ids_all = [c.company_id for c in companies]
-
-    runnable_ids: List[str] = []
-    for cid in company_ids_all:
-        snap = await state.get_company_snapshot(cid, recompute=False)
-        st = snap.status or COMPANY_STATUS_PENDING
-        if not _should_skip_company(st, str(args.llm_mode)):
-            runnable_ids.append(cid)
-
-    await state.update_run_totals(run_id, total_companies=len(runnable_ids))
+        company_id_set = set(company_ids_all)
 
     dataset_externals = build_dataset_externals(args=args, companies=companies)
 
@@ -1116,7 +1201,7 @@ async def main_async(args: argparse.Namespace) -> None:
     url_scorer: Optional[DualBM25Scorer] = bm25["url_scorer"]
     bm25_filter: Optional[DualBM25Filter] = bm25["url_filter"]
 
-    dfs_factory: Optional[DeepCrawlStrategyFactory] = None
+    dfs_factory: Optional[DeepCrawlStrategyFactoryType] = None
     if args.strategy == "dfs":
         dfs_factory = DeepCrawlStrategyFactory(
             provider=DFSDeepCrawlStrategyProvider(default_max_depth=3)
@@ -1132,10 +1217,12 @@ async def main_async(args: argparse.Namespace) -> None:
     )
     await crawler_pool.start()
 
-    inflight_by_cid: Dict[str, asyncio.Task] = {}
-    cid_by_task: Dict[asyncio.Task, str] = {}
+    stop_event = asyncio.Event()
+    stop_state = _StopState(reason="none", sigint_count=0)
 
-    def get_active_company_ids() -> List[str]:
+    inflight_by_cid: Dict[str, asyncio.Task] = {}
+
+    def get_active_company_ids() -> Sequence[str]:
         return [cid for cid, t in inflight_by_cid.items() if not t.done()]
 
     def request_cancel_companies(ids: Sequence[str]) -> None:
@@ -1148,298 +1235,351 @@ async def main_async(args: argparse.Namespace) -> None:
         logger.info("request_recycle_idle count=%d reason=%s (noop)", count, reason)
         return 0
 
-    scheduler_cfg = AdaptiveSchedulingConfig(
-        log_path=_global_path("adaptive_scheduling_state.jsonl"),
-        heartbeat_path=_global_path("heartbeat.json"),
-        initial_target=min(4, int(args.company_concurrency)),
-        max_target=int(args.company_concurrency),
-        retry_base_dir=out_dir / "_retry",
+    sched_cfg = AdaptiveSchedulingConfig(
+        retry_base_dir=(out_dir / "_retry").resolve(),
         max_start_per_tick=int(args.max_start_per_tick),
+        crawler_capacity_multiplier=int(args.crawler_capacity_multiplier),
         idle_recycle_interval_sec=float(args.idle_recycle_interval_sec),
         idle_recycle_raw_frac=float(args.idle_recycle_raw_frac),
         idle_recycle_eff_frac=float(args.idle_recycle_eff_frac),
-        crawler_capacity_multiplier=max(1, int(args.crawler_capacity_multiplier)),
     )
-
     scheduler = AdaptiveScheduler(
-        cfg=scheduler_cfg,
+        cfg=sched_cfg,
         get_active_company_ids=get_active_company_ids,
         request_cancel_companies=request_cancel_companies,
         request_recycle_idle=request_recycle_idle,
     )
     await scheduler.start()
 
-    retry_store: retry_mod.RetryStateStore = scheduler.retry_store
+    retry_store = scheduler.retry_store
     _retry_store_instance = retry_store
 
-    async def is_company_runnable(cid: str, *, recompute: bool = False) -> bool:
-        if retry_store.is_quarantined(cid):
+    async def is_company_runnable(cid: str) -> bool:
+        """
+        Runnable gate:
+          - Terminal -> not runnable
+          - If llm requested: runnable iff status != LLM_DONE
+          - Else: runnable iff status != MD_DONE
+        NOTE: recompute=True so we trust crawl.runner meta (crawl_finished).
+        """
+        if cid not in company_id_set:
             return False
-        snap = await state.get_company_snapshot(cid, recompute=recompute)
+
+        company = companies_by_id.get(cid)
+        if company is None:
+            return False
+
+        snap = await state.get_company_snapshot(cid, recompute=True)
+        logger.debug(
+            "is_company_runnable snapshot cid=%s status=%s crawl_finished=%s urls_total=%d md_done=%d llm_done=%d last_error=%r",
+            cid,
+            snap.status,
+            bool(snap.crawl_finished),
+            int(snap.urls_total),
+            int(snap.urls_markdown_done),
+            int(snap.urls_llm_done),
+            snap.last_error,
+        )
         st = snap.status or COMPANY_STATUS_PENDING
-        return not _should_skip_company(st, args.llm_mode)
+
+        if st == COMPANY_STATUS_TERMINAL_DONE:
+            return False
+
+        do_llm_requested = llm_requested(args, industry_llm_cache)
+
+        if do_llm_requested:
+            return st != COMPANY_STATUS_LLM_DONE
+
+        return st != COMPANY_STATUS_MD_DONE
+
+    pending_retry_ids = set(await retry_store.pending_ids(exclude_quarantined=True))
+    for rid in pending_retry_ids:
+        if rid not in company_id_set:
+            await retry_store.mark_success(
+                rid, stage="startup_cleanup", note="orphan_retry_id"
+            )
+            continue
+        if not await is_company_runnable(rid):
+            await retry_store.mark_success(
+                rid, stage="startup_cleanup", note="already_done_or_terminal"
+            )
 
     await scheduler.cleanup_completed_retry_ids(
-        is_company_runnable=lambda cid: is_company_runnable(cid, recompute=False),
+        is_company_runnable=is_company_runnable,
         treat_non_runnable_as_done=True,
-        stage="startup_cleanup",
     )
+
+    runnable_ids: List[str] = []
+    for cid in company_ids_all:
+        if await is_company_runnable(cid):
+            runnable_ids.append(cid)
+
+    await state.update_run_totals(run_id, total_companies=len(runnable_ids))
 
     await scheduler.set_worklist(
         runnable_ids,
         retry_mode=str(args.retry_mode),
-        is_company_runnable=lambda cid: is_company_runnable(cid, recompute=False),
+        is_company_runnable=is_company_runnable,
     )
 
-    stop_event = asyncio.Event()
-    stop_reason: Optional[str] = None
-    stop_sig: Optional[str] = None
+    last_global_write = 0.0
+    write_interval = float(args.global_state_write_interval_sec)
 
-    def _on_stop(sig: str) -> None:
-        nonlocal stop_reason, stop_sig
-        logger.warning(
-            "[Signal] %s received; cancelling in-flight work and shutting down.", sig
+    async def maybe_write_global_state() -> None:
+        nonlocal last_global_write
+        now = time.monotonic()
+        if (now - last_global_write) < write_interval:
+            return
+        last_global_write = now
+        await state.write_global_state_throttled(
+            min_interval_sec=max(0.05, write_interval)
         )
-        stop_reason = "user_interrupt"
-        stop_sig = sig
+
+    async def force_write_global_state() -> None:
+        nonlocal last_global_write
+        last_global_write = time.monotonic()
+        await state.write_global_state_throttled(min_interval_sec=0.0)
+
+    def _cancel_inflight(tag: str) -> None:
+        for t in inflight_by_cid.values():
+            if not t.done():
+                t.cancel(tag)
+
+    def on_sigint() -> None:
+        global _forced_exit_code
+        stop_state.sigint_count += 1
+        if stop_state.sigint_count >= 2:
+            _forced_exit_code = 130
+            os._exit(130)
+        stop_state.reason = "sigint"
+        _forced_exit_code = 130
+        logger.warning("SIGINT received -> graceful shutdown")
         stop_event.set()
+        _cancel_inflight("stop:user")
+
+    def on_sigterm() -> None:
+        global _forced_exit_code
+        if getattr(scheduler, "restart_recommended", False):
+            stop_state.reason = "restart_recommended"
+            _forced_exit_code = int(args.retry_exit_code)
+            logger.error(
+                "SIGTERM received and restart is recommended -> exiting retry-exit-code=%s",
+                _forced_exit_code,
+            )
+            stop_event.set()
+            _cancel_inflight("stop:term")
+            return
+        stop_state.reason = "sigterm"
+        _forced_exit_code = 143
+        logger.warning("SIGTERM received -> graceful shutdown")
+        stop_event.set()
+        _cancel_inflight("stop:term")
 
     loop = asyncio.get_running_loop()
-    try:
-        loop.add_signal_handler(signal.SIGTERM, lambda: _on_stop("SIGTERM"))
-        loop.add_signal_handler(signal.SIGINT, lambda: _on_stop("SIGINT"))
-    except NotImplementedError:
-        logger.warning("Signal handlers not supported on this platform")
+    loop.add_signal_handler(signal.SIGINT, on_sigint)
+    loop.add_signal_handler(signal.SIGTERM, on_sigterm)
 
-    def _on_oom_hard(used_frac: float) -> None:
-        global _forced_exit_code
-        nonlocal stop_reason, stop_sig
-        logger.error(
-            "OOM hard triggered used_frac=%.4f forcing exit_code=%d",
-            used_frac,
-            RETRY_EXIT_CODE,
-        )
-        _forced_exit_code = RETRY_EXIT_CODE
-        stop_reason = "oom_hard"
-        stop_sig = "OOM_HARD"
-        stop_event.set()
+    if not runnable_ids and not scheduler.has_pending():
+        with suppress(Exception):
+            await force_write_global_state()
+        _forced_exit_code = 0
+        with suppress(Exception):
+            await crawler_pool.stop()
+        with suppress(Exception):
+            await guard.stop()
+        if resource_monitor is not None:
+            resource_monitor.stop()
+        return
 
-    oom = OOMGuard(
-        cfg=OOMGuardConfig(
-            soft_frac=float(args.oom_soft_frac),
-            hard_frac=float(args.oom_hard_frac),
-            check_interval_sec=float(args.oom_check_interval_sec),
-            soft_pause_sec=float(args.oom_soft_pause_sec),
-        ),
-        on_hard=_on_oom_hard,
-    )
-    oom.start(stop_event)
-
-    global_writer_task: Optional[asyncio.Task] = None
-    global_write_interval = max(
-        0.2, float(getattr(args, "global_state_write_interval_sec", 1.5))
-    )
-
-    async def _global_writer() -> None:
-        while not stop_event.is_set():
-            await state.write_global_state_throttled(
-                min_interval_sec=global_write_interval
-            )
-            await asyncio.sleep(0.25)
-
-    global_writer_task = asyncio.create_task(
-        _global_writer(), name="global_state_writer"
-    )
-
-    attempt_counter = 0
-    total_unique = int(len(runnable_ids))
     done_counter: Dict[str, int] = {"done": 0}
+    total_unique = len(runnable_ids)
+
+    cap = max(1, int(args.company_concurrency))
+    mult = max(1, int(args.crawler_capacity_multiplier))
+    free_crawlers_for_sched = max(
+        1, min(int(args.crawler_pool_size), (cap + mult - 1) // mult)
+    )
+
+    async def drain_reconcile_and_reseed() -> bool:
+        await state.recompute_all_in_progress(concurrency=32)
+
+        unfinished: List[str] = []
+        for cid in company_ids_all:
+            if await is_company_runnable(cid):
+                unfinished.append(cid)
+
+        if not unfinished:
+            return True
+
+        added = 0
+        try:
+            added = int(await scheduler.ensure_worklist(unfinished))
+        except Exception as e:
+            logger.warning("ensure_worklist failed err=%s", retry_mod.short_exc(e))
+            added = 0
+
+        if added <= 0:
+            for cid in unfinished:
+                with suppress(Exception):
+                    await scheduler.requeue_company(
+                        cid, force=True, reason="drain_reconcile"
+                    )
+
+        with suppress(Exception):
+            await force_write_global_state()
+        return False
 
     try:
-        while True:
-            if stop_event.is_set():
-                for t in list(inflight_by_cid.values()):
-                    if not t.done():
-                        t.cancel()
+        while not stop_event.is_set():
+            finished: List[str] = [
+                cid for cid, t in inflight_by_cid.items() if t.done()
+            ]
+            for cid in finished:
+                t = inflight_by_cid.pop(cid)
 
-                if inflight_by_cid:
-                    await asyncio.gather(
-                        *list(inflight_by_cid.values()), return_exceptions=True
+                ok = False
+                try:
+                    ok = bool(t.result())
+                except asyncio.CancelledError:
+                    ok = False
+                except Exception as e:
+                    logger.error(
+                        "Company task crashed company_id=%s err=%s",
+                        cid,
+                        retry_mod.short_exc(e),
                     )
+                    ok = False
 
-                logger.warning(
-                    "Shutdown requested reason=%s sig=%s active_before_cancel=%d",
-                    stop_reason,
-                    stop_sig,
-                    len(inflight_by_cid),
+                scheduler.register_company_completed()
+                if ok:
+                    done_counter["done"] = int(done_counter["done"]) + 1
+
+            with suppress(Exception):
+                await maybe_write_global_state()
+
+            if getattr(scheduler, "restart_recommended", False):
+                stop_state.reason = "restart_recommended"
+                _forced_exit_code = int(args.retry_exit_code)
+                logger.error(
+                    "Scheduler recommends restart -> stopping run exit_code=%s",
+                    _forced_exit_code,
                 )
-
-                await state.write_global_state_from_db_only()
+                stop_event.set()
+                _cancel_inflight("stop:term")
                 break
 
-            active_n = sum(1 for _cid, t in inflight_by_cid.items() if not t.done())
-            pending_total = scheduler.pending_total()
-            retry_pending = retry_store.pending_total(exclude_quarantined=True)
-            db_in_prog = await state.has_in_progress_companies()
-
-            if (
-                active_n == 0
-                and pending_total == 0
-                and retry_pending == 0
-                and not db_in_prog
-            ):
-                payload = await state.write_global_state_from_db_only()
-                if payload and (payload.get("in_progress_company_ids") or []):
-                    await asyncio.sleep(0.5)
-                    continue
-                break
-
-            free_crawlers = (
-                0
-                if time.time() < oom.pause_until_ts
-                else crawler_pool.free_slots_approx()
-            )
-            start_ids = await scheduler.plan_start_batch(free_crawlers=free_crawlers)
-
-            for cid in start_ids:
-                c = companies_by_id[cid]
-                attempt_counter += 1
-                scheduler.touch_company(cid, kind="start")
-
-                t = asyncio.create_task(
-                    run_company_pipeline(
-                        c,
-                        attempt_no=attempt_counter,
-                        total_unique=total_unique,
-                        done_counter=done_counter,
-                        logging_ext=logging_ext,
-                        state=state,
-                        guard=guard,
-                        crawler_pool=crawler_pool,
-                        args=args,
-                        dataset_externals=dataset_externals,
-                        url_scorer=url_scorer,
-                        bm25_filter=bm25_filter,
-                        run_id=run_id,
-                        industry_llm_cache=industry_llm_cache,
-                        dfs_factory=dfs_factory,
-                        crawler_base_cfg=crawler_base_cfg,
-                        page_policy=page_policy,
-                        page_interaction_factory=page_interaction_factory,
-                        retry_store=retry_store,
-                        scheduler=scheduler,
-                        stop_event=stop_event,
-                    ),
-                    name=f"company-{cid}",
+            if len(inflight_by_cid) < cap:
+                to_start = await scheduler.plan_start_batch(
+                    free_crawlers=int(free_crawlers_for_sched)
                 )
-                inflight_by_cid[cid] = t
-                cid_by_task[t] = cid
-
-            if not inflight_by_cid:
-                await asyncio.sleep(max(0.25, float(retry_store.sleep_hint_sec())))
-                continue
-
-            done, _ = await asyncio.wait(
-                list(inflight_by_cid.values()),
-                timeout=1.0,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            for t in done:
-                cid = cid_by_task.pop(t)
-                inflight_by_cid.pop(cid, None)
-
-                if t.cancelled():
-                    logger.warning("task cancelled cid=%s", cid)
-                    scheduler.touch_company(cid, kind="cancel")
-                    continue
-
-                ok = bool(t.result())
-                still_runnable = await is_company_runnable(cid, recompute=True)
-
-                if still_runnable and not stop_event.is_set():
-                    rq = retry_mod.decide_requeue(
-                        store=retry_store,
-                        company_id=cid,
-                        is_runnable=True,
-                        stop_requested=False,
-                    )
-                    if rq.should_requeue:
-                        await scheduler.requeue_company(
-                            cid,
-                            delay_sec=float(rq.delay_sec),
-                            reason=str(rq.reason),
-                        )
-                        scheduler.touch_company(cid, kind="requeue")
+                for cid in to_start:
+                    if stop_event.is_set():
+                        break
+                    if cid in inflight_by_cid and not inflight_by_cid[cid].done():
+                        continue
+                    c = companies_by_id.get(cid)
+                    if c is None:
                         continue
 
-                if ok and not still_runnable:
-                    done_counter["done"] = int(done_counter.get("done", 0)) + 1
-                    scheduler.register_company_completed()
-                    scheduler.touch_company(cid, kind="done")
-                else:
-                    scheduler.touch_company(cid, kind="fail")
+                    async def _runner(company: Company) -> bool:
+                        return await run_company_pipeline(
+                            company,
+                            attempt_no=1,
+                            total_unique=total_unique,
+                            done_counter=done_counter,
+                            logging_ext=logging_ext,
+                            state=state,
+                            guard=guard,
+                            crawler_pool=crawler_pool,
+                            args=args,
+                            dataset_externals=dataset_externals,
+                            url_scorer=url_scorer,
+                            bm25_filter=bm25_filter,
+                            run_id=run_id,
+                            industry_llm_cache=industry_llm_cache,
+                            dfs_factory=dfs_factory,
+                            crawler_base_cfg=crawler_base_cfg,
+                            page_policy=page_policy,
+                            page_interaction_factory=page_interaction_factory,
+                            retry_store=retry_store,
+                            scheduler=scheduler,
+                            stop_event=stop_event,
+                            llm_sem=llm_sem,
+                            repo_root=repo_root,
+                        )
 
-                await state.write_global_state_throttled(
-                    min_interval_sec=global_write_interval
-                )
+                    inflight_by_cid[cid] = asyncio.create_task(
+                        _runner(c), name=f"company:{cid}"
+                    )
 
-        pending_total = scheduler.pending_total()
-        retry_pending = retry_store.pending_total(exclude_quarantined=True)
-        db_in_prog = await state.has_in_progress_companies()
-        payload = await state.write_global_state_from_db_only()
-        in_progress_payload = bool(
-            (payload.get("in_progress_company_ids") or []) if payload else False
-        )
+            if not inflight_by_cid and not scheduler.has_pending():
+                should_break = await drain_reconcile_and_reseed()
+                if should_break:
+                    break
+                continue
 
-        _forced_exit_code = retry_mod.decide_exit_code(
-            forced_exit_code=_forced_exit_code,
-            retry_exit_code=RETRY_EXIT_CODE,
-            scheduler_pending_total=pending_total,
-            retry_pending_total=retry_pending,
-            db_in_progress=db_in_prog,
-            in_progress_payload=in_progress_payload,
-        )
+            hint = float(scheduler.sleep_hint_sec())
+            await asyncio.sleep(max(0.05, min(0.5, hint)))
 
     finally:
-        if global_writer_task is not None:
-            global_writer_task.cancel()
-            try:
-                await global_writer_task
-            except asyncio.CancelledError:
-                pass
+        if stop_state.reason == "sigint":
+            _cancel_inflight("stop:user")
+        elif stop_state.reason in ("sigterm", "restart_recommended"):
+            _cancel_inflight("stop:term")
 
-        await oom.stop()
-        await scheduler.stop()
-        await guard.stop()
-        await crawler_pool.stop()
-        logging_ext.close()
+        if inflight_by_cid:
+            await asyncio.gather(*inflight_by_cid.values(), return_exceptions=True)
 
-        if resource_monitor:
+        with suppress(Exception):
+            await crawler_pool.stop()
+        with suppress(Exception):
+            await guard.stop()
+
+        if resource_monitor is not None:
             resource_monitor.stop()
 
-        state.close()
-        gc.collect()
+        with suppress(Exception):
+            await force_write_global_state()
+
+        if stop_state.reason == "sigint":
+            _forced_exit_code = 130
+            return
+        if stop_state.reason == "sigterm":
+            _forced_exit_code = 143
+            return
+        if stop_state.reason == "restart_recommended":
+            _forced_exit_code = int(args.retry_exit_code)
+            return
+
+        await scheduler.cleanup_completed_retry_ids(
+            is_company_runnable=is_company_runnable,
+            treat_non_runnable_as_done=True,
+        )
+
+        with suppress(Exception):
+            should_break = await drain_reconcile_and_reseed()
+            if should_break:
+                await scheduler.cleanup_completed_retry_ids(
+                    is_company_runnable=is_company_runnable,
+                    treat_non_runnable_as_done=True,
+                )
+
+        if not scheduler.has_pending():
+            _forced_exit_code = 0
+            return
+
+        _forced_exit_code = int(
+            compute_retry_exit_code_from_store(
+                scheduler.retry_store,
+                retry_exit_code=int(args.retry_exit_code),
+            )
+        )
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
-    global _forced_exit_code, _retry_store_instance
-
     args = parse_args(argv)
-    try:
-        asyncio.run(main_async(args))
-    except KeyboardInterrupt:
-        logger.warning("KeyboardInterrupt; exiting.")
-    finally:
-        exit_code = 0
-        if _retry_store_instance is not None:
-            exit_code = compute_retry_exit_code_from_store(
-                _retry_store_instance, RETRY_EXIT_CODE
-            )
-        if _forced_exit_code is not None:
-            exit_code = int(_forced_exit_code)
-        if exit_code != 0:
-            raise SystemExit(exit_code)
+    asyncio.run(main_async(args))
+    raise SystemExit(int(_forced_exit_code or 0))
 
 
 if __name__ == "__main__":
