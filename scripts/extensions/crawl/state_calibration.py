@@ -41,12 +41,13 @@ class CalibrationReport:
     touched_companies: int
     wrote_global_state: bool
     source_companies_loaded: int
+    source_companies_used: int
     sample_before: CalibrationSample
     sample_after: CalibrationSample
 
 
 # -----------------------------------------------------------------------------
-# Output-path resolution (NO mkdir; never creates company folders)
+# Output-path resolution
 # -----------------------------------------------------------------------------
 
 
@@ -57,16 +58,16 @@ def _company_base(out_dir: Path, company_id: str) -> Path:
 def _crawl_meta_candidates(out_dir: Path, company_id: str) -> List[Path]:
     base = _company_base(out_dir, company_id)
     return [
-        base / "meta" / "crawl_meta.json",  # requested canonical for calibration
-        base / "metadata" / "crawl_meta.json",  # legacy layout
+        base / "meta" / "crawl_meta.json",
+        base / "metadata" / "crawl_meta.json",
     ]
 
 
 def _url_index_candidates(out_dir: Path, company_id: str) -> List[Path]:
     base = _company_base(out_dir, company_id)
     return [
-        base / "url_index.json",  # requested canonical
-        base / "metadata" / "url_index.json",  # legacy layout
+        base / "url_index.json",
+        base / "metadata" / "url_index.json",
     ]
 
 
@@ -90,7 +91,7 @@ def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def _write_json_file(path: Path, obj: Mapping[str, Any], *, pretty: bool) -> None:
-    # IMPORTANT: no mkdir here; must only update existing files
+    # Intentionally only touches existing files (calibration should not invent new files)
     if not path.exists():
         return
     if pretty:
@@ -128,7 +129,8 @@ def _normalize_url_index_file(
         ent_dict = dict(ent)
         ent_dict.setdefault("company_id", company_id)
         ent_dict.setdefault("url", url)
-        normalized = UrlIndexEntry.from_dict(ent_dict, company_id=company_id, url=url)
+        normalized = UrlIndexEntry.from_dict(
+            ent_dict, company_id=company_id, url=url)
         out[url] = normalized.to_dict()
 
     meta_raw = idx.get(URL_INDEX_META_KEY)
@@ -145,7 +147,7 @@ def _normalize_url_index_file(
 
 
 # -----------------------------------------------------------------------------
-# crawl_meta.json patching (reads/writes existing meta/crawl_meta.json only)
+# crawl_meta.json canonical rewrite (allowlist; removes legacy keys)
 # -----------------------------------------------------------------------------
 
 
@@ -154,33 +156,71 @@ def _patch_crawl_meta_file(
     company_id: str,
     *,
     src: Optional[Company],
+    db_snap: Company,
     version_meta: Dict[str, Any],
 ) -> None:
     p = _first_existing(_crawl_meta_candidates(out_dir, company_id))
     if p is None:
         return
 
-    cm = _read_json_file(p) or {}
-    cm = dict(cm)
+    # Canonical rewrite: do NOT start from existing JSON (prevents legacy key retention).
+    meta: Dict[str, Any] = {}
 
-    cm.setdefault("company_id", company_id)
-    cm["calibrated_at"] = _now_iso()
-    cm[_VERSION_META_KEY] = version_meta
+    # Prefer DB snapshot as source of truth (it reflects any upsert you did).
+    meta["company_id"] = db_snap.company_id
+    meta["root_url"] = db_snap.root_url
+    meta["name"] = db_snap.name
 
-    # If we have a source Company, attach deterministic canonical fields
-    if src is not None:
-        cm["root_url"] = src.root_url
-        cm["name"] = src.name
-        if src.industry is not None:
-            cm["industry"] = int(src.industry)
-        if src.nace is not None:
-            cm["nace"] = int(src.nace)
-        if src.industry_label:
-            cm["industry_label"] = src.industry_label
-        if src.industry_label_source:
-            cm["industry_label_source"] = src.industry_label_source
+    md = db_snap.metadata if isinstance(db_snap.metadata, dict) else {}
+    meta["metadata"] = md
 
-    _write_json_file(p, cm, pretty=True)
+    meta["industry"] = db_snap.industry
+    meta["nace"] = db_snap.nace
+    meta["industry_label"] = db_snap.industry_label
+    meta["industry_label_source"] = db_snap.industry_label_source
+
+    meta["status"] = db_snap.status
+    meta["crawl_finished"] = bool(db_snap.crawl_finished)
+
+    meta["urls_total"] = int(db_snap.urls_total or 0)
+    meta["urls_markdown_done"] = int(db_snap.urls_markdown_done or 0)
+    meta["urls_llm_done"] = int(db_snap.urls_llm_done or 0)
+
+    meta["created_at"] = db_snap.created_at
+    meta["updated_at"] = db_snap.updated_at
+    meta["last_crawled_at"] = db_snap.last_crawled_at
+
+    meta["retry_cls"] = db_snap.retry_cls
+    meta["retry_attempts"] = int(db_snap.retry_attempts or 0)
+    meta["retry_next_eligible_at"] = float(
+        db_snap.retry_next_eligible_at or 0.0)
+    meta["retry_updated_at"] = float(db_snap.retry_updated_at or 0.0)
+    meta["retry_last_error"] = db_snap.retry_last_error or ""
+    meta["retry_last_stage"] = db_snap.retry_last_stage or ""
+
+    meta["retry_net_attempts"] = int(db_snap.retry_net_attempts or 0)
+    meta["retry_stall_attempts"] = int(db_snap.retry_stall_attempts or 0)
+    meta["retry_mem_attempts"] = int(db_snap.retry_mem_attempts or 0)
+    meta["retry_other_attempts"] = int(db_snap.retry_other_attempts or 0)
+
+    meta["retry_mem_hits"] = int(db_snap.retry_mem_hits or 0)
+    meta["retry_last_stall_kind"] = db_snap.retry_last_stall_kind or "unknown"
+
+    meta["retry_last_progress_md_done"] = int(
+        db_snap.retry_last_progress_md_done or 0)
+    meta["retry_last_seen_md_done"] = int(db_snap.retry_last_seen_md_done or 0)
+
+    meta["retry_last_error_sig"] = db_snap.retry_last_error_sig or ""
+    meta["retry_same_error_streak"] = int(db_snap.retry_same_error_streak or 0)
+    meta["retry_last_error_sig_updated_at"] = float(
+        db_snap.retry_last_error_sig_updated_at or 0.0
+    )
+
+    meta[_VERSION_META_KEY] = version_meta
+    meta["max_pages"] = db_snap.max_pages
+
+    # Note: intentionally NOT writing "calibrated_at" to avoid persisting extra fields.
+    _write_json_file(p, meta, pretty=True)
 
 
 # -----------------------------------------------------------------------------
@@ -431,9 +471,12 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
                     _to_int_or_none(_row_get(r, "crawl_finished")) or 0
                 )
 
-                urls_total = int(_to_int_or_none(_row_get(r, "urls_total")) or 0)
-                urls_md = int(_to_int_or_none(_row_get(r, "urls_markdown_done")) or 0)
-                urls_llm = int(_to_int_or_none(_row_get(r, "urls_llm_done")) or 0)
+                urls_total = int(_to_int_or_none(
+                    _row_get(r, "urls_total")) or 0)
+                urls_md = int(_to_int_or_none(
+                    _row_get(r, "urls_markdown_done")) or 0)
+                urls_llm = int(_to_int_or_none(
+                    _row_get(r, "urls_llm_done")) or 0)
 
                 last_error = _to_str_or_none(_row_get(r, "last_error"))
                 done_reason = _to_str_or_none(_row_get(r, "done_reason"))
@@ -442,7 +485,8 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
 
                 created_at = _to_str_or_none(_row_get(r, "created_at")) or now
                 updated_at = _to_str_or_none(_row_get(r, "updated_at")) or now
-                last_crawled_at = _to_str_or_none(_row_get(r, "last_crawled_at"))
+                last_crawled_at = _to_str_or_none(
+                    _row_get(r, "last_crawled_at"))
 
                 max_pages = _to_int_or_none(_row_get(r, "max_pages"))
 
@@ -451,7 +495,8 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
                     _to_int_or_none(_row_get(r, "retry_attempts")) or 0
                 )
                 retry_next_eligible_at = float(
-                    _to_float_or_none(_row_get(r, "retry_next_eligible_at")) or 0.0
+                    _to_float_or_none(
+                        _row_get(r, "retry_next_eligible_at")) or 0.0
                 )
                 retry_updated_at = float(
                     _to_float_or_none(_row_get(r, "retry_updated_at")) or 0.0
@@ -480,24 +525,29 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
                     _to_int_or_none(_row_get(r, "retry_mem_hits")) or 0
                 )
                 retry_last_stall_kind = (
-                    _to_str_or_none(_row_get(r, "retry_last_stall_kind")) or "unknown"
+                    _to_str_or_none(
+                        _row_get(r, "retry_last_stall_kind")) or "unknown"
                 )
 
                 retry_last_progress_md_done = int(
-                    _to_int_or_none(_row_get(r, "retry_last_progress_md_done")) or 0
+                    _to_int_or_none(
+                        _row_get(r, "retry_last_progress_md_done")) or 0
                 )
                 retry_last_seen_md_done = int(
-                    _to_int_or_none(_row_get(r, "retry_last_seen_md_done")) or 0
+                    _to_int_or_none(
+                        _row_get(r, "retry_last_seen_md_done")) or 0
                 )
 
                 retry_last_error_sig = (
                     _to_str_or_none(_row_get(r, "retry_last_error_sig")) or ""
                 )
                 retry_same_error_streak = int(
-                    _to_int_or_none(_row_get(r, "retry_same_error_streak")) or 0
+                    _to_int_or_none(
+                        _row_get(r, "retry_same_error_streak")) or 0
                 )
                 retry_last_error_sig_updated_at = float(
-                    _to_float_or_none(_row_get(r, "retry_last_error_sig_updated_at"))
+                    _to_float_or_none(
+                        _row_get(r, "retry_last_error_sig_updated_at"))
                     or 0.0
                 )
 
@@ -583,9 +633,11 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
                 run_id = _to_str_or_none(_row_get(r, "run_id"))
                 if not run_id:
                     continue
-                last_company_id = _to_str_or_none(_row_get(r, "last_company_id"))
+                last_company_id = _to_str_or_none(
+                    _row_get(r, "last_company_id"))
                 if last_company_id is None and "last_company_bvdid" in old_cols:
-                    last_company_id = _to_str_or_none(_row_get(r, "last_company_bvdid"))
+                    last_company_id = _to_str_or_none(
+                        _row_get(r, "last_company_bvdid"))
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO runs_new (
@@ -601,7 +653,8 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
                         _to_str_or_none(_row_get(r, "pipeline")),
                         _to_str_or_none(_row_get(r, "version")),
                         _to_str_or_none(_row_get(r, "args_hash")),
-                        _to_str_or_none(_row_get(r, "crawl4ai_cache_base_dir")),
+                        _to_str_or_none(
+                            _row_get(r, "crawl4ai_cache_base_dir")),
                         _to_str_or_none(_row_get(r, "crawl4ai_cache_mode")),
                         _to_str_or_none(_row_get(r, "started_at")),
                         int(_to_int_or_none(_row_get(r, "total_companies")) or 0),
@@ -644,7 +697,8 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
 
         conn.execute("ALTER TABLE companies_new RENAME TO companies")
         conn.execute("ALTER TABLE runs_new RENAME TO runs")
-        conn.execute("ALTER TABLE run_company_done_new RENAME TO run_company_done")
+        conn.execute(
+            "ALTER TABLE run_company_done_new RENAME TO run_company_done")
 
     finally:
         conn.close()
@@ -695,7 +749,7 @@ async def _sample(
 
 
 # -----------------------------------------------------------------------------
-# Source enrichment
+# Source enrichment (LOAD ONLY; NEVER inserts into DB)
 # -----------------------------------------------------------------------------
 
 
@@ -705,16 +759,12 @@ def _industry_cfg(
     industry_fallback_path: Optional[Path],
 ) -> IndustryEnrichmentConfig:
     return IndustryEnrichmentConfig(
-        nace_path=(
-            industry_nace_path
-            if industry_nace_path is not None
-            else DEFAULT_NACE_INDUSTRY_PATH
-        ),
-        fallback_path=(
-            industry_fallback_path
-            if industry_fallback_path is not None
-            else DEFAULT_INDUSTRY_FALLBACK_PATH
-        ),
+        nace_path=industry_nace_path
+        if industry_nace_path is not None
+        else DEFAULT_NACE_INDUSTRY_PATH,
+        fallback_path=industry_fallback_path
+        if industry_fallback_path is not None
+        else DEFAULT_INDUSTRY_FALLBACK_PATH,
         enabled=True,
     )
 
@@ -760,29 +810,13 @@ def _load_source_company_map(
     return out, len(all_companies)
 
 
-async def _ensure_companies_exist_in_db(
-    state: CrawlState, src: Mapping[str, Company]
-) -> int:
-    if not src:
-        return 0
-
-    rows = await state._query_all("SELECT company_id FROM companies", tuple())
-    have = {str(r["company_id"]) for r in rows}
-
-    missing = [cid for cid in src.keys() if cid not in have]
-    for cid in missing:
-        c = src[cid]
-        await state.upsert_company(
-            cid,
-            root_url=c.root_url,
-            name=c.name,
-            metadata=c.metadata,
-            industry=c.industry,
-            nace=c.nace,
-            industry_label=c.industry_label,
-            industry_label_source=c.industry_label_source,
-        )
-    return len(missing)
+def _filter_source_map_to_db(
+    *, db_company_ids: List[str], src_map: Mapping[str, Company]
+) -> Dict[str, Company]:
+    if not src_map:
+        return {}
+    have = set(db_company_ids)
+    return {cid: src_map[cid] for cid in have if cid in src_map}
 
 
 # -----------------------------------------------------------------------------
@@ -819,19 +853,21 @@ async def calibrate_async(
 
     state = CrawlState(db_path=actual_db_path)
     try:
+        rows = await state._query_all("SELECT company_id FROM companies", tuple())
+        db_ids = [str(r["company_id"]) for r in rows]
+
         src_map, src_loaded_rows = _load_source_company_map(
             dataset_file=dataset_file,
             company_file=company_file,
             industry_nace_path=industry_nace_path,
             industry_fallback_path=industry_fallback_path,
         )
-        await _ensure_companies_exist_in_db(state, src_map)
+        src_map = _filter_source_map_to_db(
+            db_company_ids=db_ids, src_map=src_map)
+        src_used = int(len(src_map))
 
         company_id = _pick_sample_company_id(state, sample_company_id)
         sample_before = await _sample(out_dir, state, company_id)
-
-        rows = await state._query_all("SELECT company_id FROM companies", tuple())
-        ids = [str(r["company_id"]) for r in rows]
 
         sem = asyncio.Semaphore(max(1, int(concurrency)))
 
@@ -839,36 +875,41 @@ async def calibrate_async(
             async with sem:
                 src = src_map.get(cid)
 
-                # DB normalization/enrichment (does not touch filesystem layout)
                 if src is not None:
                     await state.upsert_company(
                         cid,
                         root_url=src.root_url,
                         name=src.name,
-                        metadata=src.metadata,
+                        # Set to {} to match "new version crawl" crawl_meta.json (metadata: {}).
+                        # If you need dataset metadata elsewhere, change this back to src.metadata.
+                        metadata={},
                         industry=src.industry,
                         nace=src.nace,
                         industry_label=src.industry_label,
                         industry_label_source=src.industry_label_source,
                     )
 
-                # Filesystem normalization: update existing files only (NO mkdir)
+                db_snap = await state.get_company_snapshot(cid, recompute=False)
+
                 await asyncio.to_thread(
-                    _normalize_url_index_file, out_dir, cid, version_meta=version_meta
+                    _normalize_url_index_file,
+                    out_dir,
+                    cid,
+                    version_meta=version_meta,
                 )
                 await asyncio.to_thread(
                     _patch_crawl_meta_file,
                     out_dir,
                     cid,
                     src=src,
+                    db_snap=db_snap,
                     version_meta=version_meta,
                 )
 
         batch = max(64, int(concurrency) * 8)
-        for i in range(0, len(ids), batch):
-            await asyncio.gather(*(_one(cid) for cid in ids[i : i + batch]))
+        for i in range(0, len(db_ids), batch):
+            await asyncio.gather(*(_one(cid) for cid in db_ids[i: i + batch]))
 
-        # Root-level global state in out_dir (db lives here as crawl_state.sqlite3)
         if write_global_state:
             await state.write_global_state_from_db_only(pretty=False)
 
@@ -877,9 +918,10 @@ async def calibrate_async(
         return CalibrationReport(
             out_dir=str(out_dir),
             db_path=str(state.db_path),
-            touched_companies=int(len(ids)),
+            touched_companies=int(len(db_ids)),
             wrote_global_state=bool(write_global_state),
             source_companies_loaded=int(src_loaded_rows),
+            source_companies_used=int(src_used),
             sample_before=sample_before,
             sample_after=sample_after,
         )

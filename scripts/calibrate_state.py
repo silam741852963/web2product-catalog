@@ -103,17 +103,19 @@ def main() -> None:
 
     p_check = sub.add_parser("check")
     p_check.add_argument("--out-dir", type=str, required=True)
-    p_check.add_argument("--db-path", type=str, default=None)  # optional override
+    p_check.add_argument("--db-path", type=str,
+                         default=None)  # optional override
     p_check.add_argument("--sample-company-id", type=str, default=None)
 
     p_cal = sub.add_parser("calibrate")
     p_cal.add_argument("--out-dir", type=str, required=True)
-    p_cal.add_argument("--db-path", type=str, default=None)  # optional override
+    p_cal.add_argument("--db-path", type=str,
+                       default=None)  # optional override
     p_cal.add_argument("--sample-company-id", type=str, default=None)
     p_cal.add_argument("--no-global-state", action="store_true")
     p_cal.add_argument("--concurrency", type=int, default=32)
 
-    # Source enrichment
+    # Source enrichment (ONLY enriches companies that already exist in DB)
     p_cal.add_argument("--dataset-file", type=str, default=None)
     p_cal.add_argument("--company-file", type=str, default=None)
 
@@ -140,7 +142,8 @@ def main() -> None:
     sample_company_id = args.sample_company_id
 
     if args.cmd == "check":
-        s = check(out_dir=out_dir, db_path=db_path, sample_company_id=sample_company_id)
+        s = check(out_dir=out_dir, db_path=db_path,
+                  sample_company_id=sample_company_id)
         _print_sample("CHECK", s)
         return
 
@@ -187,6 +190,7 @@ def main() -> None:
                     "touched_companies": rep.touched_companies,
                     "wrote_global_state": rep.wrote_global_state,
                     "source_companies_loaded": rep.source_companies_loaded,
+                    "source_companies_used": rep.source_companies_used,
                 },
                 ensure_ascii=False,
                 indent=2,
