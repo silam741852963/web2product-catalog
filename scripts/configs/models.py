@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Mapping, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -65,14 +65,28 @@ def _prefer_higher_status(
 
 
 def _to_int_or_none(v: Any) -> Optional[int]:
+    """
+    Int parser that tolerates pandas/JSON artifacts like "0.0" / 0.0.
+    Raises ValueError for truly invalid values (keeps errors actionable).
+    """
     if v is None or isinstance(v, bool):
         return None
     if isinstance(v, int):
         return v
+    if isinstance(v, float):
+        return int(v)
+
     s = str(v).strip()
     if not s:
         return None
-    return int(s)
+
+    try:
+        return int(s)
+    except ValueError:
+        try:
+            return int(float(s))
+        except ValueError as e:
+            raise ValueError(f"invalid literal for int(): {v!r}") from e
 
 
 def _to_float_or_none(v: Any) -> Optional[float]:
@@ -117,6 +131,314 @@ def _safe_json_obj(v: Any) -> Optional[Dict[str, Any]]:
         return v
     # NOTE: Keep strict: only dict is accepted at model level.
     return None
+
+
+# ---------------------------------------------------------------------------
+# URL Index models (url_index.json)
+# ---------------------------------------------------------------------------
+
+URL_INDEX_META_KEY: str = "__meta__"
+
+# NOTE: status is intentionally not strict; pipelines may add more statuses.
+UrlIndexEntryStatus = str
+
+
+@dataclass(slots=True)
+class UrlIndexEntry:
+    """
+    Canonical per-URL entry payload stored under url_index.json[url].
+
+    This mirrors what crawl.runner.py writes today, plus adds company_id
+    so a single entry remains self-identifying when merged/exported.
+    """
+
+    # identity
+    company_id: str
+    url: str
+    requested_url: Optional[str] = None
+
+    # network / crawl signals
+    status_code: Optional[int] = None
+    error: Any = None
+    depth: Optional[int] = None
+
+    # pipeline counters
+    presence: int = 0
+    extracted: int = 0
+
+    # markdown gating
+    gating_accept: bool = False
+    gating_action: Optional[str] = None
+    gating_reason: Optional[str] = None
+    md_total_words: Optional[float] = None
+
+    # status + timestamps
+    status: UrlIndexEntryStatus = ""
+    updated_at: Optional[str] = None
+    created_at: Optional[str] = None  # recommended to be set once at first write
+
+    # artifacts
+    markdown_path: Optional[str] = None
+    html_path: Optional[str] = None
+
+    # retry markers
+    scheduled_retry: Optional[bool] = None
+    timeout_page_exceeded: Optional[bool] = None
+    memory_pressure: Optional[bool] = None
+
+    # stage-done hints (crawl.state.py may infer from these)
+    markdown_done: Optional[bool] = None
+    llm_done: Optional[bool] = None
+
+    # llm artifacts (crawl.state.py checks these keys today)
+    json_path: Optional[str] = None
+    extraction_path: Optional[str] = None
+    product_path: Optional[str] = None
+    products_path: Optional[str] = None
+
+    # forward-compat: keep unknown fields
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def normalized(self) -> "UrlIndexEntry":
+        cid = (self.company_id or "").strip()
+        u = (self.url or "").strip()
+
+        return UrlIndexEntry(
+            company_id=cid,
+            url=u,
+            requested_url=_to_str_or_none(self.requested_url),
+            status_code=_to_int_or_none(self.status_code),
+            error=self.error,
+            depth=_to_int_or_none(self.depth),
+            presence=int(self.presence or 0),
+            extracted=int(self.extracted or 0),
+            gating_accept=_to_bool(self.gating_accept),
+            gating_action=_to_str_or_none(self.gating_action),
+            gating_reason=_to_str_or_none(self.gating_reason),
+            md_total_words=_to_float_or_none(self.md_total_words),
+            status=str(self.status or ""),
+            updated_at=_to_str_or_none(self.updated_at),
+            created_at=_to_str_or_none(self.created_at),
+            markdown_path=_to_str_or_none(self.markdown_path),
+            html_path=_to_str_or_none(self.html_path),
+            scheduled_retry=(
+                None if self.scheduled_retry is None else _to_bool(self.scheduled_retry)
+            ),
+            timeout_page_exceeded=(
+                None
+                if self.timeout_page_exceeded is None
+                else _to_bool(self.timeout_page_exceeded)
+            ),
+            memory_pressure=(
+                None if self.memory_pressure is None else _to_bool(self.memory_pressure)
+            ),
+            markdown_done=(
+                None if self.markdown_done is None else _to_bool(self.markdown_done)
+            ),
+            llm_done=(None if self.llm_done is None else _to_bool(self.llm_done)),
+            json_path=_to_str_or_none(self.json_path),
+            extraction_path=_to_str_or_none(self.extraction_path),
+            product_path=_to_str_or_none(self.product_path),
+            products_path=_to_str_or_none(self.products_path),
+            extra=dict(self.extra) if isinstance(self.extra, dict) else {},
+        )
+
+    @staticmethod
+    def from_dict(
+        d: Mapping[str, Any], *, company_id: str, url: str
+    ) -> "UrlIndexEntry":
+        src = dict(d) if isinstance(d, Mapping) else {}
+        known = UrlIndexEntry(
+            company_id=_to_str_or_none(src.pop("company_id")) or company_id,
+            url=_to_str_or_none(src.pop("url")) or url,
+            requested_url=_to_str_or_none(src.pop("requested_url")),
+            status_code=_to_int_or_none(src.pop("status_code", None)),
+            error=src.pop("error", None),
+            depth=_to_int_or_none(src.pop("depth", None)),
+            presence=int(src.pop("presence", 0) or 0),
+            extracted=int(src.pop("extracted", 0) or 0),
+            gating_accept=_to_bool(src.pop("gating_accept", False)),
+            gating_action=_to_str_or_none(src.pop("gating_action", None)),
+            gating_reason=_to_str_or_none(src.pop("gating_reason", None)),
+            md_total_words=_to_float_or_none(src.pop("md_total_words", None)),
+            status=str(src.pop("status", "") or ""),
+            updated_at=_to_str_or_none(src.pop("updated_at", None)),
+            created_at=_to_str_or_none(src.pop("created_at", None)),
+            markdown_path=_to_str_or_none(src.pop("markdown_path", None)),
+            html_path=_to_str_or_none(src.pop("html_path", None)),
+            scheduled_retry=(
+                None
+                if "scheduled_retry" not in src
+                else _to_bool(src.pop("scheduled_retry"))
+            ),
+            timeout_page_exceeded=(
+                None
+                if "timeout_page_exceeded" not in src
+                else _to_bool(src.pop("timeout_page_exceeded"))
+            ),
+            memory_pressure=(
+                None
+                if "memory_pressure" not in src
+                else _to_bool(src.pop("memory_pressure"))
+            ),
+            markdown_done=(
+                None
+                if "markdown_done" not in src
+                else _to_bool(src.pop("markdown_done"))
+            ),
+            llm_done=None if "llm_done" not in src else _to_bool(src.pop("llm_done")),
+            json_path=_to_str_or_none(src.pop("json_path", None)),
+            extraction_path=_to_str_or_none(src.pop("extraction_path", None)),
+            product_path=_to_str_or_none(src.pop("product_path", None)),
+            products_path=_to_str_or_none(src.pop("products_path", None)),
+            extra=src,  # leftover fields
+        )
+        return known.normalized()
+
+    def to_dict(self) -> Dict[str, Any]:
+        base = {
+            "company_id": self.company_id,
+            "url": self.url,
+            "requested_url": self.requested_url,
+            "status_code": self.status_code,
+            "error": self.error,
+            "depth": self.depth,
+            "presence": int(self.presence),
+            "extracted": int(self.extracted),
+            "gating_accept": bool(self.gating_accept),
+            "gating_action": self.gating_action,
+            "gating_reason": self.gating_reason,
+            "md_total_words": self.md_total_words,
+            "status": self.status,
+            "updated_at": self.updated_at,
+            "created_at": self.created_at,
+            "markdown_path": self.markdown_path,
+            "html_path": self.html_path,
+            "scheduled_retry": self.scheduled_retry,
+            "timeout_page_exceeded": self.timeout_page_exceeded,
+            "memory_pressure": self.memory_pressure,
+            "markdown_done": self.markdown_done,
+            "llm_done": self.llm_done,
+            "json_path": self.json_path,
+            "extraction_path": self.extraction_path,
+            "product_path": self.product_path,
+            "products_path": self.products_path,
+        }
+        if isinstance(self.extra, dict) and self.extra:
+            base.update(self.extra)
+        return {k: v for k, v in base.items() if v is not None}
+
+
+@dataclass(slots=True)
+class UrlIndexMeta:
+    """
+    Canonical __meta__ payload stored at url_index.json["__meta__"].
+
+    crawl.runner.py currently writes:
+      - crawl_finished, crawl_finished_at, crawl_reason
+      - total_pages, markdown_saved, markdown_suppressed, timeout_pages, memory_pressure_pages
+      - pages_seen, hard_max_pages, hard_max_pages_hit
+    """
+
+    company_id: str
+
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    crawl_finished: Optional[bool] = None
+    crawl_finished_at: Optional[str] = None
+    crawl_reason: Optional[str] = None
+
+    total_pages: Optional[int] = None
+    markdown_saved: Optional[int] = None
+    markdown_suppressed: Optional[int] = None
+    timeout_pages: Optional[int] = None
+    memory_pressure_pages: Optional[int] = None
+
+    pages_seen: Optional[int] = None
+    hard_max_pages: Optional[int] = None
+    hard_max_pages_hit: Optional[bool] = None
+
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def normalized(self) -> "UrlIndexMeta":
+        return UrlIndexMeta(
+            company_id=(self.company_id or "").strip(),
+            created_at=_to_str_or_none(self.created_at),
+            updated_at=_to_str_or_none(self.updated_at),
+            crawl_finished=(
+                None if self.crawl_finished is None else _to_bool(self.crawl_finished)
+            ),
+            crawl_finished_at=_to_str_or_none(self.crawl_finished_at),
+            crawl_reason=_to_str_or_none(self.crawl_reason),
+            total_pages=_to_int_or_none(self.total_pages),
+            markdown_saved=_to_int_or_none(self.markdown_saved),
+            markdown_suppressed=_to_int_or_none(self.markdown_suppressed),
+            timeout_pages=_to_int_or_none(self.timeout_pages),
+            memory_pressure_pages=_to_int_or_none(self.memory_pressure_pages),
+            pages_seen=_to_int_or_none(self.pages_seen),
+            hard_max_pages=_to_int_or_none(self.hard_max_pages),
+            hard_max_pages_hit=(
+                None
+                if self.hard_max_pages_hit is None
+                else _to_bool(self.hard_max_pages_hit)
+            ),
+            extra=dict(self.extra) if isinstance(self.extra, dict) else {},
+        )
+
+    @staticmethod
+    def from_dict(d: Mapping[str, Any], *, company_id: str) -> "UrlIndexMeta":
+        src = dict(d) if isinstance(d, Mapping) else {}
+        known = UrlIndexMeta(
+            company_id=_to_str_or_none(src.pop("company_id")) or company_id,
+            created_at=_to_str_or_none(src.pop("created_at", None)),
+            updated_at=_to_str_or_none(src.pop("updated_at", None)),
+            crawl_finished=(
+                None
+                if "crawl_finished" not in src
+                else _to_bool(src.pop("crawl_finished"))
+            ),
+            crawl_finished_at=_to_str_or_none(src.pop("crawl_finished_at", None)),
+            crawl_reason=_to_str_or_none(src.pop("crawl_reason", None)),
+            total_pages=_to_int_or_none(src.pop("total_pages", None)),
+            markdown_saved=_to_int_or_none(src.pop("markdown_saved", None)),
+            markdown_suppressed=_to_int_or_none(src.pop("markdown_suppressed", None)),
+            timeout_pages=_to_int_or_none(src.pop("timeout_pages", None)),
+            memory_pressure_pages=_to_int_or_none(
+                src.pop("memory_pressure_pages", None)
+            ),
+            pages_seen=_to_int_or_none(src.pop("pages_seen", None)),
+            hard_max_pages=_to_int_or_none(src.pop("hard_max_pages", None)),
+            hard_max_pages_hit=(
+                None
+                if "hard_max_pages_hit" not in src
+                else _to_bool(src.pop("hard_max_pages_hit"))
+            ),
+            extra=src,
+        )
+        return known.normalized()
+
+    def to_dict(self) -> Dict[str, Any]:
+        base = {
+            "company_id": self.company_id,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "crawl_finished": self.crawl_finished,
+            "crawl_finished_at": self.crawl_finished_at,
+            "crawl_reason": self.crawl_reason,
+            "total_pages": self.total_pages,
+            "markdown_saved": self.markdown_saved,
+            "markdown_suppressed": self.markdown_suppressed,
+            "timeout_pages": self.timeout_pages,
+            "memory_pressure_pages": self.memory_pressure_pages,
+            "pages_seen": self.pages_seen,
+            "hard_max_pages": self.hard_max_pages,
+            "hard_max_pages": self.hard_max_pages,
+            "hard_max_pages_hit": self.hard_max_pages_hit,
+        }
+        if isinstance(self.extra, dict) and self.extra:
+            base.update(self.extra)
+        return {k: v for k, v in base.items() if v is not None}
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +768,6 @@ class Company:
         c = Company(company_id=company_id, root_url=root_url, name=name, metadata=md)
 
         # If enrichment wrote into metadata, pull it into canonical fields.
-        # (This matches load_source.py behavior but stored canonically.)
         c.industry = _to_int_or_none(md.get("industry"))
         c.nace = _to_int_or_none(md.get("nace"))
         c.industry_label = _to_str_or_none(md.get("industry_label"))
@@ -465,7 +786,6 @@ class Company:
         self.industry = _to_int_or_none(snap.get("industry"))
         self.nace = _to_int_or_none(snap.get("nace"))
         self.industry_label = _to_str_or_none(snap.get("industry_label"))
-        # snapshot field name is usually "industry_source"
         self.industry_label_source = _to_str_or_none(
             snap.get("industry_label_source")
             if "industry_label_source" in snap
@@ -475,9 +795,9 @@ class Company:
         self.status = _normalize_company_status(_to_str_or_none(snap.get("status")))
         self.crawl_finished = _to_bool(snap.get("crawl_finished"))
 
-        self.urls_total = int(snap.get("urls_total") or 0)
-        self.urls_markdown_done = int(snap.get("urls_markdown_done") or 0)
-        self.urls_llm_done = int(snap.get("urls_llm_done") or 0)
+        self.urls_total = _to_int_or_none(snap.get("urls_total")) or 0
+        self.urls_markdown_done = _to_int_or_none(snap.get("urls_markdown_done")) or 0
+        self.urls_llm_done = _to_int_or_none(snap.get("urls_llm_done")) or 0
 
         self.last_error = _to_str_or_none(snap.get("last_error"))
         self.done_reason = _to_str_or_none(snap.get("done_reason"))
@@ -512,4 +832,9 @@ __all__ = [
     "COMPANY_STATUS_LLM_NOT_DONE",
     "COMPANY_STATUS_LLM_DONE",
     "COMPANY_STATUS_TERMINAL_DONE",
+    # url index models
+    "URL_INDEX_META_KEY",
+    "UrlIndexEntry",
+    "UrlIndexEntryStatus",
+    "UrlIndexMeta",
 ]

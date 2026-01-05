@@ -9,7 +9,9 @@ from configs.language import default_language_factory
 
 logger = logging.getLogger(__name__)
 
-InterstitialKind = Literal["none", "cookie", "legal", "age", "login", "paywall", "unknown"]
+InterstitialKind = Literal[
+    "none", "cookie", "legal", "age", "login", "paywall", "unknown"
+]
 
 # ---------------------------------------------------------------------------
 # Language / token regexes (DI via language config)
@@ -260,7 +262,9 @@ def evaluate_markdown(
     if require_structure:
         has_heading = _HEADING_RE.search(text) is not None
         has_list = _LIST_RE.search(text) is not None
-        if not (has_heading or has_list or total_words >= max(5, int(min_meaningful_words))):
+        if not (
+            has_heading or has_list or total_words >= max(5, int(min_meaningful_words))
+        ):
             return "suppress", "no-structure", stats
 
     if total_words < max(5, int(min_meaningful_words)):
@@ -316,3 +320,4 @@ def build_gating_config(
         interstitial_max_share=interstitial_max_share,
         interstitial_min_hits=interstitial_min_hits,
     )
+

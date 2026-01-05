@@ -11,7 +11,13 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from crawl4ai import AsyncWebCrawler, CacheMode
 
-from configs.models import Company
+from configs.models import (
+    Company,
+    URL_INDEX_META_KEY,
+    UrlIndexEntry,
+    UrlIndexEntryStatus,
+    UrlIndexMeta,
+)
 
 from extensions.crawl.state import patch_url_index_meta, upsert_url_index_entry
 from extensions.filter import md_gating
@@ -27,6 +33,11 @@ from extensions.schedule.retry import (
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.addHandler(logging.NullHandler())
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
 
 # --------------------------------------------------------------------------------------
 # Failure markers + detection (single source of truth)
@@ -198,7 +209,7 @@ class UrlIndexUpdateWriter:
       - patch_url_index_meta(bvdid, patch)
     """
 
-    META_KEY = "__meta__"
+    META_KEY = URL_INDEX_META_KEY
 
     def __init__(self, bvdid: str, *, cfg: UrlIndexWriteConfig) -> None:
         self.bvdid = bvdid
@@ -365,7 +376,7 @@ async def process_page_result(
 
     gating_accept = action == "save"
     md_path: Optional[str] = None
-    md_status: str
+    md_status: UrlIndexEntryStatus
 
     if gating_accept and markdown:
         md_path = await _save_stage_threaded(
@@ -381,35 +392,29 @@ async def process_page_result(
     if memory_pressure:
         md_status = "memory_pressure"
 
-    entry: Dict[str, Any] = {
-        "url": url,
-        "requested_url": requested_url,
-        "status_code": status_code,
-        "error": error,
-        "depth": _getattr(page_result, "depth", None),
-        "presence": 0,
-        "extracted": 0,
-        "gating_accept": gating_accept,
-        "gating_action": action,
-        "gating_reason": reason,
-        "md_total_words": stats.get("total_words"),
-        "status": md_status,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-    }
+    entry = UrlIndexEntry(
+        company_id=str(company_id),
+        url=str(url),
+        requested_url=str(requested_url) if requested_url else None,
+        status_code=status_code if status_code is not None else None,
+        error=error,
+        depth=_getattr(page_result, "depth", None),
+        presence=0,
+        extracted=0,
+        gating_accept=bool(gating_accept),
+        gating_action=action,
+        gating_reason=reason,
+        md_total_words=stats.get("total_words"),
+        status=str(md_status),
+        updated_at=_now_iso(),
+        markdown_path=md_path,
+        html_path=html_path,
+        scheduled_retry=True if (timeout_exceeded or memory_pressure) else None,
+        timeout_page_exceeded=True if timeout_exceeded else None,
+        memory_pressure=True if memory_pressure else None,
+    )
 
-    if timeout_exceeded:
-        entry["timeout_page_exceeded"] = True
-        entry["scheduled_retry"] = True
-    if memory_pressure:
-        entry["memory_pressure"] = True
-        entry["scheduled_retry"] = True
-
-    if md_path is not None:
-        entry["markdown_path"] = md_path
-    if html_path is not None:
-        entry["html_path"] = html_path
-
-    await url_index_sink(url, entry)
+    await url_index_sink(url, entry.to_dict())
 
     sc_int: Optional[int] = None
     try:
@@ -474,6 +479,16 @@ class ConcurrentPageResultProcessor:
     async def start(self) -> None:
         ensure_company_dirs(str(self.company_id))
         await self._writer.start()
+
+        # Write initial meta patch early so partial runs still have stable identity fields.
+        now = _now_iso()
+        meta0 = UrlIndexMeta(
+            company_id=str(self.company_id),
+            created_at=now,
+            updated_at=now,
+        )
+        await self._writer.patch_meta(meta0.to_dict())
+
         for i in range(self.concurrency):
             t = asyncio.create_task(
                 self._worker_loop(i), name=f"page-worker-{self.company_id}-{i}"
@@ -491,8 +506,10 @@ class ConcurrentPageResultProcessor:
         self, *, reason: str = "ok", meta_patch: Optional[Dict[str, Any]] = None
     ) -> None:
         patch: Dict[str, Any] = {
+            "company_id": str(self.company_id),
+            "updated_at": _now_iso(),
             "crawl_finished": True,
-            "crawl_finished_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "crawl_finished_at": _now_iso(),
             "crawl_reason": str(reason or "ok"),
         }
         if meta_patch:
@@ -509,6 +526,8 @@ class ConcurrentPageResultProcessor:
             async with self._summary_lock:
                 self._crawl_finished_meta_patch.update(
                     {
+                        "company_id": str(self.company_id),
+                        "updated_at": _now_iso(),
                         "total_pages": int(self._summary.total_pages),
                         "markdown_saved": int(self._summary.markdown_saved),
                         "markdown_suppressed": int(self._summary.markdown_suppressed),
@@ -833,6 +852,8 @@ async def run_company_crawl(
             processor.mark_crawl_finished(
                 reason=reason,
                 meta_patch={
+                    "company_id": company.company_id,
+                    "updated_at": _now_iso(),
                     "pages_seen": int(pages_seen),
                     "hard_max_pages": (
                         int(cfg.hard_max_pages)

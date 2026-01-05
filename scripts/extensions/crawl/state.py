@@ -10,7 +10,7 @@ import time
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Literal
+from typing import Any, Dict, List, Optional, Tuple, Literal, Mapping
 
 from configs.models import (
     Company,
@@ -21,6 +21,10 @@ from configs.models import (
     COMPANY_STATUS_LLM_NOT_DONE,
     COMPANY_STATUS_LLM_DONE,
     COMPANY_STATUS_TERMINAL_DONE,
+    URL_INDEX_META_KEY,
+    UrlIndexEntry,
+    UrlIndexEntryStatus,
+    UrlIndexMeta,
 )
 
 from extensions.io import output_paths
@@ -31,7 +35,6 @@ META_NAME = "crawl_meta.json"
 URL_INDEX_NAME = "url_index.json"
 GLOBAL_STATE_NAME = "crawl_global_state.json"
 
-URL_INDEX_META_KEY = "__meta__"
 URL_INDEX_RESERVED_PREFIX = "__"
 
 _VERSION_META_KEY = "version_metadata"
@@ -51,13 +54,7 @@ def _now_iso() -> str:
 
 
 def _output_root() -> Path:
-    fn = getattr(output_paths, "get_output_root", None)
-    if callable(fn):
-        return Path(fn()).resolve()
-
-    root = getattr(output_paths, "OUTPUT_ROOT", None)
-    if root is None:
-        return Path("outputs").resolve()
+    root = output_paths.get_output_root()
     return Path(root).resolve()
 
 
@@ -356,12 +353,34 @@ def upsert_url_index_entry(company_id: str, url: str, patch: Dict[str, Any]) -> 
                 existing = loaded
 
         ent = existing.get(url)
-        ent_dict = dict(ent) if isinstance(ent, dict) else {}
+        ent_dict: Dict[str, Any] = dict(ent) if isinstance(ent, dict) else {}
+
+        # Enforce/repair identity at write-time (export-friendly)
+        ent_dict.setdefault("company_id", company_id)
+        ent_dict.setdefault("url", url)
+        ent_dict.setdefault("created_at", _now_iso())
 
         if isinstance(patch, dict):
-            ent_dict.update({k: v for k, v in patch.items() if v is not None})
+            patch_dict = {k: v for k, v in patch.items() if v is not None}
 
-        existing[url] = ent_dict
+            # Enforce/repair again on incoming patch
+            patch_dict.setdefault("company_id", company_id)
+            patch_dict.setdefault("url", url)
+            patch_dict.setdefault(
+                "created_at", ent_dict.get("created_at") or _now_iso()
+            )
+
+            if "updated_at" not in patch_dict:
+                patch_dict["updated_at"] = _now_iso()
+
+            ent_dict.update(patch_dict)
+        else:
+            ent_dict["updated_at"] = _now_iso()
+
+        # Normalize + preserve unknown fields via UrlIndexEntry.extra
+        normalized = UrlIndexEntry.from_dict(ent_dict, company_id=company_id, url=url)
+        existing[url] = normalized.to_dict()
+
         _atomic_write_text(
             idx_path,
             json.dumps(existing, ensure_ascii=False, separators=(",", ":")),
@@ -381,12 +400,29 @@ def patch_url_index_meta(company_id: str, patch: Dict[str, Any]) -> None:
                 existing = loaded
 
         meta = existing.get(URL_INDEX_META_KEY)
-        meta_dict = dict(meta) if isinstance(meta, dict) else {}
+        meta_dict: Dict[str, Any] = dict(meta) if isinstance(meta, dict) else {}
+
+        # Enforce/repair identity at write-time
+        meta_dict.setdefault("company_id", company_id)
+        meta_dict.setdefault("created_at", _now_iso())
 
         if isinstance(patch, dict):
-            meta_dict.update({k: v for k, v in patch.items() if v is not None})
+            patch_dict = {k: v for k, v in patch.items() if v is not None}
+            patch_dict.setdefault("company_id", company_id)
+            patch_dict.setdefault(
+                "created_at", meta_dict.get("created_at") or _now_iso()
+            )
 
-        existing[URL_INDEX_META_KEY] = meta_dict
+            if "updated_at" not in patch_dict:
+                patch_dict["updated_at"] = _now_iso()
+
+            meta_dict.update(patch_dict)
+        else:
+            meta_dict["updated_at"] = _now_iso()
+
+        normalized = UrlIndexMeta.from_dict(meta_dict, company_id=company_id)
+        existing[URL_INDEX_META_KEY] = normalized.to_dict()
+
         _atomic_write_text(
             idx_path,
             json.dumps(existing, ensure_ascii=False, separators=(",", ":")),
@@ -404,7 +440,7 @@ def _index_crawl_finished(index: Dict[str, Any]) -> bool:
 
 
 def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
-    status = str(ent.get("status") or "").strip()
+    status: UrlIndexEntryStatus = str(ent.get("status") or "").strip()
 
     has_md_path = bool(ent.get("markdown_path"))
     has_llm_artifact = bool(

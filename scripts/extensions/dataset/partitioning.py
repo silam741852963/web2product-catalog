@@ -12,19 +12,22 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
-from extensions.io.output_paths import sanitize_bvdid
-
-# Import canonical status constants from crawl_state.
-from extensions.crawl.state import (
+from configs.models import (
+    CompanyStatus,
     COMPANY_STATUS_LLM_DONE,
     COMPANY_STATUS_LLM_NOT_DONE,
     COMPANY_STATUS_MD_DONE,
     COMPANY_STATUS_MD_NOT_DONE,
     COMPANY_STATUS_PENDING,
     COMPANY_STATUS_TERMINAL_DONE,
+    URL_INDEX_META_KEY,
+    UrlIndexEntry,
+    UrlIndexMeta,
 )
+from extensions.crawl.state import CrawlState
+from extensions.io.output_paths import sanitize_bvdid
 
 logger = logging.getLogger(__name__)
 
@@ -38,41 +41,44 @@ CRAWL_DB_NAME = "crawl_state.sqlite3"
 RETRY_DIR_NAME = "_retry"
 RETRY_STATE_NAME = "retry_state.json"
 QUARANTINE_NAME = "quarantine.json"
+
+# Support both layouts:
+#   <root>/failure_ledger.jsonl
+#   <root>/_retry/failure_ledger.jsonl
 LEDGER_NAME = "failure_ledger.jsonl"
 
 URL_INDEX_NAME = "url_index.json"
-URL_INDEX_META_KEY = "__meta__"
 URL_INDEX_RESERVED_PREFIX = "__"
 
-# url_index entry status semantics
-_MARKDOWN_COMPLETE_STATUSES = {
-    "markdown_saved",
-    "markdown_suppressed",
-    "markdown_done",
-    "md_done",
-    "md_saved",
-    "saved_markdown",
-}
-_LLM_COMPLETE_STATUSES = {
-    "llm_extracted",
-    "llm_extracted_empty",
-    "llm_full_extracted",
-    "llm_done",
-    "extracted",
-    "product_saved",
-    "products_saved",
-    "json_saved",
-    "presence_done",
-}
-
-_KNOWN_COMPANY_STATUSES: Set[str] = {
+KNOWN_COMPANY_STATUSES: Tuple[CompanyStatus, ...] = (
     COMPANY_STATUS_PENDING,
     COMPANY_STATUS_MD_NOT_DONE,
     COMPANY_STATUS_MD_DONE,
     COMPANY_STATUS_LLM_NOT_DONE,
     COMPANY_STATUS_LLM_DONE,
     COMPANY_STATUS_TERMINAL_DONE,
+)
+
+_STATUS_RANK: Dict[str, int] = {
+    COMPANY_STATUS_PENDING: 0,
+    COMPANY_STATUS_MD_NOT_DONE: 1,
+    COMPANY_STATUS_MD_DONE: 2,
+    COMPANY_STATUS_LLM_NOT_DONE: 3,
+    COMPANY_STATUS_LLM_DONE: 4,
+    COMPANY_STATUS_TERMINAL_DONE: 5,
 }
+
+# Matches crawl.state.py’s “in progress” notion.
+IN_PROGRESS_STATUSES: Tuple[CompanyStatus, ...] = (
+    COMPANY_STATUS_PENDING,
+    COMPANY_STATUS_MD_NOT_DONE,
+    COMPANY_STATUS_LLM_NOT_DONE,
+)
+
+DONE_STATUSES: Tuple[CompanyStatus, ...] = (
+    COMPANY_STATUS_LLM_DONE,
+    COMPANY_STATUS_TERMINAL_DONE,
+)
 
 # --------------------------------------------------------------------------------------
 # Time / atomic I/O
@@ -94,7 +100,7 @@ def _retry_emfile(fn, attempts: int = 6, base_delay: float = 0.15):
                 time.sleep(base_delay * (2**i))
                 continue
             raise
-    raise RuntimeError("unreachable")
+    raise RuntimeError("Too many open files (EMFILE/ENFILE) persisted across retries")
 
 
 def _atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
@@ -111,7 +117,7 @@ def _atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
             os.replace(tmp, path)
         finally:
             if tmp.exists() and tmp != path:
-                tmp.unlink()
+                tmp.unlink(missing_ok=True)
 
     _retry_emfile(_write)
 
@@ -138,6 +144,48 @@ def _read_json_strict(path: Path) -> Any:
 
 
 # --------------------------------------------------------------------------------------
+# Timestamp parsing (DB rows may store float seconds OR ISO8601 strings)
+# --------------------------------------------------------------------------------------
+
+
+def _to_epoch_seconds(v: Any) -> float:
+    """
+    Best-effort normalization for CrawlState DB row timestamps.
+
+    Supported:
+      - None / "" -> 0.0
+      - int/float -> float(v)
+      - numeric strings -> float(...)
+      - ISO8601 strings (with/without timezone) -> epoch seconds
+    """
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+
+    s = str(v).strip()
+    if not s:
+        return 0.0
+
+    # numeric string
+    try:
+        return float(s)
+    except ValueError:
+        pass
+
+    # ISO8601
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return 0.0
+
+    if dt.tzinfo is None:
+        # treat naive as UTC
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+# --------------------------------------------------------------------------------------
 # Dataset (CSV/TSV) handling (preserve columns)
 # --------------------------------------------------------------------------------------
 
@@ -151,8 +199,8 @@ class Table:
     delimiter: str
 
 
-_ID_CANDIDATES = ["bvdid", "company_id", "id", "BVDID", "BvDID", "BVD_ID", "bvd_id"]
-_URL_CANDIDATES = ["url", "domain_url", "website", "web", "homepage", "root_url"]
+_ID_CANDIDATES = ["company_id", "bvdid", "id", "BVDID", "BvDID", "BVD_ID", "bvd_id"]
+_URL_CANDIDATES = ["root_url", "domain_url", "url", "website", "web", "homepage"]
 
 
 def _detect_delimiter(path: Path) -> str:
@@ -171,7 +219,7 @@ def _find_col(cols: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
     return None
 
 
-def read_table_preserve(path: Path) -> Table:
+def read_table_preserve(path: Path, *, id_col_override: Optional[str] = None) -> Table:
     delim = _detect_delimiter(path)
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, delimiter=delim)
@@ -179,11 +227,18 @@ def read_table_preserve(path: Path) -> Table:
         if not header:
             raise ValueError(f"Dataset file has no header: {path}")
 
-        id_col = _find_col(header, _ID_CANDIDATES)
-        if not id_col:
-            raise ValueError(
-                f"Could not detect company id column. Tried: {_ID_CANDIDATES}. Columns: {header}"
-            )
+        if id_col_override is not None:
+            if id_col_override not in header:
+                raise ValueError(
+                    f"--id-col={id_col_override!r} not found in header: {header}"
+                )
+            id_col = id_col_override
+        else:
+            id_col = _find_col(header, _ID_CANDIDATES)
+            if not id_col:
+                raise ValueError(
+                    f"Could not detect company id column. Tried: {_ID_CANDIDATES}. Columns: {header}"
+                )
 
         url_col = _find_col(header, _URL_CANDIDATES)
 
@@ -213,6 +268,16 @@ def write_table_preserve(path: Path, table: Table, rows: List[Dict[str, str]]) -
             w.writerow(out)
 
 
+def group_rows_by_company_id(table: Table) -> Dict[str, List[Dict[str, str]]]:
+    groups: Dict[str, List[Dict[str, str]]] = {}
+    for r in table.rows:
+        cid = (r.get(table.id_col) or "").strip()
+        if not cid:
+            continue
+        groups.setdefault(cid, []).append(r)
+    return groups
+
+
 def split_table_by_ids(
     table: Table, move_ids: Set[str]
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
@@ -230,47 +295,83 @@ def split_table_by_ids(
 def merge_tables_dedupe(
     base: Table,
     base_rows: List[Dict[str, str]],
-    other: Table,
-    other_rows: List[Dict[str, str]],
-) -> Tuple[List[str], List[Dict[str, str]]]:
-    id_col_base = base.id_col
-    id_col_other = other.id_col
+    add: Table,
+    add_rows: List[Dict[str, str]],
+) -> Tuple[Table, List[Dict[str, str]]]:
+    """
+    Merge two tables and dedupe by base.id_col.
 
-    header_union = list(base.header)
-    for c in other.header:
-        if c not in header_union:
-            header_union.append(c)
+    - Output delimiter/header order follows base.
+    - Header is base.header + new columns from add.header (in add order).
+    - Deduping keeps first-seen company_id from base_rows, then fills missing ids from add_rows.
+    """
+    base_id = base.id_col
+    header = list(base.header)
+    seen = set(header)
+    for c in add.header:
+        if c not in seen:
+            header.append(c)
+            seen.add(c)
 
-    seen: Set[str] = set()
+    def _normalize_row(r: Dict[str, str]) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for k in header:
+            v = r.get(k)
+            out[k] = "" if v is None else str(v)
+        return out
+
     out_rows: List[Dict[str, str]] = []
-
-    def _emit(r: Dict[str, str], *, src_header: List[str], src_id_col: str) -> None:
-        cid = (r.get(src_id_col) or "").strip()
-        if not cid or cid in seen:
-            return
-        seen.add(cid)
-        merged = {k: "" for k in header_union}
-        for k in src_header:
-            merged[k] = "" if r.get(k) is None else str(r.get(k) or "")
-        if src_id_col != id_col_base:
-            merged[id_col_base] = cid
-        out_rows.append(merged)
+    seen_ids: Set[str] = set()
 
     for r in base_rows:
-        _emit(r, src_header=base.header, src_id_col=id_col_base)
-    for r in other_rows:
-        _emit(r, src_header=other.header, src_id_col=id_col_other)
+        cid = (r.get(base_id) or "").strip()
+        if not cid:
+            continue
+        if cid in seen_ids:
+            continue
+        out_rows.append(_normalize_row(r))
+        seen_ids.add(cid)
 
-    return header_union, out_rows
+    # add any missing ids from add_rows
+    add_id_col = add.id_col
+    for r in add_rows:
+        cid = (r.get(add_id_col) or "").strip()
+        if not cid:
+            continue
+        if cid in seen_ids:
+            continue
+        out_rows.append(_normalize_row(r))
+        seen_ids.add(cid)
+
+    merged = Table(
+        header=header,
+        rows=out_rows,
+        id_col=base.id_col,
+        url_col=base.url_col,
+        delimiter=base.delimiter,
+    )
+    return merged, out_rows
+
+
+# --------------------------------------------------------------------------------------
+# Partitioning helpers (deterministic, balanced)
+# --------------------------------------------------------------------------------------
+
+
+def sample_ids(ids: Sequence[str], k: int, *, seed: int) -> List[str]:
+    uniq = list(dict.fromkeys([str(x).strip() for x in ids if str(x).strip()]))
+    if k < 0:
+        raise ValueError("k must be >= 0")
+    if k > len(uniq):
+        raise ValueError(f"Requested k={k} but only {len(uniq)} ids are available")
+    rng = random.Random(int(seed))
+    rng.shuffle(uniq)
+    return uniq[:k]
 
 
 # --------------------------------------------------------------------------------------
 # Run-root paths / company dirs
 # --------------------------------------------------------------------------------------
-
-
-def retry_dir(root: Path) -> Path:
-    return root / RETRY_DIR_NAME
 
 
 def crawl_db_path(root: Path) -> Path:
@@ -279,6 +380,10 @@ def crawl_db_path(root: Path) -> Path:
 
 def global_state_path(root: Path) -> Path:
     return root / GLOBAL_STATE_NAME
+
+
+def retry_dir(root: Path) -> Path:
+    return root / RETRY_DIR_NAME
 
 
 def find_company_dir(root: Path, company_id: str) -> Optional[Path]:
@@ -295,192 +400,34 @@ def expected_company_dir(root: Path, company_id: str) -> Path:
     return root / sanitize_bvdid(company_id)
 
 
+def _company_meta_dir(company_dir: Path) -> Path:
+    m1 = company_dir / "metadata"
+    if m1.exists():
+        return m1
+    m2 = company_dir / "checkpoints"
+    if m2.exists():
+        return m2
+    return company_dir / "metadata"
+
+
 def url_index_path_in_company_dir(company_dir: Path) -> Path:
-    p1 = company_dir / "metadata" / URL_INDEX_NAME
-    if p1.exists():
-        return p1
-    return company_dir / "checkpoints" / URL_INDEX_NAME
+    return _company_meta_dir(company_dir) / URL_INDEX_NAME
+
+
+def _ledger_paths(root: Path) -> List[Path]:
+    p = retry_dir(root) / LEDGER_NAME
+    out: List[Path] = []
+    if p.exists() and p not in out:
+        out.append(p)
+    return out
+
+
+def _target_ledger_path(root: Path) -> Path:
+    return retry_dir(root) / LEDGER_NAME
 
 
 # --------------------------------------------------------------------------------------
-# SQLite schema (match crawl.state.py)
-# --------------------------------------------------------------------------------------
-
-COMPANIES_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS companies (
-    bvdid TEXT PRIMARY KEY,
-    name TEXT,
-    root_url TEXT,
-    status TEXT,
-    urls_total INTEGER DEFAULT 0,
-    urls_markdown_done INTEGER DEFAULT 0,
-    urls_llm_done INTEGER DEFAULT 0,
-    last_error TEXT,
-    done_reason TEXT,
-    done_details TEXT,
-    done_at TEXT,
-    created_at TEXT,
-    updated_at TEXT,
-    industry INTEGER,
-    nace INTEGER,
-    industry_label TEXT,
-    industry_source TEXT
-);
-"""
-
-RUNS_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS runs (
-    run_id TEXT PRIMARY KEY,
-    pipeline TEXT,
-    version TEXT,
-    args_hash TEXT,
-    crawl4ai_cache_base_dir TEXT,
-    crawl4ai_cache_mode TEXT,
-    started_at TEXT,
-    total_companies INTEGER DEFAULT 0,
-    completed_companies INTEGER DEFAULT 0,
-    last_company_bvdid TEXT,
-    last_updated TEXT
-);
-"""
-
-RUN_COMPANY_DONE_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS run_company_done (
-    run_id TEXT NOT NULL,
-    bvdid TEXT NOT NULL,
-    done_at TEXT,
-    PRIMARY KEY (run_id, bvdid)
-);
-"""
-
-
-def _open_db(db: Path) -> sqlite3.Connection:
-    db.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db), timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    return conn
-
-
-def init_crawl_db(db: Path) -> None:
-    conn = _open_db(db)
-    try:
-        conn.execute(COMPANIES_SCHEMA_SQL)
-        conn.execute(RUNS_SCHEMA_SQL)
-        conn.execute(RUN_COMPANY_DONE_SCHEMA_SQL)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def read_companies_rows(db: Path) -> Dict[str, Dict[str, Any]]:
-    if not db.exists():
-        return {}
-    conn = _open_db(db)
-    try:
-        rows = conn.execute("SELECT * FROM companies").fetchall()
-        out: Dict[str, Dict[str, Any]] = {}
-        for r in rows:
-            d = dict(r)
-            cid = str(d.get("bvdid") or "").strip()
-            if cid:
-                out[cid] = d
-        return out
-    finally:
-        conn.close()
-
-
-def read_latest_run_row(db: Path) -> Optional[Dict[str, Any]]:
-    if not db.exists():
-        return None
-    conn = _open_db(db)
-    try:
-        row = conn.execute(
-            "SELECT * FROM runs ORDER BY started_at DESC LIMIT 1"
-        ).fetchone()
-        return dict(row) if row is not None else None
-    finally:
-        conn.close()
-
-
-def read_run_company_done_count(db: Path, run_id: str) -> Optional[int]:
-    if not db.exists():
-        return None
-    conn = _open_db(db)
-    try:
-        row = conn.execute(
-            "SELECT COUNT(*) AS c FROM run_company_done WHERE run_id=?",
-            (run_id,),
-        ).fetchone()
-        if row is None:
-            return 0
-        return int(row["c"] or 0)
-    finally:
-        conn.close()
-
-
-def delete_company_rows(db: Path, company_ids: Sequence[str]) -> int:
-    if (not db.exists()) or (not company_ids):
-        return 0
-    conn = _open_db(db)
-    try:
-        n = 0
-        chunk = 500
-        for i in range(0, len(company_ids), chunk):
-            part = list(company_ids[i : i + chunk])
-            q = ",".join("?" for _ in part)
-            cur = conn.execute(
-                f"DELETE FROM companies WHERE bvdid IN ({q})", tuple(part)
-            )
-            n += int(cur.rowcount or 0)
-        conn.commit()
-        return n
-    finally:
-        conn.close()
-
-
-def write_companies_rows(db: Path, rows: Dict[str, Dict[str, Any]]) -> None:
-    init_crawl_db(db)
-    conn = _open_db(db)
-    try:
-        cols = [
-            "bvdid",
-            "name",
-            "root_url",
-            "status",
-            "urls_total",
-            "urls_markdown_done",
-            "urls_llm_done",
-            "last_error",
-            "done_reason",
-            "done_details",
-            "done_at",
-            "created_at",
-            "updated_at",
-            "industry",
-            "nace",
-            "industry_label",
-            "industry_source",
-        ]
-        placeholders = ",".join("?" for _ in cols)
-
-        conn.execute("BEGIN;")
-        for cid, r in rows.items():
-            payload = dict(r)
-            payload["bvdid"] = cid
-            conn.execute(
-                f"INSERT OR REPLACE INTO companies ({', '.join(cols)}) VALUES ({placeholders})",
-                tuple(payload.get(k) for k in cols),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# --------------------------------------------------------------------------------------
-# url_index.json classification (mirror crawl.state.py semantics)
+# url_index.json merge (uses configs.models + crawl.state semantics)
 # --------------------------------------------------------------------------------------
 
 
@@ -488,244 +435,131 @@ def _is_reserved_url_index_key(k: Any) -> bool:
     return str(k).startswith(URL_INDEX_RESERVED_PREFIX)
 
 
-def _index_crawl_finished(index: Dict[str, Any]) -> bool:
-    meta = index.get(URL_INDEX_META_KEY)
-    return bool(isinstance(meta, dict) and meta.get("crawl_finished"))
+def _classify_url_entry_like_crawl_state(ent: Dict[str, Any]) -> Tuple[bool, bool]:
+    """
+    Mirrors crawl.state.py::_classify_url_entry.
 
-
-def _status_has_any(s: str, needles: Tuple[str, ...]) -> bool:
-    return any(n in s for n in needles)
-
-
-def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
-    status = str(ent.get("status") or "").strip().lower()
-
-    has_md_path = bool(ent.get("markdown_path") or ent.get("md_path"))
+    markdown_done = md_flag OR markdown_path OR status==markdown_done OR llm_flag OR llm_artifacts OR status==llm_done
+    llm_done = llm_flag OR llm_artifacts OR status==llm_done
+    """
+    status = str(ent.get("status") or "").strip()
+    has_md_path = bool(ent.get("markdown_path"))
     has_llm_artifact = bool(
         ent.get("json_path")
+        or ent.get("extraction_path")
         or ent.get("product_path")
         or ent.get("products_path")
-        or ent.get("llm_json_path")
-        or ent.get("extraction_path")
     )
+    md_flag = bool(ent.get("markdown_done"))
+    llm_flag = bool(ent.get("llm_done"))
+    status_md_done = status == "markdown_done"
+    status_llm_done = status == "llm_done"
 
-    presence_checked = bool(ent.get("presence_checked") or ent.get("presence_done"))
-    extracted_flag = bool(ent.get("extracted") or ent.get("llm_extracted"))
-
-    status_md_done = (
-        status in _MARKDOWN_COMPLETE_STATUSES
-        or _status_has_any(
-            status, ("markdown_done", "markdown_saved", "md_done", "md_saved")
-        )
-        or (
-            ("markdown" in status or status == "md")
-            and _status_has_any(status, ("done", "saved", "complete", "suppressed"))
-        )
+    markdown_done = bool(
+        md_flag
+        or has_md_path
+        or status_md_done
+        or llm_flag
+        or has_llm_artifact
+        or status_llm_done
     )
-    status_llm_done = (
-        status in _LLM_COMPLETE_STATUSES
-        or _status_has_any(
-            status,
-            (
-                "llm_done",
-                "llm_extracted",
-                "full_extracted",
-                "product_saved",
-                "products_saved",
-                "json_saved",
-            ),
-        )
-        or (
-            ("llm" in status or "extract" in status)
-            and _status_has_any(status, ("done", "saved", "complete", "extracted"))
-        )
-    )
-
-    markdown_done = bool(has_md_path or status_md_done)
-    if has_llm_artifact or extracted_flag or status_llm_done or presence_checked:
-        markdown_done = True
-
-    llm_done = bool(
-        extracted_flag or has_llm_artifact or status_llm_done or presence_checked
-    )
+    llm_done = bool(llm_flag or has_llm_artifact or status_llm_done)
     return markdown_done, llm_done
 
 
-def compute_company_stage_from_url_index(
-    index: Dict[str, Any],
-) -> Tuple[str, int, int, int]:
-    """
-    Match crawl.state.py:
-
-    - Reserved keys (starting with "__") are ignored as URLs.
-    - Never conclude markdown_done/llm_done unless __meta__.crawl_finished == True.
-    """
-    if not index:
-        return COMPANY_STATUS_PENDING, 0, 0, 0
-
-    crawl_finished = _index_crawl_finished(index)
-
-    urls_total = 0
-    md_done = 0
-    llm_done = 0
-
-    for url, raw_ent in index.items():
-        if _is_reserved_url_index_key(url):
-            continue
-        urls_total += 1
-        ent = raw_ent if isinstance(raw_ent, dict) else {}
-        m, l = _classify_url_entry(ent)
-        if m:
-            md_done += 1
-        if l:
-            llm_done += 1
-
-    if urls_total == 0:
-        return COMPANY_STATUS_PENDING, 0, 0, 0
-
-    if not crawl_finished:
-        if llm_done > 0:
-            return COMPANY_STATUS_LLM_NOT_DONE, urls_total, md_done, llm_done
-        if md_done > 0:
-            return COMPANY_STATUS_MD_NOT_DONE, urls_total, md_done, llm_done
-        return COMPANY_STATUS_PENDING, urls_total, md_done, llm_done
-
-    if llm_done == urls_total:
-        return COMPANY_STATUS_LLM_DONE, urls_total, md_done, llm_done
-    if llm_done > 0:
-        return COMPANY_STATUS_LLM_NOT_DONE, urls_total, md_done, llm_done
-    if md_done == urls_total:
-        return COMPANY_STATUS_MD_DONE, urls_total, md_done, llm_done
-    return COMPANY_STATUS_MD_NOT_DONE, urls_total, md_done, llm_done
-
-
-def read_url_index_file(path: Path) -> Dict[str, Any]:
+def _json_obj(path: Path) -> Dict[str, Any]:
     obj = _read_json_strict(path)
     if obj is None:
         return {}
     if not isinstance(obj, dict):
-        raise ValueError(f"url_index.json is not a JSON object: {path}")
+        raise ValueError(f"{path} is not a JSON object")
     return obj
 
 
-# --------------------------------------------------------------------------------------
-# Retry state subset/merge (raw JSON files)
-# --------------------------------------------------------------------------------------
-
-
-def _load_retry_state(
-    root: Path,
-) -> Tuple[Dict[str, Any], Dict[str, Any], Path, Path, Path]:
-    rdir = retry_dir(root)
-    sp = rdir / RETRY_STATE_NAME
-    qp = rdir / QUARANTINE_NAME
-    lp = rdir / LEDGER_NAME
-
-    state_raw = _read_json_strict(sp) if sp.exists() else None
-    quarantine_raw = _read_json_strict(qp) if qp.exists() else None
-
-    state = state_raw if isinstance(state_raw, dict) else {}
-    quarantine = quarantine_raw if isinstance(quarantine_raw, dict) else {}
-    return state, quarantine, sp, qp, lp
-
-
-def write_retry_state(
-    root: Path, state: Dict[str, Any], quarantine: Dict[str, Any]
-) -> None:
-    rdir = retry_dir(root)
-    rdir.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(rdir / RETRY_STATE_NAME, state, pretty=False)
-    _atomic_write_json(rdir / QUARANTINE_NAME, quarantine, pretty=False)
-
-
-def filter_ledger(src_ledger: Path, dst_ledger: Path, keep_ids: Set[str]) -> int:
-    if not src_ledger.exists():
-        return 0
-    dst_ledger.parent.mkdir(parents=True, exist_ok=True)
-    kept = 0
-
-    def _iter_lines() -> Iterator[str]:
-        with open(src_ledger, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                yield line
-
-    with open(dst_ledger, "a", encoding="utf-8", newline="") as out:
-        for line in _iter_lines():
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError:
-                logger.warning("Skipping invalid JSON line in ledger: %s", src_ledger)
-                continue
-            if not isinstance(obj, dict):
-                continue
-            cid = str(obj.get("company_id") or obj.get("bvdid") or "").strip()
-            if cid and cid in keep_ids:
-                out.write(
-                    json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
-                )
-                kept += 1
-    return kept
-
-
-def merge_retry_states(
-    a_state: Dict[str, Any], b_state: Dict[str, Any]
-) -> Dict[str, Any]:
+def merge_url_index_files(dst_path: Path, src_path: Path) -> None:
     """
-    Merge retry_state.json dicts. For conflicts, pick the entry with higher updated_at,
-    fallback to higher attempts.
+    Merge url_index.json dicts with per-URL preference:
+      score(llm_done)=2, score(md_done)=1
+    __meta__ is normalized via UrlIndexMeta.
+    Entries are normalized via UrlIndexEntry to preserve extra fields.
     """
-    out = dict(a_state)
-    for cid, ent in b_state.items():
-        if cid not in out:
-            out[cid] = ent
-            continue
-        ea = out.get(cid)
-        eb = ent
-        if not isinstance(ea, dict) or not isinstance(eb, dict):
-            out[cid] = eb
-            continue
-        ua = float(ea.get("updated_at") or 0.0)
-        ub = float(eb.get("updated_at") or 0.0)
-        if ub > ua:
-            out[cid] = eb
-            continue
-        if ua > ub:
-            continue
-        aa = int(ea.get("attempts") or 0)
-        ab = int(eb.get("attempts") or 0)
-        if ab > aa:
-            out[cid] = eb
-    return out
+    src = _json_obj(src_path) if src_path.exists() else {}
+    if not src:
+        return
 
+    dst = _json_obj(dst_path) if dst_path.exists() else {}
+    if not dst:
+        _atomic_write_json(dst_path, src, pretty=False)
+        return
 
-def merge_quarantine(a_q: Dict[str, Any], b_q: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(a_q)
-    for cid, ent in b_q.items():
-        if cid not in out:
-            out[cid] = ent
+    merged: Dict[str, Any] = dict(dst)
+
+    # __meta__
+    if URL_INDEX_META_KEY in src or URL_INDEX_META_KEY in dst:
+        md = dst.get(URL_INDEX_META_KEY)
+        ms = src.get(URL_INDEX_META_KEY)
+        mdict = dict(md) if isinstance(md, dict) else {}
+        sdict = dict(ms) if isinstance(ms, dict) else {}
+
+        # OR crawl_finished
+        mdict["crawl_finished"] = bool(mdict.get("crawl_finished")) or bool(
+            sdict.get("crawl_finished")
+        )
+
+        for k, v in sdict.items():
+            if k == "crawl_finished":
+                continue
+            if k not in mdict or mdict.get(k) in ("", None, [], {}):
+                mdict[k] = v
+
+        cid = str(mdict.get("company_id") or sdict.get("company_id") or "").strip()
+        normalized_meta = UrlIndexMeta.from_dict(mdict, company_id=cid or "unknown")
+        merged[URL_INDEX_META_KEY] = normalized_meta.to_dict()
+
+    def _score(ent: Dict[str, Any]) -> int:
+        md_done, llm_done = _classify_url_entry_like_crawl_state(ent)
+        return (2 if llm_done else 0) + (1 if md_done else 0)
+
+    for url, raw_ent in src.items():
+        if _is_reserved_url_index_key(url):
             continue
-        ea = out.get(cid)
-        eb = ent
-        if not isinstance(ea, dict) or not isinstance(eb, dict):
-            out[cid] = eb
+        ent = raw_ent if isinstance(raw_ent, dict) else {}
+
+        if url not in merged:
+            cid = str(ent.get("company_id") or "").strip()
+            merged[url] = UrlIndexEntry.from_dict(
+                ent, company_id=cid or "unknown", url=str(url)
+            ).to_dict()
             continue
 
-        def _ts(x: Dict[str, Any]) -> float:
-            for k in ("updated_at", "quarantined_at", "at", "ts"):
-                if k in x:
-                    return float(x.get(k) or 0.0)
-            return 0.0
+        cur_raw = merged.get(url)
+        cur_ent = cur_raw if isinstance(cur_raw, dict) else {}
 
-        if _ts(eb) >= _ts(ea):
-            out[cid] = eb
-    return out
+        s_new = _score(ent)
+        s_cur = _score(cur_ent)
+
+        if s_new > s_cur:
+            cid = str(ent.get("company_id") or cur_ent.get("company_id") or "").strip()
+            merged[url] = UrlIndexEntry.from_dict(
+                ent, company_id=cid or "unknown", url=str(url)
+            ).to_dict()
+            continue
+
+        if s_new == s_cur:
+            out_ent = dict(cur_ent)
+            for k, v in ent.items():
+                if k not in out_ent or out_ent.get(k) in ("", None, [], {}):
+                    out_ent[k] = v
+            cid = str(out_ent.get("company_id") or "").strip()
+            merged[url] = UrlIndexEntry.from_dict(
+                out_ent, company_id=cid or "unknown", url=str(url)
+            ).to_dict()
+
+    _atomic_write_json(dst_path, merged, pretty=False)
 
 
 # --------------------------------------------------------------------------------------
-# File-tree sync and url_index merge
+# File-tree sync (url_index aware)
 # --------------------------------------------------------------------------------------
 
 
@@ -735,73 +569,6 @@ def _file_better(src: Path, dst: Path) -> bool:
     if ss.st_size != ds.st_size:
         return ss.st_size > ds.st_size
     return ss.st_mtime_ns > ds.st_mtime_ns
-
-
-def merge_url_index_files(dst_path: Path, src_path: Path) -> None:
-    """
-    Merge url_index.json dicts with per-URL preference:
-      score(llm_done)=2, score(md_done)=1
-
-    Reserved __meta__ is merged:
-      - crawl_finished becomes OR of both.
-      - other keys: prefer non-empty src values, else keep dst.
-    """
-    dst = read_url_index_file(dst_path) if dst_path.exists() else {}
-    src = read_url_index_file(src_path) if src_path.exists() else {}
-
-    if not src:
-        return
-    if not dst:
-        _atomic_write_json(dst_path, src, pretty=False)
-        return
-
-    def _score(ent: Dict[str, Any]) -> int:
-        md, llm = _classify_url_entry(ent if isinstance(ent, dict) else {})
-        return (2 if llm else 0) + (1 if md else 0)
-
-    merged: Dict[str, Any] = dict(dst)
-
-    # Merge __meta__ first (if any)
-    if URL_INDEX_META_KEY in src or URL_INDEX_META_KEY in dst:
-        m_dst = dst.get(URL_INDEX_META_KEY)
-        m_src = src.get(URL_INDEX_META_KEY)
-        mdict: Dict[str, Any] = dict(m_dst) if isinstance(m_dst, dict) else {}
-        sdict: Dict[str, Any] = dict(m_src) if isinstance(m_src, dict) else {}
-
-        if bool(mdict.get("crawl_finished")) or bool(sdict.get("crawl_finished")):
-            mdict["crawl_finished"] = True
-        else:
-            mdict["crawl_finished"] = False
-
-        for k, v in sdict.items():
-            if k == "crawl_finished":
-                continue
-            if k not in mdict or mdict.get(k) in ("", None, [], {}):
-                mdict[k] = v
-
-        merged[URL_INDEX_META_KEY] = mdict
-
-    for url, raw_ent in src.items():
-        if _is_reserved_url_index_key(url):
-            continue
-        ent = raw_ent if isinstance(raw_ent, dict) else {}
-        if url not in merged:
-            merged[url] = ent
-            continue
-        cur = merged.get(url)
-        cur_ent = cur if isinstance(cur, dict) else {}
-        s_new = _score(ent)
-        s_cur = _score(cur_ent)
-        if s_new > s_cur:
-            merged[url] = ent
-        elif s_new == s_cur:
-            out_ent = dict(cur_ent)
-            for k, v in ent.items():
-                if k not in out_ent or out_ent.get(k) in ("", None, [], {}):
-                    out_ent[k] = v
-            merged[url] = out_ent
-
-    _atomic_write_json(dst_path, merged, pretty=False)
 
 
 def sync_tree(src: Path, dst: Path, *, move: bool, merge: bool) -> None:
@@ -857,48 +624,394 @@ def sync_tree(src: Path, dst: Path, *, move: bool, merge: bool) -> None:
 
 
 # --------------------------------------------------------------------------------------
-# Global state (DB-only) writer (match CrawlState.write_global_state_from_db_only keys)
+# Retry state subset/merge (raw JSON files)
 # --------------------------------------------------------------------------------------
 
 
-def write_global_state_from_db_only(root: Path) -> Dict[str, Any]:
-    db = crawl_db_path(root)
+def _load_retry_state(root: Path) -> Tuple[Dict[str, Any], Dict[str, Any], Path, Path]:
+    rdir = retry_dir(root)
+    sp = rdir / RETRY_STATE_NAME
+    qp = rdir / QUARANTINE_NAME
+
+    state_raw = _read_json_strict(sp) if sp.exists() else None
+    quarantine_raw = _read_json_strict(qp) if qp.exists() else None
+
+    state = state_raw if isinstance(state_raw, dict) else {}
+    quarantine = quarantine_raw if isinstance(quarantine_raw, dict) else {}
+    return state, quarantine, sp, qp
+
+
+def write_retry_state(
+    root: Path, state: Dict[str, Any], quarantine: Dict[str, Any]
+) -> None:
+    rdir = retry_dir(root)
+    rdir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(rdir / RETRY_STATE_NAME, state, pretty=False)
+    _atomic_write_json(rdir / QUARANTINE_NAME, quarantine, pretty=False)
+
+
+def filter_ledger_lines(src_ledger: Path, dst_ledger: Path, keep_ids: Set[str]) -> int:
+    if not src_ledger.exists():
+        return 0
+    dst_ledger.parent.mkdir(parents=True, exist_ok=True)
+    kept = 0
+
+    def _iter_lines() -> Iterator[str]:
+        with open(src_ledger, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                yield line
+
+    with open(dst_ledger, "a", encoding="utf-8", newline="") as out:
+        for line in _iter_lines():
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            cid = str(obj.get("company_id") or obj.get("bvdid") or "").strip()
+            if cid and cid in keep_ids:
+                out.write(
+                    json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n"
+                )
+                kept += 1
+    return kept
+
+
+def append_ledger_all(src_ledger: Path, dst_ledger: Path) -> int:
+    if not src_ledger.exists():
+        return 0
+    dst_ledger.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with (
+        open(src_ledger, "r", encoding="utf-8", errors="ignore") as f_in,
+        open(dst_ledger, "a", encoding="utf-8", newline="") as f_out,
+    ):
+        for line in f_in:
+            if not line.strip():
+                continue
+            f_out.write(line if line.endswith("\n") else (line + "\n"))
+            n += 1
+    return n
+
+
+def merge_retry_states(
+    a_state: Dict[str, Any], b_state: Dict[str, Any]
+) -> Dict[str, Any]:
+    out = dict(a_state)
+    for cid, ent in b_state.items():
+        if cid not in out:
+            out[cid] = ent
+            continue
+        ea = out.get(cid)
+        eb = ent
+        if not isinstance(ea, dict) or not isinstance(eb, dict):
+            out[cid] = eb
+            continue
+
+        ua = _to_epoch_seconds(ea.get("updated_at"))
+        ub = _to_epoch_seconds(eb.get("updated_at"))
+        if ub > ua:
+            out[cid] = eb
+            continue
+        if ua > ub:
+            continue
+
+        aa = int(ea.get("attempts") or 0)
+        ab = int(eb.get("attempts") or 0)
+        if ab > aa:
+            out[cid] = eb
+    return out
+
+
+def merge_quarantine(a_q: Dict[str, Any], b_q: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(a_q)
+
+    def _ts(x: Dict[str, Any]) -> float:
+        for k in ("updated_at", "quarantined_at", "at", "ts"):
+            if k in x:
+                return _to_epoch_seconds(x.get(k))
+        return 0.0
+
+    for cid, ent in b_q.items():
+        if cid not in out:
+            out[cid] = ent
+            continue
+        ea = out.get(cid)
+        eb = ent
+        if not isinstance(ea, dict) or not isinstance(eb, dict):
+            out[cid] = eb
+            continue
+        if _ts(eb) >= _ts(ea):
+            out[cid] = eb
+
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# SQLite access (schema matches extensions.crawl.state.CrawlState)
+# --------------------------------------------------------------------------------------
+
+COMPANIES_COLS: Tuple[str, ...] = (
+    "company_id",
+    "root_url",
+    "name",
+    "metadata_json",
+    "industry",
+    "nace",
+    "industry_label",
+    "industry_label_source",
+    "status",
+    "crawl_finished",
+    "urls_total",
+    "urls_markdown_done",
+    "urls_llm_done",
+    "last_error",
+    "done_reason",
+    "done_details",
+    "done_at",
+    "created_at",
+    "updated_at",
+    "last_crawled_at",
+    "max_pages",
+    "retry_cls",
+    "retry_attempts",
+    "retry_next_eligible_at",
+    "retry_updated_at",
+    "retry_last_error",
+    "retry_last_stage",
+    "retry_net_attempts",
+    "retry_stall_attempts",
+    "retry_mem_attempts",
+    "retry_other_attempts",
+    "retry_mem_hits",
+    "retry_last_stall_kind",
+    "retry_last_progress_md_done",
+    "retry_last_seen_md_done",
+    "retry_last_error_sig",
+    "retry_same_error_streak",
+    "retry_last_error_sig_updated_at",
+)
+
+RUNS_COLS: Tuple[str, ...] = (
+    "run_id",
+    "pipeline",
+    "version",
+    "args_hash",
+    "crawl4ai_cache_base_dir",
+    "crawl4ai_cache_mode",
+    "started_at",
+    "total_companies",
+    "completed_companies",
+    "last_company_id",
+    "last_updated",
+)
+
+RUN_COMPANY_DONE_COLS: Tuple[str, ...] = (
+    "run_id",
+    "company_id",
+    "done_at",
+)
+
+
+def _open_db(db: Path) -> sqlite3.Connection:
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db), timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
+
+def ensure_db_initialized(db: Path) -> None:
+    cs = CrawlState(db_path=db)
+    cs.close()
+
+
+def read_company_status_map(
+    db: Path,
+    *,
+    include_statuses: Optional[Sequence[str]] = None,
+    exclude_statuses: Optional[Sequence[str]] = None,
+) -> Dict[str, str]:
     if not db.exists():
-        payload: Dict[str, Any] = {
-            "output_root": str(root.resolve()),
-            "db_path": str(db.resolve()),
-            "updated_at": _now_iso(),
-            "total_companies": 0,
-            "crawled_companies": 0,
-            "completed_companies": 0,
-            "percentage_completed": 0.0,
-            "by_status": {k: 0 for k in sorted(_KNOWN_COMPANY_STATUSES)},
-            "unknown_statuses": {},
-            "pending_company_ids": [],
-            "in_progress_company_ids": [],
-            "done_company_ids": [],
-            "terminal_done_company_ids": [],
-            "terminal_done_reasons": {},
-            "urls_total_sum": 0,
-            "urls_markdown_done_sum": 0,
-            "urls_llm_done_sum": 0,
-            "latest_run": None,
-        }
-        _atomic_write_json(global_state_path(root), payload, pretty=True)
-        return payload
+        return {}
+
+    inc = [str(x).strip() for x in (include_statuses or []) if str(x).strip()]
+    exc = [str(x).strip() for x in (exclude_statuses or []) if str(x).strip()]
+
+    sql = "SELECT company_id, status FROM companies"
+    args: List[Any] = []
+    where: List[str] = []
+
+    if inc:
+        where.append(f"status IN ({','.join('?' for _ in inc)})")
+        args.extend(inc)
+    if exc:
+        where.append(f"status NOT IN ({','.join('?' for _ in exc)})")
+        args.extend(exc)
+
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+
+    conn = _open_db(db)
+    try:
+        rows = conn.execute(sql, tuple(args)).fetchall()
+        out: Dict[str, str] = {}
+        for r in rows:
+            cid = str(r["company_id"] or "").strip()
+            if cid:
+                out[cid] = str(r["status"] or "").strip()
+        return out
+    finally:
+        conn.close()
+
+
+def read_companies_rows(db: Path) -> Dict[str, Dict[str, Any]]:
+    if not db.exists():
+        return {}
+    conn = _open_db(db)
+    try:
+        rows = conn.execute("SELECT * FROM companies").fetchall()
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            d = dict(r)
+            cid = str(d.get("company_id") or "").strip()
+            if cid:
+                out[cid] = d
+        return out
+    finally:
+        conn.close()
+
+
+def read_runs_rows(db: Path) -> List[Dict[str, Any]]:
+    if not db.exists():
+        return []
+    conn = _open_db(db)
+    try:
+        rows = conn.execute("SELECT * FROM runs").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def read_run_company_done_rows(db: Path) -> List[Dict[str, Any]]:
+    if not db.exists():
+        return []
+    conn = _open_db(db)
+    try:
+        rows = conn.execute("SELECT * FROM run_company_done").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def write_companies_rows(db: Path, rows: Dict[str, Dict[str, Any]]) -> None:
+    ensure_db_initialized(db)
+    conn = _open_db(db)
+    try:
+        placeholders = ",".join("?" for _ in COMPANIES_COLS)
+        conn.execute("BEGIN;")
+        for cid, r in rows.items():
+            payload = dict(r)
+            payload["company_id"] = cid
+            conn.execute(
+                f"INSERT OR REPLACE INTO companies ({', '.join(COMPANIES_COLS)}) VALUES ({placeholders})",
+                tuple(payload.get(k) for k in COMPANIES_COLS),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def write_runs_rows(db: Path, runs: List[Dict[str, Any]]) -> None:
+    ensure_db_initialized(db)
+    conn = _open_db(db)
+    try:
+        placeholders = ",".join("?" for _ in RUNS_COLS)
+        conn.execute("BEGIN;")
+        for r in runs:
+            payload = dict(r)
+            conn.execute(
+                f"INSERT OR IGNORE INTO runs ({', '.join(RUNS_COLS)}) VALUES ({placeholders})",
+                tuple(payload.get(k) for k in RUNS_COLS),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def write_run_company_done_rows(db: Path, rows: List[Dict[str, Any]]) -> None:
+    ensure_db_initialized(db)
+    conn = _open_db(db)
+    try:
+        placeholders = ",".join("?" for _ in RUN_COMPANY_DONE_COLS)
+        conn.execute("BEGIN;")
+        for r in rows:
+            payload = dict(r)
+            conn.execute(
+                f"INSERT OR IGNORE INTO run_company_done ({', '.join(RUN_COMPANY_DONE_COLS)}) VALUES ({placeholders})",
+                tuple(payload.get(k) for k in RUN_COMPANY_DONE_COLS),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_company_rows(db: Path, company_ids: Sequence[str]) -> int:
+    if (not db.exists()) or (not company_ids):
+        return 0
+    ids = [str(x).strip() for x in company_ids if str(x).strip()]
+    if not ids:
+        return 0
+
+    conn = _open_db(db)
+    try:
+        n = 0
+        chunk = 500
+        for i in range(0, len(ids), chunk):
+            part = ids[i : i + chunk]
+            q = ",".join("?" for _ in part)
+            cur = conn.execute(
+                f"DELETE FROM companies WHERE company_id IN ({q})", tuple(part)
+            )
+            n += int(cur.rowcount or 0)
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------------------
+# Global state writer (DB-only) (matches CrawlState.write_global_state_from_db_only keys)
+# --------------------------------------------------------------------------------------
+
+
+def write_global_state_from_db_only(
+    root: Path, *, max_ids: int = 200, pretty: bool = False
+) -> Dict[str, Any]:
+    db = crawl_db_path(root)
+    ensure_db_initialized(db)
 
     conn = _open_db(db)
     try:
         rows = conn.execute(
             """
-            SELECT bvdid, status, urls_total, urls_markdown_done, urls_llm_done,
-                   done_reason, done_at
+            SELECT company_id, status, crawl_finished,
+                   urls_total, urls_markdown_done, urls_llm_done,
+                   done_reason
               FROM companies
             """
         ).fetchall()
+
         run_row = conn.execute(
             "SELECT * FROM runs ORDER BY started_at DESC LIMIT 1"
         ).fetchone()
+
         run_done_count: Optional[int] = None
         if run_row is not None:
             rrid = str(run_row["run_id"])
@@ -906,65 +1019,78 @@ def write_global_state_from_db_only(root: Path) -> Dict[str, Any]:
                 "SELECT COUNT(*) AS c FROM run_company_done WHERE run_id=?",
                 (rrid,),
             ).fetchone()
-            run_done_count = int(c["c"] or 0) if c is not None else 0
+            run_done_count = int(c["c"] or 0) if c is not None else None
     finally:
         conn.close()
 
     total = len(rows)
-    by_status: Dict[str, int] = {k: 0 for k in _KNOWN_COMPANY_STATUSES}
-    unknown_statuses: Dict[str, int] = {}
+    by_status: Dict[str, int] = {k: 0 for k in KNOWN_COMPANY_STATUSES}
 
-    pending: List[str] = []
-    in_progress: List[str] = []
-    done: List[str] = []
-    terminal_done: List[str] = []
-    terminal_reasons: Dict[str, int] = {}
+    pending_ids: List[str] = []
+    in_progress_ids: List[str] = []
+    done_ids: List[str] = []
+
+    md_done_companies = 0
+    llm_done_companies = 0
+    terminal_done_companies = 0
+    terminal_done_reasons: Dict[str, int] = {}
 
     urls_total_sum = 0
     urls_md_done_sum = 0
     urls_llm_done_sum = 0
+    crawl_finished_companies = 0
 
     for r in rows:
-        b = str(r["bvdid"])
-        raw_st = r["status"]
-        st_norm = (
-            str(raw_st).strip().lower() if raw_st is not None else ""
-        ) or COMPANY_STATUS_PENDING
+        st = str(r["status"] or "").strip() or COMPANY_STATUS_PENDING
+        cid = str(r["company_id"] or "").strip()
+        if not cid:
+            continue
 
-        if st_norm in _KNOWN_COMPANY_STATUSES:
-            by_status[st_norm] = by_status.get(st_norm, 0) + 1
-            st_effective = st_norm
-        else:
-            unknown_statuses[st_norm] = unknown_statuses.get(st_norm, 0) + 1
-            by_status[COMPANY_STATUS_PENDING] = (
-                by_status.get(COMPANY_STATUS_PENDING, 0) + 1
-            )
-            st_effective = COMPANY_STATUS_PENDING
+        if st not in by_status:
+            by_status[st] = 0
+        by_status[st] += 1
 
-        if st_effective == COMPANY_STATUS_PENDING:
-            pending.append(b)
-        elif st_effective in (COMPANY_STATUS_MD_NOT_DONE, COMPANY_STATUS_LLM_NOT_DONE):
-            in_progress.append(b)
-        elif st_effective == COMPANY_STATUS_TERMINAL_DONE:
-            done.append(b)
-            terminal_done.append(b)
-            dr = (r["done_reason"] or "unknown").strip()
-            terminal_reasons[dr] = terminal_reasons.get(dr, 0) + 1
+        if st == COMPANY_STATUS_PENDING:
+            if len(pending_ids) < max_ids:
+                pending_ids.append(cid)
+        elif st in (COMPANY_STATUS_MD_NOT_DONE, COMPANY_STATUS_LLM_NOT_DONE):
+            if len(in_progress_ids) < max_ids:
+                in_progress_ids.append(cid)
         else:
-            done.append(b)
+            if len(done_ids) < max_ids:
+                done_ids.append(cid)
+
+        if st in (
+            COMPANY_STATUS_MD_DONE,
+            COMPANY_STATUS_LLM_DONE,
+            COMPANY_STATUS_TERMINAL_DONE,
+        ):
+            md_done_companies += 1
+        if st == COMPANY_STATUS_LLM_DONE:
+            llm_done_companies += 1
+        if st == COMPANY_STATUS_TERMINAL_DONE:
+            terminal_done_companies += 1
+            dr = str(r["done_reason"] or "unknown").strip() or "unknown"
+            terminal_done_reasons[dr] = terminal_done_reasons.get(dr, 0) + 1
+
+        if bool(int(r["crawl_finished"] or 0)):
+            crawl_finished_companies += 1
 
         urls_total_sum += int(r["urls_total"] or 0)
         urls_md_done_sum += int(r["urls_markdown_done"] or 0)
         urls_llm_done_sum += int(r["urls_llm_done"] or 0)
 
-    crawled = total - len(pending)
-    completed = len(done)
-    percentage_completed = (completed / total * 100.0) if total else 0.0
+    crawled_companies = total - by_status.get(COMPANY_STATUS_PENDING, 0)
+
+    md_done_pct = (md_done_companies / total * 100.0) if total else 0.0
+    llm_done_pct = (llm_done_companies / total * 100.0) if total else 0.0
+    crawl_finished_pct = (crawl_finished_companies / total * 100.0) if total else 0.0
 
     latest_run: Optional[Dict[str, Any]] = None
     if run_row is not None:
         run_total = int(run_row["total_companies"] or 0)
         run_completed = int(run_row["completed_companies"] or 0)
+
         if run_done_count is not None and run_done_count > 0:
             run_completed = int(run_done_count)
 
@@ -982,413 +1108,407 @@ def write_global_state_from_db_only(root: Path) -> Dict[str, Any]:
             "started_at": run_row["started_at"],
             "total_companies": run_total,
             "completed_companies": run_completed,
-            "last_company_bvdid": run_row["last_company_bvdid"],
+            "last_company_id": run_row["last_company_id"],
             "last_updated": run_row["last_updated"],
         }
 
-    payload = {
+    payload: Dict[str, Any] = {
         "output_root": str(root.resolve()),
-        "db_path": str(db.resolve()),
+        "db_path": str(crawl_db_path(root).resolve()),
         "updated_at": _now_iso(),
-        "total_companies": total,
-        "crawled_companies": int(crawled),
-        "completed_companies": int(completed),
-        "percentage_completed": round(percentage_completed, 2),
+        "total_companies": int(total),
+        "crawled_companies": int(crawled_companies),
+        "crawl_finished_companies": int(crawl_finished_companies),
+        "md_done_companies": int(md_done_companies),
+        "llm_done_companies": int(llm_done_companies),
+        "terminal_done_companies": int(terminal_done_companies),
+        "crawl_finished_pct": round(crawl_finished_pct, 2),
+        "md_done_pct": round(md_done_pct, 2),
+        "llm_done_pct": round(llm_done_pct, 2),
         "by_status": by_status,
-        "unknown_statuses": unknown_statuses,
-        "pending_company_ids": pending[:200],
-        "in_progress_company_ids": in_progress[:200],
-        "done_company_ids": done[:200],
-        "terminal_done_company_ids": terminal_done[:200],
-        "terminal_done_reasons": terminal_reasons,
+        "company_ids_sample": {
+            "pending": pending_ids,
+            "in_progress": in_progress_ids,
+            "done": done_ids,
+        },
         "urls_total_sum": int(urls_total_sum),
         "urls_markdown_done_sum": int(urls_md_done_sum),
         "urls_llm_done_sum": int(urls_llm_done_sum),
         "latest_run": latest_run,
     }
 
-    _atomic_write_json(global_state_path(root), payload, pretty=True)
+    if terminal_done_reasons:
+        payload["terminal_done_reasons"] = terminal_done_reasons
+
+    _atomic_write_json(global_state_path(root), payload, pretty=pretty)
     return payload
 
 
 # --------------------------------------------------------------------------------------
-# High-level operations: split and merge
+# Split / Merge run roots (workflows from usage doc)
 # --------------------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class SplitPlan:
-    move_ids: List[str]
-    remain_ids: List[str]
+def _status_rank(st: Any) -> int:
+    s = str(st or "").strip()
+    return _STATUS_RANK.get(s, -1)
 
 
-def plan_split(
-    *,
-    root: Path,
-    dataset_table: Table,
-    move_count: Optional[int],
-    move_ids: Optional[Set[str]],
-    seed: int,
-    only_not_done: bool,
-) -> SplitPlan:
-    db_rows = read_companies_rows(crawl_db_path(root))
+def _pick_better_company_row(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Prefer higher status rank, then higher updated_at.
 
-    dataset_ids: List[str] = []
-    for r in dataset_table.rows:
-        cid = (r.get(dataset_table.id_col) or "").strip()
-        if cid:
-            dataset_ids.append(cid)
+    updated_at may be:
+      - float seconds
+      - ISO8601 string (e.g. '2026-01-04T15:28:31.779492+00:00')
+    """
+    sa = _status_rank(a.get("status"))
+    sb = _status_rank(b.get("status"))
+    if sb > sa:
+        return b
+    if sa > sb:
+        return a
 
-    candidates: List[str] = []
-    for cid in dataset_ids:
-        row = db_rows.get(cid)
-        st = (
-            str((row or {}).get("status") or COMPANY_STATUS_PENDING).strip().lower()
-            or COMPANY_STATUS_PENDING
-        )
-        if only_not_done and st in (
-            COMPANY_STATUS_MD_DONE,
-            COMPANY_STATUS_LLM_DONE,
-            COMPANY_STATUS_TERMINAL_DONE,
-        ):
+    ua = _to_epoch_seconds(a.get("updated_at"))
+    ub = _to_epoch_seconds(b.get("updated_at"))
+    if ub > ua:
+        return b
+    return a
+
+
+def _read_ids_file(path: Path) -> List[str]:
+    ids: List[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
             continue
-        candidates.append(cid)
-
-    if move_ids is not None:
-        chosen = [cid for cid in candidates if cid in move_ids]
-    else:
-        n = int(move_count or 0)
-        if n <= 0:
-            raise ValueError("move_count must be > 0 when move_ids not provided.")
-        rnd = random.Random(int(seed))
-        pool = list(candidates)
-        rnd.shuffle(pool)
-        chosen = pool[: min(n, len(pool))]
-
-    move_set = set(chosen)
-    remain = [cid for cid in dataset_ids if cid not in move_set]
-    return SplitPlan(move_ids=chosen, remain_ids=remain)
+        ids.append(s)
+    # keep order, dedupe
+    return list(dict.fromkeys(ids))
 
 
-def _prefer_non_empty(dst: Dict[str, Any], src: Dict[str, Any], key: str) -> None:
-    if dst.get(key) in ("", None, [], {}):
-        if src.get(key) not in ("", None, [], {}):
-            dst[key] = src.get(key)
-
-
-def rebuild_db_from_outputs(
-    root: Path,
-    company_ids: Sequence[str],
-    *,
-    prefer_existing_rows: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> None:
-    """
-    Build a fresh crawl_state.sqlite3 in root from url_index.json under each company dir.
-
-    - Preserves name/root_url/industry/nace/industry_label/industry_source and terminal fields from prefer_existing_rows.
-    - Status is derived from url_index unless existing status is terminal_done.
-    """
-    prefer_existing_rows = prefer_existing_rows or {}
-
-    tmp = root / f"{CRAWL_DB_NAME}.tmp.{int(time.time())}"
-    init_crawl_db(tmp)
-
-    out_rows: Dict[str, Dict[str, Any]] = {}
-    now_iso = _now_iso()
-
-    for cid in company_ids:
-        base = prefer_existing_rows.get(cid, {})
-
-        name = base.get("name")
-        root_url = base.get("root_url")
-
-        industry = base.get("industry")
-        nace = base.get("nace")
-        industry_label = base.get("industry_label")
-        industry_source = base.get("industry_source")
-
-        existing_status = (
-            str(base.get("status") or "").strip().lower() or COMPANY_STATUS_PENDING
-        )
-        keep_terminal = existing_status == COMPANY_STATUS_TERMINAL_DONE
-
-        status = COMPANY_STATUS_PENDING
-        ut = 0
-        md = 0
-        llm = 0
-
-        cdir = find_company_dir(root, cid)
-        if cdir is not None:
-            ip = url_index_path_in_company_dir(cdir)
-            if ip.exists():
-                idx = read_url_index_file(ip)
-                status, ut, md, llm = compute_company_stage_from_url_index(idx)
-
-        # Normalize counts like crawl.state recompute_company_from_index does.
-        total = max(int(ut), int(md), int(llm))
-        md_done = min(int(md), total)
-        llm_done = min(int(llm), total)
-
-        if keep_terminal:
-            status = COMPANY_STATUS_TERMINAL_DONE
-
-        row = {
-            "bvdid": cid,
-            "name": name,
-            "root_url": root_url,
-            "status": status,
-            "urls_total": int(total),
-            "urls_markdown_done": int(md_done),
-            "urls_llm_done": int(llm_done),
-            "last_error": base.get("last_error"),
-            "done_reason": base.get("done_reason"),
-            "done_details": base.get("done_details"),
-            "done_at": base.get("done_at"),
-            "created_at": base.get("created_at") or now_iso,
-            "updated_at": now_iso,
-            "industry": industry,
-            "nace": nace,
-            "industry_label": industry_label,
-            "industry_source": industry_source,
-        }
-        out_rows[cid] = row
-
-    write_companies_rows(tmp, out_rows)
-
-    final = crawl_db_path(root)
-    if final.exists():
-        final.unlink()
-    os.replace(tmp, final)
+def _validate_run_root(root: Path) -> None:
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"Run root not found: {root}")
+    db = crawl_db_path(root)
+    if not db.exists():
+        raise ValueError(f"Run root missing crawl_state.sqlite3: {db}")
 
 
 def split_run_root(
     *,
     root: Path,
-    dataset_path: Path,
+    dataset: Path,
     bundle_root: Path,
-    remain_dataset_out: Path,
+    remaining_dataset_out: Path,
     moved_dataset_out: Path,
     move_count: Optional[int],
     move_ids_file: Optional[Path],
-    seed: int,
-    only_not_done: bool,
-    move_mode: str,  # "move" or "copy"
-    include_ledger: bool,
-    dry_run: bool,
+    seed: int = 7,
+    only_not_done: bool = False,
+    move_mode: str = "move",  # move|copy
+    include_ledger: bool = False,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
-    root = root.resolve()
-    bundle_root = bundle_root.resolve()
+    """
+    Split a run root into a bundle root + remaining/moved dataset files.
 
-    table = read_table_preserve(dataset_path)
+    Returns a JSON-serializable dict (printed by CLI).
+    """
+    root = Path(root)
+    dataset = Path(dataset)
+    bundle_root = Path(bundle_root)
+    remaining_dataset_out = Path(remaining_dataset_out)
+    moved_dataset_out = Path(moved_dataset_out)
 
-    move_ids: Optional[Set[str]] = None
-    if move_ids_file is not None:
-        lines = move_ids_file.read_text(encoding="utf-8").splitlines()
-        move_ids = {ln.strip() for ln in lines if ln.strip()}
+    _validate_run_root(root)
+    if move_mode not in ("move", "copy"):
+        raise ValueError("--move-mode must be move or copy")
 
-    plan = plan_split(
-        root=root,
-        dataset_table=table,
-        move_count=move_count,
-        move_ids=move_ids,
-        seed=seed,
-        only_not_done=only_not_done,
+    if (move_count is None) == (move_ids_file is None):
+        raise ValueError("Exactly one of --move-count or --move-ids-file is required")
+
+    table = read_table_preserve(dataset)
+    dataset_ids = sorted(
+        {
+            (r.get(table.id_col) or "").strip()
+            for r in table.rows
+            if (r.get(table.id_col) or "").strip()
+        }
     )
 
-    move_set = set(plan.move_ids)
-    remain_rows, moved_rows = split_table_by_ids(table, move_set)
+    # candidates = dataset ids that exist in DB
+    db = crawl_db_path(root)
+    status_map = read_company_status_map(db)
+    db_ids = set(status_map.keys())
 
-    report: Dict[str, Any] = {
+    candidates = [cid for cid in dataset_ids if cid in db_ids]
+    missing_in_db = [cid for cid in dataset_ids if cid not in db_ids]
+
+    # optional only-not-done
+    if only_not_done:
+        candidates = [
+            cid for cid in candidates if status_map.get(cid) not in DONE_STATUSES
+        ]
+
+    # selection
+    if move_ids_file is not None:
+        requested = _read_ids_file(Path(move_ids_file))
+        unknown = [cid for cid in requested if cid not in set(candidates)]
+        if unknown:
+            raise ValueError(
+                f"Some requested ids are not eligible candidates: {unknown[:20]}"
+            )
+        chosen = requested
+    else:
+        assert move_count is not None
+        chosen = sample_ids(candidates, int(move_count), seed=int(seed))
+
+    chosen_set = set(chosen)
+
+    # dataset outputs
+    remaining_rows, moved_rows = split_table_by_ids(table, chosen_set)
+
+    moved_row_ids = {
+        (r.get(table.id_col) or "").strip()
+        for r in moved_rows
+        if (r.get(table.id_col) or "").strip()
+    }
+    missing_in_dataset_rows = [cid for cid in chosen if cid not in moved_row_ids]
+    if missing_in_dataset_rows:
+        raise ValueError(
+            f"Selected ids missing from dataset rows: {missing_in_dataset_rows[:20]}"
+        )
+
+    plan = {
         "root": str(root),
+        "dataset": str(dataset),
         "bundle_root": str(bundle_root),
-        "dataset": str(dataset_path),
         "move_mode": move_mode,
         "only_not_done": bool(only_not_done),
-        "move_count": len(plan.move_ids),
-        "remain_count": len(plan.remain_ids),
+        "seed": int(seed),
+        "selected_count": len(chosen),
+        "selected_ids_sample": chosen[:20],
+        "remaining_rows": len(remaining_rows),
+        "moved_rows": len(moved_rows),
+        "missing_ids_in_db_from_dataset_sample": missing_in_db[:20],
     }
 
     if dry_run:
-        return report
+        return {
+            "cmd": "split",
+            "dry_run": True,
+            "plan": plan,
+        }
 
-    bundle_root.mkdir(parents=True, exist_ok=True)
-
-    # 1) Write dataset files
-    write_table_preserve(remain_dataset_out, table, remain_rows)
+    # write datasets
+    write_table_preserve(remaining_dataset_out, table, remaining_rows)
     write_table_preserve(moved_dataset_out, table, moved_rows)
-    write_table_preserve(bundle_root / dataset_path.name, table, moved_rows)
 
-    # 2) Move/copy company dirs
-    do_move = move_mode.strip().lower() == "move"
-    for cid in plan.move_ids:
-        src_dir = find_company_dir(root, cid)
-        if src_dir is None:
-            continue
-        dst_dir = expected_company_dir(bundle_root, cid)
-        sync_tree(src_dir, dst_dir, move=do_move, merge=True)
+    # copy moved dataset into bundle root (same basename)
+    bundle_root.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(moved_dataset_out, bundle_root / moved_dataset_out.name)
 
-    # 3) Retry state subset into bundle; if move, remove from source.
-    src_state, src_q, _, _, src_ledger = _load_retry_state(root)
-    bundle_state = {cid: v for cid, v in src_state.items() if cid in move_set}
-    bundle_q = {cid: v for cid, v in src_q.items() if cid in move_set}
-    write_retry_state(bundle_root, bundle_state, bundle_q)
+    move_dirs = move_mode == "move"
 
-    if include_ledger:
-        kept = filter_ledger(src_ledger, retry_dir(bundle_root) / LEDGER_NAME, move_set)
-        report["bundle_ledger_rows"] = kept
+    # company dirs
+    moved_company_dirs = 0
+    for cid in chosen:
+        sdir = find_company_dir(root, cid)
+        if sdir is None:
+            raise ValueError(f"Company directory missing for selected id: {cid}")
+        ddir = expected_company_dir(bundle_root, cid)
+        sync_tree(sdir, ddir, move=move_dirs, merge=True)
+        moved_company_dirs += 1
 
-    if do_move:
-        remain_state = {cid: v for cid, v in src_state.items() if cid not in move_set}
-        remain_q = {cid: v for cid, v in src_q.items() if cid not in move_set}
-        write_retry_state(root, remain_state, remain_q)
+    # db subset into bundle
+    ensure_db_initialized(crawl_db_path(bundle_root))
+    src_companies = read_companies_rows(crawl_db_path(root))
+    subset = {cid: src_companies[cid] for cid in chosen if cid in src_companies}
+    write_companies_rows(crawl_db_path(bundle_root), subset)
 
-    # 4) Rebuild bundle DB from outputs (authoritative), preserving fields from source DB.
-    src_db = crawl_db_path(root)
-    src_rows = read_companies_rows(src_db)
-
-    prefer_for_bundle: Dict[str, Dict[str, Any]] = {}
-    for cid in plan.move_ids:
-        if cid in src_rows:
-            prefer_for_bundle[cid] = dict(src_rows[cid])
-
-    rebuild_db_from_outputs(
-        bundle_root, plan.move_ids, prefer_existing_rows=prefer_for_bundle
+    # carry over runs + run_company_done (union)
+    write_runs_rows(crawl_db_path(bundle_root), read_runs_rows(crawl_db_path(root)))
+    write_run_company_done_rows(
+        crawl_db_path(bundle_root), read_run_company_done_rows(crawl_db_path(root))
     )
-    write_global_state_from_db_only(bundle_root)
 
-    # 5) If move, rebuild source DB from remaining outputs (authoritative), preserving remaining fields.
-    if do_move:
-        prefer_for_source: Dict[str, Dict[str, Any]] = {}
-        for cid in plan.remain_ids:
-            if cid in src_rows:
-                prefer_for_source[cid] = dict(src_rows[cid])
-        rebuild_db_from_outputs(
-            root, plan.remain_ids, prefer_existing_rows=prefer_for_source
-        )
-        write_global_state_from_db_only(root)
+    # retry subset
+    src_retry, src_quarantine, _, _ = _load_retry_state(root)
+    dst_retry = {cid: src_retry.get(cid) for cid in chosen if cid in src_retry}
+    dst_quarantine = {
+        cid: src_quarantine.get(cid) for cid in chosen if cid in src_quarantine
+    }
+    write_retry_state(bundle_root, dst_retry, dst_quarantine)
 
-    else:
-        # copy mode: source unchanged; still refresh global state file to reflect DB as-is
-        write_global_state_from_db_only(root)
+    # ledger subset
+    ledger_kept = 0
+    if include_ledger:
+        dst_ledger = _target_ledger_path(bundle_root)
+        for lp in _ledger_paths(root):
+            ledger_kept += filter_ledger_lines(lp, dst_ledger, chosen_set)
 
-    return report
+    # scrub from source db/retry if move
+    if move_dirs:
+        delete_company_rows(crawl_db_path(root), chosen)
+
+        new_retry = {k: v for k, v in src_retry.items() if str(k) not in chosen_set}
+        new_quarantine = {
+            k: v for k, v in src_quarantine.items() if str(k) not in chosen_set
+        }
+        write_retry_state(root, new_retry, new_quarantine)
+
+    # global state refresh
+    write_global_state_from_db_only(bundle_root, pretty=False)
+    write_global_state_from_db_only(root, pretty=False)
+
+    return {
+        "cmd": "split",
+        "dry_run": False,
+        "plan": plan,
+        "outputs": {
+            "remaining_dataset_out": str(remaining_dataset_out),
+            "moved_dataset_out": str(moved_dataset_out),
+            "bundle_moved_dataset_copy": str(bundle_root / moved_dataset_out.name),
+        },
+        "bundle": {
+            "moved_company_dirs": moved_company_dirs,
+            "ledger_lines_copied": ledger_kept,
+        },
+    }
 
 
 def merge_run_roots(
     *,
     target_root: Path,
     source_roots: Sequence[Path],
-    move_mode: str,  # "move" or "copy"
-    include_ledger: bool,
-    dry_run: bool,
+    move_mode: str = "copy",  # copy|move
+    include_ledger: bool = False,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
-    target_root = target_root.resolve()
-    srcs = [Path(p).resolve() for p in source_roots]
+    """
+    Merge multiple run roots into one target root.
 
-    report: Dict[str, Any] = {
-        "target_root": str(target_root),
-        "sources": [str(s) for s in srcs],
-        "move_mode": move_mode,
-    }
+    Returns a JSON-serializable dict (printed by CLI).
+    """
+    target_root = Path(target_root)
+    srcs = [Path(s) for s in source_roots]
+    if move_mode not in ("move", "copy"):
+        raise ValueError("--move-mode must be move or copy")
+    if not srcs:
+        raise ValueError("--source-roots requires at least one path")
+
+    for s in srcs:
+        _validate_run_root(s)
 
     if dry_run:
-        return report
+        return {
+            "cmd": "merge",
+            "dry_run": True,
+            "target_root": str(target_root),
+            "source_roots": [str(s) for s in srcs],
+            "move_mode": move_mode,
+            "include_ledger": bool(include_ledger),
+        }
 
     target_root.mkdir(parents=True, exist_ok=True)
-    do_move = move_mode.strip().lower() == "move"
+    ensure_db_initialized(crawl_db_path(target_root))
 
-    all_company_ids: Set[str] = set()
-    prefer_rows: Dict[str, Dict[str, Any]] = {}
+    # load existing target DB state
+    tgt_db = crawl_db_path(target_root)
+    tgt_companies = read_companies_rows(tgt_db)
+    tgt_runs = read_runs_rows(tgt_db)
+    tgt_done = read_run_company_done_rows(tgt_db)
 
-    # 1) Merge company dirs; collect prefer rows from source DBs
-    per_source_ids: Dict[Path, List[str]] = {}
-    for src_root in srcs:
-        rows = read_companies_rows(crawl_db_path(src_root))
-        ids = list(rows.keys())
-        per_source_ids[src_root] = ids
+    merged_company_ids: Set[str] = set()
+    ledger_appended = 0
 
-        for cid, r in rows.items():
-            all_company_ids.add(cid)
-            if cid not in prefer_rows:
-                prefer_rows[cid] = dict(r)
+    for sroot in srcs:
+        sdb = crawl_db_path(sroot)
+        src_companies = read_companies_rows(sdb)
+
+        # 1) company dirs + url_index merge
+        for cid in src_companies.keys():
+            sdir = find_company_dir(sroot, cid)
+            if sdir is None:
+                logger.warning(
+                    "Source company dir missing: root=%s company_id=%s", sroot, cid
+                )
+                continue
+            ddir = expected_company_dir(target_root, cid)
+            sync_tree(sdir, ddir, move=(move_mode == "move"), merge=True)
+            merged_company_ids.add(cid)
+
+        # 2) merge DB companies rows (prefer better)
+        for cid, row in src_companies.items():
+            if cid not in tgt_companies:
+                tgt_companies[cid] = row
             else:
-                cur = prefer_rows[cid]
-                # Preserve first non-empty for these fields.
-                for k in (
-                    "name",
-                    "root_url",
-                    "industry",
-                    "nace",
-                    "industry_label",
-                    "industry_source",
-                    "done_reason",
-                    "done_details",
-                    "done_at",
-                    "last_error",
-                    "status",
-                    "created_at",
-                ):
-                    _prefer_non_empty(cur, r, k)
+                tgt_companies[cid] = _pick_better_company_row(tgt_companies[cid], row)
 
-        for cid in ids:
-            src_dir = find_company_dir(src_root, cid)
-            if src_dir is None:
-                continue
-            dst_dir = expected_company_dir(target_root, cid)
-            sync_tree(src_dir, dst_dir, move=do_move, merge=True)
+        # 3) union runs + done rows
+        tgt_runs.extend(read_runs_rows(sdb))
+        tgt_done.extend(read_run_company_done_rows(sdb))
 
-    report["company_ids_merged"] = len(all_company_ids)
+        # 4) merge retry/quarantine
+        src_retry, src_quarantine, _, _ = _load_retry_state(sroot)
+        tgt_retry, tgt_quarantine, _, _ = _load_retry_state(target_root)
+        merged_retry = merge_retry_states(tgt_retry, src_retry)
+        merged_quarantine = merge_quarantine(tgt_quarantine, src_quarantine)
+        write_retry_state(target_root, merged_retry, merged_quarantine)
 
-    # 2) Merge retry state (and optionally ledgers)
-    merged_state: Dict[str, Any] = {}
-    merged_q: Dict[str, Any] = {}
-    ledgers_to_append: List[Path] = []
+        # 5) ledger
+        if include_ledger:
+            dst_ledger = _target_ledger_path(target_root)
+            for lp in _ledger_paths(sroot):
+                ledger_appended += append_ledger_all(lp, dst_ledger)
 
-    for src_root in srcs:
-        st, q, _, _, lp = _load_retry_state(src_root)
-        merged_state = merge_retry_states(merged_state, st)
-        merged_q = merge_quarantine(merged_q, q)
-        if include_ledger and lp.exists():
-            ledgers_to_append.append(lp)
+        # 6) scrub source root db/retry (if move-mode move)
+        if move_mode == "move":
+            delete_company_rows(sdb, list(src_companies.keys()))
+            write_retry_state(sroot, {}, {})
+            write_global_state_from_db_only(sroot, pretty=False)
 
-    write_retry_state(target_root, merged_state, merged_q)
+    # write merged DB
+    write_companies_rows(tgt_db, tgt_companies)
 
-    if include_ledger and ledgers_to_append:
-        out_ledger = retry_dir(target_root) / LEDGER_NAME
-        out_ledger.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_ledger, "a", encoding="utf-8", newline="") as out:
-            for lp in ledgers_to_append:
-                with open(lp, "r", encoding="utf-8", errors="ignore") as f:
-                    shutil.copyfileobj(f, out)
+    # de-dupe runs and done rows by primary keys using INSERT OR IGNORE semantics
+    write_runs_rows(tgt_db, tgt_runs)
+    write_run_company_done_rows(tgt_db, tgt_done)
 
-    # 3) Rebuild target DB from merged outputs (authoritative)
-    rebuild_db_from_outputs(
-        target_root, sorted(all_company_ids), prefer_existing_rows=prefer_rows
-    )
-    write_global_state_from_db_only(target_root)
+    # final global state
+    write_global_state_from_db_only(target_root, pretty=False)
 
-    # 4) If move, also scrub moved IDs from each source DB/retry and refresh source global state
-    if do_move:
-        for src_root in srcs:
-            moved_ids = per_source_ids.get(src_root, [])
-            if not moved_ids:
-                continue
+    return {
+        "cmd": "merge",
+        "dry_run": False,
+        "target_root": str(target_root),
+        "source_roots": [str(s) for s in srcs],
+        "move_mode": move_mode,
+        "include_ledger": bool(include_ledger),
+        "merged_company_ids": len(merged_company_ids),
+        "ledger_lines_appended": ledger_appended,
+    }
 
-            # Retry state: remove moved IDs
-            st, q, _, _, _ = _load_retry_state(src_root)
-            st2 = {cid: v for cid, v in st.items() if cid not in set(moved_ids)}
-            q2 = {cid: v for cid, v in q.items() if cid not in set(moved_ids)}
-            write_retry_state(src_root, st2, q2)
 
-            # DB: rebuild from remaining company dirs by scanning remaining ids in db after deletion.
-            src_db = crawl_db_path(src_root)
-            delete_company_rows(src_db, moved_ids)
-            remaining_rows = read_companies_rows(src_db)
-            rebuild_db_from_outputs(
-                src_root,
-                sorted(remaining_rows.keys()),
-                prefer_existing_rows=remaining_rows,
-            )
-            write_global_state_from_db_only(src_root)
-
-    return report
+__all__ = [
+    # tables
+    "Table",
+    "read_table_preserve",
+    "write_table_preserve",
+    "merge_tables_dedupe",
+    "split_table_by_ids",
+    "group_rows_by_company_id",
+    # statuses
+    "IN_PROGRESS_STATUSES",
+    "DONE_STATUSES",
+    # roots
+    "crawl_db_path",
+    "global_state_path",
+    "find_company_dir",
+    "expected_company_dir",
+    "write_global_state_from_db_only",
+    # workflows
+    "split_run_root",
+    "merge_run_roots",
+]
