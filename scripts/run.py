@@ -10,7 +10,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import urlparse
 
 from crawl4ai import CacheMode
@@ -124,8 +124,6 @@ async def run_company_pipeline(
     company: Company,
     *,
     attempt_no: int,
-    total_unique: int,
-    done_counter: MutableMapping[str, int],
     logging_ext: LoggingExtension,
     state: CrawlState,
     guard: ConnectivityGuard,
@@ -235,11 +233,15 @@ async def run_company_pipeline(
             )
             return True
 
-        done_now = int(done_counter.get("done", 0))
+        # DB-derived progress (stable across concurrency + restarts).
+        done_db, total_db = await state.get_db_progress_counts(
+            llm_requested=do_llm_requested
+        )
+
         clog.info(
             "=== [done=%d/%d attempt=%d] company_id=%s url=%s industry_label=%s industry=%s nace=%s status=%s llm=%s llm_requested=%s has_ctx=%s ===",
-            done_now,
-            total_unique,
+            done_db,
+            total_db,
             attempt_no,
             company.company_id,
             company.domain_url,
@@ -1241,7 +1243,9 @@ async def main_async(args: argparse.Namespace) -> None:
         crawler_capacity_multiplier=int(args.crawler_capacity_multiplier),
         idle_recycle_interval_sec=float(args.idle_recycle_interval_sec),
         idle_recycle_raw_frac=float(args.idle_recycle_raw_frac),
-        idle_recycle_eff_frac=float(args.idle_recycle_eff_frac),
+        idle_recycle_eff_frac=float(args.idle_recycle_eff_frace)
+        if hasattr(args, "idle_recycle_eff_frace")
+        else float(args.idle_recycle_eff_frac),
     )
     scheduler = AdaptiveScheduler(
         cfg=sched_cfg,
@@ -1286,10 +1290,8 @@ async def main_async(args: argparse.Namespace) -> None:
             return False
 
         do_llm_requested = llm_requested(args, industry_llm_cache)
-
         if do_llm_requested:
             return st != COMPANY_STATUS_LLM_DONE
-
         return st != COMPANY_STATUS_MD_DONE
 
     pending_retry_ids = set(await retry_store.pending_ids(exclude_quarantined=True))
@@ -1391,9 +1393,6 @@ async def main_async(args: argparse.Namespace) -> None:
             resource_monitor.stop()
         return
 
-    done_counter: Dict[str, int] = {"done": 0}
-    total_unique = len(runnable_ids)
-
     cap = max(1, int(args.company_concurrency))
     mult = max(1, int(args.crawler_capacity_multiplier))
     free_crawlers_for_sched = max(
@@ -1451,8 +1450,6 @@ async def main_async(args: argparse.Namespace) -> None:
                     ok = False
 
                 scheduler.register_company_completed()
-                if ok:
-                    done_counter["done"] = int(done_counter["done"]) + 1
 
             with suppress(Exception):
                 await maybe_write_global_state()
@@ -1481,12 +1478,13 @@ async def main_async(args: argparse.Namespace) -> None:
                     if c is None:
                         continue
 
-                    async def _runner(company: Company) -> bool:
+                    # DB-backed attempt number (stable across restarts).
+                    attempt_no = await state.mark_company_attempt_started(run_id, cid)
+
+                    async def _runner(company: Company, attempt_no_: int) -> bool:
                         return await run_company_pipeline(
                             company,
-                            attempt_no=1,
-                            total_unique=total_unique,
-                            done_counter=done_counter,
+                            attempt_no=attempt_no_,
                             logging_ext=logging_ext,
                             state=state,
                             guard=guard,
@@ -1509,7 +1507,7 @@ async def main_async(args: argparse.Namespace) -> None:
                         )
 
                     inflight_by_cid[cid] = asyncio.create_task(
-                        _runner(c), name=f"company:{cid}"
+                        _runner(c, attempt_no), name=f"company:{cid}"
                     )
 
             if not inflight_by_cid and not scheduler.has_pending():

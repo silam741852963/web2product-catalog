@@ -355,7 +355,6 @@ def upsert_url_index_entry(company_id: str, url: str, patch: Dict[str, Any]) -> 
         ent = existing.get(url)
         ent_dict: Dict[str, Any] = dict(ent) if isinstance(ent, dict) else {}
 
-        # Enforce/repair identity at write-time (export-friendly)
         ent_dict.setdefault("company_id", company_id)
         ent_dict.setdefault("url", url)
         ent_dict.setdefault("created_at", _now_iso())
@@ -363,7 +362,6 @@ def upsert_url_index_entry(company_id: str, url: str, patch: Dict[str, Any]) -> 
         if isinstance(patch, dict):
             patch_dict = {k: v for k, v in patch.items() if v is not None}
 
-            # Enforce/repair again on incoming patch
             patch_dict.setdefault("company_id", company_id)
             patch_dict.setdefault("url", url)
             patch_dict.setdefault(
@@ -377,7 +375,6 @@ def upsert_url_index_entry(company_id: str, url: str, patch: Dict[str, Any]) -> 
         else:
             ent_dict["updated_at"] = _now_iso()
 
-        # Normalize + preserve unknown fields via UrlIndexEntry.extra
         normalized = UrlIndexEntry.from_dict(ent_dict, company_id=company_id, url=url)
         existing[url] = normalized.to_dict()
 
@@ -402,7 +399,6 @@ def patch_url_index_meta(company_id: str, patch: Dict[str, Any]) -> None:
         meta = existing.get(URL_INDEX_META_KEY)
         meta_dict: Dict[str, Any] = dict(meta) if isinstance(meta, dict) else {}
 
-        # Enforce/repair identity at write-time
         meta_dict.setdefault("company_id", company_id)
         meta_dict.setdefault("created_at", _now_iso())
 
@@ -705,6 +701,18 @@ class CrawlState:
             """
         )
 
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS run_company_attempts (
+                run_id TEXT NOT NULL,
+                company_id TEXT NOT NULL,
+                attempt_no INTEGER NOT NULL,
+                started_at TEXT,
+                PRIMARY KEY (run_id, company_id, attempt_no)
+            )
+            """
+        )
+
         self._ensure_columns_locked()
 
     def _ensure_columns_locked(self) -> None:
@@ -808,6 +816,61 @@ class CrawlState:
             COMPANY_STATUS_MD_NOT_DONE,
             COMPANY_STATUS_LLM_NOT_DONE,
         )
+
+    @staticmethod
+    def _done_statuses_for_progress(*, llm_requested: bool) -> Tuple[str, ...]:
+        if llm_requested:
+            return (COMPANY_STATUS_LLM_DONE, COMPANY_STATUS_TERMINAL_DONE)
+        return (
+            COMPANY_STATUS_MD_DONE,
+            COMPANY_STATUS_LLM_DONE,
+            COMPANY_STATUS_TERMINAL_DONE,
+        )
+
+    async def get_db_progress_counts(self, *, llm_requested: bool) -> Tuple[int, int]:
+        done_sts = self._done_statuses_for_progress(llm_requested=llm_requested)
+        placeholders = ",".join("?" for _ in done_sts)
+
+        def _run() -> Tuple[int, int]:
+            with self._lock:
+                total_row = self._conn.execute(
+                    "SELECT COUNT(*) AS c FROM companies"
+                ).fetchone()
+                done_row = self._conn.execute(
+                    f"SELECT COUNT(*) AS c FROM companies WHERE status IN ({placeholders})",
+                    tuple(done_sts),
+                ).fetchone()
+            total = int(total_row["c"] or 0) if total_row is not None else 0
+            done = int(done_row["c"] or 0) if done_row is not None else 0
+            return done, total
+
+        return await asyncio.to_thread(_run)
+
+    async def mark_company_attempt_started(self, run_id: str, company_id: str) -> int:
+        now = _now_iso()
+
+        def _run() -> int:
+            with self._lock:
+                prev_row = self._conn.execute(
+                    """
+                    SELECT COALESCE(MAX(attempt_no), 0) AS m
+                      FROM run_company_attempts
+                     WHERE run_id=? AND company_id=?
+                    """,
+                    (run_id, company_id),
+                ).fetchone()
+                prev = int(prev_row["m"] or 0) if prev_row is not None else 0
+                attempt_no = prev + 1
+                self._conn.execute(
+                    """
+                    INSERT INTO run_company_attempts (run_id, company_id, attempt_no, started_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (run_id, company_id, attempt_no, now),
+                )
+                return attempt_no
+
+        return await asyncio.to_thread(_run)
 
     def _row_to_company(self, row: sqlite3.Row) -> Company:
         md: Dict[str, Any] = {}
