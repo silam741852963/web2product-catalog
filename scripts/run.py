@@ -919,7 +919,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--dataset-file", type=str, default=None)
 
-    p.add_argument("--company-concurrency", type=int, default=8)
+    p.add_argument("--company-concurrency", type=int, default=12)
     p.add_argument("--llm-concurrency", type=int, default=4)
     p.add_argument("--max-pages", type=int, default=100)
     p.add_argument("--page-timeout-ms", type=int, default=30000)
@@ -978,7 +978,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     p.add_argument("--page-queue-maxsize", type=int, default=32)
     p.add_argument("--url-index-queue-maxsize", type=int, default=1024)
 
-    p.add_argument("--crawler-pool-size", type=int, default=4)
+    p.add_argument("--crawler-pool-size", type=int, default=6)
     p.add_argument("--crawler-recycle-after", type=int, default=12)
 
     p.add_argument("--max-start-per-tick", type=int, default=3)
@@ -1243,9 +1243,7 @@ async def main_async(args: argparse.Namespace) -> None:
         crawler_capacity_multiplier=int(args.crawler_capacity_multiplier),
         idle_recycle_interval_sec=float(args.idle_recycle_interval_sec),
         idle_recycle_raw_frac=float(args.idle_recycle_raw_frac),
-        idle_recycle_eff_frac=float(args.idle_recycle_eff_frace)
-        if hasattr(args, "idle_recycle_eff_frace")
-        else float(args.idle_recycle_eff_frac),
+        idle_recycle_eff_frac=float(args.idle_recycle_eff_frac),
     )
     scheduler = AdaptiveScheduler(
         cfg=sched_cfg,
