@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "web2product-catalog-scripts"
-version = "0.10.3"
+version = "0.11.1"
 description = "Web2Product catalog scripts (configs/extensions/cli)"
 readme = "README.md"
-requires-python = "==3.13.11"
+requires-python = ">=3.10,<3.14"
 dynamic = ["dependencies"]
 
 [tool.setuptools]
