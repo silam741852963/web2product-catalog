@@ -67,6 +67,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p_split.add_argument("--include-ledger", action="store_true")
     p_split.add_argument("--dry-run", action="store_true")
 
+    # Concurrency
+    p_split.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Thread workers for syncing company directories (0 = auto).",
+    )
+
     # ------------------------------------------------------------
     # merge
     # ------------------------------------------------------------
@@ -78,6 +86,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     p_merge.add_argument("--move-mode", choices=["copy", "move"], default="copy")
     p_merge.add_argument("--include-ledger", action="store_true")
     p_merge.add_argument("--dry-run", action="store_true")
+
+    # Concurrency
+    p_merge.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Thread workers for syncing company directories per source root (0 = auto).",
+    )
 
     # ------------------------------------------------------------
     # merge-csv
@@ -106,6 +122,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             move_mode=str(args.move_mode),
             include_ledger=bool(args.include_ledger),
             dry_run=bool(args.dry_run),
+            workers=int(args.workers),
         )
         _dump_json(res)
         return
@@ -117,6 +134,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             move_mode=str(args.move_mode),
             include_ledger=bool(args.include_ledger),
             dry_run=bool(args.dry_run),
+            workers=int(args.workers),
         )
         _dump_json(res)
         return

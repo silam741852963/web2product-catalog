@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 from pydantic import ValidationError
 
-from .schema import (
+from configs.llm.schema import (
     Offering,
     ExtractionPayload,
     PresencePayload,

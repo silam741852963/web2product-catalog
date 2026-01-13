@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,6 +26,21 @@ try:
 except Exception:
     tiktoken = None  # type: ignore
 
+# --------------------------------------------------------------------------- #
+# Canonical models + paths
+# --------------------------------------------------------------------------- #
+
+from configs.models import (
+    COMPANY_STATUS_TERMINAL_DONE,
+    URL_INDEX_META_KEY,
+    Company,
+    UrlIndexEntry,
+)
+
+from extensions.io.output_paths import (
+    ensure_output_root,
+    sanitize_bvdid,
+)
 
 # --------------------------------------------------------------------------- #
 # UTC timestamp helper
@@ -52,7 +68,6 @@ STATUS_MISSING = "missing_status"
 DB_MISSING = "missing_db"
 META_MISSING = "missing_crawl_meta"
 
-URL_INDEX_META_KEY = "__meta__"
 URL_INDEX_RESERVED_PREFIX = "__"
 
 
@@ -64,6 +79,16 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except Exception:
         return float(default)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return int(default)
 
 
 def _env_str(name: str, default: str) -> str:
@@ -129,6 +154,16 @@ def _to_int_if_nat(x: Any) -> Any:
     return int(float(x)) if _is_nat_number(x) else x
 
 
+def _default_workers() -> int:
+    """
+    IO-heavy workload (many small file reads). Default to a moderate number.
+    Override with --workers or ANALYZE_WORKERS.
+    """
+    cpu = os.cpu_count() or 4
+    # Keep it sane: IO parallelism helps, but too many threads can thrash disk.
+    return int(min(64, max(4, cpu * 2)))
+
+
 # --------------------------------------------------------------------------- #
 # Token counter (tiktoken if available; otherwise approx)
 # --------------------------------------------------------------------------- #
@@ -139,6 +174,7 @@ class TokenCounter:
         self.mode = _env_str("ANALYZE_TOKENIZER", "tiktoken").strip().lower()
         self._enc = None
         self._cache: Dict[str, Tuple[int, int]] = {}  # path -> (mtime_ns, tokens)
+        self._lock = threading.Lock()
 
         if self.mode == "tiktoken" and tiktoken is not None:
             try:
@@ -164,9 +200,10 @@ class TokenCounter:
         key = path.resolve().as_posix()
         mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
 
-        cached = self._cache.get(key)
-        if cached and cached[0] == mtime_ns:
-            return cached[1]
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached and cached[0] == mtime_ns:
+                return cached[1]
 
         try:
             txt = path.read_text(encoding="utf-8", errors="ignore")
@@ -174,12 +211,13 @@ class TokenCounter:
             txt = ""
 
         tokens = self.count_text(txt)
-        self._cache[key] = (mtime_ns, tokens)
+        with self._lock:
+            self._cache[key] = (mtime_ns, tokens)
         return tokens
 
 
 # --------------------------------------------------------------------------- #
-# URL status heuristics (match extensions.crawl.state.py)
+# URL status heuristics (match crawl.state.py intent, prefer explicit flags)
 # --------------------------------------------------------------------------- #
 
 _MARKDOWN_COMPLETE_STATUSES = {
@@ -192,10 +230,10 @@ _MARKDOWN_COMPLETE_STATUSES = {
 }
 
 _LLM_COMPLETE_STATUSES = {
+    "llm_done",
     "llm_extracted",
     "llm_extracted_empty",
     "llm_full_extracted",
-    "llm_done",
     "extracted",
     "product_saved",
     "products_saved",
@@ -208,23 +246,37 @@ def _status_has_any(s: str, needles: Tuple[str, ...]) -> bool:
     return any(n in s for n in needles)
 
 
-def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
+def _classify_url_entry(
+    ent_raw: Dict[str, Any], *, company_id: str, url: str
+) -> Tuple[bool, bool]:
     """
-    Return (markdown_done, llm_done) with the same tolerant heuristics as crawl.state.py.
-    """
-    status = str(ent.get("status") or "").strip().lower()
+    Return (markdown_done, llm_done) using:
+      1) explicit boolean flags if present (markdown_done / llm_done),
+      2) artifact presence,
+      3) tolerant status heuristics.
 
-    has_md_path = bool(ent.get("markdown_path") or ent.get("md_path"))
+    This stays compatible with older url_index payloads while aligning to configs.models.UrlIndexEntry.
+    """
+    ent = UrlIndexEntry.from_dict(ent_raw or {}, company_id=company_id, url=url)
+
+    # 1) explicit flags win if present
+    if ent.markdown_done is True and ent.llm_done is True:
+        return True, True
+    if ent.llm_done is True:
+        return True, True  # llm implies markdown
+    if ent.markdown_done is True and ent.llm_done is False:
+        return True, False
+    if ent.markdown_done is False and ent.llm_done is False:
+        return False, False
+
+    # 2) artifact presence
+    has_md_path = bool(ent.markdown_path)
     has_llm_artifact = bool(
-        ent.get("json_path")
-        or ent.get("product_path")
-        or ent.get("products_path")
-        or ent.get("llm_json_path")
-        or ent.get("extraction_path")
+        ent.json_path or ent.product_path or ent.products_path or ent.extraction_path
     )
 
-    presence_checked = bool(ent.get("presence_checked") or ent.get("presence_done"))
-    extracted_flag = bool(ent.get("extracted") or ent.get("llm_extracted"))
+    # 3) tolerant status
+    status = str(ent.status or "").strip().lower()
 
     status_md_done = (
         status in _MARKDOWN_COMPLETE_STATUSES
@@ -256,12 +308,13 @@ def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
     )
 
     markdown_done = bool(has_md_path or status_md_done)
-    if has_llm_artifact or extracted_flag or status_llm_done or presence_checked:
+    if has_llm_artifact:
         markdown_done = True
 
-    llm_done = bool(
-        extracted_flag or has_llm_artifact or status_llm_done or presence_checked
-    )
+    llm_done = bool(has_llm_artifact or status_llm_done)
+    if llm_done:
+        markdown_done = True
+
     return markdown_done, llm_done
 
 
@@ -310,7 +363,7 @@ def _categorize_status_code(code: Optional[int]) -> Tuple[str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# DB helpers (crawl_state.sqlite3)
+# DB helpers (crawl_state.sqlite3) - NEW schema (company_id, metadata_json, ...)
 # --------------------------------------------------------------------------- #
 
 
@@ -333,7 +386,7 @@ def _db_companies(
     if company_ids:
         placeholders = ",".join("?" for _ in company_ids)
         rows = conn.execute(
-            f"SELECT * FROM companies WHERE bvdid IN ({placeholders})",
+            f"SELECT * FROM companies WHERE company_id IN ({placeholders})",
             tuple(company_ids),
         ).fetchall()
     else:
@@ -341,8 +394,64 @@ def _db_companies(
     return [dict(r) for r in rows]
 
 
+def _company_from_db_row(row: Dict[str, Any]) -> Company:
+    """
+    Build configs.models.Company from a DB row in the NEW schema.
+    """
+    md = _safe_json_load(row.get("metadata_json")) or {}
+    c = Company.from_input(
+        company_id=str(row.get("company_id") or ""),
+        root_url=str(row.get("root_url") or ""),
+        name=(str(row.get("name")) if row.get("name") is not None else None),
+        metadata=md,
+    )
+
+    snap: Dict[str, Any] = {
+        "company_id": row.get("company_id"),
+        "root_url": row.get("root_url"),
+        "name": row.get("name"),
+        "industry": row.get("industry"),
+        "nace": row.get("nace"),
+        "industry_label": row.get("industry_label"),
+        "industry_label_source": row.get("industry_label_source"),
+        "status": row.get("status"),
+        "crawl_finished": row.get("crawl_finished"),
+        "urls_total": row.get("urls_total"),
+        "urls_markdown_done": row.get("urls_markdown_done"),
+        "urls_llm_done": row.get("urls_llm_done"),
+        "last_error": row.get("last_error"),
+        "done_reason": row.get("done_reason"),
+        "done_details": _safe_json_load(row.get("done_details")),
+        "done_at": row.get("done_at"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "last_crawled_at": row.get("last_crawled_at"),
+        "max_pages": row.get("max_pages"),
+        # retry fields
+        "retry_cls": row.get("retry_cls"),
+        "retry_attempts": row.get("retry_attempts"),
+        "retry_next_eligible_at": row.get("retry_next_eligible_at"),
+        "retry_updated_at": row.get("retry_updated_at"),
+        "retry_last_error": row.get("retry_last_error"),
+        "retry_last_stage": row.get("retry_last_stage"),
+        "retry_net_attempts": row.get("retry_net_attempts"),
+        "retry_stall_attempts": row.get("retry_stall_attempts"),
+        "retry_mem_attempts": row.get("retry_mem_attempts"),
+        "retry_other_attempts": row.get("retry_other_attempts"),
+        "retry_mem_hits": row.get("retry_mem_hits"),
+        "retry_last_stall_kind": row.get("retry_last_stall_kind"),
+        "retry_last_progress_md_done": row.get("retry_last_progress_md_done"),
+        "retry_last_seen_md_done": row.get("retry_last_seen_md_done"),
+        "retry_last_error_sig": row.get("retry_last_error_sig"),
+        "retry_same_error_streak": row.get("retry_same_error_streak"),
+        "retry_last_error_sig_updated_at": row.get("retry_last_error_sig_updated_at"),
+    }
+    c.apply_snapshot_dict(snap)
+    return c.normalized()
+
+
 # --------------------------------------------------------------------------- #
-# Company profile parsing (outputs/<company_id>/company_profile.json + metadata/company_profile.md)
+# Company profile parsing
 # --------------------------------------------------------------------------- #
 
 
@@ -469,7 +578,7 @@ class CompanyRow:
     industry: int
     nace: int
     industry_label: str
-    industry_source: str
+    industry_label_source: str
 
     # db url stats
     urls_total: int
@@ -537,31 +646,24 @@ class CompanyRow:
     _url_index_path: str
     _db_path: str
 
+    # Multi-root
+    source_root: str = ""
+
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 # --------------------------------------------------------------------------- #
-# Filesystem discovery / loading
+# Filesystem discovery / loading (canonical output layout)
 # --------------------------------------------------------------------------- #
 
 
-def _fallback_sanitize_bvdid(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", (s or "").strip())
-
-
-def _company_dir_for(outputs_root: Path, bvdid: str) -> Path:
-    direct = (outputs_root / bvdid).resolve()
+def _company_dir_for(outputs_root: Path, company_id: str) -> Path:
+    direct = (outputs_root / company_id).resolve()
     if direct.exists():
         return direct
-    try:
-        from extensions.io.output_paths import sanitize_bvdid  # type: ignore
-
-        safe = sanitize_bvdid(bvdid)
-    except Exception:
-        safe = _fallback_sanitize_bvdid(bvdid)
-    alt = (outputs_root / safe).resolve()
-    return alt
+    safe = sanitize_bvdid(company_id)
+    return (outputs_root / safe).resolve()
 
 
 def discover_company_dirs(outputs_root: Path) -> List[Path]:
@@ -602,42 +704,43 @@ def _load_crawl_meta(company_dir: Path) -> Dict[str, Any]:
 def _row_from_db_company(
     outputs_root: Path,
     db_path: Path,
-    company: Dict[str, Any],
+    company: Company,
     tc: TokenCounter,
     *,
     cache_hit_rate: float,
     input_cost_hit_per_1m: float,
     input_cost_miss_per_1m: float,
     output_cost_per_1m: float,
+    source_root: str,
 ) -> CompanyRow:
-    bvdid = str(company.get("bvdid") or "")
-    company_dir = _company_dir_for(outputs_root, bvdid)
+    company_id = str(company.company_id or "")
+    company_dir = _company_dir_for(outputs_root, company_id)
 
     url_index = _load_url_index(company_dir)
     crawl_meta = _load_crawl_meta(company_dir)
 
-    name = str(company.get("name") or crawl_meta.get("company_name") or "")
-    root_url = str(company.get("root_url") or crawl_meta.get("root_url") or "")
-
-    status = str(company.get("status") or "").strip() or STATUS_MISSING
-
-    last_error = str(company.get("last_error") or "")
-    done_reason = str(company.get("done_reason") or "")
-    done_at = str(company.get("done_at") or "")
-
-    # Industry from DB (preferred)
-    industry = int(company.get("industry") or 0)
-    nace = int(company.get("nace") or 0)
-    industry_label = (
-        str(company.get("industry_label") or "Unclassified").strip() or "Unclassified"
+    name = str(
+        company.name or crawl_meta.get("name") or crawl_meta.get("company_name") or ""
     )
-    industry_source = str(company.get("industry_source") or "").strip()
+    root_url = str(company.root_url or crawl_meta.get("root_url") or "")
 
-    urls_total = int(company.get("urls_total") or 0)
-    urls_markdown_done = int(company.get("urls_markdown_done") or 0)
-    urls_llm_done = int(company.get("urls_llm_done") or 0)
+    status: str = str(company.status or "").strip() or STATUS_MISSING
 
-    # URL index aggregates
+    last_error = str(company.last_error or "")
+    done_reason = str(company.done_reason or "")
+    done_at = str(company.done_at or "")
+
+    industry = int(company.industry or 0)
+    nace = int(company.nace or 0)
+    industry_label = (
+        str(company.industry_label or "Unclassified").strip() or "Unclassified"
+    )
+    industry_label_source = str(company.industry_label_source or "").strip()
+
+    urls_total = int(company.urls_total or 0)
+    urls_markdown_done = int(company.urls_markdown_done or 0)
+    urls_llm_done = int(company.urls_llm_done or 0)
+
     url_count = 0
     url_status_ok = 0
     url_status_redirect = 0
@@ -666,9 +769,10 @@ def _row_from_db_company(
 
     if isinstance(url_index, dict) and url_index:
         for url_key, rec0 in url_index.items():
-            if _is_reserved_url_index_key(url_key):
+            if url_key == URL_INDEX_META_KEY or _is_reserved_url_index_key(url_key):
                 continue
 
+            url = str(url_key)
             rec = rec0 if isinstance(rec0, dict) else {}
             url_count += 1
 
@@ -695,36 +799,34 @@ def _row_from_db_company(
             elif gating_accept is False:
                 gating_accept_false += 1
 
-            presence_checked = bool(
-                rec.get("presence_checked") or rec.get("presence_done")
-            )
-            presence_val = rec.get("presence")
-            is_pos = False
-            if presence_val is True:
-                is_pos = True
-            elif isinstance(presence_val, (int, float)) and float(presence_val) > 0:
-                is_pos = True
-            elif isinstance(presence_val, str) and presence_val.strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "positive",
-            }:
-                is_pos = True
+            pres = rec.get("presence", 0)
+            try:
+                if isinstance(pres, bool):
+                    pres_int = 1 if pres else 0
+                elif isinstance(pres, (int, float)):
+                    pres_int = int(pres)
+                else:
+                    pres_int = int(float(str(pres).strip() or "0"))
+            except Exception:
+                pres_int = 0
 
-            if is_pos:
+            if pres_int > 0:
                 presence_positive += 1
             else:
-                presence_zero += (
-                    1 if presence_checked or True else 1
-                )  # keep bucket stable
+                presence_zero += 1
 
-            exv = rec.get("extracted") or rec.get("llm_extracted")
-            if exv is True:
-                extracted_positive += 1
-            elif isinstance(exv, (int, float)) and float(exv) > 0:
-                extracted_positive += 1
-            elif isinstance(exv, str) and exv.strip().lower() in {"1", "true", "yes"}:
+            exv = rec.get("extracted", 0)
+            try:
+                if isinstance(exv, bool):
+                    ex_int = 1 if exv else 0
+                elif isinstance(exv, (int, float)):
+                    ex_int = int(exv)
+                else:
+                    ex_int = int(float(str(exv).strip() or "0"))
+            except Exception:
+                ex_int = 0
+
+            if ex_int > 0:
                 extracted_positive += 1
             else:
                 extracted_zero += 1
@@ -746,17 +848,18 @@ def _row_from_db_company(
                 if w >= 0:
                     md_word_vals.append(w)
 
-            md_done, llm_done = _classify_url_entry(rec)
+            md_done, llm_done = _classify_url_entry(rec, company_id=company_id, url=url)
             if llm_done:
                 llm_done_pages += 1
 
-                mp = rec.get("markdown_path") or rec.get("md_path")
+                mp = rec.get("markdown_path")
                 mdp = _resolve_maybe(company_dir, mp) if isinstance(mp, str) else None
                 if mdp is None:
                     pp0 = (
                         rec.get("product_path")
                         or rec.get("json_path")
-                        or rec.get("llm_json_path")
+                        or rec.get("extraction_path")
+                        or rec.get("products_path")
                     )
                     ppp = (
                         _resolve_maybe(company_dir, pp0)
@@ -773,7 +876,6 @@ def _row_from_db_company(
                 pp = (
                     rec.get("product_path")
                     or rec.get("json_path")
-                    or rec.get("llm_json_path")
                     or rec.get("products_path")
                     or rec.get("extraction_path")
                 )
@@ -833,7 +935,7 @@ def _row_from_db_company(
     prof = _analyze_company_profile(company_dir, tc)
 
     return CompanyRow(
-        company_id=bvdid,
+        company_id=company_id,
         name=name,
         root_url=root_url,
         status=status,
@@ -843,7 +945,7 @@ def _row_from_db_company(
         industry=industry,
         nace=nace,
         industry_label=industry_label,
-        industry_source=industry_source,
+        industry_label_source=industry_label_source,
         urls_total=urls_total,
         urls_markdown_done=urls_markdown_done,
         urls_llm_done=urls_llm_done,
@@ -898,11 +1000,158 @@ def _row_from_db_company(
         _meta_path=str((company_dir / "metadata" / "crawl_meta.json").resolve()),
         _url_index_path=str((company_dir / "metadata" / "url_index.json").resolve()),
         _db_path=str(db_path.resolve()),
+        source_root=source_root,
     )
 
 
+# --------------------------------------------------------------------------- #
+# Global state helper (crawl_global_state.json)
+# --------------------------------------------------------------------------- #
+
+
+def _load_global_state(outputs_root: Path) -> Optional[Dict[str, Any]]:
+    path = outputs_root / "crawl_global_state.json"
+    obj = _load_json(path)
+    return obj if isinstance(obj, dict) else None
+
+
+def _print_global_state(outputs_root: Path) -> None:
+    gs = _load_global_state(outputs_root)
+    if not gs:
+        return
+
+    print("=" * 80)
+    print("Global crawl state (from crawl_global_state.json):")
+    print(f"  updated_at:                 {gs.get('updated_at')}")
+    print(f"  output_root:                {gs.get('output_root')}")
+    print(f"  db_path:                    {gs.get('db_path')}")
+    print(f"  total_companies:            {_to_int_if_nat(gs.get('total_companies'))}")
+    print(
+        f"  crawled_companies:          {_to_int_if_nat(gs.get('crawled_companies'))}"
+    )
+    print(
+        f"  crawl_finished_companies:   {_to_int_if_nat(gs.get('crawl_finished_companies'))}  ({gs.get('crawl_finished_pct')})"
+    )
+    print(
+        f"  md_done_companies:          {_to_int_if_nat(gs.get('md_done_companies'))}  ({gs.get('md_done_pct')})"
+    )
+    print(
+        f"  llm_done_companies:         {_to_int_if_nat(gs.get('llm_done_companies'))}  ({gs.get('llm_done_pct')})"
+    )
+    print(
+        f"  terminal_done_companies:    {_to_int_if_nat(gs.get('terminal_done_companies'))}"
+    )
+
+    by_status = gs.get("by_status") or {}
+    if isinstance(by_status, dict) and by_status:
+        print("  by_status: (showing up to 30)")
+        for i, (k, v) in enumerate(by_status.items()):
+            if i >= 30:
+                print(f"    ... ({len(by_status) - 30} more)")
+                break
+            print(f"    {k}: {_to_int_if_nat(v)}")
+
+    ids = gs.get("company_ids_sample") or {}
+    if isinstance(ids, dict) and ids:
+        print("  company_ids_sample:")
+        for k in ("pending", "in_progress", "done"):
+            v = ids.get(k)
+            if isinstance(v, list):
+                print(f"    {k}: {len(v)} sample(s)")
+
+    print(f"  urls_total_sum:             {_to_int_if_nat(gs.get('urls_total_sum'))}")
+    print(
+        f"  urls_markdown_done_sum:     {_to_int_if_nat(gs.get('urls_markdown_done_sum'))}"
+    )
+    print(
+        f"  urls_llm_done_sum:          {_to_int_if_nat(gs.get('urls_llm_done_sum'))}"
+    )
+
+    tdr = gs.get("terminal_done_reasons") or {}
+    if isinstance(tdr, dict) and tdr:
+        print("  terminal_done_reasons:")
+        for k, v in tdr.items():
+            print(f"    {k}: {_to_int_if_nat(v)}")
+
+    unknown = gs.get("unknown_statuses") or {}
+    if isinstance(unknown, dict) and unknown:
+        print("  unknown_statuses:")
+        for k, v in unknown.items():
+            print(f"    {k}: {_to_int_if_nat(v)}")
+
+    lr = gs.get("latest_run") or {}
+    if isinstance(lr, dict) and lr:
+        print("  latest_run:")
+        for k in (
+            "run_id",
+            "pipeline",
+            "version",
+            "args_hash",
+            "crawl4ai_cache_base_dir",
+            "crawl4ai_cache_mode",
+            "started_at",
+            "total_companies",
+            "completed_companies",
+            "last_company_id",
+            "last_updated",
+        ):
+            if k in lr:
+                print(f"    {k}: {lr.get(k)}")
+    print()
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency helpers
+# --------------------------------------------------------------------------- #
+
+
+def _map_concurrently(
+    items: List[Any],
+    fn,
+    *,
+    workers: int,
+    progress: bool,
+    progress_every: int = 250,
+) -> List[Any]:
+    if not items:
+        return []
+    if workers <= 1:
+        out: List[Any] = []
+        for i, it in enumerate(items, 1):
+            out.append(fn(it))
+            if progress and (i % progress_every == 0):
+                print(f"  progress: {i}/{len(items)}")
+        return out
+
+    out: List[Any] = []
+    with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+        futs = {ex.submit(fn, it): it for it in items}
+        done = 0
+        total = len(items)
+        for fut in as_completed(futs):
+            done += 1
+            try:
+                out.append(fut.result())
+            except Exception as e:
+                # fn should generally not throw (it should return error-row),
+                # but keep this as a last line of defense.
+                out.append({"status": "analyze_error", "_error": str(e)})
+            if progress and (done % progress_every == 0 or done == total):
+                print(f"  progress: {done}/{total}")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Data collection (single root + multi-root)
+# --------------------------------------------------------------------------- #
+
+
 def collect_dataframe(
-    outputs_root: Path, company_ids: Optional[List[str]] = None
+    outputs_root: Path,
+    company_ids: Optional[List[str]] = None,
+    *,
+    workers: int = 1,
+    progress: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     tc = TokenCounter()
 
@@ -917,7 +1166,6 @@ def collect_dataframe(
         "ANALYZE_OUTPUT_COST_PER_1M", DEFAULT_OUTPUT_COST_PER_1M
     )
 
-    # Prefer global state's db_path if present (new format)
     gs = _load_global_state(outputs_root)
     db_path = None
     if isinstance(gs, dict):
@@ -932,6 +1180,7 @@ def collect_dataframe(
         "outputs_root": str(outputs_root.resolve()),
         "db_path": str(db_path),
         "tokenizer_mode": tc.mode,
+        "workers": int(workers),
         "cache_hit_rate": float(min(max(cache_hit_rate, 0.0), 1.0)),
         "pricing_usd_per_1m": {
             "input_cache_hit": float(input_cost_hit_per_1m),
@@ -948,22 +1197,25 @@ def collect_dataframe(
                 "ANALYZE_INPUT_COST_PER_1M_CACHE_MISS"
             ),
             "ANALYZE_OUTPUT_COST_PER_1M": os.getenv("ANALYZE_OUTPUT_COST_PER_1M"),
+            "ANALYZE_WORKERS": os.getenv("ANALYZE_WORKERS"),
         },
         "global_state": gs,
     }
 
     rows: List[Dict[str, Any]] = []
+    source_root = str(outputs_root.resolve())
 
     if db_path.exists():
         conn = _open_db(db_path)
         try:
             run_cfg["latest_run"] = _db_latest_run(conn)
-            companies = _db_companies(conn, company_ids)
+            companies_raw = _db_companies(conn, company_ids)
         finally:
             conn.close()
 
-        for c in companies:
+        def _one_db_row(r: Dict[str, Any]) -> Dict[str, Any]:
             try:
+                c = _company_from_db_row(r)
                 row = _row_from_db_company(
                     outputs_root,
                     db_path,
@@ -973,28 +1225,34 @@ def collect_dataframe(
                     input_cost_hit_per_1m=input_cost_hit_per_1m,
                     input_cost_miss_per_1m=input_cost_miss_per_1m,
                     output_cost_per_1m=output_cost_per_1m,
+                    source_root=source_root,
                 )
-                rows.append(row.as_dict())
+                return row.as_dict()
             except Exception as e:
-                bvdid = str(c.get("bvdid") or "")
-                cdir = _company_dir_for(outputs_root, bvdid)
-                rows.append(
-                    {
-                        "company_id": bvdid or cdir.name,
-                        "name": str(c.get("name") or ""),
-                        "root_url": str(c.get("root_url") or ""),
-                        "status": "analyze_error",
-                        "industry": int(c.get("industry") or 0),
-                        "nace": int(c.get("nace") or 0),
-                        "industry_label": str(
-                            c.get("industry_label") or "Unclassified"
-                        ),
-                        "industry_source": str(c.get("industry_source") or ""),
-                        "_company_dir": str(cdir.resolve()),
-                        "_db_path": str(db_path),
-                        "_error": str(e),
-                    }
-                )
+                cid = str(r.get("company_id") or "")
+                cdir = _company_dir_for(outputs_root, cid or "UNKNOWN")
+                return {
+                    "company_id": cid or cdir.name,
+                    "name": str(r.get("name") or ""),
+                    "root_url": str(r.get("root_url") or ""),
+                    "status": "analyze_error",
+                    "industry": int(r.get("industry") or 0),
+                    "nace": int(r.get("nace") or 0),
+                    "industry_label": str(r.get("industry_label") or "Unclassified"),
+                    "industry_label_source": str(r.get("industry_label_source") or ""),
+                    "_company_dir": str(cdir.resolve()),
+                    "_db_path": str(db_path),
+                    "_error": str(e),
+                    "source_root": source_root,
+                }
+
+        rows = _map_concurrently(
+            companies_raw,
+            _one_db_row,
+            workers=int(workers),
+            progress=bool(progress),
+            progress_every=250,
+        )
     else:
         run_cfg["latest_run"] = None
         run_cfg["db_missing"] = True
@@ -1006,29 +1264,37 @@ def collect_dataframe(
         )
         company_dirs = [d for d in company_dirs if d.exists() and d.is_dir()]
 
-        for cdir in company_dirs:
+        def _one_fs_dir(cdir: Path) -> Dict[str, Any]:
             crawl = _load_crawl_meta(cdir) or {}
-            bvdid = str(crawl.get("company_id") or cdir.name)
-            rows.append(
-                {
-                    "company_id": bvdid,
-                    "name": str(crawl.get("company_name") or ""),
-                    "root_url": str(crawl.get("root_url") or ""),
-                    "status": DB_MISSING,
-                    "industry": int(_to_int_if_nat(crawl.get("industry") or 0)),
-                    "nace": int(_to_int_if_nat(crawl.get("nace") or 0)),
-                    "industry_label": str(
-                        crawl.get("industry_label") or "Unclassified"
-                    ),
-                    "industry_source": str(crawl.get("industry_source") or ""),
-                    "_company_dir": str(cdir.resolve()),
-                    "_db_path": str(db_path),
-                }
-            )
+            cid = str(crawl.get("company_id") or cdir.name)
+            return {
+                "company_id": cid,
+                "name": str(crawl.get("name") or crawl.get("company_name") or ""),
+                "root_url": str(crawl.get("root_url") or ""),
+                "status": DB_MISSING,
+                "industry": int(_to_int_if_nat(crawl.get("industry") or 0)),
+                "nace": int(_to_int_if_nat(crawl.get("nace") or 0)),
+                "industry_label": str(crawl.get("industry_label") or "Unclassified"),
+                "industry_label_source": str(
+                    crawl.get("industry_label_source")
+                    or crawl.get("industry_source")
+                    or ""
+                ),
+                "_company_dir": str(cdir.resolve()),
+                "_db_path": str(db_path),
+                "source_root": source_root,
+            }
+
+        rows = _map_concurrently(
+            company_dirs,
+            _one_fs_dir,
+            workers=int(workers),
+            progress=bool(progress),
+            progress_every=500,
+        )
 
     df = pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    # Robust numeric conversion
     numeric_candidates = [
         c
         for c in df.columns
@@ -1044,6 +1310,74 @@ def collect_dataframe(
             except Exception:
                 pass
 
+    if "company_id" in df.columns and "source_root" in df.columns:
+        try:
+            df = df.sort_values(["source_root", "company_id"], ascending=[True, True])
+        except Exception:
+            pass
+
+    return df, run_cfg
+
+
+def collect_dataframe_multi(
+    outputs_roots: List[Path],
+    company_ids: Optional[List[str]] = None,
+    *,
+    workers: int = 1,
+    progress: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Analyze multiple output roots (e.g., 5 source roots) and return one combined DataFrame.
+    Uses the SAME worker count per-root; for many roots, consider lowering workers.
+    """
+    per_root_cfg: List[Dict[str, Any]] = []
+    dfs: List[pd.DataFrame] = []
+
+    for i, root in enumerate(outputs_roots, 1):
+        if progress:
+            print("=" * 80)
+            print(f"[{i}/{len(outputs_roots)}] Collecting: {root}")
+        df_i, cfg_i = collect_dataframe(
+            root,
+            company_ids=company_ids,
+            workers=workers,
+            progress=progress,
+        )
+        per_root_cfg.append(cfg_i)
+        if df_i is not None and not df_i.empty:
+            dfs.append(df_i)
+
+    if dfs:
+        df = pd.concat(dfs, ignore_index=True)
+    else:
+        df = pd.DataFrame()
+
+    run_cfg: Dict[str, Any] = {
+        "generated_at": _utc_iso_z(),
+        "outputs_roots": [str(r.resolve()) for r in outputs_roots],
+        "roots_count": int(len(outputs_roots)),
+        "workers": int(workers),
+        "per_root": per_root_cfg,
+        # For compatibility with downstream code paths
+        "outputs_root": str(outputs_roots[0].resolve()) if outputs_roots else "",
+        "db_path": "",
+        "latest_run": None,
+        "tokenizer_mode": per_root_cfg[0].get("tokenizer_mode")
+        if per_root_cfg
+        else "approx",
+        "cache_hit_rate": per_root_cfg[0].get("cache_hit_rate")
+        if per_root_cfg
+        else DEFAULT_CACHE_HIT_RATE,
+        "pricing_usd_per_1m": per_root_cfg[0].get("pricing_usd_per_1m")
+        if per_root_cfg
+        else {
+            "input_cache_hit": DEFAULT_INPUT_COST_PER_1M_CACHE_HIT,
+            "input_cache_miss": DEFAULT_INPUT_COST_PER_1M_CACHE_MISS,
+            "output": DEFAULT_OUTPUT_COST_PER_1M,
+        },
+        "env_overrides": per_root_cfg[0].get("env_overrides") if per_root_cfg else {},
+        "global_state": None,
+    }
     return df, run_cfg
 
 
@@ -1154,7 +1488,9 @@ def compute_summary(df: pd.DataFrame, run_cfg: Dict[str, Any]) -> Dict[str, Any]
         tmp = df.copy()
         tmp["status"] = tmp["status"].fillna("").astype(str)
         tmp["done_reason"] = tmp["done_reason"].fillna("").astype(str)
-        term = tmp[tmp["status"].astype(str).str.strip() == "terminal_done"]
+        term = tmp[
+            tmp["status"].astype(str).str.strip() == COMPANY_STATUS_TERMINAL_DONE
+        ]
         if not term.empty:
             vr = term["done_reason"].replace("", "unknown").value_counts()
             terminal_reasons = {str(k): int(v) for k, v in vr.items()}
@@ -1162,9 +1498,11 @@ def compute_summary(df: pd.DataFrame, run_cfg: Dict[str, Any]) -> Dict[str, Any]
     summary: Dict[str, Any] = {
         "generated_at": run_cfg.get("generated_at"),
         "outputs_root": run_cfg.get("outputs_root"),
+        "outputs_roots": run_cfg.get("outputs_roots"),
         "db_path": run_cfg.get("db_path"),
         "latest_run": run_cfg.get("latest_run"),
         "tokenizer_mode": run_cfg.get("tokenizer_mode"),
+        "workers": run_cfg.get("workers"),
         "companies_count": int(n),
         "pricing_usd_per_1m": {
             "input_cache_hit": in_hit,
@@ -1199,7 +1537,9 @@ def compute_summary(df: pd.DataFrame, run_cfg: Dict[str, Any]) -> Dict[str, Any]
             "pricing_units": "USD per 1M tokens",
             "llm_input_tokens_done_definition": "sum of tokens in markdown files referenced by url_index entries classified as llm_done",
             "llm_output_tokens_done_definition": "sum of tokens in product/json files referenced by url_index entries classified as llm_done",
+            "multi_root": "If multiple outputs roots were provided, results are concatenated with a 'source_root' column.",
         },
+        "per_root": run_cfg.get("per_root"),
         "global_state": run_cfg.get("global_state"),
     }
     return summary
@@ -1275,92 +1615,6 @@ def _write_plotly_hist(
 
 
 # --------------------------------------------------------------------------- #
-# Global state helper (crawl_global_state.json) - UPDATED to new schema
-# --------------------------------------------------------------------------- #
-
-
-def _load_global_state(outputs_root: Path) -> Optional[Dict[str, Any]]:
-    path = outputs_root / "crawl_global_state.json"
-    obj = _load_json(path)
-    return obj if isinstance(obj, dict) else None
-
-
-def _print_global_state(outputs_root: Path) -> None:
-    gs = _load_global_state(outputs_root)
-    if not gs:
-        return
-
-    print("=" * 80)
-    print("Global crawl state (from crawl_global_state.json):")
-    print(f"  updated_at:            {gs.get('updated_at')}")
-    print(f"  output_root:           {gs.get('output_root')}")
-    print(f"  db_path:               {gs.get('db_path')}")
-    print(f"  total_companies:       {_to_int_if_nat(gs.get('total_companies'))}")
-    print(f"  crawled_companies:     {_to_int_if_nat(gs.get('crawled_companies'))}")
-    print(
-        f"  md_done_companies:     {_to_int_if_nat(gs.get('md_done_companies'))}  ({gs.get('md_done_pct')})"
-    )
-    print(
-        f"  llm_done_companies:    {_to_int_if_nat(gs.get('llm_done_companies'))}  ({gs.get('llm_done_pct')})"
-    )
-    print(
-        f"  terminal_done_companies:{_to_int_if_nat(gs.get('terminal_done_companies'))}"
-    )
-
-    by_status = gs.get("by_status") or {}
-    if isinstance(by_status, dict) and by_status:
-        print("  by_status:")
-        for k, v in by_status.items():
-            print(f"    {k}: {_to_int_if_nat(v)}")
-
-    ids = gs.get("company_ids_sample") or {}
-    if isinstance(ids, dict) and ids:
-        print("  company_ids_sample:")
-        for k in ("pending", "in_progress", "done"):
-            v = ids.get(k)
-            if isinstance(v, list):
-                print(f"    {k}: {len(v)} sample(s)")
-
-    print(f"  urls_total_sum:        {_to_int_if_nat(gs.get('urls_total_sum'))}")
-    print(
-        f"  urls_markdown_done_sum:{_to_int_if_nat(gs.get('urls_markdown_done_sum'))}"
-    )
-    print(f"  urls_llm_done_sum:     {_to_int_if_nat(gs.get('urls_llm_done_sum'))}")
-
-    tdr = gs.get("terminal_done_reasons") or {}
-    if isinstance(tdr, dict) and tdr:
-        print("  terminal_done_reasons:")
-        for k, v in tdr.items():
-            print(f"    {k}: {_to_int_if_nat(v)}")
-
-    unknown = gs.get("unknown_statuses") or {}
-    if isinstance(unknown, dict) and unknown:
-        print("  unknown_statuses:")
-        for k, v in unknown.items():
-            print(f"    {k}: {_to_int_if_nat(v)}")
-
-    lr = gs.get("latest_run") or {}
-    if isinstance(lr, dict) and lr:
-        print("  latest_run:")
-        for k in (
-            "run_id",
-            "pipeline",
-            "version",
-            "args_hash",
-            "crawl4ai_cache_base_dir",
-            "crawl4ai_cache_mode",
-            "started_at",
-            "total_companies",
-            "completed_companies",
-            "last_company_bvdid",
-            "last_updated",
-        ):
-            if k in lr:
-                print(f"    {k}: {lr.get(k)}")
-    print()
-
-
-# --------------------------------------------------------------------------- #
 # Terminal reporting helpers
 # --------------------------------------------------------------------------- #
 
@@ -1401,9 +1655,14 @@ def _print_basic_run_info(
     print("=" * 80)
     print("Analyze configuration:")
     print(f"  outputs_root:                  {str(outputs_root.resolve())}")
+    if run_cfg.get("outputs_roots"):
+        print(
+            f"  outputs_roots:                 {len(run_cfg.get('outputs_roots') or [])}"
+        )
     print(f"  out_dir:                       {str(out_dir.resolve())}")
     print(f"  db_path:                       {run_cfg.get('db_path')}")
     print(f"  tokenizer_mode:                {run_cfg.get('tokenizer_mode')}")
+    print(f"  workers:                       {run_cfg.get('workers')}")
     print(f"  cache_hit_rate_assumed:        {cache_hit_rate:.2%}")
     print("  pricing (USD per 1M tokens):")
     print(f"    input_cache_hit_per_1m:      {in_hit}")
@@ -1597,7 +1856,9 @@ def _print_top_companies(
         cid = str(r.get("company_id") or "")
         root = str(r.get("root_url") or "")
         val = r.get(col)
-        print(f"  {cid}: {col}={_fmt_int(val)}  root_url={root}")
+        src = str(r.get("source_root") or "")
+        extra = f"  source_root={src}" if src else ""
+        print(f"  {cid}: {col}={_fmt_int(val)}  root_url={root}{extra}")
     print()
 
 
@@ -1697,8 +1958,7 @@ def _industry_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     def _rate(num: pd.Series, den: pd.Series) -> pd.Series:
         den2 = den.replace(0, np.nan)
-        r = (num / den2).fillna(0.0)
-        return r
+        return (num / den2).fillna(0.0)
 
     if "urls_total_sum" in industry_summary.columns:
         industry_summary["markdown_done_rate"] = _rate(
@@ -1740,17 +2000,29 @@ def _industry_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def run_analysis(
-    outputs_root: Path,
+    outputs_roots: List[Path],
     out_dir: Path,
     company_ids: Optional[List[str]] = None,
     *,
+    workers: int = 1,
+    progress: bool = False,
     write_plots: bool = True,
 ) -> Dict[str, Any]:
-    df, run_cfg = collect_dataframe(outputs_root, company_ids=company_ids)
+    if len(outputs_roots) == 1:
+        df, run_cfg = collect_dataframe(
+            outputs_roots[0],
+            company_ids=company_ids,
+            workers=workers,
+            progress=progress,
+        )
+    else:
+        df, run_cfg = collect_dataframe_multi(
+            outputs_roots, company_ids=company_ids, workers=workers, progress=progress
+        )
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if df.empty:
+    if df is None or df.empty:
         summary = {**run_cfg, "companies_count": 0, "message": "No companies found."}
         _write_json(out_dir / "summary.json", summary)
         return summary
@@ -1786,7 +2058,7 @@ def run_analysis(
             df,
             "md_tokens_all",
             out_dir / "hist_md_tokens_all.png",
-            "Distribution of markdown tokens (all md/*.md)",
+            "Distribution of markdown tokens (all markdown/*.md)",
             "md_tokens_all",
         )
         _plot_hist(
@@ -1848,16 +2120,20 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Analyze web2product-catalog outputs (DB + url_index)."
     )
+
+    # Backward compatible: allow repeating --outputs-root.
     p.add_argument(
-        "outputs_root",
+        "--outputs-root",
         type=str,
-        help="Outputs root directory (contains crawl_state.sqlite3 and crawl_global_state.json).",
+        action="append",
+        default=[],
+        help="Outputs root directory (repeatable). Each root contains crawl_state.sqlite3 and crawl_global_state.json.",
     )
     p.add_argument(
         "--out-dir",
         type=str,
         default="",
-        help="Output directory for analysis artifacts (default: <outputs_root>/analysis_<timestamp>).",
+        help="Output directory for analysis artifacts (default: <first_outputs_root>/analysis_<timestamp>).",
     )
     p.add_argument(
         "--company-id",
@@ -1865,15 +2141,24 @@ def _parse_args() -> argparse.Namespace:
         default=[],
         help="Analyze only this company id (repeatable). If omitted, analyze all companies in DB.",
     )
+
     p.add_argument(
-        "--no-plots",
-        action="store_true",
-        help="Skip plot generation.",
+        "--workers",
+        type=int,
+        default=0,
+        help="Concurrency for per-company analysis (threads). Default: ANALYZE_WORKERS or a sane CPU-based value.",
     )
+    p.add_argument(
+        "--progress",
+        action="store_true",
+        help="Print progress counters while analyzing (useful for large datasets).",
+    )
+
+    p.add_argument("--no-plots", action="store_true", help="Skip plot generation.")
     p.add_argument(
         "--print-global-state",
         action="store_true",
-        help="Print crawl_global_state.json summary before analysis.",
+        help="Print crawl_global_state.json summary before analysis (for each root).",
     )
     p.add_argument(
         "--quiet",
@@ -1885,26 +2170,68 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    outputs_root = Path(args.outputs_root).expanduser().resolve()
+
+    if not args.outputs_root:
+        raise SystemExit("Missing --outputs-root (repeatable).")
+
+    # Canonicalize each root using shared helper. Note: ensure_output_root sets global output root;
+    # we call it for the first root, then resolve others without re-setting global state.
+    outputs_roots_raw = [
+        Path(x).expanduser() for x in args.outputs_root if str(x).strip()
+    ]
+    if not outputs_roots_raw:
+        raise SystemExit("No valid --outputs-root provided.")
+
+    first_root = ensure_output_root(str(outputs_roots_raw[0]))
+    other_roots: List[Path] = [
+        Path(x).expanduser().resolve() for x in outputs_roots_raw[1:]
+    ]
+    outputs_roots: List[Path] = [first_root] + other_roots
+
     out_dir = (
         Path(args.out_dir).expanduser().resolve()
         if args.out_dir
-        else (
-            outputs_root / f"analysis_{_utc_iso_z().replace(':', '').replace('-', '')}"
-        )
+        else (first_root / f"analysis_{_utc_iso_z().replace(':', '').replace('-', '')}")
     )
+
     company_ids = [str(x) for x in (args.company_id or []) if str(x).strip()] or None
 
+    workers = (
+        int(args.workers)
+        if int(args.workers or 0) > 0
+        else _env_int("ANALYZE_WORKERS", _default_workers())
+    )
+    workers = int(max(1, workers))
+
     if args.print_global_state:
-        _print_global_state(outputs_root)
+        for r in outputs_roots:
+            _print_global_state(r)
 
     summary = run_analysis(
-        outputs_root, out_dir, company_ids=company_ids, write_plots=(not args.no_plots)
+        outputs_roots,
+        out_dir,
+        company_ids=company_ids,
+        workers=workers,
+        progress=bool(args.progress),
+        write_plots=(not args.no_plots),
     )
 
     if not args.quiet:
-        df, run_cfg = collect_dataframe(outputs_root, company_ids=company_ids)
-        _print_basic_run_info(outputs_root, out_dir, run_cfg, df)
+        # For printing, use the combined DF the same way we wrote it:
+        if len(outputs_roots) == 1:
+            df, run_cfg = collect_dataframe(
+                outputs_roots[0],
+                company_ids=company_ids,
+                workers=workers,
+                progress=False,
+            )
+            _print_basic_run_info(outputs_roots[0], out_dir, run_cfg, df)
+        else:
+            df, run_cfg = collect_dataframe_multi(
+                outputs_roots, company_ids=company_ids, workers=workers, progress=False
+            )
+            _print_basic_run_info(outputs_roots[0], out_dir, run_cfg, df)
+
         _print_status_distribution(df)
         _print_top_companies(
             df,

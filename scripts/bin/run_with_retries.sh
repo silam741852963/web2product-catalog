@@ -9,7 +9,6 @@ export RETRY_EXIT_CODE
 export DEEP_CRAWL_RETRY_EXIT_CODE="$RETRY_EXIT_CODE"
 
 # ---- allocator / fragmentation mitigations (glibc) ----
-# Keep these as harmless environment-level knobs (not "OOM protection" logic).
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 # export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
@@ -70,21 +69,26 @@ print(len(lst))
 PYEOF
 }
 
+# Ensure we're running from repo root (so relative paths and outputs match expectations).
+# scripts/bin/run_with_retries.sh -> repo root is two levels up.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
+
 ITER=1
 while :; do
   echo "[retry-wrapper] iteration=${ITER} out_dir=${OUT_DIR} retry_exit_code=${RETRY_EXIT_CODE}"
 
+  # Run as a module so it works after `pip install -e .`
   # shellcheck disable=SC2068
-  python3 scripts/run.py ${ARGS[@]}
+  python3 -m cli.crawl_extract.run ${ARGS[@]}
   EXIT_CODE=$?
 
   if [[ "$EXIT_CODE" -eq 0 ]]; then
     inprog="$(read_in_progress_count)"
     if [[ "$inprog" -gt 0 ]]; then
       echo "[retry-wrapper] clean exit but in_progress_companies=${inprog}; running finalize pass (markdown only)."
-      # --finalize-in-progress-md forces --llm-mode none inside run.py, but we set it explicitly anyway.
       # shellcheck disable=SC2068
-      python3 scripts/run.py ${ARGS[@]} --finalize-in-progress-md --llm-mode none
+      python3 -m cli.crawl_extract.run ${ARGS[@]} --finalize-in-progress-md --llm-mode none
       FINALIZE_EXIT=$?
       if [[ "$FINALIZE_EXIT" -ne 0 ]]; then
         echo "[retry-wrapper] finalize pass failed exit_code=${FINALIZE_EXIT}; stopping."

@@ -141,7 +141,6 @@ async def run_company_pipeline(
     retry_store: retry_mod.RetryStateStore,
     scheduler: AdaptiveScheduler,
     stop_event: asyncio.Event,
-    llm_sem: asyncio.Semaphore,
     repo_root: Path,
 ) -> bool:
     token = logging_ext.set_company_context(company.company_id)
@@ -576,25 +575,22 @@ async def run_company_pipeline(
                 try:
                     ctx = build_industry_context(company)
 
-                    async with llm_sem:
-                        if args.llm_mode == "presence":
-                            strat = industry_llm_cache.get_strategy(
-                                mode="presence", ctx=ctx
-                            )
-                            await run_presence_pass_for_company(
-                                company,
-                                presence_strategy=strat,
-                                repo_root=repo_root,
-                            )
-                        elif args.llm_mode == "full":
-                            strat = industry_llm_cache.get_strategy(
-                                mode="schema", ctx=ctx
-                            )
-                            await run_full_pass_for_company(
-                                company,
-                                full_strategy=strat,
-                                repo_root=repo_root,
-                            )
+                    if args.llm_mode == "presence":
+                        strat = industry_llm_cache.get_strategy(
+                            mode="presence", ctx=ctx
+                        )
+                        await run_presence_pass_for_company(
+                            company,
+                            presence_strategy=strat,
+                            repo_root=repo_root,
+                        )
+                    elif args.llm_mode == "full":
+                        strat = industry_llm_cache.get_strategy(mode="schema", ctx=ctx)
+                        await run_full_pass_for_company(
+                            company,
+                            full_strategy=strat,
+                            repo_root=repo_root,
+                        )
 
                     signal_progress("progress")
                     llm_exc = None
@@ -920,7 +916,6 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     p.add_argument("--dataset-file", type=str, default=None)
 
     p.add_argument("--company-concurrency", type=int, default=12)
-    p.add_argument("--llm-concurrency", type=int, default=4)
     p.add_argument("--max-pages", type=int, default=100)
     p.add_argument("--page-timeout-ms", type=int, default=30000)
 
@@ -1036,9 +1031,6 @@ async def main_async(args: argparse.Namespace) -> None:
 
     repo_root = Path(str(args.repo_root)).expanduser().resolve()
 
-    llm_conc = max(1, int(getattr(args, "llm_concurrency", 2)))
-    llm_sem = asyncio.Semaphore(llm_conc)
-
     logging_ext = LoggingExtension(
         global_level=log_level,
         per_company_level=log_level,
@@ -1064,6 +1056,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
     industry_llm_cache: Optional[IndustryAwareStrategyCache] = None
     if args.llm_mode != "none":
+        # Defaults to vLLM (Gemma 3 270m-it) when args.llm_model is empty/None.
         provider_strategy = provider_strategy_from_llm_model_selector(args.llm_model)
         llm_factory = LLMExtractionFactory(provider_strategy=provider_strategy)
         _ = (BASE_FULL_INSTRUCTION, BASE_PRESENCE_INSTRUCTION)
@@ -1434,18 +1427,16 @@ async def main_async(args: argparse.Namespace) -> None:
             for cid in finished:
                 t = inflight_by_cid.pop(cid)
 
-                ok = False
                 try:
-                    ok = bool(t.result())
+                    _ = bool(t.result())
                 except asyncio.CancelledError:
-                    ok = False
+                    pass
                 except Exception as e:
                     logger.error(
                         "Company task crashed company_id=%s err=%s",
                         cid,
                         retry_mod.short_exc(e),
                     )
-                    ok = False
 
                 scheduler.register_company_completed()
 
@@ -1500,7 +1491,6 @@ async def main_async(args: argparse.Namespace) -> None:
                             retry_store=retry_store,
                             scheduler=scheduler,
                             stop_event=stop_event,
-                            llm_sem=llm_sem,
                             repo_root=repo_root,
                         )
 

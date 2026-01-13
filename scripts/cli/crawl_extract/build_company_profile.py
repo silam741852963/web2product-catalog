@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from extensions.company_profile.builder import build_company_profile_for_company
+from extensions.io import output_paths
 
 runner_logger = logging.getLogger("company_profile")
 
@@ -24,28 +25,34 @@ def _is_company_dir(p: Path) -> bool:
 
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        description="Build company_profile.json from <outputs_dir>/<company_id>/product/*.json"
+        description="Build company_profile.json from <output_root>/<company_id>/product/*.json"
     )
+
     p.add_argument(
-        "--outputs-dir",
+        "--out-dir",
         type=str,
-        default="outputs",
-        help="Directory that contains company folders (<company_id>/product, <company_id>/metadata, ...).",
+        default="",
+        help="(Optional) Output root directory. If empty, uses extensions.io.output_paths.get_output_root().",
     )
 
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--company-id", type=str, help="Run for one company folder name")
     g.add_argument(
-        "--all", action="store_true", help="Run all company folders under outputs_dir"
+        "--all", action="store_true", help="Run all company folders under output root"
     )
 
-    # The only embedding-related flag:
     p.add_argument(
         "--embed-device",
         type=str,
         default="cpu",
         choices=["cpu", "cuda", "mps"],
-        help="Embedding device: cpu (default), cuda (NVIDIA), mps (Apple).",
+        help="Embedding device used for clustering/dedup (always on): cpu (default), cuda (NVIDIA), mps (Apple).",
+    )
+
+    p.add_argument(
+        "--embed-text-output",
+        action="store_true",
+        help="If set, also embed company_profile.md and per-offering text into company_profile.json. Default: off.",
     )
 
     p.add_argument("--log-level", type=str, default="INFO")
@@ -53,21 +60,32 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = p.parse_args(argv)
     _setup_root_logger(args.log_level)
 
-    outputs_dir = Path(args.outputs_dir).resolve()
-    if not outputs_dir.exists():
-        runner_logger.error("outputs_dir does not exist: %s", outputs_dir)
+    # Resolve out root
+    output_root = (
+        Path(args.out_dir).expanduser().resolve()
+        if str(args.out_dir or "").strip()
+        else Path(output_paths.get_output_root()).resolve()
+    )
+
+    if not output_root.exists():
+        runner_logger.error("output_root does not exist: %s", output_root)
         return 1
+
+    # ✅ CRITICAL FIX:
+    # Make output_root the canonical global root so every downstream module
+    # (output_paths.ensure_company_dirs, crawl_state.load_*, etc.) uses it.
+    output_paths.ensure_output_root(output_root)
 
     if args.all:
         company_ids = sorted(
-            [d.name for d in outputs_dir.iterdir() if _is_company_dir(d)]
+            [d.name for d in output_root.iterdir() if _is_company_dir(d)]
         )
         runner_logger.info(
-            "mode=all outputs_dir=%s companies=%d", outputs_dir, len(company_ids)
+            "mode=all output_root=%s companies=%d", output_root, len(company_ids)
         )
         if not company_ids:
             runner_logger.warning(
-                "No valid company folders found under %s", outputs_dir
+                "No valid company folders found under %s", output_root
             )
             return 0
     else:
@@ -80,9 +98,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     ok_all = True
     for cid in company_ids:
         ok = build_company_profile_for_company(
-            outputs_dir=outputs_dir,
             company_id=cid,
+            outputs_dir=output_root,  # still passed for clarity/sanity
             embed_device=args.embed_device,
+            embed_text_output=bool(args.embed_text_output),
         )
         if not ok:
             ok_all = False

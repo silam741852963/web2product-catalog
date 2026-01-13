@@ -9,18 +9,23 @@ from typing import Any, Dict, Optional, Protocol, Tuple
 
 from crawl4ai import LLMConfig, LLMExtractionStrategy
 
-from .prompting import (
+from configs.llm.prompting import (
     IndustryContext,
     BASE_FULL_INSTRUCTION,
     BASE_PRESENCE_INSTRUCTION,
     build_full_instruction,
     build_presence_instruction,
 )
-from .schema import ExtractionPayload, PresencePayload
+from configs.llm.schema import ExtractionPayload, PresencePayload
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logger.addHandler(logging.NullHandler())
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def _to_text(v: Any) -> str:
@@ -42,7 +47,45 @@ def _provider_prefix(provider: str) -> str:
     return p.lower()
 
 
-def _infer_api_token(provider: str) -> Optional[str]:
+def _stable_json_sha1(obj: Any) -> str:
+    s = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _ensure_non_empty(s: str, label: str) -> str:
+    v = (s or "").strip()
+    if not v:
+        raise ValueError(f"{label} must be non-empty.")
+    return v
+
+
+def _validate_vllm_base_url(base_url: str) -> str:
+    """
+    vLLM OpenAI-compatible servers usually expose /v1.
+    Accept both:
+      - http://127.0.0.1:8000
+      - http://127.0.0.1:8000/v1
+    and normalize to end with /v1.
+    """
+    u = (base_url or "").strip()
+    if not u:
+        raise ValueError("VLLM base_url must be non-empty.")
+    if u.endswith("/v1"):
+        return u
+    return u.rstrip("/") + "/v1"
+
+
+def _strip_known_prefix(s: str, prefix: str) -> str:
+    if not s.startswith(prefix):
+        raise ValueError(f"Expected prefix {prefix!r}, got {s!r}")
+    return s[len(prefix) :].lstrip()
+
+
+def _infer_api_token_for_provider(provider: str) -> Optional[str]:
+    """
+    Only infer for providers we explicitly support inference for.
+    Never infer OpenAI here.
+    """
     pref = _provider_prefix(provider)
     if pref in {"gemini", "google"}:
         return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -53,9 +96,46 @@ def _is_gemini_like_provider(provider: Optional[str]) -> bool:
     return _provider_prefix(provider or "") in {"gemini", "google"}
 
 
-def _stable_json_sha1(obj: Any) -> str:
-    s = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+def _is_plain_model_id(s: str) -> bool:
+    """
+    Detect "bare model id" (HF-style repo id) like 'google/gemma-3-270m-it'
+    that is NOT intended as a LiteLLM provider route.
+
+    We treat these as LOCAL vLLM model_ids.
+    """
+    if not s or "/" not in s:
+        return False
+
+    pref = _provider_prefix(s)
+
+    known_provider_prefixes = {
+        "vllm",
+        "hosted_vllm",
+        "ollama",
+        "openai",
+        "azure",
+        "anthropic",
+        "bedrock",
+        "vertex_ai",
+        "mistral",
+        "cohere",
+        "groq",
+        "together_ai",
+        "huggingface",
+        "replicate",
+        "perplexity",
+        "xai",
+        "deepseek",
+        "fireworks_ai",
+        "openrouter",
+        "gemini",
+    }
+    return pref not in known_provider_prefixes
+
+
+# ---------------------------------------------------------------------------
+# Provider strategies
+# ---------------------------------------------------------------------------
 
 
 class LLMProviderStrategy(Protocol):
@@ -81,44 +161,113 @@ class OllamaProviderStrategy(LLMProviderStrategy):
 
 
 @dataclass(frozen=True, slots=True)
+class VLLMProviderStrategy(LLMProviderStrategy):
+    """
+    Local vLLM via LiteLLM "hosted_vllm/<model_id>" routing.
+    Default model is instruction-tuned to ensure tokenizer chat_template exists.
+    """
+
+    model_id: str = "google/gemma-3-270m-it"
+    base_url: str = "http://127.0.0.1:8000/v1"
+    placeholder_api_token: str = "EMPTY"
+
+    def build_config(self) -> LLMConfig:
+        mid = _ensure_non_empty(self.model_id, "VLLMProviderStrategy.model_id")
+        bu = _validate_vllm_base_url(self.base_url)
+
+        token = os.getenv("HOSTED_VLLM_API_KEY") or self.placeholder_api_token
+
+        cfg = LLMConfig(
+            provider=f"hosted_vllm/{mid}",
+            api_token=token,
+            base_url=bu,
+        )
+        logger.debug("[llm] provider=hosted_vllm model_id=%s base_url=%s", mid, bu)
+        return cfg
+
+
+@dataclass(frozen=True, slots=True)
 class RemoteAPIProviderStrategy(LLMProviderStrategy):
+    """
+    Pass-through for true remote providers (openai/..., gemini/..., anthropic/..., etc.)
+    No rewriting. No OpenAI fallback.
+    """
+
     provider: str
     api_token: Optional[str] = None
     base_url: Optional[str] = None
 
     def build_config(self) -> LLMConfig:
-        if not self.provider:
-            raise ValueError(
-                "RemoteAPIProviderStrategy requires non-empty provider string."
-            )
+        prov = _ensure_non_empty(self.provider, "RemoteAPIProviderStrategy.provider")
 
         token = self.api_token
         if token is None:
-            token = _infer_api_token(self.provider)
+            token = _infer_api_token_for_provider(prov)
 
-        cfg = LLMConfig(provider=self.provider, api_token=token, base_url=self.base_url)
-        logger.debug("[llm] provider=%s base_url=%s", self.provider, self.base_url)
+        cfg = LLMConfig(provider=prov, api_token=token, base_url=self.base_url)
+        logger.debug("[llm] provider=%s base_url=%s", prov, self.base_url)
         return cfg
+
+
+# ---------------------------------------------------------------------------
+# Provider selection
+# ---------------------------------------------------------------------------
 
 
 def provider_strategy_from_llm_model_selector(
     llm_model: Optional[str],
     *,
+    vllm_base_url: str = "http://127.0.0.1:8000/v1",
+    default_vllm_model_id: str = "google/gemma-3-270m-it",
     ollama_base_url: str = "http://localhost:11434",
     default_ollama_model: str = "mistral-3:14b",
     api_token: Optional[str] = None,
     base_url: Optional[str] = None,
 ) -> LLMProviderStrategy:
+    """
+    Explicit, deterministic selection. NO silent OpenAI fallback.
+
+    - Empty -> local vLLM default (hosted_vllm/<model_id>)
+    - vllm/<model_id> or hosted_vllm/<model_id> -> local vLLM
+    - ollama/<model> -> Ollama
+    - no "/" -> legacy -> Ollama
+    - bare org/model (plain model id) -> local vLLM
+    - otherwise -> remote provider string as-is
+    """
     s = (llm_model or "").strip()
     if not s:
+        return VLLMProviderStrategy(
+            model_id=default_vllm_model_id, base_url=vllm_base_url
+        )
+
+    low = s.lower()
+
+    if low.startswith("vllm/"):
+        model_id = _strip_known_prefix(s, s[:5])
+        return VLLMProviderStrategy(model_id=model_id, base_url=vllm_base_url)
+
+    if low.startswith("hosted_vllm/"):
+        model_id = _strip_known_prefix(s, s[:12])
+        return VLLMProviderStrategy(model_id=model_id, base_url=vllm_base_url)
+
+    if low.startswith("ollama/"):
+        model = _strip_known_prefix(s, s[:7])
+        return OllamaProviderStrategy(model=model, base_url=ollama_base_url)
+
+    if "/" not in s:
         return OllamaProviderStrategy(
-            model=default_ollama_model, base_url=ollama_base_url
+            model=(s or default_ollama_model), base_url=ollama_base_url
         )
-    if "/" in s:
-        return RemoteAPIProviderStrategy(
-            provider=s, api_token=api_token, base_url=base_url
-        )
-    return OllamaProviderStrategy(model=s, base_url=ollama_base_url)
+
+    if _is_plain_model_id(s):
+        return VLLMProviderStrategy(model_id=s, base_url=vllm_base_url)
+
+    return RemoteAPIProviderStrategy(provider=s, api_token=api_token, base_url=base_url)
+
+
+# ---------------------------------------------------------------------------
+# Extraction factory + caching
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -158,6 +307,12 @@ class LLMExtractionFactory:
 
         llm_cfg = self.provider_strategy.build_config()
 
+        provider = _clean_ws(_to_text(getattr(llm_cfg, "provider", "")))
+        if not provider:
+            raise RuntimeError(
+                "LLMConfig.provider is empty. Refusing to proceed to avoid hidden fallback."
+            )
+
         used_input_format = (
             input_format or self.default_input_format or "markdown"
         ).strip()
@@ -190,7 +345,7 @@ class LLMExtractionFactory:
         if extra_args:
             _extra.update(extra_args)
 
-        if _is_gemini_like_provider(getattr(llm_cfg, "provider", None)):
+        if _is_gemini_like_provider(provider):
             _extra.setdefault("response_format", {"type": "json_object"})
 
         return LLMExtractionStrategy(
@@ -215,9 +370,6 @@ class IndustryAwareStrategyCache:
       - context key (industry_label + industry + nace) OR "default"
       - provider fingerprint (no secrets)
       - schema hash + factory knobs
-
-    Also supports default (generic) strategies without any context dependency:
-      - get_default_strategy(mode="presence"|"schema")
     """
 
     factory: LLMExtractionFactory
@@ -267,9 +419,6 @@ class IndustryAwareStrategyCache:
         return self._factory_fp
 
     def get_default_strategy(self, *, mode: str) -> LLMExtractionStrategy:
-        """
-        Generic strategy (no industry context). Uses BASE_*_INSTRUCTION only.
-        """
         m = (mode or "").strip().lower()
         if m not in {"schema", "presence"}:
             raise ValueError(f"mode must be 'schema' or 'presence', got {mode!r}")
@@ -291,10 +440,9 @@ class IndustryAwareStrategyCache:
         schema_hash = _stable_json_sha1(used_schema)
         extra_hash = _stable_json_sha1(self.extra_args or {})
         provider_fp = self._get_provider_fingerprint()
-        factory_fp = self._get_factory_fingerprint()
+        _ = self._get_factory_fingerprint()
 
         ctx_key = "default"
-
         key = (
             m,
             ctx_key,
@@ -333,10 +481,6 @@ class IndustryAwareStrategyCache:
         return st
 
     def get_strategy(self, *, mode: str, ctx: IndustryContext) -> LLMExtractionStrategy:
-        """
-        Context-aware strategy. If ctx.industry_label is empty, we still allow it,
-        but the prompting layer will emit the base instruction only.
-        """
         m = (mode or "").strip().lower()
         if m not in {"schema", "presence"}:
             raise ValueError(f"mode must be 'schema' or 'presence', got {mode!r}")
@@ -358,7 +502,7 @@ class IndustryAwareStrategyCache:
         schema_hash = _stable_json_sha1(used_schema)
         extra_hash = _stable_json_sha1(self.extra_args or {})
         provider_fp = self._get_provider_fingerprint()
-        factory_fp = self._get_factory_fingerprint()
+        _ = self._get_factory_fingerprint()
 
         ctx_key = _stable_json_sha1(
             {

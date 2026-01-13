@@ -110,7 +110,14 @@ def _atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
 
 def _json_load(path: Path) -> Any:
     raw = path.read_text(encoding="utf-8")
-    return json.loads(raw)
+    if raw.strip() == "":
+        raise ValueError(f"Empty/whitespace JSON file: {path} (len={len(raw)})")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"Invalid JSON in {path} (len={len(raw)}; head={raw[:8000]!r})"
+        ) from e
 
 
 def _json_dumps(obj: Any, *, pretty: bool) -> str:
@@ -1664,12 +1671,12 @@ class CrawlState:
                     run_done_count = int(c["c"] or 0) if c is not None else None
 
             total = len(rows)
-            by_status: Dict[str, int] = {k: 0 for k in _STATUS_RANK.keys()}
 
             pending_ids: List[str] = []
             in_progress_ids: List[str] = []
             done_ids: List[str] = []
 
+            pending_companies = 0
             md_done_companies = 0
             llm_done_companies = 0
             terminal_done_companies = 0
@@ -1684,9 +1691,8 @@ class CrawlState:
                 st = _normalize_status(r["status"])
                 cid = str(r["company_id"])
 
-                by_status[st] = by_status.get(st, 0) + 1
-
                 if st == COMPANY_STATUS_PENDING:
+                    pending_companies += 1
                     if len(pending_ids) < max_ids:
                         pending_ids.append(cid)
                 elif st in (COMPANY_STATUS_MD_NOT_DONE, COMPANY_STATUS_LLM_NOT_DONE):
@@ -1716,7 +1722,7 @@ class CrawlState:
                 urls_md_done_sum += int(r["urls_markdown_done"] or 0)
                 urls_llm_done_sum += int(r["urls_llm_done"] or 0)
 
-            crawled_companies = total - by_status.get(COMPANY_STATUS_PENDING, 0)
+            crawled_companies = total - pending_companies
 
             md_done_pct = (md_done_companies / total * 100.0) if total else 0.0
             llm_done_pct = (llm_done_companies / total * 100.0) if total else 0.0
@@ -1763,7 +1769,6 @@ class CrawlState:
                 "crawl_finished_pct": round(crawl_finished_pct, 2),
                 "md_done_pct": round(md_done_pct, 2),
                 "llm_done_pct": round(llm_done_pct, 2),
-                "by_status": by_status,
                 "company_ids_sample": {
                     "pending": pending_ids,
                     "in_progress": in_progress_ids,

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +28,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# -----------------------------------------------------------------------------
+# Data classes
+# -----------------------------------------------------------------------------
+
+
 @dataclass(frozen=True, slots=True)
 class CalibrationSample:
     company_id: str
@@ -44,6 +51,39 @@ class CalibrationReport:
     source_companies_used: int
     sample_before: CalibrationSample
     sample_after: CalibrationSample
+
+
+@dataclass(frozen=True, slots=True)
+class CorruptJsonFile:
+    company_id: str
+    path: str
+    size_bytes: int
+    reason: str
+    head_bytes_hex: str
+    head_text_preview: str
+
+
+@dataclass(frozen=True, slots=True)
+class CorruptionReport:
+    out_dir: str
+    db_path: str
+    scanned_companies: int
+    affected_companies: int
+    affected_files: int
+    examples: List[CorruptJsonFile]
+
+
+@dataclass(frozen=True, slots=True)
+class CorruptionFixReport:
+    out_dir: str
+    db_path: str
+    dry_run: bool
+    scanned_companies: int
+    affected_companies: int
+    quarantined_files: int
+    marked_pending: int
+    run_done_unmarked: int
+    examples: List[CorruptJsonFile]
 
 
 # -----------------------------------------------------------------------------
@@ -78,7 +118,80 @@ def _first_existing(paths: List[Path]) -> Optional[Path]:
     return None
 
 
+# -----------------------------------------------------------------------------
+# JSON helpers (robust corruption detection)
+# -----------------------------------------------------------------------------
+
+
+def _read_bytes(path: Path) -> Optional[bytes]:
+    try:
+        return path.read_bytes()
+    except Exception:
+        return None
+
+
+def _bytes_head_hex(b: bytes, n: int = 80) -> str:
+    h = b[:n]
+    return h.hex()
+
+
+def _bytes_text_preview(b: bytes, n: int = 200) -> str:
+    # best-effort preview
+    try:
+        s = b[:n].decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    # keep control chars visible-ish
+    return s.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+
+def _is_probably_binary_nul(b: bytes) -> bool:
+    # Your observed failure: starts with NULs
+    if not b:
+        return False
+    # consider "corrupt" if it starts with many NULs OR contains NUL before any printable JSON char
+    if b[:16] == b"\x00" * 16:
+        return True
+    # also if there are NUL bytes very early
+    early = b[:256]
+    if b"\x00" in early:
+        # if the first non-whitespace is NUL, that's not JSON text
+        for ch in early:
+            if ch in (9, 10, 13, 32):  # whitespace
+                continue
+            return ch == 0
+        return True
+    return False
+
+
+def _validate_json_bytes(path: Path) -> Tuple[bool, str]:
+    """
+    Returns (ok, reason_if_bad).
+    """
+    b = _read_bytes(path)
+    if b is None:
+        return False, "unreadable"
+    if len(b) == 0:
+        return False, "empty"
+    if _is_probably_binary_nul(b):
+        return False, "nul_bytes_prefix_or_early"
+    try:
+        txt = b.decode("utf-8")
+    except Exception:
+        return False, "non_utf8_bytes"
+    if txt.strip() == "":
+        return False, "whitespace_only"
+    try:
+        obj = json.loads(txt)
+    except Exception:
+        return False, "json_parse_error"
+    if not isinstance(obj, dict):
+        return False, "json_not_dict"
+    return True, ""
+
+
 def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    # legacy helper used by sampling/calibration; keep permissive
     try:
         txt = path.read_text(encoding="utf-8")
     except Exception:
@@ -116,6 +229,11 @@ def _normalize_url_index_file(
     if p is None:
         return
 
+    # If it's corrupted, do not touch it here.
+    ok, _ = _validate_json_bytes(p)
+    if not ok:
+        return
+
     idx = _read_json_file(p)
     if not isinstance(idx, dict) or not idx:
         return
@@ -129,8 +247,7 @@ def _normalize_url_index_file(
         ent_dict = dict(ent)
         ent_dict.setdefault("company_id", company_id)
         ent_dict.setdefault("url", url)
-        normalized = UrlIndexEntry.from_dict(
-            ent_dict, company_id=company_id, url=url)
+        normalized = UrlIndexEntry.from_dict(ent_dict, company_id=company_id, url=url)
         out[url] = normalized.to_dict()
 
     meta_raw = idx.get(URL_INDEX_META_KEY)
@@ -163,10 +280,8 @@ def _patch_crawl_meta_file(
     if p is None:
         return
 
-    # Canonical rewrite: do NOT start from existing JSON (prevents legacy key retention).
     meta: Dict[str, Any] = {}
 
-    # Prefer DB snapshot as source of truth (it reflects any upsert you did).
     meta["company_id"] = db_snap.company_id
     meta["root_url"] = db_snap.root_url
     meta["name"] = db_snap.name
@@ -192,8 +307,7 @@ def _patch_crawl_meta_file(
 
     meta["retry_cls"] = db_snap.retry_cls
     meta["retry_attempts"] = int(db_snap.retry_attempts or 0)
-    meta["retry_next_eligible_at"] = float(
-        db_snap.retry_next_eligible_at or 0.0)
+    meta["retry_next_eligible_at"] = float(db_snap.retry_next_eligible_at or 0.0)
     meta["retry_updated_at"] = float(db_snap.retry_updated_at or 0.0)
     meta["retry_last_error"] = db_snap.retry_last_error or ""
     meta["retry_last_stage"] = db_snap.retry_last_stage or ""
@@ -206,8 +320,7 @@ def _patch_crawl_meta_file(
     meta["retry_mem_hits"] = int(db_snap.retry_mem_hits or 0)
     meta["retry_last_stall_kind"] = db_snap.retry_last_stall_kind or "unknown"
 
-    meta["retry_last_progress_md_done"] = int(
-        db_snap.retry_last_progress_md_done or 0)
+    meta["retry_last_progress_md_done"] = int(db_snap.retry_last_progress_md_done or 0)
     meta["retry_last_seen_md_done"] = int(db_snap.retry_last_seen_md_done or 0)
 
     meta["retry_last_error_sig"] = db_snap.retry_last_error_sig or ""
@@ -219,12 +332,11 @@ def _patch_crawl_meta_file(
     meta[_VERSION_META_KEY] = version_meta
     meta["max_pages"] = db_snap.max_pages
 
-    # Note: intentionally NOT writing "calibrated_at" to avoid persisting extra fields.
     _write_json_file(p, meta, pretty=True)
 
 
 # -----------------------------------------------------------------------------
-# DB schema migration kept as-is (operates only on db_path)
+# DB schema migration (kept as-is from your file)
 # -----------------------------------------------------------------------------
 
 
@@ -471,12 +583,9 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
                     _to_int_or_none(_row_get(r, "crawl_finished")) or 0
                 )
 
-                urls_total = int(_to_int_or_none(
-                    _row_get(r, "urls_total")) or 0)
-                urls_md = int(_to_int_or_none(
-                    _row_get(r, "urls_markdown_done")) or 0)
-                urls_llm = int(_to_int_or_none(
-                    _row_get(r, "urls_llm_done")) or 0)
+                urls_total = int(_to_int_or_none(_row_get(r, "urls_total")) or 0)
+                urls_md = int(_to_int_or_none(_row_get(r, "urls_markdown_done")) or 0)
+                urls_llm = int(_to_int_or_none(_row_get(r, "urls_llm_done")) or 0)
 
                 last_error = _to_str_or_none(_row_get(r, "last_error"))
                 done_reason = _to_str_or_none(_row_get(r, "done_reason"))
@@ -485,8 +594,7 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
 
                 created_at = _to_str_or_none(_row_get(r, "created_at")) or now
                 updated_at = _to_str_or_none(_row_get(r, "updated_at")) or now
-                last_crawled_at = _to_str_or_none(
-                    _row_get(r, "last_crawled_at"))
+                last_crawled_at = _to_str_or_none(_row_get(r, "last_crawled_at"))
 
                 max_pages = _to_int_or_none(_row_get(r, "max_pages"))
 
@@ -495,8 +603,7 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
                     _to_int_or_none(_row_get(r, "retry_attempts")) or 0
                 )
                 retry_next_eligible_at = float(
-                    _to_float_or_none(
-                        _row_get(r, "retry_next_eligible_at")) or 0.0
+                    _to_float_or_none(_row_get(r, "retry_next_eligible_at")) or 0.0
                 )
                 retry_updated_at = float(
                     _to_float_or_none(_row_get(r, "retry_updated_at")) or 0.0
@@ -525,29 +632,24 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
                     _to_int_or_none(_row_get(r, "retry_mem_hits")) or 0
                 )
                 retry_last_stall_kind = (
-                    _to_str_or_none(
-                        _row_get(r, "retry_last_stall_kind")) or "unknown"
+                    _to_str_or_none(_row_get(r, "retry_last_stall_kind")) or "unknown"
                 )
 
                 retry_last_progress_md_done = int(
-                    _to_int_or_none(
-                        _row_get(r, "retry_last_progress_md_done")) or 0
+                    _to_int_or_none(_row_get(r, "retry_last_progress_md_done")) or 0
                 )
                 retry_last_seen_md_done = int(
-                    _to_int_or_none(
-                        _row_get(r, "retry_last_seen_md_done")) or 0
+                    _to_int_or_none(_row_get(r, "retry_last_seen_md_done")) or 0
                 )
 
                 retry_last_error_sig = (
                     _to_str_or_none(_row_get(r, "retry_last_error_sig")) or ""
                 )
                 retry_same_error_streak = int(
-                    _to_int_or_none(
-                        _row_get(r, "retry_same_error_streak")) or 0
+                    _to_int_or_none(_row_get(r, "retry_same_error_streak")) or 0
                 )
                 retry_last_error_sig_updated_at = float(
-                    _to_float_or_none(
-                        _row_get(r, "retry_last_error_sig_updated_at"))
+                    _to_float_or_none(_row_get(r, "retry_last_error_sig_updated_at"))
                     or 0.0
                 )
 
@@ -633,11 +735,9 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
                 run_id = _to_str_or_none(_row_get(r, "run_id"))
                 if not run_id:
                     continue
-                last_company_id = _to_str_or_none(
-                    _row_get(r, "last_company_id"))
+                last_company_id = _to_str_or_none(_row_get(r, "last_company_id"))
                 if last_company_id is None and "last_company_bvdid" in old_cols:
-                    last_company_id = _to_str_or_none(
-                        _row_get(r, "last_company_bvdid"))
+                    last_company_id = _to_str_or_none(_row_get(r, "last_company_bvdid"))
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO runs_new (
@@ -653,8 +753,7 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
                         _to_str_or_none(_row_get(r, "pipeline")),
                         _to_str_or_none(_row_get(r, "version")),
                         _to_str_or_none(_row_get(r, "args_hash")),
-                        _to_str_or_none(
-                            _row_get(r, "crawl4ai_cache_base_dir")),
+                        _to_str_or_none(_row_get(r, "crawl4ai_cache_base_dir")),
                         _to_str_or_none(_row_get(r, "crawl4ai_cache_mode")),
                         _to_str_or_none(_row_get(r, "started_at")),
                         int(_to_int_or_none(_row_get(r, "total_companies")) or 0),
@@ -697,8 +796,7 @@ def _rebuild_db_to_current_schema(db_path: Path) -> None:
 
         conn.execute("ALTER TABLE companies_new RENAME TO companies")
         conn.execute("ALTER TABLE runs_new RENAME TO runs")
-        conn.execute(
-            "ALTER TABLE run_company_done_new RENAME TO run_company_done")
+        conn.execute("ALTER TABLE run_company_done_new RENAME TO run_company_done")
 
     finally:
         conn.close()
@@ -820,7 +918,262 @@ def _filter_source_map_to_db(
 
 
 # -----------------------------------------------------------------------------
-# Public API
+# Corruption scan & fix
+# -----------------------------------------------------------------------------
+
+
+def _collect_corrupt_for_company(
+    out_dir: Path, company_id: str
+) -> List[CorruptJsonFile]:
+    out: List[CorruptJsonFile] = []
+    for p in _url_index_candidates(out_dir, company_id):
+        if not p.exists() or not p.is_file():
+            continue
+        ok, reason = _validate_json_bytes(p)
+        if ok:
+            continue
+        b = _read_bytes(p) or b""
+        out.append(
+            CorruptJsonFile(
+                company_id=company_id,
+                path=str(p),
+                size_bytes=int(len(b)),
+                reason=reason,
+                head_bytes_hex=_bytes_head_hex(b, 80),
+                head_text_preview=_bytes_text_preview(b, 200),
+            )
+        )
+    return out
+
+
+async def scan_corrupt_url_indexes_async(
+    *,
+    out_dir: Path,
+    db_path: Path,
+    max_examples: int = 1,
+) -> CorruptionReport:
+    out_dir = ensure_output_root(str(out_dir))
+    actual_db_path = Path(db_path).expanduser().resolve()
+    _rebuild_db_to_current_schema(actual_db_path)
+
+    state = CrawlState(db_path=actual_db_path)
+    try:
+        rows = await state._query_all("SELECT company_id FROM companies", tuple())
+        db_ids = [str(r["company_id"]) for r in rows]
+
+        sem = asyncio.Semaphore(64)
+        examples: List[CorruptJsonFile] = []
+        affected_company_set: set[str] = set()
+        affected_files = 0
+
+        async def _one(cid: str) -> None:
+            nonlocal affected_files
+            async with sem:
+                files = await asyncio.to_thread(
+                    _collect_corrupt_for_company, out_dir, cid
+                )
+                if files:
+                    affected_company_set.add(cid)
+                    affected_files += len(files)
+                    # Keep a few examples for review
+                    if len(examples) < max_examples:
+                        examples.extend(files[: max_examples - len(examples)])
+
+        batch = 512
+        for i in range(0, len(db_ids), batch):
+            await asyncio.gather(*(_one(cid) for cid in db_ids[i : i + batch]))
+
+        return CorruptionReport(
+            out_dir=str(out_dir),
+            db_path=str(actual_db_path),
+            scanned_companies=len(db_ids),
+            affected_companies=len(affected_company_set),
+            affected_files=int(affected_files),
+            examples=examples,
+        )
+    finally:
+        state.close()
+
+
+def scan_corrupt_url_indexes(
+    *,
+    out_dir: Path,
+    db_path: Path,
+    max_examples: int = 1,
+) -> CorruptionReport:
+    return asyncio.run(
+        scan_corrupt_url_indexes_async(
+            out_dir=out_dir,
+            db_path=db_path,
+            max_examples=max_examples,
+        )
+    )
+
+
+def _quarantine_file(path: Path) -> bool:
+    """
+    Rename corrupted file aside: url_index.json -> url_index.json.corrupt.<ts>.<pid>
+    """
+    if not path.exists():
+        return False
+    ts = int(time.time())
+    suffix = f".corrupt.{ts}.{os.getpid()}"
+    dst = Path(str(path) + suffix)
+    try:
+        path.rename(dst)
+        return True
+    except Exception:
+        return False
+
+
+async def _unmark_latest_run_done(state: CrawlState, company_id: str) -> int:
+    """
+    Remove (latest_run_id, company_id) from run_company_done so the scheduler won't skip it.
+    Returns number of rows deleted (0/1).
+    """
+    row = await state._query_one(
+        "SELECT run_id FROM runs ORDER BY started_at DESC LIMIT 1",
+        tuple(),
+    )
+    if row is None:
+        return 0
+    rid = str(row["run_id"])
+    # execute delete
+    await state._exec(
+        "DELETE FROM run_company_done WHERE run_id=? AND company_id=?",
+        (rid, company_id),
+    )
+    # sqlite changes() is per-connection; easiest is to re-check existence
+    row2 = await state._query_one(
+        "SELECT 1 AS x FROM run_company_done WHERE run_id=? AND company_id=? LIMIT 1",
+        (rid, company_id),
+    )
+    return 0 if row2 is not None else 1
+
+
+async def fix_corrupt_url_indexes_async(
+    *,
+    out_dir: Path,
+    db_path: Path,
+    max_examples: int = 1,
+    mark_pending: bool = True,
+    quarantine: bool = True,
+    unmark_run_done: bool = True,
+    dry_run: bool = False,
+) -> CorruptionFixReport:
+    out_dir = ensure_output_root(str(out_dir))
+    actual_db_path = Path(db_path).expanduser().resolve()
+    _rebuild_db_to_current_schema(actual_db_path)
+
+    state = CrawlState(db_path=actual_db_path)
+    try:
+        rows = await state._query_all("SELECT company_id FROM companies", tuple())
+        db_ids = [str(r["company_id"]) for r in rows]
+
+        sem = asyncio.Semaphore(64)
+        examples: List[CorruptJsonFile] = []
+        affected_company_set: set[str] = set()
+        quarantined = 0
+        marked = 0
+        unmarked = 0
+
+        async def _one(cid: str) -> None:
+            nonlocal quarantined, marked, unmarked
+            async with sem:
+                files = await asyncio.to_thread(
+                    _collect_corrupt_for_company, out_dir, cid
+                )
+                if not files:
+                    return
+
+                affected_company_set.add(cid)
+
+                # keep examples
+                if len(examples) < max_examples:
+                    examples.extend(files[: max_examples - len(examples)])
+
+                # quarantine corrupted files
+                if quarantine:
+                    for f in files:
+                        p = Path(f.path)
+                        if dry_run:
+                            quarantined += 1
+                        else:
+                            ok = await asyncio.to_thread(_quarantine_file, p)
+                            if ok:
+                                quarantined += 1
+
+                # mark pending in DB
+                if mark_pending:
+                    if not dry_run:
+                        # Reset progress so the crawler redoes it from scratch.
+                        # Note: leave retry counters intact; they help throttling.
+                        await state.upsert_company(
+                            cid,
+                            status="pending",
+                            crawl_finished=False,
+                            urls_total=0,
+                            urls_markdown_done=0,
+                            urls_llm_done=0,
+                            done_reason=None,
+                            done_details=None,
+                            done_at=None,
+                            last_error="corrupt_url_index_json",
+                            write_meta=True,
+                        )
+                    marked += 1
+
+                # remove run_done for latest run (optional)
+                if unmark_run_done:
+                    if dry_run:
+                        unmarked += 1
+                    else:
+                        unmarked += await _unmark_latest_run_done(state, cid)
+
+        batch = 512
+        for i in range(0, len(db_ids), batch):
+            await asyncio.gather(*(_one(cid) for cid in db_ids[i : i + batch]))
+
+        return CorruptionFixReport(
+            out_dir=str(out_dir),
+            db_path=str(actual_db_path),
+            dry_run=bool(dry_run),
+            scanned_companies=len(db_ids),
+            affected_companies=len(affected_company_set),
+            quarantined_files=int(quarantined),
+            marked_pending=int(marked),
+            run_done_unmarked=int(unmarked),
+            examples=examples,
+        )
+    finally:
+        state.close()
+
+
+def fix_corrupt_url_indexes(
+    *,
+    out_dir: Path,
+    db_path: Path,
+    max_examples: int = 1,
+    mark_pending: bool = True,
+    quarantine: bool = True,
+    unmark_run_done: bool = True,
+    dry_run: bool = False,
+) -> CorruptionFixReport:
+    return asyncio.run(
+        fix_corrupt_url_indexes_async(
+            out_dir=out_dir,
+            db_path=db_path,
+            max_examples=max_examples,
+            mark_pending=mark_pending,
+            quarantine=quarantine,
+            unmark_run_done=unmark_run_done,
+            dry_run=dry_run,
+        )
+    )
+
+
+# -----------------------------------------------------------------------------
+# Public API (existing calibrate/check, unchanged behavior unless you call corrupt funcs)
 # -----------------------------------------------------------------------------
 
 
@@ -862,8 +1215,7 @@ async def calibrate_async(
             industry_nace_path=industry_nace_path,
             industry_fallback_path=industry_fallback_path,
         )
-        src_map = _filter_source_map_to_db(
-            db_company_ids=db_ids, src_map=src_map)
+        src_map = _filter_source_map_to_db(db_company_ids=db_ids, src_map=src_map)
         src_used = int(len(src_map))
 
         company_id = _pick_sample_company_id(state, sample_company_id)
@@ -880,8 +1232,6 @@ async def calibrate_async(
                         cid,
                         root_url=src.root_url,
                         name=src.name,
-                        # Set to {} to match "new version crawl" crawl_meta.json (metadata: {}).
-                        # If you need dataset metadata elsewhere, change this back to src.metadata.
                         metadata={},
                         industry=src.industry,
                         nace=src.nace,
@@ -892,10 +1242,7 @@ async def calibrate_async(
                 db_snap = await state.get_company_snapshot(cid, recompute=False)
 
                 await asyncio.to_thread(
-                    _normalize_url_index_file,
-                    out_dir,
-                    cid,
-                    version_meta=version_meta,
+                    _normalize_url_index_file, out_dir, cid, version_meta=version_meta
                 )
                 await asyncio.to_thread(
                     _patch_crawl_meta_file,
@@ -908,7 +1255,7 @@ async def calibrate_async(
 
         batch = max(64, int(concurrency) * 8)
         for i in range(0, len(db_ids), batch):
-            await asyncio.gather(*(_one(cid) for cid in db_ids[i: i + batch]))
+            await asyncio.gather(*(_one(cid) for cid in db_ids[i : i + batch]))
 
         if write_global_state:
             await state.write_global_state_from_db_only(pretty=False)
@@ -930,10 +1277,7 @@ async def calibrate_async(
 
 
 async def check_async(
-    *,
-    out_dir: Path,
-    db_path: Path,
-    sample_company_id: Optional[str] = None,
+    *, out_dir: Path, db_path: Path, sample_company_id: Optional[str] = None
 ) -> CalibrationSample:
     out_dir = ensure_output_root(str(out_dir))
     actual_db_path = Path(db_path).expanduser().resolve()
@@ -975,10 +1319,7 @@ def calibrate(
 
 
 def check(
-    *,
-    out_dir: Path,
-    db_path: Path,
-    sample_company_id: Optional[str] = None,
+    *, out_dir: Path, db_path: Path, sample_company_id: Optional[str] = None
 ) -> CalibrationSample:
     return asyncio.run(
         check_async(

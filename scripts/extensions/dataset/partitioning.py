@@ -8,11 +8,13 @@ import os
 import random
 import shutil
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from configs.models import (
     CompanyStatus,
@@ -49,15 +51,6 @@ LEDGER_NAME = "failure_ledger.jsonl"
 
 URL_INDEX_NAME = "url_index.json"
 URL_INDEX_RESERVED_PREFIX = "__"
-
-KNOWN_COMPANY_STATUSES: Tuple[CompanyStatus, ...] = (
-    COMPANY_STATUS_PENDING,
-    COMPANY_STATUS_MD_NOT_DONE,
-    COMPANY_STATUS_MD_DONE,
-    COMPANY_STATUS_LLM_NOT_DONE,
-    COMPANY_STATUS_LLM_DONE,
-    COMPANY_STATUS_TERMINAL_DONE,
-)
 
 _STATUS_RANK: Dict[str, int] = {
     COMPANY_STATUS_PENDING: 0,
@@ -105,7 +98,7 @@ def _retry_emfile(fn, attempts: int = 6, base_delay: float = 0.15):
 
 def _atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    stamp = f"{int(time.time() * 1000)}-{os.getpid()}"
+    stamp = f"{int(time.time() * 1000)}-{os.getpid()}-{threading.get_ident()}"
     tmp = Path(f"{str(path)}.tmp.{stamp}")
 
     def _write() -> None:
@@ -141,6 +134,61 @@ def _read_json_strict(path: Path) -> Any:
         return json.loads(raw)
 
     return _retry_emfile(_read)
+
+
+# --------------------------------------------------------------------------------------
+# Concurrency helpers
+# --------------------------------------------------------------------------------------
+
+
+def _default_workers() -> int:
+    # IO-bound; don’t go crazy by default.
+    c = os.cpu_count() or 4
+    return max(1, min(16, c * 2))
+
+
+def _resolve_workers(workers: Optional[int]) -> int:
+    if workers is None:
+        return _default_workers()
+    w = int(workers)
+    if w <= 0:
+        return _default_workers()
+    return w
+
+
+def _run_threaded(label: str, items: Sequence[Any], fn, *, workers: int) -> None:
+    """
+    Run fn(item) for each item concurrently with ThreadPoolExecutor.
+
+    - Raises first exception, after all futures completed.
+    - Keeps concurrency bounded.
+    """
+    if not items:
+        return
+    w = max(1, int(workers))
+
+    # Avoid oversubscribing for tiny worklists.
+    w = min(w, len(items))
+
+    t0 = time.time()
+    logger.info("%s: starting %d tasks with workers=%d", label, len(items), w)
+
+    errors: List[BaseException] = []
+    with ThreadPoolExecutor(max_workers=w, thread_name_prefix="partition") as ex:
+        futs = [ex.submit(fn, it) for it in items]
+        for fut in as_completed(futs):
+            try:
+                fut.result()
+            except BaseException as e:
+                errors.append(e)
+
+    dt = time.time() - t0
+    if errors:
+        logger.error(
+            "%s: %d/%d tasks failed (elapsed=%.2fs)", label, len(errors), len(items), dt
+        )
+        raise errors[0]
+    logger.info("%s: completed %d tasks (elapsed=%.2fs)", label, len(items), dt)
 
 
 # --------------------------------------------------------------------------------------
@@ -332,7 +380,6 @@ def merge_tables_dedupe(
         out_rows.append(_normalize_row(r))
         seen_ids.add(cid)
 
-    # add any missing ids from add_rows
     add_id_col = add.id_col
     for r in add_rows:
         cid = (r.get(add_id_col) or "").strip()
@@ -415,6 +462,7 @@ def url_index_path_in_company_dir(company_dir: Path) -> Path:
 
 
 def _ledger_paths(root: Path) -> List[Path]:
+    # currently we only support the canonical layout used by the crawler:
     p = retry_dir(root) / LEDGER_NAME
     out: List[Path] = []
     if p.exists() and p not in out:
@@ -987,13 +1035,28 @@ def delete_company_rows(db: Path, company_ids: Sequence[str]) -> int:
 
 
 # --------------------------------------------------------------------------------------
-# Global state writer (DB-only) (matches CrawlState.write_global_state_from_db_only keys)
+# Global state writer (DB-only) for arbitrary run roots
+#   IMPORTANT: matches crawl.state.py payload shape (NO by_status)
 # --------------------------------------------------------------------------------------
+
+
+def _normalize_status(st: Any) -> CompanyStatus:
+    s = str(st or "").strip()
+    if s in _STATUS_RANK:
+        return s  # type: ignore[return-value]
+    return COMPANY_STATUS_PENDING
 
 
 def write_global_state_from_db_only(
     root: Path, *, max_ids: int = 200, pretty: bool = False
 ) -> Dict[str, Any]:
+    """
+    Write <root>/crawl_global_state.json using ONLY the DB content in <root>/crawl_state.sqlite3.
+
+    Payload shape intentionally matches CrawlState.write_global_state_from_db_only in crawl.state.py:
+      - NO "by_status"
+      - includes company_ids_sample, *_pct, urls_*_sum, latest_run, terminal_done_reasons (optional)
+    """
     db = crawl_db_path(root)
     ensure_db_initialized(db)
 
@@ -1014,7 +1077,7 @@ def write_global_state_from_db_only(
 
         run_done_count: Optional[int] = None
         if run_row is not None:
-            rrid = str(run_row["run_id"])
+            rrid = run_row["run_id"]
             c = conn.execute(
                 "SELECT COUNT(*) AS c FROM run_company_done WHERE run_id=?",
                 (rrid,),
@@ -1024,12 +1087,12 @@ def write_global_state_from_db_only(
         conn.close()
 
     total = len(rows)
-    by_status: Dict[str, int] = {k: 0 for k in KNOWN_COMPANY_STATUSES}
 
     pending_ids: List[str] = []
     in_progress_ids: List[str] = []
     done_ids: List[str] = []
 
+    pending_companies = 0
     md_done_companies = 0
     llm_done_companies = 0
     terminal_done_companies = 0
@@ -1041,16 +1104,13 @@ def write_global_state_from_db_only(
     crawl_finished_companies = 0
 
     for r in rows:
-        st = str(r["status"] or "").strip() or COMPANY_STATUS_PENDING
+        st = _normalize_status(r["status"])
         cid = str(r["company_id"] or "").strip()
         if not cid:
             continue
 
-        if st not in by_status:
-            by_status[st] = 0
-        by_status[st] += 1
-
         if st == COMPANY_STATUS_PENDING:
+            pending_companies += 1
             if len(pending_ids) < max_ids:
                 pending_ids.append(cid)
         elif st in (COMPANY_STATUS_MD_NOT_DONE, COMPANY_STATUS_LLM_NOT_DONE):
@@ -1080,7 +1140,7 @@ def write_global_state_from_db_only(
         urls_md_done_sum += int(r["urls_markdown_done"] or 0)
         urls_llm_done_sum += int(r["urls_llm_done"] or 0)
 
-    crawled_companies = total - by_status.get(COMPANY_STATUS_PENDING, 0)
+    crawled_companies = total - pending_companies
 
     md_done_pct = (md_done_companies / total * 100.0) if total else 0.0
     llm_done_pct = (llm_done_companies / total * 100.0) if total else 0.0
@@ -1125,7 +1185,6 @@ def write_global_state_from_db_only(
         "crawl_finished_pct": round(crawl_finished_pct, 2),
         "md_done_pct": round(md_done_pct, 2),
         "llm_done_pct": round(llm_done_pct, 2),
-        "by_status": by_status,
         "company_ids_sample": {
             "pending": pending_ids,
             "in_progress": in_progress_ids,
@@ -1183,8 +1242,7 @@ def _read_ids_file(path: Path) -> List[str]:
         if not s or s.startswith("#"):
             continue
         ids.append(s)
-    # keep order, dedupe
-    return list(dict.fromkeys(ids))
+    return list(dict.fromkeys(ids))  # keep order, dedupe
 
 
 def _validate_run_root(root: Path) -> None:
@@ -1209,11 +1267,13 @@ def split_run_root(
     move_mode: str = "move",  # move|copy
     include_ledger: bool = False,
     dry_run: bool = False,
+    workers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Split a run root into a bundle root + remaining/moved dataset files.
 
-    Returns a JSON-serializable dict (printed by CLI).
+    Concurrency:
+      - Company directory sync is executed in parallel with `workers`.
     """
     root = Path(root)
     dataset = Path(dataset)
@@ -1237,7 +1297,6 @@ def split_run_root(
         }
     )
 
-    # candidates = dataset ids that exist in DB
     db = crawl_db_path(root)
     status_map = read_company_status_map(db)
     db_ids = set(status_map.keys())
@@ -1245,13 +1304,11 @@ def split_run_root(
     candidates = [cid for cid in dataset_ids if cid in db_ids]
     missing_in_db = [cid for cid in dataset_ids if cid not in db_ids]
 
-    # optional only-not-done
     if only_not_done:
         candidates = [
             cid for cid in candidates if status_map.get(cid) not in DONE_STATUSES
         ]
 
-    # selection
     if move_ids_file is not None:
         requested = _read_ids_file(Path(move_ids_file))
         unknown = [cid for cid in requested if cid not in set(candidates)]
@@ -1266,7 +1323,6 @@ def split_run_root(
 
     chosen_set = set(chosen)
 
-    # dataset outputs
     remaining_rows, moved_rows = split_table_by_ids(table, chosen_set)
 
     moved_row_ids = {
@@ -1292,48 +1348,41 @@ def split_run_root(
         "remaining_rows": len(remaining_rows),
         "moved_rows": len(moved_rows),
         "missing_ids_in_db_from_dataset_sample": missing_in_db[:20],
+        "workers": _resolve_workers(workers),
     }
 
     if dry_run:
-        return {
-            "cmd": "split",
-            "dry_run": True,
-            "plan": plan,
-        }
+        return {"cmd": "split", "dry_run": True, "plan": plan}
 
-    # write datasets
     write_table_preserve(remaining_dataset_out, table, remaining_rows)
     write_table_preserve(moved_dataset_out, table, moved_rows)
 
-    # copy moved dataset into bundle root (same basename)
     bundle_root.mkdir(parents=True, exist_ok=True)
     shutil.copy2(moved_dataset_out, bundle_root / moved_dataset_out.name)
 
     move_dirs = move_mode == "move"
+    w = _resolve_workers(workers)
 
-    # company dirs
-    moved_company_dirs = 0
-    for cid in chosen:
+    def _sync_one(cid: str) -> None:
         sdir = find_company_dir(root, cid)
         if sdir is None:
             raise ValueError(f"Company directory missing for selected id: {cid}")
         ddir = expected_company_dir(bundle_root, cid)
         sync_tree(sdir, ddir, move=move_dirs, merge=True)
-        moved_company_dirs += 1
 
-    # db subset into bundle
+    _run_threaded("split:sync_company_dirs", chosen, _sync_one, workers=w)
+    moved_company_dirs = len(chosen)
+
     ensure_db_initialized(crawl_db_path(bundle_root))
     src_companies = read_companies_rows(crawl_db_path(root))
     subset = {cid: src_companies[cid] for cid in chosen if cid in src_companies}
     write_companies_rows(crawl_db_path(bundle_root), subset)
 
-    # carry over runs + run_company_done (union)
     write_runs_rows(crawl_db_path(bundle_root), read_runs_rows(crawl_db_path(root)))
     write_run_company_done_rows(
         crawl_db_path(bundle_root), read_run_company_done_rows(crawl_db_path(root))
     )
 
-    # retry subset
     src_retry, src_quarantine, _, _ = _load_retry_state(root)
     dst_retry = {cid: src_retry.get(cid) for cid in chosen if cid in src_retry}
     dst_quarantine = {
@@ -1341,24 +1390,20 @@ def split_run_root(
     }
     write_retry_state(bundle_root, dst_retry, dst_quarantine)
 
-    # ledger subset
     ledger_kept = 0
     if include_ledger:
         dst_ledger = _target_ledger_path(bundle_root)
         for lp in _ledger_paths(root):
             ledger_kept += filter_ledger_lines(lp, dst_ledger, chosen_set)
 
-    # scrub from source db/retry if move
     if move_dirs:
         delete_company_rows(crawl_db_path(root), chosen)
-
         new_retry = {k: v for k, v in src_retry.items() if str(k) not in chosen_set}
         new_quarantine = {
             k: v for k, v in src_quarantine.items() if str(k) not in chosen_set
         }
         write_retry_state(root, new_retry, new_quarantine)
 
-    # global state refresh
     write_global_state_from_db_only(bundle_root, pretty=False)
     write_global_state_from_db_only(root, pretty=False)
 
@@ -1385,11 +1430,14 @@ def merge_run_roots(
     move_mode: str = "copy",  # copy|move
     include_ledger: bool = False,
     dry_run: bool = False,
+    workers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Merge multiple run roots into one target root.
 
-    Returns a JSON-serializable dict (printed by CLI).
+    Concurrency:
+      - For each source root, company directory sync runs in parallel with `workers`.
+      - Source roots are processed sequentially to avoid races when multiple sources contain the same company_id.
     """
     target_root = Path(target_root)
     srcs = [Path(s) for s in source_roots]
@@ -1401,6 +1449,8 @@ def merge_run_roots(
     for s in srcs:
         _validate_run_root(s)
 
+    w = _resolve_workers(workers)
+
     if dry_run:
         return {
             "cmd": "merge",
@@ -1409,12 +1459,12 @@ def merge_run_roots(
             "source_roots": [str(s) for s in srcs],
             "move_mode": move_mode,
             "include_ledger": bool(include_ledger),
+            "workers": w,
         }
 
     target_root.mkdir(parents=True, exist_ok=True)
     ensure_db_initialized(crawl_db_path(target_root))
 
-    # load existing target DB state
     tgt_db = crawl_db_path(target_root)
     tgt_companies = read_companies_rows(tgt_db)
     tgt_runs = read_runs_rows(tgt_db)
@@ -1423,21 +1473,32 @@ def merge_run_roots(
     merged_company_ids: Set[str] = set()
     ledger_appended = 0
 
+    # Load target retry/quarantine once and update in-memory; write after each source for resilience.
+    tgt_retry, tgt_quarantine, _, _ = _load_retry_state(target_root)
+
     for sroot in srcs:
         sdb = crawl_db_path(sroot)
         src_companies = read_companies_rows(sdb)
+        src_company_ids = list(src_companies.keys())
 
-        # 1) company dirs + url_index merge
-        for cid in src_companies.keys():
+        # 1) company dirs + url_index merge (parallel per source)
+        def _sync_one(cid: str) -> None:
             sdir = find_company_dir(sroot, cid)
             if sdir is None:
                 logger.warning(
                     "Source company dir missing: root=%s company_id=%s", sroot, cid
                 )
-                continue
+                return
             ddir = expected_company_dir(target_root, cid)
             sync_tree(sdir, ddir, move=(move_mode == "move"), merge=True)
-            merged_company_ids.add(cid)
+
+        _run_threaded(
+            f"merge:sync_company_dirs[{sroot.name}]",
+            src_company_ids,
+            _sync_one,
+            workers=w,
+        )
+        merged_company_ids.update(src_company_ids)
 
         # 2) merge DB companies rows (prefer better)
         for cid, row in src_companies.items():
@@ -1450,12 +1511,11 @@ def merge_run_roots(
         tgt_runs.extend(read_runs_rows(sdb))
         tgt_done.extend(read_run_company_done_rows(sdb))
 
-        # 4) merge retry/quarantine
+        # 4) merge retry/quarantine in-memory
         src_retry, src_quarantine, _, _ = _load_retry_state(sroot)
-        tgt_retry, tgt_quarantine, _, _ = _load_retry_state(target_root)
-        merged_retry = merge_retry_states(tgt_retry, src_retry)
-        merged_quarantine = merge_quarantine(tgt_quarantine, src_quarantine)
-        write_retry_state(target_root, merged_retry, merged_quarantine)
+        tgt_retry = merge_retry_states(tgt_retry, src_retry)
+        tgt_quarantine = merge_quarantine(tgt_quarantine, src_quarantine)
+        write_retry_state(target_root, tgt_retry, tgt_quarantine)
 
         # 5) ledger
         if include_ledger:
@@ -1465,18 +1525,14 @@ def merge_run_roots(
 
         # 6) scrub source root db/retry (if move-mode move)
         if move_mode == "move":
-            delete_company_rows(sdb, list(src_companies.keys()))
+            delete_company_rows(sdb, src_company_ids)
             write_retry_state(sroot, {}, {})
             write_global_state_from_db_only(sroot, pretty=False)
 
-    # write merged DB
     write_companies_rows(tgt_db, tgt_companies)
-
-    # de-dupe runs and done rows by primary keys using INSERT OR IGNORE semantics
     write_runs_rows(tgt_db, tgt_runs)
     write_run_company_done_rows(tgt_db, tgt_done)
 
-    # final global state
     write_global_state_from_db_only(target_root, pretty=False)
 
     return {
@@ -1486,6 +1542,7 @@ def merge_run_roots(
         "source_roots": [str(s) for s in srcs],
         "move_mode": move_mode,
         "include_ledger": bool(include_ledger),
+        "workers": w,
         "merged_company_ids": len(merged_company_ids),
         "ledger_lines_appended": ledger_appended,
     }

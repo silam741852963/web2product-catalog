@@ -5,7 +5,12 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from extensions.crawl.state_calibration import calibrate, check
+from extensions.crawl.state_calibration import (
+    calibrate,
+    check,
+    scan_corrupt_url_indexes,
+    fix_corrupt_url_indexes,
+)
 from extensions.io.load_source import (
     DEFAULT_INDUSTRY_FALLBACK_PATH,
     DEFAULT_NACE_INDUSTRY_PATH,
@@ -67,7 +72,6 @@ def _print_sample(title: str, s) -> None:
             "updated_at",
             "last_crawled_at",
             "max_pages",
-            "calibrated_at",
         )
     }
     print(json.dumps(cm_excerpt, ensure_ascii=False, indent=2))
@@ -97,29 +101,56 @@ def _print_sample(title: str, s) -> None:
     print(json.dumps(im_excerpt, ensure_ascii=False, indent=2))
 
 
+def _print_corruption_report(title: str, rep) -> None:
+    print(f"\n== {title} ==")
+    print(
+        json.dumps(
+            {
+                "out_dir": rep.out_dir,
+                "db_path": rep.db_path,
+                "scanned_companies": rep.scanned_companies,
+                "affected_companies": rep.affected_companies,
+                "affected_files": getattr(rep, "affected_files", None),
+                "quarantined_files": getattr(rep, "quarantined_files", None),
+                "marked_pending": getattr(rep, "marked_pending", None),
+                "run_done_unmarked": getattr(rep, "run_done_unmarked", None),
+                "dry_run": getattr(rep, "dry_run", None),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    if rep.examples:
+        print("\n[Example corrupted file(s)]")
+        for ex in rep.examples:
+            print("-" * 80)
+            print(f"company_id: {ex.company_id}")
+            print(f"path:      {ex.path}")
+            print(f"size:      {ex.size_bytes}")
+            print(f"reason:    {ex.reason}")
+            print(f"head_hex:  {ex.head_bytes_hex}")
+            print(f"preview:   {ex.head_text_preview!r}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="crawl_state_calibrate")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_check = sub.add_parser("check")
     p_check.add_argument("--out-dir", type=str, required=True)
-    p_check.add_argument("--db-path", type=str,
-                         default=None)  # optional override
+    p_check.add_argument("--db-path", type=str, default=None)
     p_check.add_argument("--sample-company-id", type=str, default=None)
 
     p_cal = sub.add_parser("calibrate")
     p_cal.add_argument("--out-dir", type=str, required=True)
-    p_cal.add_argument("--db-path", type=str,
-                       default=None)  # optional override
+    p_cal.add_argument("--db-path", type=str, default=None)
     p_cal.add_argument("--sample-company-id", type=str, default=None)
     p_cal.add_argument("--no-global-state", action="store_true")
     p_cal.add_argument("--concurrency", type=int, default=32)
 
-    # Source enrichment (ONLY enriches companies that already exist in DB)
     p_cal.add_argument("--dataset-file", type=str, default=None)
     p_cal.add_argument("--company-file", type=str, default=None)
 
-    # Same defaults as extensions.io.load_source
     p_cal.add_argument(
         "--industry-nace-path", type=str, default=str(DEFAULT_NACE_INDUSTRY_PATH)
     )
@@ -129,34 +160,62 @@ def main() -> None:
         default=str(DEFAULT_INDUSTRY_FALLBACK_PATH),
     )
 
+    # NEW: corruption scan/fix
+    p_cor = sub.add_parser(
+        "corrupt", help="scan/fix corrupted url_index.json (e.g., NUL-byte files)"
+    )
+    p_cor.add_argument("--out-dir", type=str, required=True)
+    p_cor.add_argument("--db-path", type=str, default=None)
+    p_cor.add_argument("--max-examples", type=int, default=1)
+
+    p_cor.add_argument(
+        "--mark-pending",
+        action="store_true",
+        help="If set: quarantine corrupted url_index.json and mark the company pending/not-done in DB.",
+    )
+    p_cor.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change but do not modify files/DB.",
+    )
+    p_cor.add_argument(
+        "--no-quarantine",
+        action="store_true",
+        help="Do not rename corrupted files aside.",
+    )
+    p_cor.add_argument(
+        "--no-unmark-run-done",
+        action="store_true",
+        help="Do not delete (latest_run, company_id) from run_company_done when marking pending.",
+    )
+
     args = p.parse_args()
 
     out_dir = ensure_output_root(args.out_dir)
 
     db_path: Optional[Path]
-    if args.db_path:
+    if getattr(args, "db_path", None):
         db_path = Path(args.db_path).expanduser().resolve()
     else:
         db_path = (out_dir / "crawl_state.sqlite3").resolve()
 
-    sample_company_id = args.sample_company_id
-
     if args.cmd == "check":
-        s = check(out_dir=out_dir, db_path=db_path,
-                  sample_company_id=sample_company_id)
+        s = check(
+            out_dir=out_dir, db_path=db_path, sample_company_id=args.sample_company_id
+        )
         _print_sample("CHECK", s)
         return
 
     if args.cmd == "calibrate":
         before = check(
-            out_dir=out_dir, db_path=db_path, sample_company_id=sample_company_id
+            out_dir=out_dir, db_path=db_path, sample_company_id=args.sample_company_id
         )
         _print_sample("BEFORE", before)
 
         rep = calibrate(
             out_dir=out_dir,
             db_path=db_path,
-            sample_company_id=sample_company_id,
+            sample_company_id=args.sample_company_id,
             write_global_state=(not args.no_global_state),
             concurrency=int(args.concurrency),
             dataset_file=(
@@ -198,6 +257,29 @@ def main() -> None:
         )
 
         _print_sample("AFTER", rep.sample_after)
+        return
+
+    if args.cmd == "corrupt":
+        quarantine = not bool(args.no_quarantine)
+        unmark_run_done = not bool(args.no_unmark_run_done)
+
+        if not args.mark_pending:
+            rep = scan_corrupt_url_indexes(
+                out_dir=out_dir, db_path=db_path, max_examples=int(args.max_examples)
+            )
+            _print_corruption_report("CORRUPTION SCAN", rep)
+            return
+
+        rep2 = fix_corrupt_url_indexes(
+            out_dir=out_dir,
+            db_path=db_path,
+            max_examples=int(args.max_examples),
+            mark_pending=True,
+            quarantine=quarantine,
+            unmark_run_done=unmark_run_done,
+            dry_run=bool(args.dry_run),
+        )
+        _print_corruption_report("CORRUPTION FIX", rep2)
         return
 
     raise RuntimeError(f"Unhandled cmd: {args.cmd!r}")

@@ -4,10 +4,10 @@ import hashlib
 import json
 import logging
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from configs.models import UrlIndexEntry
 from extensions.company_profile.embedding_backend import Embedder, cosine
 from extensions.company_profile.text_norm import (
     descriptiveness_score,
@@ -18,34 +18,17 @@ from extensions.company_profile.text_norm import (
     norm_type,
     split_sentences,
 )
+from extensions.crawl import state as crawl_state
+from extensions.io import output_paths
 
 logger = logging.getLogger("company_profile_builder")
 
 PIPELINE_VERSION = "profile-v1"
 EMBED_MODEL = "BAAI/bge-m3"
 
-
-@dataclass
-class PageRecord:
-    url: str
-    product_json_path: Path
-    markdown_path: Optional[Path]
-    root_url: Optional[str] = None
-    company_domain: Optional[str] = None
-
-
-@dataclass
-class Mention:
-    type_raw: str
-    raw_name: str
-    raw_description: str
-    source_url: str
-    product_json_path: Path
-    markdown_path: Optional[Path]
-
-    type_norm: str = ""
-    name_norm: str = ""
-    desc_norm: str = ""
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
 
 
 class UnionFind:
@@ -122,7 +105,7 @@ def _domain_from_root(root_url: Optional[str]) -> Optional[str]:
 
 def _resolve_maybe_relative(base: Path, p: str) -> Path:
     """
-    url_index.json often stores:
+    url_index.json may store:
       - absolute paths (older runs)
       - or relative paths like "product/xxx.json" / "markdown/xxx.md"
     We accept both.
@@ -131,18 +114,43 @@ def _resolve_maybe_relative(base: Path, p: str) -> Path:
     return pp if pp.is_absolute() else (base / pp).resolve()
 
 
-def _load_inputs(
-    outputs_dir: Path, company_id: str
-) -> Tuple[Path, List[PageRecord], Dict[str, Any]]:
-    company_dir = outputs_dir / company_id
-    meta_dir = company_dir / "metadata"
-    prod_dir = company_dir / "product"
+def _company_dirs(company_id: str) -> Dict[str, Path]:
+    """
+    Centralized directory contract via extensions.io.output_paths.py
 
-    crawl_meta_path = meta_dir / "crawl_meta.json"
-    url_index_path = meta_dir / "url_index.json"
+    IMPORTANT: output_paths.ensure_company_dirs() is rooted at the *global*
+    output root. So callers MUST ensure output_paths.ensure_output_root(...)
+    has been called before this, if they want a non-default root.
+    """
+    dirs = output_paths.ensure_company_dirs(company_id)
 
-    crawl_meta = _load_json(crawl_meta_path) if crawl_meta_path.exists() else None
-    url_index = _load_json(url_index_path) if url_index_path.exists() else None
+    # Normalize keys to a stable contract for this module.
+    # output_paths.ensure_company_dirs returns:
+    #   base/html/markdown/product/log/metadata
+    out: Dict[str, Path] = {
+        "company_dir": Path(dirs["base"]).resolve(),
+        "html": Path(dirs["html"]).resolve(),
+        "markdown": Path(dirs["markdown"]).resolve(),
+        "product": Path(dirs["product"]).resolve(),
+        "log": Path(dirs["log"]).resolve(),
+        "metadata": Path(dirs["metadata"]).resolve(),
+    }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Input loading
+# ---------------------------------------------------------------------------
+
+
+def _load_inputs(company_id: str) -> Tuple[Path, List[Dict[str, Any]], Dict[str, Any]]:
+    dirs = _company_dirs(company_id)
+    company_dir = dirs["company_dir"]
+    prod_dir = dirs["product"]
+    md_dir = dirs["markdown"]
+
+    crawl_meta = crawl_state.load_crawl_meta(company_id)
+    url_index = crawl_state.load_url_index(company_id)
 
     crawl_meta = crawl_meta if isinstance(crawl_meta, dict) else {}
     url_index = url_index if isinstance(url_index, dict) else {}
@@ -161,18 +169,20 @@ def _load_inputs(
     # Primary linking: via url_index[*].product_path (absolute or relative)
     prod_map: Dict[str, Tuple[str, Optional[str]]] = {}
     for url, ent in url_index.items():
-        if not isinstance(ent, dict):
+        if not isinstance(url, str) or not isinstance(ent, dict):
             continue
-        pp = ent.get("product_path")
-        mp = ent.get("markdown_path")
-        if isinstance(pp, str):
-            resolved_pp = _resolve_maybe_relative(company_dir, pp)
+        try:
+            e = UrlIndexEntry.from_dict(ent, company_id=company_id, url=url)
+        except Exception:
+            continue
+        if isinstance(e.product_path, str) and e.product_path.strip():
+            resolved_pp = _resolve_maybe_relative(company_dir, e.product_path).resolve()
             prod_map[resolved_pp.as_posix()] = (
-                str(url),
-                mp if isinstance(mp, str) else None,
+                url,
+                e.markdown_path if isinstance(e.markdown_path, str) else None,
             )
 
-    records: List[PageRecord] = []
+    records: List[Dict[str, Any]] = []
     unlinked: List[Path] = []
 
     for pf in product_files:
@@ -185,25 +195,26 @@ def _load_inputs(
         else:
             # Fallback: stem match .json <-> .md
             stem = pf.stem
-            md_guess = company_dir / "markdown" / f"{stem}.md"
+            md_guess = (md_dir / f"{stem}.md").resolve()
             if md_guess.exists():
                 md = md_guess.as_posix()
 
+            # filename match against url_index
             for u, ent in url_index.items():
-                if isinstance(ent, dict):
-                    pp = ent.get("product_path")
-                    if isinstance(pp, str):
-                        # Compare by filename too, in case stored as "product/x.json" etc
-                        try:
-                            if Path(pp).name == pf.name:
-                                url = str(u)
-                                if md is None:
-                                    mp = ent.get("markdown_path")
-                                    if isinstance(mp, str):
-                                        md = mp
-                                break
-                        except Exception:
-                            pass
+                if not isinstance(u, str) or not isinstance(ent, dict):
+                    continue
+                pp = ent.get("product_path")
+                if isinstance(pp, str):
+                    try:
+                        if Path(pp).name == pf.name:
+                            url = u
+                            if md is None:
+                                mp = ent.get("markdown_path")
+                                if isinstance(mp, str):
+                                    md = mp
+                            break
+                    except Exception:
+                        pass
 
         if url is None:
             unlinked.append(pf)
@@ -218,13 +229,13 @@ def _load_inputs(
                 )
 
         records.append(
-            PageRecord(
-                url=url,
-                product_json_path=pf.resolve(),
-                markdown_path=md_path,
-                root_url=str(root_url) if root_url else None,
-                company_domain=domain,
-            )
+            {
+                "url": url,
+                "product_json_path": pf.resolve(),
+                "markdown_path": md_path,
+                "root_url": str(root_url) if root_url else None,
+                "company_domain": domain,
+            }
         )
 
     logger.info("step1: linked_records=%d", len(records))
@@ -238,13 +249,18 @@ def _load_inputs(
     return company_dir, records, crawl_meta
 
 
-def _flatten_mentions(records: List[PageRecord]) -> List[Mention]:
-    mentions: List[Mention] = []
+# ---------------------------------------------------------------------------
+# Mention extraction + filtering
+# ---------------------------------------------------------------------------
+
+
+def _flatten_mentions(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    mentions: List[Dict[str, Any]] = []
     bad = 0
     pages_with = 0
 
     for r in records:
-        obj = _load_json(r.product_json_path)
+        obj = _load_json(Path(r["product_json_path"]))
         if not isinstance(obj, dict):
             bad += 1
             continue
@@ -257,20 +273,23 @@ def _flatten_mentions(records: List[PageRecord]) -> List[Mention]:
             if not isinstance(o, dict):
                 continue
             mentions.append(
-                Mention(
-                    type_raw=str(o.get("type") or ""),
-                    raw_name=str(o.get("name") or ""),
-                    raw_description=str(o.get("description") or ""),
-                    source_url=r.url,
-                    product_json_path=r.product_json_path,
-                    markdown_path=r.markdown_path,
-                )
+                {
+                    "type_raw": str(o.get("type") or ""),
+                    "raw_name": str(o.get("name") or ""),
+                    "raw_description": str(o.get("description") or ""),
+                    "source_url": str(r["url"]),
+                    "product_json_path": Path(r["product_json_path"]),
+                    "markdown_path": r.get("markdown_path"),
+                    "type_norm": "",
+                    "name_norm": "",
+                    "desc_norm": "",
+                }
             )
             count += 1
 
         if count:
             pages_with += 1
-            logger.debug("step2: page=%s mentions=%d", r.url, count)
+            logger.debug("step2: page=%s mentions=%d", r["url"], count)
 
     logger.info(
         "step2: mentions=%d pages_with_mentions=%d malformed_product_json=%d",
@@ -296,8 +315,8 @@ def _load_markdown_cached(md_path: Optional[Path], cache: Dict[str, str]) -> str
 
 
 def _normalize_filter_mentions(
-    mentions: List[Mention], *, min_name_len: int = 3
-) -> List[Mention]:
+    mentions: List[Dict[str, Any]], *, min_name_len: int = 3
+) -> List[Dict[str, Any]]:
     md_cache: Dict[str, str] = {}
 
     dropped_empty = 0
@@ -305,24 +324,28 @@ def _normalize_filter_mentions(
     dropped_deny = 0
     dropped_unsupported = 0
 
-    clean: List[Mention] = []
+    clean: List[Dict[str, Any]] = []
     for m in mentions:
-        m.type_norm = norm_type(m.type_raw)
-        m.name_norm = norm_name(m.raw_name)
-        m.desc_norm = norm_desc(m.raw_description)
+        m["type_norm"] = norm_type(m.get("type_raw", ""))
+        m["name_norm"] = norm_name(m.get("raw_name", ""))
+        m["desc_norm"] = norm_desc(m.get("raw_description", ""))
 
-        if not m.name_norm:
+        if not m["name_norm"]:
             dropped_empty += 1
             continue
-        if len(m.name_norm) < min_name_len:
+        if len(m["name_norm"]) < min_name_len:
             dropped_short += 1
             continue
-        if is_denylisted(m.raw_name) or is_denylisted(m.raw_description):
+        if is_denylisted(m.get("raw_name", "")) or is_denylisted(
+            m.get("raw_description", "")
+        ):
             dropped_deny += 1
             continue
 
-        md_body = _load_markdown_cached(m.markdown_path, md_cache)
-        if not evidence_probe(md_body, m.raw_name, m.raw_description):
+        md_body = _load_markdown_cached(m.get("markdown_path"), md_cache)
+        if not evidence_probe(
+            md_body, m.get("raw_name", ""), m.get("raw_description", "")
+        ):
             dropped_unsupported += 1
             continue
 
@@ -342,17 +365,22 @@ def _normalize_filter_mentions(
     return clean
 
 
+# ---------------------------------------------------------------------------
+# Clustering + dedup (embedding ALWAYS ON for these)
+# ---------------------------------------------------------------------------
+
+
 def _cluster_mentions(
-    mentions: List[Mention],
+    mentions: List[Dict[str, Any]],
     *,
     embedder: Embedder,
     name_merge_threshold: float,
-) -> Dict[str, List[List[Mention]]]:
-    by_type: Dict[str, List[Mention]] = {"product": [], "service": []}
+) -> Dict[str, List[List[Dict[str, Any]]]]:
+    by_type: Dict[str, List[Dict[str, Any]]] = {"product": [], "service": []}
     for m in mentions:
-        by_type.setdefault(m.type_norm, []).append(m)
+        by_type.setdefault(str(m.get("type_norm") or ""), []).append(m)
 
-    clusters_by_type: Dict[str, List[List[Mention]]] = {}
+    clusters_by_type: Dict[str, List[List[Dict[str, Any]]]] = {}
 
     for typ, items in by_type.items():
         if not items:
@@ -361,7 +389,7 @@ def _cluster_mentions(
 
         blocks: Dict[str, List[int]] = {}
         for i, m in enumerate(items):
-            blocks.setdefault(m.name_norm, []).append(i)
+            blocks.setdefault(str(m.get("name_norm") or ""), []).append(i)
 
         uf = UnionFind(len(items))
 
@@ -371,7 +399,7 @@ def _cluster_mentions(
                 for j in idxs[1:]:
                     uf.union(base, j)
 
-        unique_names = sorted(blocks.keys())
+        unique_names = sorted([k for k in blocks.keys() if k])
         er = embedder.embed_texts(unique_names, normalize=True)
         vecs = er.vectors
 
@@ -404,7 +432,7 @@ def _cluster_mentions(
             "step4[%s]: name_cosine_comparisons=%d merges=%d", typ, comps, merges
         )
 
-        group: Dict[int, List[Mention]] = {}
+        group: Dict[int, List[Dict[str, Any]]] = {}
         for i, m in enumerate(items):
             root = uf.find(i)
             group.setdefault(root, []).append(m)
@@ -492,7 +520,7 @@ def _dedup_descriptions(
 
 def _merge_clusters_to_offerings(
     company_id: str,
-    clusters_by_type: Dict[str, List[List[Mention]]],
+    clusters_by_type: Dict[str, List[List[Dict[str, Any]]]],
     *,
     embedder: Embedder,
     sent_merge_threshold: float,
@@ -502,8 +530,16 @@ def _merge_clusters_to_offerings(
 
     for typ in ("product", "service"):
         for ci, cluster in enumerate(clusters_by_type.get(typ, [])):
-            names = [m.raw_name for m in cluster if m.raw_name]
-            descs = [m.raw_description for m in cluster if m.raw_description]
+            names = [
+                str(m.get("raw_name") or "")
+                for m in cluster
+                if str(m.get("raw_name") or "").strip()
+            ]
+            descs = [
+                str(m.get("raw_description") or "")
+                for m in cluster
+                if str(m.get("raw_description") or "").strip()
+            ]
 
             best, others = _pick_best_name(names)
             best_norm = norm_name(best)
@@ -511,13 +547,22 @@ def _merge_clusters_to_offerings(
 
             sources_map: Dict[str, Dict[str, str]] = {}
             for m in cluster:
-                key = f"{m.source_url}|{m.product_json_path.as_posix()}"
+                src_url = str(m.get("source_url") or "")
+                pj = m.get("product_json_path")
+                mp = m.get("markdown_path")
+
+                pj_s = Path(pj).as_posix() if isinstance(pj, Path) else str(pj or "")
+                mp_s = (
+                    Path(mp).as_posix()
+                    if isinstance(mp, Path)
+                    else (str(mp or "") if mp else "")
+                )
+
+                key = f"{src_url}|{pj_s}"
                 sources_map[key] = {
-                    "url": m.source_url,
-                    "product_json_path": m.product_json_path.as_posix(),
-                    "markdown_path": m.markdown_path.as_posix()
-                    if m.markdown_path
-                    else "",
+                    "url": src_url,
+                    "product_json_path": pj_s,
+                    "markdown_path": mp_s,
                 }
 
             descriptions = _dedup_descriptions(
@@ -550,6 +595,11 @@ def _merge_clusters_to_offerings(
 
     logger.info("step5: canonical_offerings=%d", len(offerings))
     return offerings
+
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
 
 
 def _write_company_profile_md(
@@ -643,7 +693,7 @@ def _offering_embed_text(o: Dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-def _embed_all(
+def _embed_text_outputs(
     company_dir: Path,
     embedder: Embedder,
     md_path: Path,
@@ -698,10 +748,25 @@ def _write_company_profile_json(
     offerings: List[Dict[str, Any]],
     *,
     embedder: Embedder,
-    company_vec: List[float],
-    offering_vecs: Dict[str, List[float]],
+    embed_text_output: bool,
+    company_vec: Optional[List[float]] = None,
+    offering_vecs: Optional[Dict[str, List[float]]] = None,
 ) -> Path:
     out_path = company_dir / "company_profile.json"
+
+    # Single unified embedding section:
+    embedding_block: Dict[str, Any] = {
+        "model": EMBED_MODEL,
+        "dim": int(embedder.dim),
+        "backend": str(embedder.backend),
+        "text_output_enabled": bool(embed_text_output),
+    }
+
+    # Only attach vector payloads when explicitly requested.
+    if embed_text_output:
+        embedding_block["company_profile"] = company_vec or []
+        embedding_block["offerings"] = offering_vecs or {}
+
     payload: Dict[str, Any] = {
         "company_id": company_id,
         "pipeline_version": PIPELINE_VERSION,
@@ -709,44 +774,71 @@ def _write_company_profile_json(
         "root_url": crawl_meta.get("root_url"),
         "crawl_meta": crawl_meta,
         "offerings": offerings,
-        "embeddings": {
-            "model": EMBED_MODEL,
-            "dim": embedder.dim,
-            "embedding_company_profile": company_vec,
-            "embedding_offerings": offering_vecs,
-        },
+        # ✅ only one top-level key now
+        "embedding": embedding_block,
     }
 
     tmp = out_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(out_path)
+
     logger.info(
-        "step8: wrote_json=%s offerings=%d size_bytes=%d",
+        "step8: wrote_json=%s offerings=%d size_bytes=%d embed_text_output=%s",
         out_path,
         len(offerings),
         out_path.stat().st_size,
+        embed_text_output,
     )
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# Public entrypoint
+# ---------------------------------------------------------------------------
+
+
 def build_company_profile_for_company(
     *,
-    outputs_dir: Path,
     company_id: str,
+    outputs_dir: Optional[Path] = None,
     embed_device: str = "cpu",
+    embed_text_output: bool = False,
     name_merge_threshold: float = 0.94,
     sent_merge_threshold: float = 0.90,
     max_desc_sentences: int = 8,
+    write_meta_patch: bool = True,
 ) -> bool:
-    company_dir = outputs_dir / company_id
+    """
+    - Clustering + sentence dedup ALWAYS uses embeddings.
+    - Text output embeddings (company profile + offerings vectors) are OPTIONAL
+      and controlled by embed_text_output (default False).
+    - outputs_dir, if provided, MUST become the global output root so that
+      crawl_state + output_paths resolve consistently.
+    """
+    # ✅ CRITICAL FIX:
+    # If outputs_dir is provided, make it the canonical global output root
+    # before any ensure_company_dirs/load_crawl_meta/load_url_index call happens.
+    if outputs_dir is not None:
+        output_paths.ensure_output_root(outputs_dir)
+
+    # Resolve company_dir via output_paths contract (now rooted correctly)
+    dirs = _company_dirs(company_id)
+    company_dir = dirs["company_dir"]
+
     _setup_company_logger(company_dir)
 
     try:
+        if outputs_dir is None:
+            outputs_dir = Path(output_paths.get_output_root()).resolve()
+        else:
+            outputs_dir = outputs_dir.expanduser().resolve()
+
         logger.info(
-            "company_id=%s outputs_dir=%s embed_device=%s",
+            "company_id=%s output_root=%s embed_device=%s embed_text_output=%s",
             company_id,
             outputs_dir,
             embed_device,
+            embed_text_output,
         )
         logger.info(
             "step0: detected_paths metadata=%s product=%s markdown=%s",
@@ -755,56 +847,9 @@ def build_company_profile_for_company(
             company_dir / "markdown",
         )
 
-        company_dir, records, crawl_meta = _load_inputs(outputs_dir, company_id)
-        if not records:
-            logger.warning("no linked product records; writing empty profile")
-            empty_offerings: List[Dict[str, Any]] = []
-            md_path = _write_company_profile_md(
-                company_dir, company_id, crawl_meta.get("root_url"), empty_offerings
-            )
+        company_dir, records, crawl_meta = _load_inputs(company_id)
 
-            embedder = Embedder(EMBED_MODEL, device=embed_device)
-            company_vec, offering_vecs = _embed_all(
-                company_dir, embedder, md_path, empty_offerings
-            )
-            _write_company_profile_json(
-                company_dir,
-                company_id,
-                crawl_meta,
-                empty_offerings,
-                embedder=embedder,
-                company_vec=company_vec,
-                offering_vecs=offering_vecs,
-            )
-            return True
-
-        mentions = _flatten_mentions(records)
-
-        clean = _normalize_filter_mentions(mentions)
-        if not clean:
-            logger.warning(
-                "all mentions dropped after filtering; writing empty profile"
-            )
-            empty_offerings = []
-            md_path = _write_company_profile_md(
-                company_dir, company_id, crawl_meta.get("root_url"), empty_offerings
-            )
-
-            embedder = Embedder(EMBED_MODEL, device=embed_device)
-            company_vec, offering_vecs = _embed_all(
-                company_dir, embedder, md_path, empty_offerings
-            )
-            _write_company_profile_json(
-                company_dir,
-                company_id,
-                crawl_meta,
-                empty_offerings,
-                embedder=embedder,
-                company_vec=company_vec,
-                offering_vecs=offering_vecs,
-            )
-            return True
-
+        # Embedder is ALWAYS needed for clustering/dedup
         embedder = Embedder(EMBED_MODEL, device=embed_device)
         logger.info(
             "embedder_ready model=%s backend=%s dim=%d device=%s",
@@ -813,6 +858,88 @@ def build_company_profile_for_company(
             embedder.dim,
             embed_device,
         )
+
+        if not records:
+            logger.warning("no linked product records; writing empty profile")
+            offerings: List[Dict[str, Any]] = []
+            md_path = _write_company_profile_md(
+                company_dir, company_id, crawl_meta.get("root_url"), offerings
+            )
+
+            company_vec: Optional[List[float]] = None
+            offering_vecs: Optional[Dict[str, List[float]]] = None
+            if embed_text_output:
+                company_vec, offering_vecs = _embed_text_outputs(
+                    company_dir, embedder, md_path, offerings
+                )
+
+            _write_company_profile_json(
+                company_dir,
+                company_id,
+                crawl_meta,
+                offerings,
+                embedder=embedder,
+                embed_text_output=embed_text_output,
+                company_vec=company_vec,
+                offering_vecs=offering_vecs,
+            )
+
+            if write_meta_patch:
+                crawl_state.patch_crawl_meta(
+                    company_id,
+                    {
+                        "company_profile_built": True,
+                        "company_profile_pipeline_version": PIPELINE_VERSION,
+                        "company_profile_embed_text_output": bool(embed_text_output),
+                        "company_profile_embedding_model": EMBED_MODEL,
+                        "company_profile_embedding_dim": int(embedder.dim),
+                    },
+                    pretty=True,
+                )
+            return True
+
+        mentions = _flatten_mentions(records)
+        clean = _normalize_filter_mentions(mentions)
+        if not clean:
+            logger.warning(
+                "all mentions dropped after filtering; writing empty profile"
+            )
+            offerings = []
+            md_path = _write_company_profile_md(
+                company_dir, company_id, crawl_meta.get("root_url"), offerings
+            )
+
+            company_vec = None
+            offering_vecs = None
+            if embed_text_output:
+                company_vec, offering_vecs = _embed_text_outputs(
+                    company_dir, embedder, md_path, offerings
+                )
+
+            _write_company_profile_json(
+                company_dir,
+                company_id,
+                crawl_meta,
+                offerings,
+                embedder=embedder,
+                embed_text_output=embed_text_output,
+                company_vec=company_vec,
+                offering_vecs=offering_vecs,
+            )
+
+            if write_meta_patch:
+                crawl_state.patch_crawl_meta(
+                    company_id,
+                    {
+                        "company_profile_built": True,
+                        "company_profile_pipeline_version": PIPELINE_VERSION,
+                        "company_profile_embed_text_output": bool(embed_text_output),
+                        "company_profile_embedding_model": EMBED_MODEL,
+                        "company_profile_embedding_dim": int(embedder.dim),
+                    },
+                    pretty=True,
+                )
+            return True
 
         clusters_by_type = _cluster_mentions(
             clean, embedder=embedder, name_merge_threshold=name_merge_threshold
@@ -830,9 +957,12 @@ def build_company_profile_for_company(
             company_dir, company_id, crawl_meta.get("root_url"), offerings
         )
 
-        company_vec, offering_vecs = _embed_all(
-            company_dir, embedder, md_path, offerings
-        )
+        company_vec = None
+        offering_vecs = None
+        if embed_text_output:
+            company_vec, offering_vecs = _embed_text_outputs(
+                company_dir, embedder, md_path, offerings
+            )
 
         _write_company_profile_json(
             company_dir,
@@ -840,9 +970,24 @@ def build_company_profile_for_company(
             crawl_meta,
             offerings,
             embedder=embedder,
+            embed_text_output=embed_text_output,
             company_vec=company_vec,
             offering_vecs=offering_vecs,
         )
+
+        if write_meta_patch:
+            crawl_state.patch_crawl_meta(
+                company_id,
+                {
+                    "company_profile_built": True,
+                    "company_profile_pipeline_version": PIPELINE_VERSION,
+                    "company_profile_embed_text_output": bool(embed_text_output),
+                    "company_profile_embedding_model": EMBED_MODEL,
+                    "company_profile_embedding_dim": int(embedder.dim),
+                    "company_profile_offerings_total": int(len(offerings)),
+                },
+                pretty=True,
+            )
 
         logger.info("done company_id=%s", company_id)
         return True

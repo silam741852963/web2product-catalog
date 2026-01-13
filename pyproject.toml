@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=80.0.0", "wheel>=0.45.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "web2product-catalog-scripts"
+version = "0.10.3"
+description = "Web2Product catalog scripts (configs/extensions/cli)"
+readme = "README.md"
+requires-python = "==3.13.11"
+dynamic = ["dependencies"]
+
+[tool.setuptools]
+package-dir = {"" = "scripts"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["scripts"]
+include = [
+  "configs*",
+  "extensions*",
+  "cli*",
+]
+exclude = [
+  "__pycache__*",
+  "*.tests*",
+  "outputs*",
+  "out*",
+  ".venv*",
+]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
