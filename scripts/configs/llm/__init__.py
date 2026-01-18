@@ -24,18 +24,20 @@ from .parsing import (
 
 import litellm
 
-# Explicitly register local vLLM model metadata
-litellm.model_cost["hosted_vllm/google/gemma-3-270m-it"] = {
-    # pricing irrelevant for local models
-    "input_cost_per_token": 0.0,
-    "output_cost_per_token": 0.0,
-    # Gemma 3 270M IT context window
-    # adjust if you started vLLM with a different limit
-    "max_input_tokens": 8192,
-    "max_output_tokens": 8192,
-    # Optional but helps debug clarity
-    "mode": "chat",
+_LOCAL_VLLM_MODELS = {
+    "hosted_vllm/google/gemma-3-270m-it": 8192,
+    "hosted_vllm/google/gemma-3-1b-it": 8192,
 }
+
+for name, ctx in _LOCAL_VLLM_MODELS.items():
+    litellm.model_cost[name] = {
+        "input_cost_per_token": 0.0,
+        "output_cost_per_token": 0.0,
+        "max_input_tokens": ctx,
+        "max_output_tokens": ctx,
+        "mode": "chat",
+    }
+
 __all__ = [
     "Offering",
     "ExtractionPayload",

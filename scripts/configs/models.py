@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 from typing import Any, Dict, Literal, Mapping, Optional
 
 
@@ -37,9 +38,9 @@ _COMPANY_STATUS_RANK: Dict[str, int] = {
     COMPANY_STATUS_PENDING: 0,
     COMPANY_STATUS_MD_NOT_DONE: 1,
     COMPANY_STATUS_MD_DONE: 2,
+    COMPANY_STATUS_TERMINAL_DONE: 2,
     COMPANY_STATUS_LLM_NOT_DONE: 3,
     COMPANY_STATUS_LLM_DONE: 4,
-    COMPANY_STATUS_TERMINAL_DONE: 5,
 }
 
 
@@ -56,17 +57,30 @@ def _status_rank(st: Optional[str]) -> int:
     return _COMPANY_STATUS_RANK.get(_normalize_company_status(st), -1)
 
 
-def _prefer_higher_status(
-    current: Optional[str], derived: Optional[str]
-) -> CompanyStatus:
-    c = _normalize_company_status(current)
-    d = _normalize_company_status(derived)
-    return c if _status_rank(c) >= _status_rank(d) else d
+def is_markdown_stage_complete(st: Optional[str]) -> bool:
+    s = _normalize_company_status(st)
+    return s in (
+        COMPANY_STATUS_MD_DONE,
+        COMPANY_STATUS_TERMINAL_DONE,
+        COMPANY_STATUS_LLM_NOT_DONE,
+        COMPANY_STATUS_LLM_DONE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Parsers / normalizers
+# ---------------------------------------------------------------------------
+
+# Sentinel used by your industry enrichment for "unclassified industry".
+# Treat it as missing at the model boundary.
+_NONE_SENTINELS_STR = {"__NA__", "nan", "NaN", "NAN"}
 
 
 def _to_int_or_none(v: Any) -> Optional[int]:
     """
-    Int parser that tolerates pandas/JSON artifacts like "0.0" / 0.0.
+    Int parser that tolerates pandas/JSON artifacts like "0.0" / 0.0 and
+    unclassified sentinels like "__NA__".
+
     Raises ValueError for truly invalid values (keeps errors actionable).
     """
     if v is None or isinstance(v, bool):
@@ -74,10 +88,14 @@ def _to_int_or_none(v: Any) -> Optional[int]:
     if isinstance(v, int):
         return v
     if isinstance(v, float):
+        if math.isnan(v):
+            return None
         return int(v)
 
     s = str(v).strip()
     if not s:
+        return None
+    if s in _NONE_SENTINELS_STR:
         return None
 
     try:
@@ -93,11 +111,15 @@ def _to_float_or_none(v: Any) -> Optional[float]:
     if v is None or isinstance(v, bool):
         return None
     if isinstance(v, float):
+        if math.isnan(v):
+            return None
         return v
     if isinstance(v, int):
         return float(v)
     s = str(v).strip()
     if not s:
+        return None
+    if s in _NONE_SENTINELS_STR:
         return None
     return float(s)
 
@@ -433,7 +455,6 @@ class UrlIndexMeta:
             "memory_pressure_pages": self.memory_pressure_pages,
             "pages_seen": self.pages_seen,
             "hard_max_pages": self.hard_max_pages,
-            "hard_max_pages": self.hard_max_pages,
             "hard_max_pages_hit": self.hard_max_pages_hit,
         }
         if isinstance(self.extra, dict) and self.extra:
@@ -642,12 +663,6 @@ class Company:
             md = total
             llm = total
 
-        # terminal_done is treated as markdown-finished for accounting,
-        # but must NOT be treated as llm_done.
-        if st == COMPANY_STATUS_TERMINAL_DONE:
-            md = total
-            llm = min(llm, total)
-
         le = self.last_error
         if le is not None:
             le = (le or "")[:4000] or None
@@ -832,6 +847,7 @@ __all__ = [
     "COMPANY_STATUS_LLM_NOT_DONE",
     "COMPANY_STATUS_LLM_DONE",
     "COMPANY_STATUS_TERMINAL_DONE",
+    "is_markdown_stage_complete",
     # url index models
     "URL_INDEX_META_KEY",
     "UrlIndexEntry",

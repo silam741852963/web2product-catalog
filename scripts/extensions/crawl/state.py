@@ -10,7 +10,7 @@ import time
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Literal, Mapping
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
 from configs.models import (
     Company,
@@ -39,13 +39,14 @@ URL_INDEX_RESERVED_PREFIX = "__"
 
 _VERSION_META_KEY = "version_metadata"
 
+
 _STATUS_RANK: Dict[str, int] = {
     COMPANY_STATUS_PENDING: 0,
     COMPANY_STATUS_MD_NOT_DONE: 1,
     COMPANY_STATUS_MD_DONE: 2,
     COMPANY_STATUS_LLM_NOT_DONE: 3,
     COMPANY_STATUS_LLM_DONE: 4,
-    COMPANY_STATUS_TERMINAL_DONE: 5,
+    COMPANY_STATUS_TERMINAL_DONE: 2,
 }
 
 
@@ -443,9 +444,19 @@ def _index_crawl_finished(index: Dict[str, Any]) -> bool:
 
 
 def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
+    """
+    Classify whether a URL is markdown-done and/or llm-done from a url_index entry.
+
+    IMPORTANT: be tolerant to historical / alternative keys.
+      - Some pipelines used "md_path" instead of "markdown_path".
+      - Some pipelines may mark markdown completion via flags/status only.
+    """
     status: UrlIndexEntryStatus = str(ent.get("status") or "").strip()
 
-    has_md_path = bool(ent.get("markdown_path"))
+    # Be tolerant to legacy keys
+    md_path = ent.get("markdown_path") or ent.get("md_path") or ent.get("md_file")
+    has_md_path = bool(md_path)
+
     has_llm_artifact = bool(
         ent.get("json_path")
         or ent.get("extraction_path")
@@ -459,6 +470,7 @@ def _classify_url_entry(ent: Dict[str, Any]) -> Tuple[bool, bool]:
     status_md_done = status == "markdown_done"
     status_llm_done = status == "llm_done"
 
+    # If LLM artifacts exist, markdown must have existed too (even if md flag missing).
     markdown_done = bool(
         md_flag
         or has_md_path
@@ -588,11 +600,6 @@ def snap_last_error(snap: Company) -> str:
 def crawl_runner_done_ok(snap: Company) -> bool:
     s = snap.normalized()
     return bool(s.crawl_finished) and (not (s.last_error or "").strip())
-
-
-def md_ready_for_llm(snap: Company) -> bool:
-    s = snap.normalized()
-    return crawl_runner_done_ok(s) and int(s.urls_markdown_done) > 0
 
 
 class CrawlState:
@@ -827,7 +834,7 @@ class CrawlState:
     @staticmethod
     def _done_statuses_for_progress(*, llm_requested: bool) -> Tuple[str, ...]:
         if llm_requested:
-            return (COMPANY_STATUS_LLM_DONE, COMPANY_STATUS_TERMINAL_DONE)
+            return (COMPANY_STATUS_LLM_DONE,)
         return (
             COMPANY_STATUS_MD_DONE,
             COMPANY_STATUS_LLM_DONE,
@@ -1445,8 +1452,6 @@ class CrawlState:
         )
         if row is not None:
             c = self._row_to_company(row)
-            if c.status == COMPANY_STATUS_TERMINAL_DONE:
-                return c
             if recompute:
                 return await self.recompute_company_from_index(company_id)
             return c
@@ -1495,15 +1500,6 @@ class CrawlState:
             if cur is not None
             else COMPANY_STATUS_PENDING
         )
-        if cur_status == COMPANY_STATUS_TERMINAL_DONE:
-            if name is not None or root_url is not None:
-                await self.upsert_company(company_id, name=name, root_url=root_url)
-            snap = await self.get_company_snapshot(company_id, recompute=False)
-            if write_meta:
-                await self.write_company_meta_snapshot(
-                    company_id, snap, pretty=True, company_ctx=company_ctx
-                )
-            return snap
 
         cur_crawl_finished = (
             bool(int(cur["crawl_finished"] or 0)) if cur is not None else False
@@ -1580,7 +1576,7 @@ class CrawlState:
         now = _now_iso()
 
         index = await asyncio.to_thread(load_url_index, company_id)
-        _, _, total, _, llm_done = _compute_company_stage_from_index(
+        _, _, total, md_done, llm_done = _compute_company_stage_from_index(
             index if isinstance(index, dict) else {}
         )
 
@@ -1593,7 +1589,7 @@ class CrawlState:
             status=COMPANY_STATUS_TERMINAL_DONE,
             crawl_finished=True,
             urls_total=int(total),
-            urls_markdown_done=int(total),
+            urls_markdown_done=int(md_done),
             urls_llm_done=min(int(llm_done), int(total)),
             last_error=last_error_trim,
             done_reason=(reason or "")[:256],
@@ -1629,6 +1625,13 @@ class CrawlState:
             new_status = COMPANY_STATUS_PENDING
 
         now = _now_iso()
+        if keep_status:
+            await self._exec(
+                "UPDATE companies SET updated_at=? WHERE company_id=?",
+                (now, company_id),
+            )
+            return
+
         await self._exec(
             """
             UPDATE companies
@@ -1830,7 +1833,6 @@ __all__ = [
     "patch_company_meta",
     "log_snapshot",
     "crawl_runner_done_ok",
-    "md_ready_for_llm",
     "snap_last_error",
     "urls_total",
     "urls_md_done",

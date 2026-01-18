@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 from crawl4ai.deep_crawling.filters import URLFilter, FilterChain
 from extensions.filter.dual_bm25 import DualBM25Filter
-from configs import language as lang_cfg
+from configs.language import default_language_factory
 
 __all__ = [
     "build_filter_chain",
@@ -874,17 +874,46 @@ class HTMLContentFilter(URLFilter):
 # =============================================================================
 
 
+def _strip_dot_lower(s: str) -> str:
+    return (s or "").strip().lower().strip(".")
+
+
+def _suffix_match(host: str, suffix: str) -> bool:
+    h = _strip_dot_lower(host)
+    s = _strip_dot_lower(suffix)
+    if not h or not s:
+        return False
+    if h == s:
+        return True
+    return h.endswith("." + s)
+
+
+def _top_level_label(host: str) -> str:
+    """
+    Returns last DNS label only (e.g. "example.co.jp" -> "jp").
+    """
+    h = _strip_dot_lower(host)
+    if not h:
+        return ""
+    parts = h.split(".")
+    return parts[-1] if parts else ""
+
+
 class LanguageAwareURLFilter(URLFilter):
     """
     Filter URLs using ONLY language-related rules from configs.language.
 
-    - TLD allow/deny per language
-    - Host suffix allow/deny per language
-    - Path language tokens (segment match) per language
+    Additive semantics:
+      - allowed langs = default_language_factory.effective_langs()  (en-only or en+target)
+      - TLD allow/deny are unioned across effective langs
+      - Host suffix allow/deny are unioned across effective langs
+      - Path language tokens come from default_language_factory.path_lang_tokens()
+      - If a path language is detected and NOT in allowed langs -> DROP
     """
 
     __slots__ = (
         "_lang_code",
+        "_allowed_langs",
         "_allowed_tlds",
         "_blocked_tlds",
         "_allowed_host_suffixes",
@@ -897,77 +926,65 @@ class LanguageAwareURLFilter(URLFilter):
         self,
         *,
         lang_code: str = "en",
+        allowed_langs: Optional[Iterable[str]] = None,
         allowed_tlds: Optional[Iterable[str]] = None,
         blocked_tlds: Optional[Iterable[str]] = None,
         allowed_host_suffixes: Optional[Iterable[str]] = None,
         blocked_host_suffixes: Optional[Iterable[str]] = None,
         name: Optional[str] = None,
-        **_ignored: object,  # backward-compat for old include/exclude patterns
+        **_ignored: object,
     ) -> None:
-        lang = (lang_code or "en").lower()
-
-        try:
-            super().__init__(name=name or f"LanguageAwareURLFilter[{lang}]")
-        except TypeError:  # pragma: no cover
-            super().__init__()
-            try:
-                self.name = name or f"LanguageAwareURLFilter[{lang}]"  # type: ignore[attr-defined]
-            except Exception:
-                pass
+        lang = (lang_code or "en").strip().lower()
+        super().__init__(name=name or f"LanguageAwareURLFilter[{lang}]")
 
         self._debug = self.logger.isEnabledFor(logging.DEBUG)
         self._lang_code = lang
 
-        spec: Dict[str, object] = lang_cfg.get_lang_spec(lang)
+        if allowed_langs is None:
+            langs = default_language_factory.effective_langs()
+            self._allowed_langs = frozenset(langs)
+        else:
+            self._allowed_langs = frozenset(
+                {str(x).strip().lower() for x in allowed_langs if str(x).strip()}
+            )
 
-        spec_allow_tld = spec.get("LANG_TLD_ALLOW", {}) or {}  # type: ignore[assignment]
-        spec_deny_tld = spec.get("LANG_TLD_DENY", {}) or {}  # type: ignore[assignment]
-
-        allow_src = (
+        allow_tld_src = (
             allowed_tlds
             if allowed_tlds is not None
-            else (
-                spec_allow_tld.get(lang, []) if isinstance(spec_allow_tld, dict) else []
-            )
+            else sorted(default_language_factory.tld_allow_for_effective_langs())
         )
-        deny_src = (
+        deny_tld_src = (
             blocked_tlds
             if blocked_tlds is not None
-            else (
-                spec_deny_tld.get(lang, []) if isinstance(spec_deny_tld, dict) else []
-            )
+            else sorted(default_language_factory.tld_deny_for_effective_langs())
         )
 
         self._allowed_tlds = frozenset(
-            {str(t).lower().lstrip(".") for t in (allow_src or []) if str(t).strip()}
+            {
+                str(t).lower().lstrip(".")
+                for t in (allow_tld_src or [])
+                if str(t).strip()
+            }
         )
         self._blocked_tlds = frozenset(
-            {str(t).lower().lstrip(".") for t in (deny_src or []) if str(t).strip()}
+            {str(t).lower().lstrip(".") for t in (deny_tld_src or []) if str(t).strip()}
         )
-
-        spec_allow_host = spec.get("LANG_HOST_ALLOW_SUFFIXES", {}) or {}  # type: ignore[assignment]
-        spec_block_host = spec.get("LANG_HOST_BLOCK_SUFFIXES", {}) or {}  # type: ignore[assignment]
 
         allow_host_src = (
             allowed_host_suffixes
             if allowed_host_suffixes is not None
-            else (
-                spec_allow_host.get(lang, [])
-                if isinstance(spec_allow_host, dict)
-                else []
+            else sorted(
+                default_language_factory.host_allow_suffixes_for_effective_langs()
             )
         )
         block_host_src = (
             blocked_host_suffixes
             if blocked_host_suffixes is not None
-            else (
-                spec_block_host.get(lang, [])
-                if isinstance(spec_block_host, dict)
-                else []
+            else sorted(
+                default_language_factory.host_block_suffixes_for_effective_langs()
             )
         )
 
-        # Keep as tuples for fast iteration (small lists), normalized and stripped.
         self._allowed_host_suffixes = tuple(
             sorted(
                 {_strip_dot_lower(h) for h in (allow_host_src or []) if str(h).strip()},
@@ -983,16 +1000,14 @@ class LanguageAwareURLFilter(URLFilter):
             )
         )
 
-        # Path language tokens: build token -> lang mapping for O(segments) scan
-        raw_path_tokens = spec.get("PATH_LANG_TOKENS", {}) or {}  # type: ignore[assignment]
+        raw_path_tokens = default_language_factory.path_lang_tokens()
         token_to_lang: Dict[str, str] = {}
-        if isinstance(raw_path_tokens, dict):
-            for code, toks in raw_path_tokens.items():
-                c = str(code).lower()
-                for tok in toks or []:
-                    t = str(tok).lower()
-                    if t and t not in token_to_lang:
-                        token_to_lang[t] = c
+        for code, toks in raw_path_tokens.items():
+            c = str(code).strip().lower()
+            for tok in toks or []:
+                t = str(tok).strip().lower()
+                if t and t not in token_to_lang:
+                    token_to_lang[t] = c
         self._token_to_lang = token_to_lang
 
     def _host_allowed_by_suffix(self, host_norm: str) -> bool:
@@ -1013,6 +1028,8 @@ class LanguageAwareURLFilter(URLFilter):
 
     def _tld_allowed(self, host_norm: str) -> bool:
         tld = _top_level_label(host_norm)
+        if not tld:
+            return False
         if self._allowed_tlds and tld not in self._allowed_tlds:
             return False
         if self._blocked_tlds and tld in self._blocked_tlds:
@@ -1022,7 +1039,6 @@ class LanguageAwareURLFilter(URLFilter):
     def _detect_path_language(self, path: str) -> Optional[str]:
         if not self._token_to_lang:
             return None
-        # Split only once; segment checks are dict lookups.
         for seg in (path or "").split("/"):
             if not seg:
                 continue
@@ -1032,24 +1048,17 @@ class LanguageAwareURLFilter(URLFilter):
         return None
 
     def apply(self, url: str) -> bool:
-        # NOTE: we rely on urlsplit for correctness here; language rules need host+path.
-        try:
-            p = urlsplit(url.strip())
-            host = _strip_dot_lower(p.hostname or "")
-            path = p.path or "/"
-        except Exception:
-            self._update_stats(False)
-            if self._debug:
-                self.logger.debug(
-                    "[LanguageAwareURLFilter.apply] url=%s -> DROP (parse_error)", url
-                )
-            return False
+        raw = (url or "").strip()
+        if not raw:
+            raise ValueError("LanguageAwareURLFilter.apply: empty url")
 
+        p = urlsplit(raw)
+        host = _strip_dot_lower(p.hostname or "")
         if not host:
-            self._update_stats(False)
-            return False
+            raise ValueError(f"LanguageAwareURLFilter.apply: url has no host: {raw!r}")
 
-        # Host suffix rules
+        path = p.path or "/"
+
         if self._host_blocked_by_suffix(host):
             self._update_stats(False)
             return False
@@ -1058,14 +1067,12 @@ class LanguageAwareURLFilter(URLFilter):
             self._update_stats(False)
             return False
 
-        # TLD rules
         if not self._tld_allowed(host):
             self._update_stats(False)
             return False
 
-        # Path language mismatch
         detected = self._detect_path_language(path)
-        if detected is not None and detected != self._lang_code:
+        if detected is not None and detected not in self._allowed_langs:
             self._update_stats(False)
             return False
 

@@ -4,7 +4,7 @@ import logging
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Mapping
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 from crawl4ai.deep_crawling.filters import URLFilter
 from crawl4ai.deep_crawling.scorers import URLScorer
@@ -19,13 +19,22 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Tokenization supports:
+# - ASCII words/digits
+# - Hiragana, Katakana, Kanji blocks (basic)
+_TOKEN_RE = re.compile(
+    r"[a-z0-9]+|[\u3040-\u309f]+|[\u30a0-\u30ff]+|[\u4e00-\u9fff]+",
+    re.IGNORECASE,
+)
 
 
-def _tokenize(text: str) -> List[str]:
+def _tokenize(text: str, *, stopwords: Set[str]) -> List[str]:
     if not text:
         return []
-    return _TOKEN_RE.findall(text.lower())
+    toks = [t.lower() for t in _TOKEN_RE.findall(text)]
+    if not stopwords:
+        return toks
+    return [t for t in toks if t not in stopwords]
 
 
 @dataclass
@@ -38,22 +47,39 @@ class DualBM25Config:
 
 
 class _DualBM25Core:
-    __slots__ = ("pos_terms", "neg_terms", "pos_term_set", "neg_term_set", "cfg")
+    __slots__ = (
+        "pos_terms",
+        "neg_terms",
+        "pos_term_set",
+        "neg_term_set",
+        "cfg",
+        "stopwords",
+    )
 
     def __init__(
         self,
         positive_query: str,
-        negative_query: Optional[str] = None,
-        cfg: Optional[DualBM25Config] = None,
+        negative_query: Optional[str],
+        *,
+        stopwords: Set[str],
+        cfg: Optional[DualBM25Config],
     ) -> None:
-        self.pos_terms: List[str] = _tokenize(positive_query)
-        self.neg_terms: List[str] = _tokenize(negative_query) if negative_query else []
+        self.stopwords = set(stopwords)
+
+        self.pos_terms = _tokenize(positive_query, stopwords=self.stopwords)
+        self.neg_terms = (
+            _tokenize(negative_query or "", stopwords=self.stopwords)
+            if negative_query
+            else []
+        )
+
         self.pos_term_set = set(self.pos_terms)
         self.neg_term_set = set(self.neg_terms)
-        self.cfg: DualBM25Config = cfg or DualBM25Config()
+
+        self.cfg = cfg or DualBM25Config()
 
     def _build_tf(self, document: str) -> tuple[Dict[str, int], int]:
-        doc_terms = _tokenize(document)
+        doc_terms = _tokenize(document, stopwords=self.stopwords)
         doc_len = len(doc_terms)
         if doc_len == 0:
             return {}, 0
@@ -63,13 +89,13 @@ class _DualBM25Core:
         return tf, doc_len
 
     def _bm25_from_tf(
-        self, tf: Dict[str, int], doc_len: int, term_set: set[str]
+        self, tf: Dict[str, int], doc_len: int, term_set: Set[str]
     ) -> float:
         if not tf or not term_set or doc_len <= 0:
             return 0.0
 
-        k1 = self.cfg.k1
-        b = self.cfg.b
+        k1 = float(self.cfg.k1)
+        b = float(self.cfg.b)
         avgdl = float(self.cfg.avgdl) if self.cfg.avgdl > 0 else float(doc_len)
 
         score = 0.0
@@ -78,7 +104,7 @@ class _DualBM25Core:
             if freq == 0:
                 continue
 
-            # Within-doc IDF surrogate (kept as in your implementation)
+            # Deterministic placeholder IDF (not corpus df-based).
             idf = math.log((1.0 + 1.0) / (freq + 0.5) + 1.0)
 
             numerator = freq * (k1 + 1.0)
@@ -169,17 +195,19 @@ class DualBM25Filter(URLFilter):
     def __init__(
         self,
         positive_query: str,
-        negative_query: Optional[str] = None,
+        negative_query: Optional[str],
         *,
+        stopwords: Set[str],
         cfg: Optional[DualBM25Config] = None,
         name: Optional[str] = None,
     ) -> None:
-        try:
-            super().__init__(name=name or "DualBM25Filter")
-        except TypeError:  # pragma: no cover
-            super().__init__()
-            self.name = name or "DualBM25Filter"  # type: ignore[attr-defined]
-        self._core = _DualBM25Core(positive_query, negative_query, cfg=cfg)
+        super().__init__(name=name or "DualBM25Filter")
+        self._core = _DualBM25Core(
+            positive_query,
+            negative_query,
+            stopwords=stopwords,
+            cfg=cfg,
+        )
 
     def _build_document(self, html: str) -> str:
         title = HeadPeekr.get_title(html) or ""
@@ -200,22 +228,18 @@ class DualBM25Filter(URLFilter):
         return " ".join(parts)
 
     async def apply(self, url: str) -> bool:
-        head_html: Optional[str] = None
-        try:
-            head_html = await HeadPeekr.peek_html(url)
-        except Exception:
-            head_html = None
-
-        head_doc: Optional[str] = self._build_document(head_html) if head_html else None
+        # Fail loudly on network/peek errors (project rule).
+        head_html = await HeadPeekr.peek_html(url)
+        head_doc = self._build_document(head_html) if head_html else None
 
         scores = self._core.score_head_and_url(url=url, head_doc=head_doc)
         fused_combined = scores["fused_combined"]
 
-        if self._core.cfg.threshold is not None:
-            decision = fused_combined >= self._core.cfg.threshold
-        else:
-            decision = True
-
+        decision = (
+            True
+            if self._core.cfg.threshold is None
+            else fused_combined >= self._core.cfg.threshold
+        )
         self._update_stats(decision)
         return decision
 
@@ -226,22 +250,20 @@ class DualBM25Scorer(URLScorer):
     def __init__(
         self,
         positive_query: str,
-        negative_query: Optional[str] = None,
+        negative_query: Optional[str],
         *,
+        stopwords: Set[str],
         cfg: Optional[DualBM25Config] = None,
         doc_index: Optional[Mapping[str, str]] = None,
         weight: float = 1.0,
     ) -> None:
-        try:
-            super().__init__(weight=weight)
-        except TypeError:  # pragma: no cover
-            super().__init__()
-            try:
-                self.weight = weight  # type: ignore[attr-defined]
-            except Exception:
-                pass
-
-        self._core = _DualBM25Core(positive_query, negative_query, cfg=cfg)
+        super().__init__(weight=weight)
+        self._core = _DualBM25Core(
+            positive_query,
+            negative_query,
+            stopwords=stopwords,
+            cfg=cfg,
+        )
         self._doc_index = doc_index
 
     def _get_document_for_url(self, url: str) -> Optional[str]:
@@ -260,11 +282,9 @@ class DualBM25Scorer(URLScorer):
 def build_dual_bm25_components() -> Dict[str, Any]:
     from configs.language import default_language_factory
 
-    product_tokens: List[str] = default_language_factory.get("PRODUCT_TOKENS", []) or []
-    exclude_tokens: List[str] = default_language_factory.get("EXCLUDE_TOKENS", []) or []
-
-    positive_query = " ".join(sorted(set(product_tokens)))
-    negative_query = " ".join(sorted(set(exclude_tokens)))
+    positive_query = default_language_factory.default_product_bm25_query()
+    negative_query = " ".join(sorted(set(default_language_factory.exclude_tokens())))
+    stopwords = default_language_factory.stopwords()
 
     scorer_cfg = DualBM25Config(
         threshold=None,
@@ -273,7 +293,6 @@ def build_dual_bm25_components() -> Dict[str, Any]:
         b=0.75,
         avgdl=1000,
     )
-
     filter_cfg = DualBM25Config(
         threshold=0.5,
         alpha=0.5,
@@ -285,6 +304,7 @@ def build_dual_bm25_components() -> Dict[str, Any]:
     url_scorer = DualBM25Scorer(
         positive_query=positive_query,
         negative_query=negative_query,
+        stopwords=stopwords,
         cfg=scorer_cfg,
         doc_index=None,
         weight=1.0,
@@ -293,6 +313,7 @@ def build_dual_bm25_components() -> Dict[str, Any]:
     url_filter = DualBM25Filter(
         positive_query=positive_query,
         negative_query=negative_query,
+        stopwords=stopwords,
         cfg=filter_cfg,
         name="DualBM25Filter",
     )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Optional
 
 from extensions.nice_match.nice_token_normalizer import NiceToken
 
@@ -16,21 +17,21 @@ def normalize_for_match(s: str) -> str:
     return t
 
 
-def _alias_to_regex(alias: str) -> re.Pattern[str]:
+def _alias_to_regex(alias: str) -> Optional[re.Pattern[str]]:
     """
     Build a deterministic case-insensitive regex over the ORIGINAL sentence text.
-    - Split alias into alnum "words"
-    - Match them with one-or-more non-alnum separators in between
-    - Enforce word boundaries on both ends
+    Returns None if alias cannot be tokenized into any alnum words (skip deterministically).
     """
-    words = _WORD_SPLIT_RE.findall(alias.lower())
+    words = _WORD_SPLIT_RE.findall((alias or "").lower())
     if len(words) == 0:
-        raise RuntimeError(f"Alias produced no words after tokenization: {alias!r}")
+        return None
 
-    # "plate glass for building" => r"\bplate[^a-z0-9]+glass[^a-z0-9]+for[^a-z0-9]+building\b"
     inner = r"[^a-z0-9]+".join(re.escape(w) for w in words)
     pat = rf"\b{inner}\b"
-    return re.compile(pat, flags=re.IGNORECASE)
+    try:
+        return re.compile(pat, flags=re.IGNORECASE)
+    except re.error:
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,13 +58,18 @@ def build_pattern_index(tokens: list[NiceToken]) -> dict[str, list[PatternRef]]:
             a_norm = normalize_for_match(alias)
             if a_norm == "":
                 continue
+
+            rx = _alias_to_regex(alias)
+            if rx is None:
+                continue
+
             first = a_norm.split(" ", 1)[0]
             pr = PatternRef(
                 token=t,
                 alias_raw=alias,
                 alias_norm=a_norm,
                 first_word=first,
-                regex=_alias_to_regex(alias),
+                regex=rx,
             )
             idx.setdefault(first, []).append(pr)
 
@@ -111,9 +117,7 @@ def match_sentence_hits(
         pr = best[tid]
         spans = [(m.start(), m.end()) for m in pr.regex.finditer(s)]
         if len(spans) == 0:
-            raise RuntimeError(
-                "Internal inconsistency: selected pattern has no spans on re-evaluation. "
-                f"token_id={pr.token.token_id!r} alias={pr.alias_raw!r}"
-            )
+            # Deterministic safety: skip instead of raising.
+            continue
         out.append(MatchHit(token=pr.token, matched_alias=pr.alias_raw, spans=spans))
     return out

@@ -34,21 +34,19 @@ _MB = 1_000_000
 
 # --------------------------------------------------------------------------------------
 # Retry-store helpers
-# --------------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------------
 def compute_retry_exit_code_from_store(
-    store: RetryStateStore, retry_exit_code: int
+    store: RetryStateStore, retry_exit_code: int, *, exclude_quarantined: bool = True
 ) -> int:
     """
     Return retry_exit_code only if there exists at least one eligible-now retry-pending company.
-
-    IMPORTANT:
-      - used by run.py without await, so this must remain sync.
     """
     now = time.time()
-    try:
-        eligible_n = int(store.pending_eligible_total_sync(now=now))
-    except Exception:
-        eligible_n = 0
+    eligible_n = int(
+        store.pending_eligible_total_sync(
+            now=now, exclude_quarantined=exclude_quarantined
+        )
+    )
     return int(retry_exit_code) if eligible_n > 0 else 0
 
 
@@ -188,7 +186,17 @@ class AdaptiveSchedulingConfig:
     doomed_goto_same_error_streak_threshold: int = 2
     doomed_goto_min_cooldown_sec: float = 1800.0
     last_one_standing_quarantine_enabled: bool = True
+
+    # Global quarantine enable/disable switch
+    # When False, scheduler MUST NOT consult retry_store quarantine for queue admission.
+    quarantine_enabled: bool = True
+
     deferred_move_log_interval_sec: float = 30.0
+
+    starvation_force_ready_enabled: bool = True
+    starvation_force_ready_max_hits_per_company: int = 3
+    starvation_force_ready_cooldown_sec: float = 60.0
+    starvation_force_ready_quarantine_on_exceed: bool = True
 
 
 class AdaptiveScheduler:
@@ -236,13 +244,14 @@ class AdaptiveScheduler:
         self._work_deferred: List[Tuple[float, str]] = []  # heap (eligible_at_ts, cid)
         self._deferred_at: Dict[str, float] = {}  # cid -> eligible_at
         self._queued: set[str] = set()  # present in ready or deferred
-        self._work_seen: set[str] = set()
         self._work_total_hint: int = 0
         self._is_company_runnable: Optional[Callable[[str], Awaitable[bool]]] = None
 
         # log throttles
         self._last_deferred_move_log_mono: float = 0.0
         self._last_block_log_mono: float = 0.0
+        self._last_watchdog_summary_mono: float = 0.0
+        self._watchdog_summary_interval_sec: float = 5.0
 
         # Memory sampling cache
         self._total_mem_bytes: int = 0
@@ -321,6 +330,13 @@ class AdaptiveScheduler:
         self._watchdog_task: Optional[asyncio.Task] = None
 
         self._last_idle_recycle_mono: float = 0.0
+
+        logger.debug(
+            "[AdaptiveScheduling][init] quarantine_enabled=%s last_one_standing_quarantine_enabled=%s retry_base_dir=%s",
+            bool(self.cfg.quarantine_enabled),
+            bool(self.cfg.last_one_standing_quarantine_enabled),
+            str(retry_base),
+        )
 
     # ----------------------------
     # Stage API (STRICT)
@@ -461,6 +477,9 @@ class AdaptiveScheduler:
         if not self._work_deferred:
             return float(self.cfg.min_idle_sleep_sec)
 
+        if (not self._work_ready) and self._deferred_at:
+            return float(self.cfg.min_idle_sleep_sec)
+
         now = time.time()
         while self._work_deferred:
             eligible_at, cid = self._work_deferred[0]
@@ -485,9 +504,13 @@ class AdaptiveScheduler:
         ids = [str(x) for x in company_ids if str(x).strip()]
         self._work_total_hint = len(ids)
 
+        # IMPORTANT: only exclude quarantined when quarantine_enabled=True
         pending_retry = set(
-            await self.retry_store.pending_ids(exclude_quarantined=True)
+            await self.retry_store.pending_ids(
+                exclude_quarantined=bool(self.cfg.quarantine_enabled)
+            )
         )
+
         rm = (retry_mode or "all").strip().lower()
         if rm == "skip-retry":
             ids = [cid for cid in ids if cid not in pending_retry]
@@ -496,55 +519,112 @@ class AdaptiveScheduler:
         else:
             rm = "all"
 
+        logger.debug(
+            "[AdaptiveScheduling][set_worklist][enter] ids=%d retry_mode=%s pending_retry=%d quarantine_enabled=%s",
+            len(ids),
+            rm,
+            len(pending_retry),
+            bool(self.cfg.quarantine_enabled),
+        )
+
         now = time.time()
+        skipped_quarantine = 0
+        skipped_queued = 0
+        enq_ready = 0
+        enq_deferred = 0
+        ineligible = 0
+
         async with self._lock:
             for cid in ids:
-                if cid in self._work_seen:
-                    continue
-                self._work_seen.add(cid)
+                if self.cfg.quarantine_enabled:
+                    if await self.retry_store.is_quarantined(cid):
+                        skipped_quarantine += 1
+                        continue
 
-                if await self.retry_store.is_quarantined(cid):
-                    continue
                 if cid in self._queued:
+                    skipped_queued += 1
                     continue
 
-                if not await self.retry_store.is_eligible(cid, now=now):
+                eligible = bool(
+                    await self.retry_store.is_eligible(
+                        cid,
+                        now=now,
+                        ignore_quarantine=(not bool(self.cfg.quarantine_enabled)),
+                    )
+                )
+
+                if not eligible:
+                    ineligible += 1
                     ts = float(await self.retry_store.next_eligible_at(cid))
                     self._enqueue_deferred_locked(cid, ts)
+                    enq_deferred += 1
+                    logger.debug(
+                        "[AdaptiveScheduling][set_worklist] enqueue_deferred cid=%s eligible=false next_ts=%.3f",
+                        cid,
+                        ts,
+                    )
                     continue
 
                 self._enqueue_ready_locked(cid)
+                enq_ready += 1
+                logger.debug(
+                    "[AdaptiveScheduling][set_worklist] enqueue_ready cid=%s eligible=true",
+                    cid,
+                )
 
         logger.info(
-            "[AdaptiveScheduling] seeded worklist ids=%d retry_mode=%s ready=%d deferred=%d",
+            "[AdaptiveScheduling] seeded worklist ids=%d retry_mode=%s ready=%d deferred=%d "
+            "(enq_ready=%d enq_deferred=%d skipped_quarantine=%d skipped_queued=%d ineligible=%d)",
             len(ids),
             rm,
             self.pending_ready(),
             len(self._deferred_at),
+            enq_ready,
+            enq_deferred,
+            skipped_quarantine,
+            skipped_queued,
+            ineligible,
         )
 
     async def ensure_worklist(
         self, company_ids: Sequence[str], *, reason: str = ""
     ) -> int:
-        """
-        Ensure the given IDs are present in scheduler queues (ready or deferred).
-
-        This exists specifically for run.py drain_reconcile_and_reseed(), which awaits it.
-        """
         ids = [str(x) for x in company_ids if str(x).strip()]
         if not ids:
+            logger.debug(
+                "[AdaptiveScheduling][ensure_worklist] empty ids reason=%s", reason
+            )
             return 0
 
         now = time.time()
         added = 0
+        skipped_quarantine = 0
+        skipped_queued = 0
+
+        logger.debug(
+            "[AdaptiveScheduling][ensure_worklist][enter] ids=%d reason=%s quarantine_enabled=%s",
+            len(ids),
+            reason or "unspecified",
+            bool(self.cfg.quarantine_enabled),
+        )
+
         async with self._lock:
             for cid in ids:
                 if cid in self._queued:
-                    continue
-                if await self.retry_store.is_quarantined(cid):
+                    skipped_queued += 1
                     continue
 
-                if not await self.retry_store.is_eligible(cid, now=now):
+                if self.cfg.quarantine_enabled:
+                    if await self.retry_store.is_quarantined(cid):
+                        skipped_quarantine += 1
+                        continue
+
+                eligible = await self.retry_store.is_eligible(
+                    cid,
+                    now=now,
+                    ignore_quarantine=(not bool(self.cfg.quarantine_enabled)),
+                )
+                if not eligible:
                     ts = float(await self.retry_store.next_eligible_at(cid))
                     self._enqueue_deferred_locked(cid, ts)
                     added += 1
@@ -555,11 +635,14 @@ class AdaptiveScheduler:
 
         if added:
             logger.info(
-                "[AdaptiveScheduling] ensure_worklist added=%d reason=%s ready=%d deferred=%d",
+                "[AdaptiveScheduling] ensure_worklist added=%d reason=%s ready=%d deferred=%d "
+                "(skipped_quarantine=%d skipped_queued=%d)",
                 added,
                 reason or "unspecified",
                 len(self._work_ready),
                 len(self._deferred_at),
+                skipped_quarantine,
+                skipped_queued,
             )
         return int(added)
 
@@ -572,6 +655,7 @@ class AdaptiveScheduler:
     ) -> int:
         ids = sorted(await self.retry_store.pending_ids(exclude_quarantined=True))
         if not ids:
+            logger.debug("[AdaptiveScheduling][cleanup_completed_retry_ids] none")
             return 0
 
         cleared = 0
@@ -582,6 +666,18 @@ class AdaptiveScheduler:
                     cid, stage=stage, note="already_done"
                 )
                 cleared += 1
+                logger.debug(
+                    "[AdaptiveScheduling][cleanup_completed_retry_ids] mark_success cid=%s stage=%s",
+                    cid,
+                    stage,
+                )
+
+        logger.info(
+            "[AdaptiveScheduling] cleanup_completed_retry_ids cleared=%d pending_before=%d stage=%s",
+            cleared,
+            len(ids),
+            stage,
+        )
         return cleared
 
     async def requeue_company(
@@ -595,13 +691,27 @@ class AdaptiveScheduler:
         cid = (company_id or "").strip()
         if not cid:
             return False
-        if await self.retry_store.is_quarantined(cid):
-            return False
+
+        if self.cfg.quarantine_enabled:
+            if await self.retry_store.is_quarantined(cid):
+                logger.debug(
+                    "[AdaptiveScheduling][requeue_company] blocked_by_quarantine cid=%s reason=%s",
+                    cid,
+                    reason or "unspecified",
+                )
+                return False
 
         now = time.time()
         ts = now + max(0.0, float(delay_sec))
 
         if await self._is_doomed_repeat_goto(cid):
+            # LLM-mode policy: do not defer doomed; mark done in retry store.
+            if await self._handle_doomed_in_llm_mode(cid, where="requeue_company"):
+                async with self._lock:
+                    self._queued.discard(cid)
+                    self._deferred_at.pop(cid, None)
+                return True
+
             if (
                 self.cfg.last_one_standing_quarantine_enabled
                 and self._only_one_left_now()
@@ -639,19 +749,45 @@ class AdaptiveScheduler:
             if cid in self._queued:
                 if cid in self._deferred_at:
                     self._enqueue_deferred_locked(cid, ts)
+                    logger.debug(
+                        "[AdaptiveScheduling][requeue_company] already_queued deferred_update cid=%s ts=%.3f",
+                        cid,
+                        ts,
+                    )
+                else:
+                    logger.debug(
+                        "[AdaptiveScheduling][requeue_company] already_queued ready_present cid=%s",
+                        cid,
+                    )
                 return True
 
             if cid in set(self._get_active_company_ids()):
                 ts = max(ts, now + float(self.cfg.cancel_requeue_min_delay_sec))
                 self._enqueue_deferred_locked(cid, ts)
+                logger.debug(
+                    "[AdaptiveScheduling][requeue_company] active->deferred cid=%s ts=%.3f",
+                    cid,
+                    ts,
+                )
                 return True
 
             if force or (
                 await self.retry_store.is_eligible(cid, now=now) and ts <= now
             ):
                 self._enqueue_ready_locked(cid)
+                logger.debug(
+                    "[AdaptiveScheduling][requeue_company] enqueue_ready cid=%s force=%s",
+                    cid,
+                    bool(force),
+                )
             else:
                 self._enqueue_deferred_locked(cid, ts)
+                logger.debug(
+                    "[AdaptiveScheduling][requeue_company] enqueue_deferred cid=%s ts=%.3f force=%s",
+                    cid,
+                    ts,
+                    bool(force),
+                )
 
         self._mark_progress()
         if reason:
@@ -698,12 +834,18 @@ class AdaptiveScheduler:
 
     async def _move_due_deferred(self, now: float) -> None:
         moved = 0
+        skipped_quarantine = 0
+        skipped_ineligible = 0
+        skipped_doomed = 0
+        skipped_stale = 0
+
         async with self._lock:
             while self._work_deferred:
                 ts, cid = self._work_deferred[0]
                 cur = self._deferred_at.get(cid)
                 if cur is None or abs(float(cur) - float(ts)) > 1e-6:
                     heapq.heappop(self._work_deferred)
+                    skipped_stale += 1
                     continue
                 if float(ts) > float(now):
                     break
@@ -711,29 +853,32 @@ class AdaptiveScheduler:
                 heapq.heappop(self._work_deferred)
                 self._deferred_at.pop(cid, None)
 
-                if await self.retry_store.is_quarantined(cid):
-                    self._queued.discard(cid)
-                    continue
+                if self.cfg.quarantine_enabled:
+                    if await self.retry_store.is_quarantined(cid):
+                        self._queued.discard(cid)
+                        skipped_quarantine += 1
+                        continue
 
-                if not await self.retry_store.is_eligible(cid, now=now):
+                eligible = await self.retry_store.is_eligible(
+                    cid,
+                    now=now,
+                    ignore_quarantine=(not bool(self.cfg.quarantine_enabled)),
+                )
+                if not eligible:
                     ts2 = float(await self.retry_store.next_eligible_at(cid))
                     self._enqueue_deferred_locked(cid, ts2)
+                    skipped_ineligible += 1
                     continue
 
+                # doomed repeat goto still applies (not quarantine-related)
                 if await self._is_doomed_repeat_goto(cid):
-                    if (
-                        self.cfg.last_one_standing_quarantine_enabled
-                        and self._only_one_left_now()
+                    # LLM-mode policy: do not keep cycling deferred-doomed.
+                    if await self._handle_doomed_in_llm_mode(
+                        cid, where="_move_due_deferred"
                     ):
-                        await self._quarantine_last_one_standing(
-                            cid,
-                            reason="scheduler_last_one_standing_repeat_goto_timeout",
-                        )
-                        logger.warning(
-                            "[AdaptiveScheduling] quarantined last-one-standing on deferred->ready cid=%s",
-                            cid,
-                        )
+                        # drop it from queued/deferred bookkeeping
                         self._queued.discard(cid)
+                        skipped_doomed += 1
                         continue
 
                     cooldown = max(0.0, float(self.cfg.doomed_goto_min_cooldown_sec))
@@ -742,15 +887,34 @@ class AdaptiveScheduler:
                         float(await self.retry_store.next_eligible_at(cid) or 0.0),
                     )
                     self._enqueue_deferred_locked(cid, ts3)
-                    logger.warning(
-                        "[AdaptiveScheduling] deferred doomed on move cid=%s delay=%.0fs",
-                        cid,
-                        max(0.0, ts3 - float(now)),
-                    )
+                    skipped_doomed += 1
                     continue
 
                 self._work_ready.append(cid)
                 moved += 1
+
+        if moved:
+            self._mark_progress()
+
+        if (
+            moved
+            or skipped_quarantine
+            or skipped_ineligible
+            or skipped_doomed
+            or skipped_stale
+        ):
+            logger.debug(
+                "[AdaptiveScheduling][_move_due_deferred] now=%.3f moved=%d ready=%d deferred=%d "
+                "skipped_quarantine=%d skipped_ineligible=%d skipped_doomed=%d skipped_stale=%d",
+                float(now),
+                moved,
+                len(self._work_ready),
+                len(self._deferred_at),
+                skipped_quarantine,
+                skipped_ineligible,
+                skipped_doomed,
+                skipped_stale,
+            )
 
         if moved:
             now_mono = time.monotonic()
@@ -767,7 +931,78 @@ class AdaptiveScheduler:
                     len(self._deferred_at),
                 )
 
+    async def _force_release_all_deferred_if_starved(self, *, reason: str) -> int:
+        if not self.cfg.starvation_force_ready_enabled:
+            return 0
+        if self._work_ready:
+            return 0
+
+        async with self._lock:
+            if self._work_ready or (not self._deferred_at):
+                return 0
+            cids = list(self._deferred_at.keys())
+
+        # IMPORTANT: if quarantine is disabled, allow forcing quarantined items too
+        await self.retry_store.force_eligible_now_many(
+            cids,
+            reason=reason or "scheduler_starvation_ready_empty",
+            stage="scheduler_force_ready",
+            flush=True,
+            max_force_ready_hits_per_company=int(
+                self.cfg.starvation_force_ready_max_hits_per_company
+            ),
+            force_ready_cooldown_sec=float(
+                self.cfg.starvation_force_ready_cooldown_sec
+            ),
+            quarantine_on_exceed=bool(
+                self.cfg.starvation_force_ready_quarantine_on_exceed
+            ),
+            ignore_quarantine=(not bool(self.cfg.quarantine_enabled)),
+        )
+
+        moved = 0
+        dropped_quarantine = 0
+
+        async with self._lock:
+            if self._work_ready:
+                return 0
+
+            for cid in cids:
+                if cid not in self._deferred_at:
+                    continue
+
+                # If quarantine is enabled, still drop quarantined. Otherwise allow it.
+                if (
+                    self.cfg.quarantine_enabled
+                    and await self.retry_store.is_quarantined(cid)
+                ):
+                    self._deferred_at.pop(cid, None)
+                    self._queued.discard(cid)
+                    dropped_quarantine += 1
+                    continue
+
+                self._deferred_at.pop(cid, None)
+                self._work_ready.append(cid)
+                moved += 1
+
+        if moved:
+            self._mark_progress()
+
+        if moved or dropped_quarantine:
+            logger.warning(
+                "[AdaptiveScheduling] starvation_release moved=%d deferred->ready dropped_quarantine=%d reason=%s ready=%d deferred=%d",
+                moved,
+                dropped_quarantine,
+                reason or "unspecified",
+                len(self._work_ready),
+                len(self._deferred_at),
+            )
+        return int(moved)
+
     async def _prune_queued_quarantined(self, *, limit: int = 2000) -> int:
+        if not self.cfg.quarantine_enabled:
+            return 0
+
         removed = 0
         if limit <= 0:
             return 0
@@ -799,7 +1034,37 @@ class AdaptiveScheduler:
                         break
                 self._work_ready = new_ready
 
+        if removed:
+            logger.debug(
+                "[AdaptiveScheduling][_prune_queued_quarantined] removed=%d ready=%d deferred=%d",
+                removed,
+                len(self._work_ready),
+                len(self._deferred_at),
+            )
         return removed
+
+    async def _handle_doomed_in_llm_mode(self, cid: str, *, where: str) -> bool:
+        """
+        In LLM mode we disable quarantine filtering (cfg.quarantine_enabled=False).
+        For repeat-goto doomed companies, do NOT defer them (avoids dead stalls).
+        Instead, mark them success in retry store so they don't block run completion.
+        Returns True if handled (caller should continue/return).
+        """
+        if bool(self.cfg.quarantine_enabled):
+            return False
+
+        await self.retry_store.mark_success(
+            cid,
+            stage=f"{where}_doomed_skip",
+            note="doomed_repeat_goto_skip_in_llm_mode",
+        )
+        logger.warning(
+            "[AdaptiveScheduling] llm_mode skip doomed cid=%s where=%s -> mark_success",
+            cid,
+            where,
+        )
+        self._mark_progress()
+        return True
 
     # ----------------------------
     # Properties
@@ -943,10 +1208,11 @@ class AdaptiveScheduler:
         )
 
         logger.info(
-            "[AdaptiveScheduling] started total_mem_mb=%.1f initial_target_parallel=%d llm_inactivity_timeout_sec=%.1f",
+            "[AdaptiveScheduling] started total_mem_mb=%.1f initial_target_parallel=%d llm_inactivity_timeout_sec=%.1f quarantine_enabled=%s",
             float(self._total_mem_bytes) / _MB if self._total_mem_bytes else -1.0,
             self._target_parallel,
             float(self.cfg.llm_inactivity_timeout_sec),
+            bool(self.cfg.quarantine_enabled),
         )
 
     async def stop(self) -> None:
@@ -1016,6 +1282,7 @@ class AdaptiveScheduler:
             "crawl_inactivity_timeout_sec": float(
                 self.cfg.crawl_inactivity_timeout_sec
             ),
+            "quarantine_enabled": bool(self.cfg.quarantine_enabled),
         }
 
     # ----------------------------
@@ -1026,41 +1293,84 @@ class AdaptiveScheduler:
         active_set = set(active_ids)
         active_n = len(active_ids)
 
+        logger.debug(
+            "[AdaptiveScheduling][plan_start_batch][enter] free_crawlers=%d active_n=%d ready=%d deferred=%d target=%d",
+            int(free_crawlers),
+            int(active_n),
+            len(self._work_ready),
+            len(self._deferred_at),
+            int(self._target_parallel),
+        )
+
         await self._move_due_deferred(time.time())
 
+        if not self._work_ready and self._deferred_at:
+            await self._force_release_all_deferred_if_starved(
+                reason="plan_start_batch_ready_empty"
+            )
+
         if not self._work_ready:
+            logger.debug(
+                "[AdaptiveScheduling][plan_start_batch] no_ready -> [] (deferred=%d)",
+                len(self._deferred_at),
+            )
             return []
 
         async with self._lock:
             now_mono = time.monotonic()
             if now_mono < float(self._pause_starts_until_mono):
+                logger.debug(
+                    "[AdaptiveScheduling][plan_start_batch] paused now_mono=%.3f pause_until=%.3f",
+                    now_mono,
+                    float(self._pause_starts_until_mono),
+                )
                 return []
             dynamic_start_limit = int(self._dynamic_max_start_per_tick_locked(now_mono))
             target_parallel = int(self._target_parallel)
 
         free = int(free_crawlers)
         if free <= 0:
+            logger.debug(
+                "[AdaptiveScheduling][plan_start_batch] free_crawlers<=0 -> []"
+            )
             return []
 
         mult = int(self.cfg.crawler_capacity_multiplier)
         if mult <= 0:
+            logger.debug(
+                "[AdaptiveScheduling][plan_start_batch] crawler_capacity_multiplier<=0 -> []"
+            )
             return []
 
         slots = await self.admissible_slots(num_waiting=len(self._work_ready))
         if slots <= 0:
+            logger.debug(
+                "[AdaptiveScheduling][plan_start_batch] admissible_slots=0 -> []"
+            )
             return []
 
         allowed_by_target = max(0, int(target_parallel) - int(active_n))
         if allowed_by_target <= 0:
+            logger.debug(
+                "[AdaptiveScheduling][plan_start_batch] allowed_by_target<=0 target=%d active=%d -> []",
+                int(target_parallel),
+                int(active_n),
+            )
             return []
 
         hard_capacity = max(0, int(self.cfg.max_target) - int(active_n))
         allowed_by_target = min(int(allowed_by_target), int(hard_capacity))
         if allowed_by_target <= 0:
+            logger.debug(
+                "[AdaptiveScheduling][plan_start_batch] hard_capacity<=0 -> []"
+            )
             return []
 
         allowed_by_crawlers = max(0, int(free) * int(mult))
         if allowed_by_crawlers <= 0:
+            logger.debug(
+                "[AdaptiveScheduling][plan_start_batch] allowed_by_crawlers<=0 -> []"
+            )
             return []
 
         allowed = min(
@@ -1073,7 +1383,19 @@ class AdaptiveScheduler:
         )
         allowed = max(0, int(allowed))
         if allowed <= 0:
+            logger.debug("[AdaptiveScheduling][plan_start_batch] allowed=0 -> []")
             return []
+
+        logger.debug(
+            "[AdaptiveScheduling][plan_start_batch] allowed=%d (slots=%d by_target=%d by_crawlers=%d max_start_per_tick=%d max_admit=%d dynamic=%d)",
+            int(allowed),
+            int(slots),
+            int(allowed_by_target),
+            int(allowed_by_crawlers),
+            int(self.cfg.max_start_per_tick),
+            int(self.cfg.max_admit_per_call),
+            int(dynamic_start_limit),
+        )
 
         picked: List[str] = []
         scanned = 0
@@ -1086,6 +1408,10 @@ class AdaptiveScheduler:
                 cid = self._pop_ready_locked()
 
             if cid is None:
+                logger.debug(
+                    "[AdaptiveScheduling][plan_start_batch] pop_ready -> None (scanned=%d)",
+                    scanned,
+                )
                 break
 
             if cid in active_set:
@@ -1093,17 +1419,29 @@ class AdaptiveScheduler:
                     self._enqueue_deferred_locked(
                         cid, now + float(self.cfg.cancel_requeue_min_delay_sec)
                     )
+                logger.debug(
+                    "[AdaptiveScheduling][plan_start_batch] picked_active->defer cid=%s",
+                    cid,
+                )
                 continue
 
             if self._is_company_runnable is not None:
                 runnable = await self._is_company_runnable(cid)
                 if not runnable:
                     await self.retry_store.mark_success(
-                        cid, stage="scheduler_skip", note="already_done_or_terminal"
+                        cid, stage="scheduler_skip", note="already_done_or_not_runnable"
+                    )
+                    logger.debug(
+                        "[AdaptiveScheduling][plan_start_batch] skip_not_runnable cid=%s",
+                        cid,
                     )
                     continue
 
             if await self._is_doomed_repeat_goto(cid):
+                # LLM-mode policy: do not defer-doomed; mark done in retry store.
+                if await self._handle_doomed_in_llm_mode(cid, where="plan_start_batch"):
+                    continue
+
                 only_one_left = (active_n == 0) and (self.pending_total() <= 1)
                 if self.cfg.last_one_standing_quarantine_enabled and only_one_left:
                     await self._quarantine_last_one_standing(
@@ -1129,6 +1467,7 @@ class AdaptiveScheduler:
                 continue
 
             picked.append(cid)
+            logger.debug("[AdaptiveScheduling][plan_start_batch] admit cid=%s", cid)
 
         if picked:
             self._ever_admitted = True
@@ -1142,6 +1481,14 @@ class AdaptiveScheduler:
                     self._company_last_heartbeat_mono.setdefault(cid, now_mono2)
                     self._company_stage.setdefault(cid, self.STAGE_CRAWL)
 
+        logger.debug(
+            "[AdaptiveScheduling][plan_start_batch][exit] picked=%d scanned=%d ready=%d deferred=%d active=%d",
+            len(picked),
+            scanned,
+            len(self._work_ready),
+            len(self._deferred_at),
+            active_n,
+        )
         return picked
 
     # ----------------------------
@@ -1173,6 +1520,7 @@ class AdaptiveScheduler:
         self._mark_heartbeat()
 
         if num_waiting <= 0:
+            logger.debug("[AdaptiveScheduling][admissible_slots] num_waiting<=0 -> 0")
             return 0
 
         async with self._lock:
@@ -1183,6 +1531,7 @@ class AdaptiveScheduler:
                     len(self._get_active_company_ids()),
                     num_waiting,
                 )
+                logger.debug("[AdaptiveScheduling][admissible_slots] paused -> 0")
                 return 0
 
             now = time.time()
@@ -1200,21 +1549,33 @@ class AdaptiveScheduler:
 
             if self._used_frac_raw >= float(self.cfg.mem_high_raw_frac):
                 self._maybe_log_block("block_mem_high_raw", active_n, num_waiting)
+                logger.debug(
+                    "[AdaptiveScheduling][admissible_slots] block_mem_high_raw -> 0"
+                )
                 return 0
 
             if active_n > 0 and self._ramp_raw_frac_per_sec >= float(
                 self.cfg.mem_ramp_high_frac_per_sec
             ):
                 self._maybe_log_block("block_mem_ramp_high", active_n, num_waiting)
+                logger.debug(
+                    "[AdaptiveScheduling][admissible_slots] block_mem_ramp_high -> 0"
+                )
                 return 0
 
             if self._used_frac_eff >= float(self.cfg.mem_high_frac):
                 self._maybe_log_block("block_mem_high_eff", active_n, num_waiting)
+                logger.debug(
+                    "[AdaptiveScheduling][admissible_slots] block_mem_high_eff -> 0"
+                )
                 return 0
 
             total = self._total_mem_bytes
             if total <= 0:
                 self._maybe_log_block("block_total_unknown", active_n, num_waiting)
+                logger.debug(
+                    "[AdaptiveScheduling][admissible_slots] block_total_unknown -> 0"
+                )
                 return 0
 
             cap_bytes = int(float(self.cfg.mem_cap_frac) * float(total))
@@ -1246,6 +1607,17 @@ class AdaptiveScheduler:
                 self._mark_progress()
                 self._last_admission_mono = time.monotonic()
 
+            logger.debug(
+                "[AdaptiveScheduling][admissible_slots] waiting=%d active=%d target=%d slots=%d used_eff=%.3f used_raw=%.3f ramp_raw=%.3f/s per_company_est_mb=%.1f",
+                int(num_waiting),
+                int(active_n),
+                int(self._target_parallel),
+                int(slots),
+                float(self._used_frac_eff),
+                float(self._used_frac_raw),
+                float(self._ramp_raw_frac_per_sec),
+                float(self._per_company_est_mb),
+            )
             return slots
 
     # ----------------------------
@@ -1273,6 +1645,12 @@ class AdaptiveScheduler:
             pause = max(0.0, float(self.cfg.stall_storm_pause_start_sec))
             self._pause_starts_until_mono = max(
                 self._pause_starts_until_mono, now_mono + pause
+            )
+            logger.warning(
+                "[AdaptiveScheduling] stall_storm pause_starts storm_n=%d pause_sec=%.1f pause_until=%.3f",
+                storm_n,
+                pause,
+                float(self._pause_starts_until_mono),
             )
 
     def _dynamic_max_start_per_tick_locked(self, now_mono: float) -> int:
@@ -1322,7 +1700,39 @@ class AdaptiveScheduler:
                 now_mono = time.monotonic()
                 self._prune_stall_events_locked(now_mono)
 
+                if logger.isEnabledFor(logging.DEBUG):
+                    if (now_mono - self._last_watchdog_summary_mono) >= float(
+                        self._watchdog_summary_interval_sec
+                    ):
+                        self._last_watchdog_summary_mono = now_mono
+                        logger.debug(
+                            "[AdaptiveScheduling][watchdog] active=%d ready=%d deferred=%d waiting=%d target=%d used_eff=%.3f used_raw=%.3f ramp_raw=%.3f/s stall_events=%d pause_for=%.1fs",
+                            int(active_n),
+                            len(self._work_ready),
+                            len(self._deferred_at),
+                            int(self._last_num_waiting),
+                            int(self._target_parallel),
+                            float(self._used_frac_eff),
+                            float(self._used_frac_raw),
+                            float(self._ramp_raw_frac_per_sec),
+                            int(
+                                self._count_stall_cancels_since(
+                                    now_mono - float(self.cfg.stall_storm_window_sec)
+                                )
+                            ),
+                            max(0.0, float(self._pause_starts_until_mono - now_mono)),
+                        )
+
             await self._prune_queued_quarantined(limit=2000)
+
+            # NOTE: the rest of your watchdog logic is unchanged from your original file.
+            # It is long; keep it as-is below this point.
+            #
+            # For brevity here, we preserve your original watchdog body verbatim.
+            #
+            # ---------------------------------------------------------------------------------
+            # ORIGINAL WATCHDOG BODY CONTINUES (unchanged except quarantine guards above)
+            # ---------------------------------------------------------------------------------
 
             async with self._lock:
                 active_ids = list(self._get_active_company_ids())
@@ -1381,6 +1791,9 @@ class AdaptiveScheduler:
                     )
 
                 stall_enabled = self.stall_detection_enabled
+
+            # --- stall detection / mem cancel / recycle (unchanged) ---
+            # Keep your original code exactly as you had it below this point.
 
             if stall_enabled and active_n > 0:
                 min_run = max(0.0, float(self.cfg.company_inactivity_min_runtime_sec))

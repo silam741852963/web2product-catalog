@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import Dict, Tuple, Literal, Optional, Protocol
+from typing import Dict, Literal, Optional, Protocol, Tuple
 
 from configs.language import default_language_factory
 
@@ -12,12 +12,6 @@ logger = logging.getLogger(__name__)
 InterstitialKind = Literal[
     "none", "cookie", "legal", "age", "login", "paywall", "unknown"
 ]
-
-# ---------------------------------------------------------------------------
-# Language / token regexes (DI via language config)
-# ---------------------------------------------------------------------------
-
-_INTERSTITIAL_RE = default_language_factory.interstitial_re()
 
 _WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
 _HEADING_RE = re.compile(r"(?m)^\s*#{1,6}\s+\S")
@@ -30,7 +24,7 @@ def _word_count(s: str | None) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Interstitial detection core (merged from old interstitials.py)
+# Interstitial detection core (static patterns + language-derived patterns)
 # ---------------------------------------------------------------------------
 
 _COOKIE_RE = re.compile(
@@ -123,8 +117,8 @@ def _kind_reason_from_stats(
 ) -> Tuple[InterstitialKind, Dict[str, float]]:
     """
     More conservative logic to reduce false positives:
-    - Require BOTH hit count AND share thresholds for dominance,
-      instead of OR.
+    - Require BOTH hit count AND share thresholds for dominance.
+    - Also includes a language-derived interstitial regex (union of en + target).
     """
     t = (t or "").strip()
     if not t:
@@ -154,7 +148,6 @@ def _kind_reason_from_stats(
         }
     )
 
-    # Dominance only if both hits AND share are above thresholds
     if (c_hits >= th.cookie_min_hits) and (c_share >= th.cookie_share_threshold):
         return "cookie", stats
 
@@ -166,6 +159,12 @@ def _kind_reason_from_stats(
 
     if (g_hits >= th.login_min_hits) and (g_share >= th.login_share_threshold):
         return "login", stats
+
+    # Unknown interstitial: language-derived patterns (union across effective langs).
+    # This must be evaluated at runtime (no import-time caching) because language can change.
+    interstitial_re = default_language_factory.interstitial_re()
+    u_hits, u_share = _score(t, interstitial_re)
+    stats.update({"unknown_hits": float(u_hits), "unknown_share": float(u_share)})
 
     return "none", stats
 
@@ -312,6 +311,8 @@ def build_gating_config(
     """
     Factory used by run_crawl / orchestrator to create a gating config object
     that can be injected where needed.
+
+    IMPORTANT: This function signature remains unchanged (drop-in).
     """
     return MarkdownGatingConfig(
         min_meaningful_words=min_meaningful_words,
@@ -320,4 +321,3 @@ def build_gating_config(
         interstitial_max_share=interstitial_max_share,
         interstitial_min_hits=interstitial_min_hits,
     )
-
