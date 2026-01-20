@@ -71,11 +71,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         runner_logger.error("output_root does not exist: %s", output_root)
         return 1
 
-    # ✅ CRITICAL FIX:
-    # Make output_root the canonical global root so every downstream module
-    # (output_paths.ensure_company_dirs, crawl_state.load_*, etc.) uses it.
-    output_paths.ensure_output_root(output_root)
-
     if args.all:
         company_ids = sorted(
             [d.name for d in output_root.iterdir() if _is_company_dir(d)]

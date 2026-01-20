@@ -2,20 +2,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
-from extensions.crawl.state_calibration import (
+from configs.language import default_language_factory
+from extensions.crawl.calibration import (
     calibrate,
     check,
-    scan_corrupt_url_indexes,
+    enforce_max_pages,
     fix_corrupt_url_indexes,
+    reconcile,
+    reset,
+    scan_corrupt_url_indexes,
 )
 from extensions.io.load_source import (
     DEFAULT_INDUSTRY_FALLBACK_PATH,
     DEFAULT_NACE_INDUSTRY_PATH,
 )
 from extensions.io.output_paths import ensure_output_root
+
+logger = logging.getLogger(__name__)
 
 
 def _print_sample(title: str, s) -> None:
@@ -132,9 +139,114 @@ def _print_corruption_report(title: str, rep) -> None:
             print(f"preview:   {ex.head_text_preview!r}")
 
 
+def _print_reconcile_report(rep) -> None:
+    print("\n== RECONCILE REPORT ==")
+    print(
+        json.dumps(
+            {
+                "out_dir": rep.out_dir,
+                "db_path": rep.db_path,
+                "dry_run": rep.dry_run,
+                "scanned_companies": rep.scanned_companies,
+                "upgraded_to_terminal_done": rep.upgraded_to_terminal_done,
+                "wrote_global_state": rep.wrote_global_state,
+                "examples": rep.example_company_ids,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def _print_reset_report(rep) -> None:
+    print("\n== RESET REPORT ==")
+    print(
+        json.dumps(
+            {
+                "out_dir": rep.out_dir,
+                "db_path": rep.db_path,
+                "dry_run": rep.dry_run,
+                "targets": rep.targets,
+                "scanned_companies": rep.scanned_companies,
+                "selected_companies": rep.selected_companies,
+                "deleted_dirs": rep.deleted_dirs,
+                "missing_dirs": rep.missing_dirs,
+                "db_rows_reset": rep.db_rows_reset,
+                "run_done_rows_deleted": rep.run_done_rows_deleted,
+                "retry_quarantine_rows_deleted": getattr(
+                    rep, "retry_quarantine_rows_deleted", None
+                ),
+                "retry_state_rows_deleted": getattr(
+                    rep, "retry_state_rows_deleted", None
+                ),
+                "wrote_global_state": rep.wrote_global_state,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    if rep.candidates:
+        print("\n[Candidates (with reasons)]")
+        for c in rep.candidates:
+            print("-" * 80)
+            print(f"company_id: {c.company_id}")
+            print(f"reasons:    {c.reasons}")
+
+
+def _print_enforce_max_pages_report(rep) -> None:
+    print("\n== ENFORCE MAX PAGES REPORT ==")
+    print(
+        json.dumps(
+            {
+                "out_dir": rep.out_dir,
+                "db_path": rep.db_path,
+                "dry_run": rep.dry_run,
+                "selector": rep.selector,
+                "scanned_companies": rep.scanned_companies,
+                "applied_companies": rep.applied_companies,
+                "skipped_companies": rep.skipped_companies,
+                "total_candidates": rep.total_candidates,
+                "total_kept": rep.total_kept,
+                "total_overflow": rep.total_overflow,
+                "wrote_global_state": rep.wrote_global_state,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    if rep.companies:
+        print("\n[Companies]")
+        for c in rep.companies:
+            print("-" * 80)
+            print(
+                json.dumps(
+                    {
+                        "company_id": c.company_id,
+                        "max_pages": c.max_pages,
+                        "candidates": c.candidates,
+                        "kept": c.kept,
+                        "overflow": c.overflow,
+                        "moved_md": c.moved_md,
+                        "moved_html": c.moved_html,
+                        "skipped_reason": c.skipped_reason,
+                        "example_overflow_urls": c.example_overflow_urls,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="crawl_state_calibrate")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=32,
+        help="Global concurrency for subcommands that support it.",
+    )
 
     p_check = sub.add_parser("check")
     p_check.add_argument("--out-dir", type=str, required=True)
@@ -146,7 +258,6 @@ def main() -> None:
     p_cal.add_argument("--db-path", type=str, default=None)
     p_cal.add_argument("--sample-company-id", type=str, default=None)
     p_cal.add_argument("--no-global-state", action="store_true")
-    p_cal.add_argument("--concurrency", type=int, default=32)
 
     p_cal.add_argument("--dataset-file", type=str, default=None)
     p_cal.add_argument("--company-file", type=str, default=None)
@@ -160,7 +271,6 @@ def main() -> None:
         default=str(DEFAULT_INDUSTRY_FALLBACK_PATH),
     )
 
-    # NEW: corruption scan/fix
     p_cor = sub.add_parser(
         "corrupt", help="scan/fix corrupted url_index.json (e.g., NUL-byte files)"
     )
@@ -189,9 +299,86 @@ def main() -> None:
         help="Do not delete (latest_run, company_id) from run_company_done when marking pending.",
     )
 
+    p_rec = sub.add_parser(
+        "reconcile", help="reconcile terminal/quarantined rows (no deletion)"
+    )
+    p_rec.add_argument("--out-dir", type=str, required=True)
+    p_rec.add_argument("--db-path", type=str, default=None)
+    p_rec.add_argument("--dry-run", action="store_true")
+    p_rec.add_argument("--no-global-state", action="store_true")
+    p_rec.add_argument("--max-examples", type=int, default=10)
+
+    p_res = sub.add_parser(
+        "reset", help="delete output dirs + reset DB + unskip run_company_done"
+    )
+    p_res.add_argument("--out-dir", type=str, required=True)
+    p_res.add_argument("--db-path", type=str, default=None)
+    p_res.add_argument(
+        "--target",
+        action="append",
+        default=[],
+        choices=[
+            "crawl_not_finished",
+            "pending",
+            "markdown_not_done",
+            "quarantined",
+            "url_index_corrupt",
+            "url_index_empty",
+            "missing_output_dir",
+        ],
+        help="OR-selection across targets; can be repeated",
+    )
+    p_res.add_argument("--include-company-id", action="append", default=[])
+    p_res.add_argument("--exclude-company-id", action="append", default=[])
+    p_res.add_argument("--dry-run", action="store_true")
+    p_res.add_argument("--no-global-state", action="store_true")
+    p_res.add_argument("--max-examples", type=int, default=200)
+    p_res.add_argument(
+        "--clear-retry-store",
+        action="store_true",
+        help="If set: also remove selected company_ids from out_dir/_retry/quarantine.json and out_dir/_retry/retry_state.json.",
+    )
+
+    p_emp = sub.add_parser(
+        "enforce-max-pages",
+        help="rank URLs with DualBM25 (language-aware) and suppress overflow beyond max_pages",
+    )
+    p_emp.add_argument("--out-dir", type=str, required=True)
+    p_emp.add_argument("--db-path", type=str, default=None)
+    p_emp.add_argument(
+        "--lang",
+        type=str,
+        required=True,
+        help="Language key for default_language_factory (required only for enforce-max-pages).",
+    )
+    p_emp.add_argument(
+        "--max-pages",
+        type=int,
+        default=None,
+        help="Hard cap; if omitted, uses companies.max_pages per company",
+    )
+    p_emp.add_argument(
+        "--apply-to",
+        type=str,
+        default="crawl_finished_true",
+        choices=["crawl_finished_true", "all"],
+        help="Selector: default only applies to crawl_finished=1 companies",
+    )
+    p_emp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change but do not move files or modify DB",
+    )
+    p_emp.add_argument("--no-global-state", action="store_true")
+    p_emp.add_argument("--max-examples", type=int, default=50)
+
     args = p.parse_args()
 
-    out_dir = ensure_output_root(args.out_dir)
+    conc = int(args.concurrency)
+    if conc <= 0:
+        raise RuntimeError("--concurrency must be >= 1")
+
+    out_dir = Path(ensure_output_root(args.out_dir)).expanduser().resolve()
 
     db_path: Optional[Path]
     if getattr(args, "db_path", None):
@@ -217,7 +404,7 @@ def main() -> None:
             db_path=db_path,
             sample_company_id=args.sample_company_id,
             write_global_state=(not args.no_global_state),
-            concurrency=int(args.concurrency),
+            concurrency=conc,
             dataset_file=(
                 Path(args.dataset_file).expanduser().resolve()
                 if args.dataset_file
@@ -265,7 +452,10 @@ def main() -> None:
 
         if not args.mark_pending:
             rep = scan_corrupt_url_indexes(
-                out_dir=out_dir, db_path=db_path, max_examples=int(args.max_examples)
+                out_dir=out_dir,
+                db_path=db_path,
+                max_examples=int(args.max_examples),
+                concurrency=conc,
             )
             _print_corruption_report("CORRUPTION SCAN", rep)
             return
@@ -278,8 +468,64 @@ def main() -> None:
             quarantine=quarantine,
             unmark_run_done=unmark_run_done,
             dry_run=bool(args.dry_run),
+            concurrency=conc,
         )
         _print_corruption_report("CORRUPTION FIX", rep2)
+        return
+
+    if args.cmd == "reconcile":
+        rep = reconcile(
+            out_dir=out_dir,
+            db_path=db_path,
+            write_global_state=(not args.no_global_state),
+            dry_run=bool(args.dry_run),
+            max_examples=int(args.max_examples),
+            concurrency=conc,
+        )
+        _print_reconcile_report(rep)
+        return
+
+    if args.cmd == "reset":
+        targets = set(getattr(args, "target", []) or [])
+        if not targets:
+            raise RuntimeError("reset requires at least one --target")
+
+        rep = reset(
+            out_dir=out_dir,
+            db_path=db_path,
+            targets=targets,
+            include_company_ids=getattr(args, "include_company_id", []) or [],
+            exclude_company_ids=getattr(args, "exclude_company_id", []) or [],
+            write_global_state=(not args.no_global_state),
+            dry_run=bool(args.dry_run),
+            max_examples=int(args.max_examples),
+            scan_concurrency=conc,
+            clear_retry_store=bool(getattr(args, "clear_retry_store", False)),
+        )
+        _print_reset_report(rep)
+        return
+
+    if args.cmd == "enforce-max-pages":
+        default_language_factory.set_language(str(args.lang))
+        effective_langs = default_language_factory.effective_langs()
+        logger.info(
+            "language_ready lang_target=%s lang_effective=%s",
+            str(args.lang),
+            ",".join(effective_langs),
+        )
+
+        rep = enforce_max_pages(
+            out_dir=out_dir,
+            db_path=db_path,
+            max_pages=(int(args.max_pages) if args.max_pages is not None else None),
+            selector=str(args.apply_to),
+            apply_only_if_crawl_finished=(str(args.apply_to) == "crawl_finished_true"),
+            write_global_state=(not args.no_global_state),
+            dry_run=bool(args.dry_run),
+            max_examples=int(args.max_examples),
+            concurrency=conc,
+        )
+        _print_enforce_max_pages_report(rep)
         return
 
     raise RuntimeError(f"Unhandled cmd: {args.cmd!r}")
