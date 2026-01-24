@@ -166,7 +166,6 @@ unlzw3==0.2.3
 urllib3==2.5.0
 warc3-wet==0.2.5
 warc3-wet-clueweb09==0.2.5
--e git+https://github.com/silam741852963/web2product-catalog.git@4f62a66e30b0e9ffeedb87cd02beef7a1e5314e5#egg=web2product_catalog_scripts
 websocket-client==1.9.0
 wsproto==1.3.2
 xxhash==3.6.0
