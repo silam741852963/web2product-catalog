@@ -868,6 +868,39 @@ class RetryStateStore:
                 return True
             return float(s.next_eligible_at) <= nowv
 
+    async def unquarantine_company(
+        self,
+        company_id: str,
+        *,
+        reason: str = "",
+        stage: str = "operator_force_requeue",
+        flush: bool = True,
+    ) -> bool:
+        cid = (company_id or "").strip()
+        if not cid:
+            return False
+
+        removed: Optional[Dict[str, Any]] = None
+        async with self._lock:
+            removed = self._quarantine.pop(cid, None)
+            if removed is None:
+                return False
+            self._dirty_quarantine = True
+
+        logger.warning(
+            "[RetryStateStore] unquarantined cid=%s stage=%s reason=%s prev=%s",
+            cid,
+            stage,
+            reason or "unspecified",
+            (removed or {}).get("reason") or "",
+        )
+
+        # Keep terminal_done as-is unless your policy wants to clear it too.
+        # Force requeue is about scheduler admission; terminal markers are separate.
+        if flush:
+            await self.flush(force=True)
+        return True
+
     async def force_eligible_now_many(
         self,
         companies: Sequence[CompanyRef],
@@ -878,14 +911,16 @@ class RetryStateStore:
         max_force_ready_hits_per_company: int = 3,
         force_ready_cooldown_sec: float = 60.0,
         quarantine_on_exceed: bool = True,
-        ignore_quarantine: bool = False,  # <-- NEW
+        ignore_quarantine: bool = False,
     ) -> int:
         """
         Force companies to become eligible immediately.
 
-        NOTE:
-          - If ignore_quarantine=True, quarantined companies are ALSO forced eligible.
-            (Useful when scheduler quarantine filtering is disabled.)
+        Semantics:
+          - Sets next_eligible_at = now for retry-pending entries.
+          - If ignore_quarantine=True, quarantined companies are ALSO updated (quarantine is not removed).
+          - If ignore_quarantine=False, quarantined companies are skipped (legacy behavior).
+          - Enforces per-company cooldown and hit-count escalation (optional quarantine).
         """
         if not companies:
             return 0
@@ -896,7 +931,9 @@ class RetryStateStore:
             return 0
 
         msg = _compact_error_text(reason or "scheduler_force_ready", max_chars=600)
+        stg = (stage or "scheduler_force_ready")[:128]
 
+        # ledger (best-effort; no lock needed since it's append-only)
         await _append_jsonl_many_async(
             self.ledger_path,
             [
@@ -904,102 +941,84 @@ class RetryStateStore:
                     "ts": now,
                     "company_id": cid,
                     "event": "force_ready",
-                    "stage": (stage or "scheduler_force_ready")[:128],
+                    "stage": stg,
                     "reason": msg,
+                    "ignore_quarantine": bool(ignore_quarantine),
                 }
                 for cid in cids
             ],
         )
 
         changed = 0
-        to_quarantine: List[str] = []
-
         skipped_quarantine = 0
         skipped_no_state = 0
         skipped_cooldown = 0
-        skipped_cap = 0
-        skipped_already_eligible = 0
+        quarantined_on_exceed = 0
 
         max_hits = max(0, int(max_force_ready_hits_per_company))
         cooldown = max(0.0, float(force_ready_cooldown_sec))
 
         async with self._lock:
             for cid in cids:
+                # If quarantine is respected, skip quarantined.
                 if (not ignore_quarantine) and (cid in self._quarantine):
                     skipped_quarantine += 1
                     continue
 
-                s = self._state.get(cid)
-                if s is None:
+                st = self._state.get(cid)
+                if st is None:
+                    # No retry state => already eligible; nothing to force in store.
                     skipped_no_state += 1
                     continue
 
-                if cooldown > 0 and float(s.last_force_ready_at) > 0:
-                    if (now - float(s.last_force_ready_at)) < cooldown:
-                        skipped_cooldown += 1
-                        continue
-
-                if max_hits > 0 and int(s.force_ready_hits) >= max_hits:
-                    skipped_cap += 1
-                    if quarantine_on_exceed and (not ignore_quarantine):
-                        to_quarantine.append(cid)
+                # Cooldown
+                last_force = float(st.last_force_ready_at or 0.0)
+                if cooldown > 0 and (now - last_force) < cooldown:
+                    skipped_cooldown += 1
                     continue
 
-                if float(s.next_eligible_at) <= float(now):
-                    skipped_already_eligible += 1
+                # Hit counter
+                hits = int(st.force_ready_hits or 0) + 1
+                st.force_ready_hits = hits
+                st.last_force_ready_at = float(now)
+
+                if max_hits > 0 and hits > max_hits and quarantine_on_exceed:
+                    # Escalate to quarantine (do not remove retry state; just quarantine it).
+                    self._quarantine[cid] = {
+                        "ts": float(now),
+                        "reason": _compact_error_text(
+                            f"force_ready_hits_exceeded hits={hits} max={max_hits}: {msg}",
+                            max_chars=600,
+                        ),
+                        "stage": stg,
+                        "cls": "permanent",
+                    }
+                    self._dirty_quarantine = True
+                    quarantined_on_exceed += 1
+                    # Do NOT also mark it eligible now; keep quarantine as the controlling state.
                     continue
 
-                s.next_eligible_at = float(now)
-                s.updated_at = float(now)
-                s.last_stage = (stage or "scheduler_force_ready")[:128]
-                if msg:
-                    s.last_error = (msg[:2000]) or s.last_error
-
-                s.force_ready_hits = int(s.force_ready_hits) + 1
-                s.last_force_ready_at = float(now)
-
+                # Force eligible now (even if quarantined when ignore_quarantine=True)
+                st.next_eligible_at = float(now)
+                st.updated_at = float(now)
+                st.last_stage = stg
+                st.last_error = msg
+                self._dirty_state = True
                 changed += 1
 
-            if changed:
-                self._dirty_state = True
-
-        quarantined_n = 0
-        for cid in to_quarantine:
-            quarantined_n += 1
-            await self.quarantine_company(
-                cid,
-                reason="force_ready_budget_exceeded",
-                stage=(stage or "scheduler_force_ready")[:128],
-                error=(msg or "force_ready_budget_exceeded"),
-                cls="permanent",
-                status_code=None,
-                nxdomain_like=False,
-                md_done=None,
-                flush=False,
-                also_mark_terminal_done=True,
-            )
-
-        _dbg(
-            "force_eligible_now_many: cids=%d changed=%d quarantined=%d ignore_quarantine=%s "
-            "skipped={quarantine:%d no_state:%d cooldown:%d cap:%d already_eligible:%d} "
-            "max_hits=%d cooldown=%.1fs reason=%r",
-            len(cids),
-            changed,
-            quarantined_n,
-            bool(ignore_quarantine),
-            skipped_quarantine,
-            skipped_no_state,
-            skipped_cooldown,
-            skipped_cap,
-            skipped_already_eligible,
-            max_hits,
-            cooldown,
-            msg[:240],
-        )
-
-        if (changed or to_quarantine) and flush:
+        if (changed or quarantined_on_exceed) and flush:
             await self.flush(force=True)
 
+        logger.info(
+            "retry_force_ready_many changed=%d quarantined_on_exceed=%d skipped_quarantine=%d skipped_no_state=%d skipped_cooldown=%d ignore_quarantine=%s stage=%s",
+            int(changed),
+            int(quarantined_on_exceed),
+            int(skipped_quarantine),
+            int(skipped_no_state),
+            int(skipped_cooldown),
+            bool(ignore_quarantine),
+            stg,
+        )
         return int(changed)
 
     async def is_doomed_repeat_goto(

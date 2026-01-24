@@ -131,7 +131,24 @@ def _atomic_write_json(path: Path, obj: Any, *, pretty: bool) -> None:
     _atomic_write_text(path, _json_dumps(obj, pretty=pretty), "utf-8")
 
 
-def _company_metadata_dir(company_id: str) -> Path:
+def _meta_path_for(company_id: str) -> Path:
+    # writes go to sanitized location
+    return _company_metadata_dir_write(company_id) / META_NAME
+
+
+def _url_index_path_for(company_id: str) -> Path:
+    # writes go to sanitized location
+    return _company_metadata_dir_write(company_id) / URL_INDEX_NAME
+
+
+def _global_state_path() -> Path:
+    return _output_root() / GLOBAL_STATE_NAME
+
+
+def _company_metadata_dir_write(company_id: str) -> Path:
+    """
+    Always write into the sanitized/company_dirs location (Windows-safe).
+    """
     dirs = ensure_company_dirs(company_id)
     meta = dirs.get("metadata") or dirs.get("checkpoints")
     if meta is None:
@@ -144,16 +161,49 @@ def _company_metadata_dir(company_id: str) -> Path:
     return p
 
 
-def _meta_path_for(company_id: str) -> Path:
-    return _company_metadata_dir(company_id) / META_NAME
+def _company_metadata_dir_legacy(company_id: str) -> Path:
+    """
+    Legacy path that may exist if someone constructed paths using raw company_id.
+    We DO NOT write here, but we may read/migrate from it.
+    """
+    # IMPORTANT: do not sanitize here
+    return _output_root() / str(company_id) / "metadata"
 
 
-def _url_index_path_for(company_id: str) -> Path:
-    return _company_metadata_dir(company_id) / URL_INDEX_NAME
+def _resolve_company_meta_file_for_read(company_id: str, filename: str) -> Path:
+    """
+    Read-path resolution:
+      1) Prefer sanitized location.
+      2) If missing, fall back to legacy raw path (when it exists).
+    """
+    p_new = _company_metadata_dir_write(company_id) / filename
+    if p_new.exists():
+        return p_new
+
+    p_old = _company_metadata_dir_legacy(company_id) / filename
+    if p_old.exists():
+        return p_old
+
+    return p_new
 
 
-def _global_state_path() -> Path:
-    return _output_root() / GLOBAL_STATE_NAME
+def _maybe_migrate_legacy_meta_file(company_id: str, filename: str) -> None:
+    """
+    If a legacy raw-path file exists but the sanitized file doesn't,
+    copy it to the sanitized location (best-effort, atomic).
+    """
+    p_new = _company_metadata_dir_write(company_id) / filename
+    if p_new.exists():
+        return
+
+    p_old = _company_metadata_dir_legacy(company_id) / filename
+    if not p_old.exists():
+        return
+
+    # best-effort migration
+    with suppress(Exception):
+        raw = p_old.read_text(encoding="utf-8")
+        _atomic_write_text(p_new, raw, encoding="utf-8")
 
 
 _VERSION_META_LOCK = threading.Lock()
@@ -205,7 +255,7 @@ def _prefer_higher_status(cur: Optional[str], derived: Optional[str]) -> Company
 
 
 def load_crawl_meta(company_id: str) -> Dict[str, Any]:
-    p = _meta_path_for(company_id)
+    p = _resolve_company_meta_file_for_read(company_id, META_NAME)
     if not p.exists():
         return {}
     obj = _json_load(p)
@@ -215,7 +265,10 @@ def load_crawl_meta(company_id: str) -> Dict[str, Any]:
 def patch_crawl_meta(
     company_id: str, patch: Dict[str, Any], *, pretty: bool = True
 ) -> None:
-    p = _meta_path_for(company_id)
+    # If legacy exists, migrate once so subsequent reads/writes are consistent.
+    _maybe_migrate_legacy_meta_file(company_id, META_NAME)
+
+    p = _meta_path_for(company_id)  # sanitized write path
     lk = _get_file_lock(p)
 
     with lk:
@@ -243,6 +296,8 @@ def patch_crawl_meta(
 def patch_company_meta(
     company_id: str, patch: Dict[str, Any], *, pretty: bool = True
 ) -> None:
+    # keep behavior identical, just ensure we don't lose legacy meta
+    _maybe_migrate_legacy_meta_file(company_id, META_NAME)
     patch_crawl_meta(company_id, patch, pretty=pretty)
 
 
@@ -342,7 +397,7 @@ def _write_company_meta_snapshot_sync(
 
 
 def load_url_index(company_id: str) -> Dict[str, Any]:
-    p = _url_index_path_for(company_id)
+    p = _resolve_company_meta_file_for_read(company_id, URL_INDEX_NAME)
     if not p.exists():
         return {}
     obj = _json_load(p)
@@ -350,7 +405,10 @@ def load_url_index(company_id: str) -> Dict[str, Any]:
 
 
 def upsert_url_index_entry(company_id: str, url: str, patch: Dict[str, Any]) -> None:
-    idx_path = _url_index_path_for(company_id)
+    # If legacy exists, migrate once so we stop "missing index" due to raw-path folders.
+    _maybe_migrate_legacy_meta_file(company_id, URL_INDEX_NAME)
+
+    idx_path = _url_index_path_for(company_id)  # sanitized write path
     lk = _get_file_lock(idx_path)
 
     with lk:
@@ -380,8 +438,6 @@ def upsert_url_index_entry(company_id: str, url: str, patch: Dict[str, Any]) -> 
                 patch_dict["updated_at"] = _now_iso()
 
             ent_dict.update(patch_dict)
-        else:
-            ent_dict["updated_at"] = _now_iso()
 
         normalized = UrlIndexEntry.from_dict(ent_dict, company_id=company_id, url=url)
         existing[url] = normalized.to_dict()
@@ -394,7 +450,10 @@ def upsert_url_index_entry(company_id: str, url: str, patch: Dict[str, Any]) -> 
 
 
 def patch_url_index_meta(company_id: str, patch: Dict[str, Any]) -> None:
-    idx_path = _url_index_path_for(company_id)
+    # If legacy exists, migrate once so we stop "missing index" due to raw-path folders.
+    _maybe_migrate_legacy_meta_file(company_id, URL_INDEX_NAME)
+
+    idx_path = _url_index_path_for(company_id)  # sanitized write path
     lk = _get_file_lock(idx_path)
 
     with lk:
@@ -421,8 +480,6 @@ def patch_url_index_meta(company_id: str, patch: Dict[str, Any]) -> None:
                 patch_dict["updated_at"] = _now_iso()
 
             meta_dict.update(patch_dict)
-        else:
-            meta_dict["updated_at"] = _now_iso()
 
         normalized = UrlIndexMeta.from_dict(meta_dict, company_id=company_id)
         existing[URL_INDEX_META_KEY] = normalized.to_dict()

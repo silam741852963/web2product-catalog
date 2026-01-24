@@ -158,7 +158,7 @@ def _print_reconcile_report(rep) -> None:
     )
 
 
-def _print_reset_report(rep) -> None:
+def _print_reset_report(rep, *, delete_db_rows: bool) -> None:
     print("\n== RESET REPORT ==")
     print(
         json.dumps(
@@ -167,6 +167,7 @@ def _print_reset_report(rep) -> None:
                 "db_path": rep.db_path,
                 "dry_run": rep.dry_run,
                 "targets": rep.targets,
+                "delete_db_rows": bool(delete_db_rows),
                 "scanned_companies": rep.scanned_companies,
                 "selected_companies": rep.selected_companies,
                 "deleted_dirs": rep.deleted_dirs,
@@ -338,6 +339,11 @@ def main() -> None:
         action="store_true",
         help="If set: also remove selected company_ids from out_dir/_retry/quarantine.json and out_dir/_retry/retry_state.json.",
     )
+    p_res.add_argument(
+        "--delete-db-rows",
+        action="store_true",
+        help="If set: delete selected company rows from DB (companies + run_company_done + any other table with company_id) instead of resetting them to pending.",
+    )
 
     p_emp = sub.add_parser(
         "enforce-max-pages",
@@ -490,6 +496,8 @@ def main() -> None:
         if not targets:
             raise RuntimeError("reset requires at least one --target")
 
+        delete_db_rows = bool(getattr(args, "delete_db_rows", False))
+
         rep = reset(
             out_dir=out_dir,
             db_path=db_path,
@@ -501,8 +509,9 @@ def main() -> None:
             max_examples=int(args.max_examples),
             scan_concurrency=conc,
             clear_retry_store=bool(getattr(args, "clear_retry_store", False)),
+            delete_db_rows=delete_db_rows,
         )
-        _print_reset_report(rep)
+        _print_reset_report(rep, delete_db_rows=delete_db_rows)
         return
 
     if args.cmd == "enforce-max-pages":

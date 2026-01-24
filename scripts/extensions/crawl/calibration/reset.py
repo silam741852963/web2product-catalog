@@ -215,6 +215,34 @@ async def _reset_select_candidates_async(
     return [selected[cid] for cid in sorted(selected.keys())]
 
 
+def _list_tables_with_company_id(conn: sqlite3.Connection) -> List[str]:
+    """
+    Best-effort schema inspection:
+    return all user tables (excluding sqlite_*) that contain a column named 'company_id'.
+    """
+    tables: List[str] = []
+    rows = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type='table'
+          AND name NOT LIKE 'sqlite_%'
+        """
+    ).fetchall()
+    for (name,) in rows:
+        try:
+            cols = conn.execute(f"PRAGMA table_info({name})").fetchall()
+            # PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+            col_names = {str(c[1]) for c in cols}
+            if "company_id" in col_names:
+                tables.append(str(name))
+        except Exception:
+            # ignore any weird PRAGMA/table name edge cases
+            continue
+    # stable order
+    return sorted(set(tables))
+
+
 async def reset_async(
     *,
     out_dir: Path,
@@ -227,6 +255,7 @@ async def reset_async(
     max_examples: int = 200,
     scan_concurrency: int = 64,
     clear_retry_store: bool = False,
+    delete_db_rows: bool = False,
 ) -> ResetReport:
     out_dir = ensure_output_root(str(out_dir))
     actual_db_path = Path(db_path).expanduser().resolve()
@@ -268,6 +297,9 @@ async def reset_async(
                     if missing:
                         missing_dirs += 1
 
+        # db_rows_reset:
+        # - if delete_db_rows=False: number of companies rows UPDATED
+        # - if delete_db_rows=True:  number of companies rows DELETED
         db_rows_reset = 0
         run_done_deleted = 0
 
@@ -282,43 +314,8 @@ async def reset_async(
                 conn.execute("BEGIN")
 
                 placeholders = ",".join(["?"] * len(selected_ids))
-                conn.execute(
-                    f"""
-                    UPDATE companies
-                    SET
-                        status=?,
-                        crawl_finished=0,
-                        urls_total=0,
-                        urls_markdown_done=0,
-                        urls_llm_done=0,
-                        done_reason=NULL,
-                        done_details=NULL,
-                        done_at=NULL,
-                        last_error=NULL,
-                        last_crawled_at=NULL,
 
-                        retry_next_eligible_at=0.0,
-                        retry_attempts=0,
-                        retry_same_error_streak=0,
-                        retry_last_error='',
-                        retry_last_stage='',
-                        retry_last_error_sig='',
-                        retry_last_error_sig_updated_at=0.0,
-
-                        retry_net_attempts=0,
-                        retry_stall_attempts=0,
-                        retry_mem_attempts=0,
-                        retry_other_attempts=0,
-                        retry_mem_hits=0,
-                        retry_last_stall_kind='unknown',
-                        retry_last_progress_md_done=0,
-                        retry_last_seen_md_done=0
-                    WHERE company_id IN ({placeholders})
-                    """,
-                    (COMPANY_STATUS_PENDING, *selected_ids),
-                )
-                db_rows_reset = int(conn.total_changes)
-
+                # always delete run_company_done entries (same as before)
                 before = conn.total_changes
                 conn.execute(
                     f"DELETE FROM run_company_done WHERE company_id IN ({placeholders})",
@@ -326,6 +323,68 @@ async def reset_async(
                 )
                 after = conn.total_changes
                 run_done_deleted = int(after - before)
+
+                if delete_db_rows:
+                    # delete from any other table that has company_id (best-effort), excluding companies/run_company_done
+                    tables = _list_tables_with_company_id(conn)
+                    for t in tables:
+                        if t in ("companies", "run_company_done"):
+                            continue
+                        # Some tables might be views or have triggers; ignore failures but keep transaction consistent.
+                        # If a delete fails, we abort (raise) because partial deletion is worse than none.
+                        conn.execute(
+                            f"DELETE FROM {t} WHERE company_id IN ({placeholders})",
+                            tuple(selected_ids),
+                        )
+
+                    # finally delete from companies
+                    before2 = conn.total_changes
+                    conn.execute(
+                        f"DELETE FROM companies WHERE company_id IN ({placeholders})",
+                        tuple(selected_ids),
+                    )
+                    after2 = conn.total_changes
+                    db_rows_reset = int(after2 - before2)
+                else:
+                    # reset companies row fields (original behavior)
+                    before2 = conn.total_changes
+                    conn.execute(
+                        f"""
+                        UPDATE companies
+                        SET
+                            status=?,
+                            crawl_finished=0,
+                            urls_total=0,
+                            urls_markdown_done=0,
+                            urls_llm_done=0,
+                            done_reason=NULL,
+                            done_details=NULL,
+                            done_at=NULL,
+                            last_error=NULL,
+                            last_crawled_at=NULL,
+
+                            retry_next_eligible_at=0.0,
+                            retry_attempts=0,
+                            retry_same_error_streak=0,
+                            retry_last_error='',
+                            retry_last_stage='',
+                            retry_last_error_sig='',
+                            retry_last_error_sig_updated_at=0.0,
+
+                            retry_net_attempts=0,
+                            retry_stall_attempts=0,
+                            retry_mem_attempts=0,
+                            retry_other_attempts=0,
+                            retry_mem_hits=0,
+                            retry_last_stall_kind='unknown',
+                            retry_last_progress_md_done=0,
+                            retry_last_seen_md_done=0
+                        WHERE company_id IN ({placeholders})
+                        """,
+                        (COMPANY_STATUS_PENDING, *selected_ids),
+                    )
+                    after2 = conn.total_changes
+                    db_rows_reset = int(after2 - before2)
 
                 conn.execute("COMMIT")
             except Exception:
@@ -337,19 +396,22 @@ async def reset_async(
 
         elif selected_ids and dry_run:
             placeholders = ",".join(["?"] * len(selected_ids))
+
+            # companies rows "affected" (count only)
             r1 = await state._query_one(
                 f"SELECT COUNT(1) AS n FROM companies WHERE company_id IN ({placeholders})",
                 tuple(selected_ids),
             )
             db_rows_reset = int(r1["n"] if r1 else 0)
 
+            # run_company_done rows that would be deleted
             r2 = await state._query_one(
                 f"SELECT COUNT(1) AS n FROM run_company_done WHERE company_id IN ({placeholders})",
                 tuple(selected_ids),
             )
             run_done_deleted = int(r2["n"] if r2 else 0)
 
-        # --- NEW: clear persistent retry store entries (quarantine + retry_state) ---
+        # --- clear persistent retry store entries (quarantine + retry_state) ---
         retry_quarantine_rows_deleted = 0
         retry_state_rows_deleted = 0
         if clear_retry_store and selected_ids:
@@ -401,6 +463,7 @@ def reset(
     max_examples: int = 200,
     scan_concurrency: int = 64,
     clear_retry_store: bool = False,
+    delete_db_rows: bool = False,
 ) -> ResetReport:
     return asyncio.run(
         reset_async(
@@ -414,5 +477,6 @@ def reset(
             max_examples=max_examples,
             scan_concurrency=scan_concurrency,
             clear_retry_store=clear_retry_store,
+            delete_db_rows=delete_db_rows,
         )
     )

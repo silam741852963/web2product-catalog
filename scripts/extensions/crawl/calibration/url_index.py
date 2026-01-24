@@ -107,6 +107,149 @@ def url_index_meta_patch_max_pages(
     return out
 
 
+# -------------------------
+# Meta recomputation helpers
+# -------------------------
+
+
+def _truthy(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return bool(v)
+    if isinstance(v, (int, float)):
+        return v != 0
+    s = str(v).strip().lower()
+    if not s:
+        return False
+    return s not in ("0", "false", "no", "none", "null", "n/a")
+
+
+def _status_norm(v: Any) -> str:
+    try:
+        return str(v or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _has_any_path(entry: Mapping[str, Any], keys: Tuple[str, ...]) -> bool:
+    for k in keys:
+        v = entry.get(k)
+        if v is None:
+            continue
+        try:
+            s = str(v).strip()
+        except Exception:
+            continue
+        if s:
+            return True
+    return False
+
+
+def _entry_has_markdown_evidence(entry: Mapping[str, Any]) -> bool:
+    # 1) explicit booleans
+    if _truthy(entry.get("markdown_done")):
+        return True
+    if _truthy(entry.get("md_done")):
+        return True
+
+    # 2) known path keys
+    if _has_any_path(entry, ("markdown_path", "md_path", "md_file", "markdown_file")):
+        return True
+
+    # 3) status / stage fields
+    st = _status_norm(entry.get("status") or entry.get("state") or entry.get("stage"))
+    if st in ("markdown_saved", "markdown_done", "llm_done"):
+        return True
+
+    # 4) any LLM artifact paths that imply markdown existed / was processed
+    if _has_any_path(
+        entry,
+        (
+            "llm_json_path",
+            "extraction_json_path",
+            "product_json_path",
+            "products_json_path",
+            "nice_json_path",
+            "md_json_path",
+        ),
+    ):
+        return True
+
+    return False
+
+
+def _entry_is_suppressed(entry: Mapping[str, Any]) -> bool:
+    # Common boolean flags
+    for k in (
+        "suppressed",
+        "markdown_suppressed",
+        "md_suppressed",
+        "is_suppressed",
+        "suppressed_by_gating",
+    ):
+        if _truthy(entry.get(k)):
+            return True
+
+    # Gating decision sub-objects (best-effort)
+    gating = entry.get("gating")
+    if isinstance(gating, Mapping):
+        decision = _status_norm(gating.get("decision") or gating.get("verdict"))
+        if decision in (
+            "suppress",
+            "suppressed",
+            "skip",
+            "skipped",
+            "blocked",
+            "deny",
+            "denied",
+        ):
+            return True
+
+    # Status values that imply suppression
+    st = _status_norm(entry.get("status") or entry.get("state") or entry.get("stage"))
+    if st in ("suppressed", "markdown_suppressed", "skipped", "blocked", "gated"):
+        return True
+
+    return False
+
+
+def _compute_meta_from_entries(
+    *,
+    entries: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, int]:
+    # entries: url -> entrydict (no __meta__)
+    pages_seen = 0
+    markdown_saved = 0
+    markdown_suppressed = 0
+    timeout_pages = 0
+    memory_pressure_pages = 0
+
+    for _url, e in entries.items():
+        pages_seen += 1
+
+        if _entry_is_suppressed(e):
+            markdown_suppressed += 1
+
+        if _entry_has_markdown_evidence(e):
+            markdown_saved += 1
+
+        if _truthy(e.get("timeout_page_exceeded")):
+            timeout_pages += 1
+
+        if _truthy(e.get("memory_pressure")):
+            memory_pressure_pages += 1
+
+    return {
+        "pages_seen": int(pages_seen),
+        "total_pages": int(pages_seen),
+        "markdown_saved": int(markdown_saved),
+        "markdown_suppressed": int(markdown_suppressed),
+        "timeout_pages": int(timeout_pages),
+        "memory_pressure_pages": int(memory_pressure_pages),
+    }
+
+
 def normalize_url_index_file(
     out_dir: Path,
     company_id: str,
@@ -125,6 +268,7 @@ def normalize_url_index_file(
     if not isinstance(idx, dict) or not idx:
         return
 
+    # Normalize URL entries
     out: Dict[str, Any] = {}
     for k, raw in idx.items():
         if str(k).startswith("__"):
@@ -137,12 +281,20 @@ def normalize_url_index_file(
         normalized = UrlIndexEntry.from_dict(ent_dict, company_id=company_id, url=url)
         out[url] = normalized.to_dict()
 
+    # Recompute meta from normalized entries (do NOT preserve stale counters)
+    # Keep non-counter meta fields (created_at, crawl_finished, hard_max_pages, etc.) if present.
     meta_raw = idx.get(URL_INDEX_META_KEY)
-    meta_dict = dict(meta_raw) if isinstance(meta_raw, Mapping) else {}
+    meta_dict: Dict[str, Any] = dict(meta_raw) if isinstance(meta_raw, Mapping) else {}
+
+    # Ensure required/expected bookkeeping
     meta_dict.setdefault("company_id", company_id)
     meta_dict.setdefault("created_at", now_iso())
     meta_dict["updated_at"] = now_iso()
     meta_dict[VERSION_META_KEY] = version_meta
+
+    # Overwrite counter fields deterministically from body
+    computed = _compute_meta_from_entries(entries={u: out[u] for u in out.keys()})
+    meta_dict.update(computed)
 
     meta_norm = UrlIndexMeta.from_dict(meta_dict, company_id=company_id)
     out[URL_INDEX_META_KEY] = meta_norm.to_dict()

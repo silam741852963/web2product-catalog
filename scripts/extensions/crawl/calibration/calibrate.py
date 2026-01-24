@@ -64,8 +64,8 @@ async def calibrate_async(
         async def _one(cid: str) -> None:
             async with sem:
                 src = src_map.get(cid)
-
                 if src is not None:
+                    # Concrete API: upsert_company(...)
                     await state.upsert_company(
                         cid,
                         root_url=src.root_url,
@@ -77,14 +77,22 @@ async def calibrate_async(
                         industry_label_source=src.industry_label_source,
                     )
 
-                db_snap = await state.get_company_snapshot(cid, recompute=False)
-
+                # 1) Normalize url_index.json (filesystem) first.
                 await asyncio.to_thread(
                     normalize_url_index_file,
                     out_dir,
                     cid,
                     version_meta=version_meta,
                 )
+
+                # 2) Concrete API: recompute_company_from_index(...) reads url_index.json and
+                # updates companies.{status,crawl_finished,urls_*} deterministically.
+                await state.recompute_company_from_index(cid, write_meta=False)
+
+                # 3) Concrete API: get_company_snapshot(..., recompute=False) to avoid re-reading index again.
+                db_snap = await state.get_company_snapshot(cid, recompute=False)
+
+                # 4) Patch crawl_meta.json from DB snapshot (your calibrator-owned file patcher).
                 await asyncio.to_thread(
                     patch_crawl_meta_file,
                     out_dir,
@@ -98,6 +106,7 @@ async def calibrate_async(
             await asyncio.gather(*(_one(cid) for cid in db_ids[i : i + batch]))
 
         if write_global_state:
+            # Concrete API: write_global_state_from_db_only(pretty=...)
             await state.write_global_state_from_db_only(pretty=False)
 
         sample_after = await sample(out_dir, state, company_id)

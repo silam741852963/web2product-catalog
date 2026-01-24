@@ -692,7 +692,19 @@ class AdaptiveScheduler:
         if not cid:
             return False
 
-        if self.cfg.quarantine_enabled:
+        # Operator override: if force=True and quarantine is enabled, remove quarantine entry
+        # so _prune_queued_quarantined() won't immediately delete it from ready/deferred.
+        if bool(self.cfg.quarantine_enabled) and bool(force):
+            with contextlib.suppress(Exception):
+                await self.retry_store.unquarantine_company(
+                    cid,
+                    reason=reason or "force_requeue",
+                    stage="scheduler_force_requeue",
+                    flush=True,
+                )
+        # Force requeue MUST bypass quarantine.
+        # Quarantine is a normal-admission filter; force requeue is an operator override.
+        if self.cfg.quarantine_enabled and (not force):
             if await self.retry_store.is_quarantined(cid):
                 logger.debug(
                     "[AdaptiveScheduling][requeue_company] blocked_by_quarantine cid=%s reason=%s",
@@ -700,6 +712,13 @@ class AdaptiveScheduler:
                     reason or "unspecified",
                 )
                 return False
+        elif self.cfg.quarantine_enabled and force:
+            logger.debug(
+                "[AdaptiveScheduling][requeue_company] bypass_quarantine force=%s cid=%s reason=%s",
+                bool(force),
+                cid,
+                reason or "unspecified",
+            )
 
         now = time.time()
         ts = now + max(0.0, float(delay_sec))

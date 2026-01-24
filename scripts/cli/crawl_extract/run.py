@@ -174,14 +174,6 @@ async def main_async(args: argparse.Namespace) -> int:
     async def is_company_runnable(cid: str) -> bool:
         nonlocal runnable_debug_seen
 
-        if cid not in company_id_set:
-            if logger.isEnabledFor(logging.DEBUG) and runnable_debug_seen < 25:
-                runnable_debug_seen += 1
-                logger.debug(
-                    "runnable_check cid=%s in_set=false => runnable=false", cid
-                )
-            return False
-
         snap = await ctx.state.get_company_snapshot(cid, recompute=True)
         st = (getattr(snap, "status", None) or "").strip() or "pending"
         md_done = int(getattr(snap, "urls_markdown_done", 0) or 0)
@@ -194,8 +186,7 @@ async def main_async(args: argparse.Namespace) -> int:
             ):
                 runnable_debug_seen += 1
                 logger.debug(
-                    "runnable_check llm_enabled=true cid=%s status=%s md_done=%d last_error_len=%d => runnable=%s "
-                    "(policy: terminal_done_allowed; last_error_ignored)",
+                    "runnable_check llm_enabled=true cid=%s status=%s md_done=%d last_error_len=%d => runnable=%s",
                     cid,
                     st,
                     md_done,
