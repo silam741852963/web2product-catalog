@@ -78,6 +78,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Debug limit: only load/process up to N companies.",
     )
 
+    # LLM-related metrics toggle
+    g = p.add_mutually_exclusive_group()
+    g.add_argument(
+        "--llm-metrics",
+        action="store_true",
+        help="Enable LLM-related analysis (default).",
+    )
+    g.add_argument(
+        "--no-llm-metrics",
+        action="store_true",
+        help="Disable LLM-related analysis (do not compute/aggregate/plot LLM & offerings).",
+    )
+
     # Parallelism
     p.add_argument(
         "--workers",
@@ -111,7 +124,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _configure_logging(level: str) -> None:
-    # Make sure logs show up in terminal even if nothing configured upstream.
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -140,6 +152,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         LOG.error("--view lv1 requires --industry <id>")
         return 2
 
+    # Default is enabled unless explicitly disabled
+    include_llm_metrics = True
+    if bool(args.no_llm_metrics):
+        include_llm_metrics = False
+    elif bool(args.llm_metrics):
+        include_llm_metrics = True
+
     kwargs: Dict[str, Any] = dict(
         out_dir=out_dir,
         run_tag=run_tag,
@@ -150,6 +169,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         include_companies_sample=bool(args.include_companies_sample),
         max_companies=args.max_companies,
         workers=workers,
+        include_llm_metrics=bool(include_llm_metrics),
     )
 
     paths = run_analysis(**kwargs)

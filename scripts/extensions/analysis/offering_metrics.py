@@ -48,7 +48,6 @@ def _offering_counts_from_profile(profile: dict | None) -> Tuple[int, int, int]:
         elif t == "service":
             s += 1
 
-        # best-effort key
         name = ""
         for k in ("name", "title", "label"):
             v = o.get(k)
@@ -86,7 +85,6 @@ def aggregate_offering_sections_for_view(
     by_company: Dict[str, CompanyOfferingOutput],
     md_tokens_by_company: Dict[str, int],
     llm_tokens_by_company: Dict[str, int],
-    # Optional extras (don’t break old callers)
     total_pages_by_company: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """
@@ -96,6 +94,9 @@ def aggregate_offering_sections_for_view(
       - offering_per_md_token = total / max(1, md_tokens)
       - offering_per_llm_token = total / max(1, llm_tokens)
       - unique_offering_ratio = unique_total / max(1,total)
+
+    NOTE: this module is intended to be invoked only when LLM metrics are enabled.
+          (run_analysis will skip calling it when include_llm_metrics=False.)
     """
     ids = list(company_ids_in_view)
 
@@ -105,10 +106,8 @@ def aggregate_offering_sections_for_view(
         if r is not None:
             rows.append(r)
 
-    # stable ordering by company_id (for tables), but vectors must align to ids (view order)
     rows_by_id: Dict[str, CompanyOfferingOutput] = {r.company_id: r for r in rows}
 
-    # per-company vectors aligned to ids
     offering_count: List[int] = []
     offering_density: List[float] = []
     offering_per_md_token: List[float] = []
@@ -134,7 +133,6 @@ def aggregate_offering_sections_for_view(
         else:
             offering_density.append(0.0)
 
-    # Aggregate by industry within the view (for stacked bars)
     by_industry: Dict[str, Dict[str, int]] = {}
     for r in rows:
         agg = by_industry.setdefault(
@@ -154,7 +152,6 @@ def aggregate_offering_sections_for_view(
         for k, v in sorted(by_industry.items(), key=lambda kv: kv[0])
     ]
 
-    # Table-ish rows (sorted by company_id for readability)
     rows_sorted = sorted(rows, key=lambda r: r.company_id)
     per_company_rows = [
         {
@@ -186,7 +183,7 @@ def aggregate_offering_sections_for_view(
             },
             "features": {
                 "offering_count": offering_count,
-                "offering_density": offering_density,  # 0.0 if pages not provided
+                "offering_density": offering_density,
                 "offering_per_md_token": offering_per_md_token,
                 "offering_per_llm_token": offering_per_llm_token,
                 "unique_offering_ratio": unique_offering_ratio,

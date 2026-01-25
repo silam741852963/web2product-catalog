@@ -33,6 +33,7 @@ class CompanyTokenInput:
     markdown_dir: Path
     product_dir: Path
     markdown_saved: int
+    include_llm_tokens: bool  # when False: do not read product_dir at all
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +43,7 @@ class CompanyTokenOutput:
     html_tokens: int
     md_tokens: int
     md_file_count: int
-    actual_output_tokens: int
+    llm_output_tokens: int  # RENAMED: actual_output_tokens -> llm_output_tokens
     markdown_saved: int
 
 
@@ -57,13 +58,14 @@ def extract_company_token_metrics(inp: CompanyTokenInput) -> CompanyTokenOutput:
         md_tok += _count_tokens_deterministic(_read_text(p))
 
     out_tok = 0
-    for p in _iter_files(inp.product_dir, suffix=".json"):
-        try:
-            obj = json.loads(_read_text(p))
-            s = json.dumps(obj, ensure_ascii=False, sort_keys=True)
-        except Exception:
-            s = _read_text(p)
-        out_tok += _count_tokens_deterministic(s)
+    if bool(inp.include_llm_tokens):
+        for p in _iter_files(inp.product_dir, suffix=".json"):
+            try:
+                obj = json.loads(_read_text(p))
+                s = json.dumps(obj, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                s = _read_text(p)
+            out_tok += _count_tokens_deterministic(s)
 
     return CompanyTokenOutput(
         company_id=inp.company_id,
@@ -71,7 +73,7 @@ def extract_company_token_metrics(inp: CompanyTokenInput) -> CompanyTokenOutput:
         html_tokens=int(html_tok),
         md_tokens=int(md_tok),
         md_file_count=int(len(md_files)),
-        actual_output_tokens=int(out_tok),
+        llm_output_tokens=int(out_tok),
         markdown_saved=int(inp.markdown_saved),
     )
 
@@ -82,13 +84,16 @@ def aggregate_token_sections_for_view(
     by_company: Dict[str, CompanyTokenOutput],
     per_doc_overhead: int,
     prompt_overhead_by_industry: Dict[str, int],
+    include_llm_metrics: bool = True,
 ) -> Dict[str, Any]:
     """
-    Updated:
-      - expected_llm_tokens removed
-      - totals reduced to md + pruned
+    Token section is always present (md + pruning totals).
+    When include_llm_metrics=False:
+      - do not include llm_output_tokens distributions
+      - do not include llm_output_tokens by_company mapping
     """
     ids = list(company_ids_in_view)
+
     rows: List[CompanyTokenOutput] = []
     for cid in ids:
         r = by_company.get(cid)
@@ -99,21 +104,47 @@ def aggregate_token_sections_for_view(
     md_tokens_by_company: Dict[str, int] = {}
     md_file_count_by_company: Dict[str, int] = {}
     markdown_saved_by_company: Dict[str, int] = {}
-    actual_out_tokens_by_company: Dict[str, int] = {}
+    llm_out_tokens_by_company: Dict[str, int] = {}
 
     for r in rows:
         html_tokens_by_company[r.company_id] = int(r.html_tokens)
         md_tokens_by_company[r.company_id] = int(r.md_tokens)
         md_file_count_by_company[r.company_id] = int(r.md_file_count)
         markdown_saved_by_company[r.company_id] = int(r.markdown_saved)
-        actual_out_tokens_by_company[r.company_id] = int(r.actual_output_tokens)
+        if bool(include_llm_metrics):
+            llm_out_tokens_by_company[r.company_id] = int(r.llm_output_tokens)
 
     html_total = sum(html_tokens_by_company.values())
     md_total = sum(md_tokens_by_company.values())
     pruned_total = max(0, int(html_total) - int(md_total))
 
     md_vals = [md_tokens_by_company.get(cid, 0) for cid in ids]
-    actual_vals = [actual_out_tokens_by_company.get(cid, 0) for cid in ids]
+
+    distributions: Dict[str, Any] = {
+        "md_tokens": {
+            "summary": summarize_distribution(md_vals),
+            "charts": {"bar": "md_tokens_bar", "hist": "md_tokens_hist"},
+        }
+    }
+
+    if bool(include_llm_metrics):
+        llm_vals = [llm_out_tokens_by_company.get(cid, 0) for cid in ids]
+        distributions["llm_output_tokens"] = {
+            "summary": summarize_distribution(llm_vals),
+            "charts": {
+                "bar": "llm_output_tokens_bar",
+                "hist": "llm_output_tokens_hist",
+            },
+        }
+
+    by_company_block: Dict[str, Any] = {
+        "md_tokens": md_tokens_by_company,
+        "html_tokens": html_tokens_by_company,
+        "md_file_count": md_file_count_by_company,
+        "markdown_saved": markdown_saved_by_company,
+    }
+    if bool(include_llm_metrics):
+        by_company_block["llm_output_tokens"] = llm_out_tokens_by_company
 
     return {
         "tokens": {
@@ -125,25 +156,7 @@ def aggregate_token_sections_for_view(
                 "md_tokens_total": int(md_total),
                 "pruned_tokens_total": int(pruned_total),
             },
-            "distributions": {
-                "md_tokens": {
-                    "summary": summarize_distribution(md_vals),
-                    "charts": {"bar": "md_tokens_bar", "hist": "md_tokens_hist"},
-                },
-                "actual_output_tokens": {
-                    "summary": summarize_distribution(actual_vals),
-                    "charts": {
-                        "bar": "actual_output_tokens_bar",
-                        "hist": "actual_output_tokens_hist",
-                    },
-                },
-            },
-            "by_company": {
-                "md_tokens": md_tokens_by_company,
-                "html_tokens": html_tokens_by_company,
-                "actual_output_tokens": actual_out_tokens_by_company,
-                "md_file_count": md_file_count_by_company,
-                "markdown_saved": markdown_saved_by_company,
-            },
+            "distributions": distributions,
+            "by_company": by_company_block,
         }
     }

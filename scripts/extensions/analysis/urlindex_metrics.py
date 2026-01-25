@@ -69,13 +69,20 @@ def _build_histogram_bins(
       bin_labels: ["lo–hi", ...]
       bin_counts: [count, ...]
     """
-    vals = [int(v) for v in values if isinstance(v, (int, float, str)) and int(v) >= 0]
+    vals: List[int] = []
+    for v in values:
+        try:
+            iv = int(v)
+            if iv >= 0:
+                vals.append(iv)
+        except Exception:
+            continue
+
     if not vals:
         return {"histogram_bins": [], "bin_labels": [], "bin_counts": [], "bin_size": 1}
 
     vmax = max(vals)
     if vmax <= 0:
-        # all zeros -> single bin
         return {
             "histogram_bins": [{"lo": 0, "hi": 0, "count": len(vals)}],
             "bin_labels": ["0"],
@@ -85,7 +92,6 @@ def _build_histogram_bins(
 
     # choose bin size to get ~target_bins
     bin_size = max(1, int(round(vmax / max(1, int(target_bins)))))
-    # avoid too tiny bins for large ranges
     if vmax > 500 and bin_size < 10:
         bin_size = 10
     if vmax > 5000 and bin_size < 50:
@@ -107,14 +113,9 @@ def _build_histogram_bins(
         lo = b * bin_size
         hi = (b + 1) * bin_size - 1
         if b == int(vmax // bin_size):
-            # last bin inclusive upper bound = vmax for nicer label
             hi = max(hi, vmax)
 
-        if lo == hi:
-            lab = f"{lo}"
-        else:
-            lab = f"{lo}–{hi}"
-
+        lab = f"{lo}" if lo == hi else f"{lo}–{hi}"
         bins.append({"lo": int(lo), "hi": int(hi), "count": int(c)})
         labels.append(lab)
         ys.append(int(c))
@@ -138,12 +139,16 @@ class CompanyUrlIndexInput:
 class CompanyUrlIndexOutput:
     company_id: str
 
-    urls_total: int
+    # NEW canonical "total url count" field you can sum for global totals.
+    total_urls: int
+
+    # Completion totals (prefer crawl_meta if present, else infer)
     urls_markdown_done: int
     urls_llm_done: int
 
     slice_counts: Counter[str]
 
+    # Page-ish distributions used elsewhere
     total_pages: int
     markdown_saved: int
 
@@ -154,12 +159,13 @@ def extract_company_urlindex_metrics(
     meta = inp.crawl_meta if isinstance(inp.crawl_meta, dict) else {}
     ui = inp.url_index if isinstance(inp.url_index, dict) else {}
 
-    urls_total = int(_intish(meta.get("urls_total")) or 0)
+    # Prefer crawl_meta numbers if present; else infer from url_index.
+    total_urls = int(_intish(meta.get("urls_total")) or 0)
     urls_md = int(_intish(meta.get("urls_markdown_done")) or 0)
     urls_llm = int(_intish(meta.get("urls_llm_done")) or 0)
 
-    if urls_total <= 0 and isinstance(ui, dict):
-        urls_total = sum(1 for k in ui.keys() if k != "__meta__")
+    if total_urls <= 0 and isinstance(ui, dict):
+        total_urls = sum(1 for k in ui.keys() if k != "__meta__")
 
     if urls_md <= 0 and isinstance(ui, dict):
         m = ui.get("__meta__")
@@ -220,7 +226,7 @@ def extract_company_urlindex_metrics(
 
     return CompanyUrlIndexOutput(
         company_id=str(inp.company_id),
-        urls_total=max(0, int(urls_total)),
+        total_urls=max(0, int(total_urls)),
         urls_markdown_done=max(0, int(urls_md)),
         urls_llm_done=max(0, int(urls_llm)),
         slice_counts=slice_counts,
@@ -238,6 +244,7 @@ def aggregate_url_completion_section_for_view(
 ) -> Dict[str, Any]:
     ids = list(company_ids_in_view)
 
+    # Keep existing behavior: prefer global_state sums for global view if present.
     if global_state is not None and bool(is_global_view):
         urls_total_sum = int(global_state.get("urls_total_sum", 0) or 0)
         urls_markdown_done_sum = int(global_state.get("urls_markdown_done_sum", 0) or 0)
@@ -250,7 +257,7 @@ def aggregate_url_completion_section_for_view(
             r = by_company.get(cid)
             if r is None:
                 continue
-            urls_total_sum += int(r.urls_total)
+            urls_total_sum += int(r.total_urls)
             urls_markdown_done_sum += int(r.urls_markdown_done)
             urls_llm_done_sum += int(r.urls_llm_done)
 
@@ -315,24 +322,20 @@ def aggregate_page_distributions_section_for_view(
                 "bin_labels": pages_hist["bin_labels"],
                 "bin_counts": pages_hist["bin_counts"],
                 "summary": summarize_distribution(total_pages_vals),
-                "charts": {
-                    "hist": f"{vslug}_total_pages_hist",
-                },
+                "charts": {"hist": f"{vslug}_total_pages_hist"},
             },
             "markdown_saved": {
                 "histogram_bins": md_hist["histogram_bins"],
                 "bin_labels": md_hist["bin_labels"],
                 "bin_counts": md_hist["bin_counts"],
                 "summary": summarize_distribution(md_saved_vals),
-                "charts": {
-                    "hist": f"{vslug}_markdown_saved_hist",
-                },
+                "charts": {"hist": f"{vslug}_markdown_saved_hist"},
             },
         }
     }
 
 
-# Backwards-compatible wrappers (kept)
+# Backwards-compatible wrappers (kept as-is)
 def compute_url_completion_section(
     view: IndustryView, *, global_state: Optional[dict] = None
 ) -> Dict[str, Any]:

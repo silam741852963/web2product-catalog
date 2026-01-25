@@ -87,33 +87,10 @@ def _parse_int(x: object) -> Optional[int]:
     return None
 
 
-def _resolve_lv1_label(
-    industry_tables: Optional[Any], industry: Optional[int]
-) -> Optional[str]:
-    if industry is None or industry_tables is None:
-        return None
-
-    # Common patterns in your codebase:
-    # - industry_tables.resolve_industry_label(industry_id, nace=None)
-    try:
-        resolver = getattr(industry_tables, "resolve_industry_label", None)
-        if callable(resolver):
-            lbl = resolver(industry, None)  # type: ignore[misc]
-            if isinstance(lbl, str) and lbl.strip():
-                return lbl.strip()
-    except Exception:
-        logger.exception(
-            "industry_tables.resolve_industry_label failed industry=%s", industry
-        )
-
-    # Dict-like fallbacks
-    for attr in ("industry_id_to_label", "industry_labels", "industry_map"):
-        m = getattr(industry_tables, attr, None)
-        if isinstance(m, dict):
-            v = m.get(industry)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-
+def _clean_str(x: object) -> Optional[str]:
+    if isinstance(x, str):
+        s = x.strip()
+        return s or None
     return None
 
 
@@ -122,33 +99,136 @@ def _resolve_lv2_from_crawl_meta(
 ) -> tuple[Optional[int], Optional[str], Optional[str]]:
     """
     Return (nace, industry_label_lv2, industry_label_source) when present.
-    lv2 is only considered valid when crawl_meta indicates it is from "industry+nace".
+    lv2 label is only considered valid when crawl_meta indicates it is from "industry+nace".
     """
     if not crawl_meta:
         return None, None, None
 
     nace = _parse_int(crawl_meta.get("nace"))
-    src = crawl_meta.get("industry_label_source")
-    lbl = crawl_meta.get("industry_label")
+    src = _clean_str(crawl_meta.get("industry_label_source"))
+    lbl = _clean_str(crawl_meta.get("industry_label"))
 
-    if (
-        isinstance(src, str)
-        and src == "industry+nace"
-        and nace is not None
-        and isinstance(lbl, str)
-        and lbl.strip()
-    ):
-        return nace, lbl.strip(), src
+    # In your example:
+    #   industry_label_source == "industry+nace"
+    #   industry_label == "Computer programming activities"
+    # => that's lv2 label (nace-resolved)
+    if src == "industry+nace" and nace is not None and lbl:
+        return nace, lbl, src
 
     # If nace exists but no label/source, still expose nace; label remains None.
     if nace is not None:
-        return (
-            nace,
-            None,
-            (src.strip() if isinstance(src, str) and src.strip() else None),
-        )
+        return nace, None, src
 
-    return None, None, (src.strip() if isinstance(src, str) and src.strip() else None)
+    return None, None, src
+
+
+def _resolve_lv1_label_from_crawl_meta(crawl_meta: Optional[dict]) -> Optional[str]:
+    """
+    If crawl_meta already contains an lv1 industry label (not the nace-derived lv2),
+    return it. We only trust it when the source indicates lv1.
+    """
+    if not crawl_meta:
+        return None
+
+    src = _clean_str(crawl_meta.get("industry_label_source"))
+    lbl = _clean_str(crawl_meta.get("industry_label"))
+
+    # We should NOT treat "industry+nace" as lv1 label.
+    if not lbl:
+        return None
+
+    # Accept a few plausible lv1 sources used across versions.
+    # (If your pipeline only ever writes "industry+nace", this will be None, and we’ll
+    #  fall back to the lookup tables.)
+    if src in {"industry", "fallback", "industry_only", "lv1"}:
+        return lbl
+
+    return None
+
+
+def _resolve_lv1_label_from_tables(
+    industry_tables: Optional[Any],
+    *,
+    industry: Optional[int],
+    nace: Optional[int],
+) -> Optional[str]:
+    """
+    Robustly resolve lv1 label using IndustryLookupTables / enrichment tables.
+    We try:
+      - resolve_industry_label with multiple call patterns
+      - known dict-like attributes
+    """
+    if industry is None or industry_tables is None:
+        return None
+
+    resolver = getattr(industry_tables, "resolve_industry_label", None)
+    if callable(resolver):
+        # Try the most common signatures seen in codebases.
+        # 1) resolve_industry_label(industry, nace)
+        try:
+            v = resolver(industry, nace)  # type: ignore[misc]
+            s = _clean_str(v)
+            if s:
+                return s
+        except Exception:
+            pass
+
+        # 2) resolve_industry_label(industry, None)
+        try:
+            v = resolver(industry, None)  # type: ignore[misc]
+            s = _clean_str(v)
+            if s:
+                return s
+        except Exception:
+            pass
+
+        # 3) resolve_industry_label(industry_id=..., nace=...)
+        try:
+            v = resolver(industry_id=industry, nace=nace)  # type: ignore[call-arg]
+            s = _clean_str(v)
+            if s:
+                return s
+        except Exception:
+            pass
+
+        # 4) resolve_industry_label(industry_id=...)
+        try:
+            v = resolver(industry_id=industry)  # type: ignore[call-arg]
+            s = _clean_str(v)
+            if s:
+                return s
+        except Exception:
+            pass
+
+    # Dict-like fallbacks (wider net than before)
+    dict_attrs = (
+        "industry_id_to_label",
+        "industry_to_label",
+        "industry_labels",
+        "industry_map",
+        "fallback_industry_id_to_label",
+        "fallback_industry_to_label",
+    )
+    for attr in dict_attrs:
+        m = getattr(industry_tables, attr, None)
+        if isinstance(m, dict):
+            v = m.get(industry)
+            s = _clean_str(v)
+            if s:
+                return s
+
+    # Some implementations keep tables nested: industry_tables.fallback.industry_id_to_label
+    fallback = getattr(industry_tables, "fallback", None)
+    if fallback is not None:
+        for attr in ("industry_id_to_label", "industry_to_label", "labels", "map"):
+            m = getattr(fallback, attr, None)
+            if isinstance(m, dict):
+                v = m.get(industry)
+                s = _clean_str(v)
+                if s:
+                    return s
+
+    return None
 
 
 def load_analysis_dataset(
@@ -161,6 +241,8 @@ def load_analysis_dataset(
 
     industry_tables: Optional[Any] = None
     try:
+        # You set nace_path=None, but load_industry_lookup_tables() apparently uses
+        # its own DEFAULT_NACE_PATH internally (as shown in your log).
         cfg = IndustryEnrichmentConfig(
             nace_path=None,
             fallback_path=DEFAULT_INDUSTRY_FALLBACK_PATH,
@@ -203,11 +285,20 @@ def load_analysis_dataset(
             root_url = str((company_profile or {}).get("root_url") or "") or None
 
         industry = _parse_int((crawl_meta or {}).get("industry"))
-        industry_label_lv1 = _resolve_lv1_label(industry_tables, industry)
-
         nace, industry_label_lv2, industry_label_source = _resolve_lv2_from_crawl_meta(
             crawl_meta
         )
+
+        # lv1 label resolution:
+        #   1) trust crawl_meta only if it explicitly says it is lv1
+        #   2) otherwise resolve from tables (industry.ods)
+        industry_label_lv1 = _resolve_lv1_label_from_crawl_meta(crawl_meta)
+        if industry_label_lv1 is None:
+            industry_label_lv1 = _resolve_lv1_label_from_tables(
+                industry_tables,
+                industry=industry,
+                nace=nace,
+            )
 
         paths = CompanyPaths(
             crawl_meta_path=crawl_meta_path,
@@ -222,7 +313,7 @@ def load_analysis_dataset(
             product_dir=cdir / "product",
         )
 
-        # Default group key here is lv1-ish; industry_view.py will override grouping at view-build time.
+        # Default group key is lv1-ish; industry_view.py may override grouping later.
         if industry is not None:
             group_key = f"industry:{industry}"
         else:
@@ -245,6 +336,29 @@ def load_analysis_dataset(
                 paths=paths,
             )
         )
+
+    # Helpful one-line summary in loader logs (keeps analysis logs simpler)
+    total = len(companies)
+    have_ind = sum(1 for c in companies if isinstance(c.industry, int))
+    have_lv1 = sum(
+        1
+        for c in companies
+        if isinstance(c.industry_label_lv1, str) and c.industry_label_lv1.strip()
+    )
+    have_nace = sum(1 for c in companies if isinstance(c.nace, int))
+    have_lv2 = sum(
+        1
+        for c in companies
+        if isinstance(c.industry_label_lv2, str) and c.industry_label_lv2.strip()
+    )
+    logger.info(
+        "[analysis_loader] companies=%d have_industry=%d have_lv1_label=%d have_nace=%d have_lv2_label=%d",
+        total,
+        have_ind,
+        have_lv1,
+        have_nace,
+        have_lv2,
+    )
 
     return AnalysisDataset(
         output_root=output_root,

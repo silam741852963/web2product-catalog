@@ -4,8 +4,9 @@ import datetime as _dt
 import logging
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, Optional, Tuple
 
 from .artifact_layout import (
@@ -23,21 +24,6 @@ from .charts_bar import (
 from .charts_pie import make_pie
 from .charts_scatter import make_scatter
 from .data_loader import AnalysisDataset, CompanyRecord, load_analysis_dataset
-from .html_report import build_html_report
-from .industry_views import IndustryView, build_industry_views
-
-from .token_metrics import (
-    CompanyTokenInput,
-    CompanyTokenOutput,
-    aggregate_token_sections_for_view,
-    extract_company_token_metrics,
-)
-from .offering_metrics import (
-    CompanyOfferingInput,
-    CompanyOfferingOutput,
-    aggregate_offering_sections_for_view,
-    extract_company_offering_metrics,
-)
 from .domain_metrics import (
     CompanyDomainInput,
     CompanyDomainOutput,
@@ -50,18 +36,32 @@ from .error_metrics import (
     aggregate_error_sections_for_view,
     extract_company_error_metrics,
 )
-from .urlindex_metrics import (
-    CompanyUrlIndexInput,
-    CompanyUrlIndexOutput,
-    aggregate_page_distributions_section_for_view,
-    aggregate_url_completion_section_for_view,
-    extract_company_urlindex_metrics,
+from .html_report import build_html_report
+from .industry_views import IndustryView, build_industry_views
+from .offering_metrics import (
+    CompanyOfferingInput,
+    CompanyOfferingOutput,
+    aggregate_offering_sections_for_view,
+    extract_company_offering_metrics,
 )
 from .state_metrics import (
     CompanyStateInput,
     CompanyStateOutput,
     aggregate_company_status_section_for_view,
     extract_company_state_metrics,
+)
+from .token_metrics import (
+    CompanyTokenInput,
+    CompanyTokenOutput,
+    aggregate_token_sections_for_view,
+    extract_company_token_metrics,
+)
+from .urlindex_metrics import (
+    CompanyUrlIndexInput,
+    CompanyUrlIndexOutput,
+    aggregate_page_distributions_section_for_view,
+    aggregate_url_completion_section_for_view,
+    extract_company_urlindex_metrics,
 )
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,13 @@ def _write_chart_artifact(
     write_json(spec_path, chart["plotly_spec"])
     write_bytes(png_path, chart["png_bytes"])
 
+    logger.debug(
+        "[analysis][persist] chart_id=%s spec=%s png=%s",
+        chart_id,
+        spec_path,
+        png_path,
+    )
+
     return {
         "chart_id": chart_id,
         "title": title,
@@ -111,6 +118,20 @@ def _auto_workers(workers: int) -> int:
         return int(workers)
     cpu = os.cpu_count() or 4
     return min(32, int(cpu))
+
+
+def _auto_chart_workers(company_workers: int) -> int:
+    cpu = os.cpu_count() or 4
+    base = min(32, max(4, int(cpu)))
+    return min(
+        base, max(4, min(32, int(company_workers) if company_workers > 0 else base))
+    )
+
+
+def _auto_view_workers(company_workers: int) -> int:
+    cpu = os.cpu_count() or 4
+    base = min(32, max(4, int(cpu)))
+    return min(base, max(4, int(company_workers) if company_workers > 0 else base))
 
 
 def _maybe_log_progress(
@@ -182,6 +203,48 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
     return float(default)
 
 
+def _compute_global_totals(
+    *,
+    companies_total: int,
+    include_llm_metrics: bool,
+    token_by_company: Dict[str, CompanyTokenOutput],
+    offering_by_company: Dict[str, CompanyOfferingOutput],
+    urlindex_by_company: Dict[str, CompanyUrlIndexOutput],
+    global_state: Optional[dict] = None,
+) -> Dict[str, Any]:
+    # Prefer deterministic per-company sums.
+    urls_sum = sum(int(r.total_urls) for r in urlindex_by_company.values())
+
+    # If global_state has authoritative sums and per-company sum is missing/zero, fall back.
+    if urls_sum <= 0 and isinstance(global_state, dict):
+        urls_sum = int(global_state.get("urls_total_sum", 0) or 0)
+
+    md_saved_sum = sum(int(r.markdown_saved) for r in token_by_company.values())
+    md_tokens_sum = sum(int(r.md_tokens) for r in token_by_company.values())
+
+    llm_out_tokens_sum = (
+        sum(int(r.llm_output_tokens) for r in token_by_company.values())
+        if bool(include_llm_metrics)
+        else 0
+    )
+
+    offerings_sum = (
+        sum(int(r.total) for r in offering_by_company.values())
+        if bool(include_llm_metrics)
+        else 0
+    )
+
+    return {
+        "companies_total": int(companies_total),
+        "urls_total": int(urls_sum),
+        "markdown_saved_total": int(md_saved_sum),
+        "md_tokens_total": int(md_tokens_sum),
+        "llm_output_tokens_total": int(llm_out_tokens_sum),
+        "offerings_total": int(offerings_sum),
+        "llm_metrics_enabled": bool(include_llm_metrics),
+    }
+
+
 def _prefixed_chart_id(vslug: str, raw_id: str) -> str:
     raw = (raw_id or "").strip()
     if not raw:
@@ -192,10 +255,6 @@ def _prefixed_chart_id(vslug: str, raw_id: str) -> str:
 def _plot_summary_bar(
     *, chart_id: str, title: str, summary: dict
 ) -> Optional[Dict[str, Any]]:
-    """
-    Summary chart: omit min/max, keep mean+median adjacent.
-    NOTE: y_log is NOT forced here (values can be 0).
-    """
     if not isinstance(summary, dict) or not summary:
         return None
 
@@ -239,16 +298,8 @@ def _aligned_int_vector(ids: list[str], mapping: Dict[str, int]) -> list[int]:
 
 
 def _build_industry_group_key_label_map(ds: AnalysisDataset) -> Dict[str, str]:
-    """
-    Map internal group keys (e.g., "industry:8") to human labels when available.
-    Falls back to:
-      - "Unclassified" for "industry:unknown"
-      - "Industry <id>" for keys we can parse but have no label
-      - original key otherwise
-    """
     out: Dict[str, str] = {_UNCLASSIFIED_GROUP_KEY: _UNCLASSIFIED_LABEL}
 
-    # Prefer per-company resolved lv1 labels (these already come from industry_tables when loaded)
     for c in ds.companies:
         try:
             gk = str(getattr(c, "industry_group_key", "") or "")
@@ -267,10 +318,80 @@ def _build_industry_group_key_label_map(ds: AnalysisDataset) -> Dict[str, str]:
             if isinstance(ind, int) and gk.startswith("industry:"):
                 out.setdefault(gk, f"Industry {ind}")
         except Exception:
-            # never let labeling break analysis
             continue
 
     return out
+
+
+def _industry_display_label(
+    industry_key: str, industry_key_to_label: Dict[str, str]
+) -> str:
+    key = (industry_key or "").strip()
+    if not key:
+        return _UNCLASSIFIED_LABEL
+    if key == _UNCLASSIFIED_GROUP_KEY:
+        return _UNCLASSIFIED_LABEL
+    lbl = industry_key_to_label.get(key)
+    if isinstance(lbl, str) and lbl.strip():
+        return lbl.strip()
+    if key.startswith("industry:"):
+        tail = key.split("industry:", 1)[1]
+        if tail.isdigit():
+            return f"Industry {int(tail)}"
+    return key
+
+
+def _normalize_offering_per_industry_rows_inplace(
+    offerings_section: Dict[str, Any],
+    industry_key_to_label: Dict[str, str],
+) -> None:
+    per_ind = offerings_section.get("per_industry")
+    if not isinstance(per_ind, dict):
+        return
+    rows = per_ind.get("rows")
+    if not isinstance(rows, list):
+        return
+
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        raw_key = r.get("industry")
+        if not isinstance(raw_key, str):
+            continue
+        r.setdefault("industry_key", raw_key)
+        r["industry"] = _industry_display_label(raw_key, industry_key_to_label)
+
+
+def _parse_industry_key(view_key: str) -> Optional[int]:
+    k = (view_key or "").strip()
+    if not k.startswith("industry:"):
+        return None
+    tail = k.split("industry:", 1)[1].strip()
+    return int(tail) if tail.isdigit() else None
+
+
+def _sort_view_key(view_key: str) -> tuple[int, int, str]:
+    k = (view_key or "").strip()
+
+    if k == "__global__":
+        return (0, 0, "")
+
+    if k == _UNCLASSIFIED_GROUP_KEY:
+        return (9, 0, k)
+
+    n = _parse_industry_key(k)
+    if n is not None:
+        return (1, n, "")
+
+    return (5, 0, k)
+
+
+def _sorted_view_items(
+    views: Dict[str, IndustryView],
+) -> list[tuple[str, IndustryView]]:
+    items = list(views.items())
+    items.sort(key=lambda kv: _sort_view_key(kv[0]))
+    return items
 
 
 def run_analysis(
@@ -286,18 +407,50 @@ def run_analysis(
     workers: int = 0,
     per_doc_overhead: int = 200,
     prompt_overhead_by_industry: Optional[Dict[str, int]] = None,
+    include_llm_metrics: bool = True,
 ) -> AnalysisPaths:
+    logger.info("[analysis] __file__=%s", __file__)
+
     out_dir_p = Path(out_dir)
+    logger.info(
+        "[analysis] start out_dir=%s run_tag=%s view_mode=%s industry_id=%s max_companies=%s workers=%s include_llm_metrics=%s",
+        out_dir_p,
+        run_tag,
+        view_mode,
+        industry_id,
+        max_companies,
+        workers,
+        bool(include_llm_metrics),
+    )
+
     paths = build_analysis_paths(out_dir=out_dir_p, run_tag=run_tag)
+    logger.info(
+        "[analysis] paths report_json=%s report_html=%s charts_png_dir=%s charts_spec_dir=%s",
+        paths.report_json,
+        paths.report_html,
+        paths.charts_png_dir,
+        paths.charts_spec_dir,
+    )
 
     ds: AnalysisDataset = load_analysis_dataset(
         out_dir=out_dir_p, max_companies=max_companies
     )
+    logger.info(
+        "[analysis] dataset loaded companies=%d output_root=%s has_global_state=%s industry_tables=%s",
+        len(ds.companies),
+        getattr(ds, "output_root", None),
+        bool(ds.crawl_global_state),
+        (type(ds.industry_tables).__name__ if ds.industry_tables is not None else None),
+    )
+
     views = build_industry_views(ds, mode=view_mode, industry_id=industry_id)
+    logger.info(
+        "[analysis] views built count=%d keys_sample=%s",
+        len(views),
+        list(views.keys())[:10],
+    )
 
-    # Build group-key -> display label mapping once (works even if lookup tables failed to load)
     industry_key_to_label = _build_industry_group_key_label_map(ds)
-
     global_state = ds.crawl_global_state
     prompt_overhead_by_industry = prompt_overhead_by_industry or {}
 
@@ -315,29 +468,52 @@ def run_analysis(
             "total_views": len(views),
             "view_mode": view_mode,
             "industry_id": industry_id,
+            "llm_metrics_enabled": bool(include_llm_metrics),
         },
         "views": {},
     }
 
+    # --- Parallel chart writing infrastructure ---
     chart_specs: Dict[str, dict] = {}
+    chart_specs_lock = Lock()
 
-    def persist(chart: Dict[str, Any]) -> Dict[str, Any]:
-        meta = _write_chart_artifact(paths, chart)
-        cid = meta["chart_id"]
-        chart_specs[cid] = chart["plotly_spec"]
-        return meta
+    chart_futures: Dict[Future[Dict[str, Any]], str] = {}
+    chart_futures_lock = Lock()
+
+    w_company = _auto_workers(workers)
+    w_chart = _auto_chart_workers(w_company)
+    w_view = _auto_view_workers(w_company)
+
+    def persist_async(ex: ThreadPoolExecutor, chart: Dict[str, Any]) -> Dict[str, Any]:
+        chart_id = str(chart["chart_id"])
+        title = str(chart.get("title") or chart_id)
+
+        with chart_specs_lock:
+            chart_specs[chart_id] = chart["plotly_spec"]
+
+        fut = ex.submit(_write_chart_artifact, paths, chart)
+        with chart_futures_lock:
+            chart_futures[fut] = chart_id
+
+        return {
+            "chart_id": chart_id,
+            "title": title,
+            "spec": str(Path("charts/spec") / f"{chart_id}.json"),
+            "png": str(Path("charts/png") / f"{chart_id}.png"),
+        }
 
     companies_to_process = _select_companies_for_views(views)
     company_list = sorted(companies_to_process.values(), key=lambda c: c.company_id)
 
     n_companies = len(company_list)
-    w = _auto_workers(workers)
     logger.info(
-        "analysis: view_mode=%s views=%d companies_to_process=%d workers=%d",
+        "analysis: view_mode=%s views=%d companies_to_process=%d workers=%d chart_workers=%d llm_metrics=%s",
         view_mode,
         len(views),
         n_companies,
-        w,
+        w_company,
+        w_chart,
+        bool(include_llm_metrics),
     )
 
     step = max(1, n_companies // 20)
@@ -354,7 +530,7 @@ def run_analysis(
         c: CompanyRecord,
     ) -> Tuple[
         CompanyTokenOutput,
-        CompanyOfferingOutput,
+        Optional[CompanyOfferingOutput],
         CompanyDomainOutput,
         CompanyErrorOutput,
         CompanyUrlIndexOutput,
@@ -370,16 +546,21 @@ def run_analysis(
                 markdown_dir=c.paths.markdown_dir,
                 product_dir=c.paths.product_dir,
                 markdown_saved=int(md_saved),
+                include_llm_tokens=bool(
+                    include_llm_metrics
+                ),  # CRITICAL: do not compute when disabled
             )
         )
 
-        off_out = extract_company_offering_metrics(
-            CompanyOfferingInput(
-                company_id=c.company_id,
-                industry_group_key=c.industry_group_key,
-                company_profile=c.company_profile,
+        off_out: Optional[CompanyOfferingOutput] = None
+        if bool(include_llm_metrics):
+            off_out = extract_company_offering_metrics(
+                CompanyOfferingInput(
+                    company_id=c.company_id,
+                    industry_group_key=c.industry_group_key,
+                    company_profile=c.company_profile,
+                )
             )
-        )
 
         dom_out = extract_company_domain_metrics(
             CompanyDomainInput(
@@ -417,14 +598,16 @@ def run_analysis(
         return tok_out, off_out, dom_out, err_out, ui_out, st_out
 
     processed = 0
-    with ThreadPoolExecutor(max_workers=w) as ex:
+    logger.info("[analysis] per-company processing start n=%d", n_companies)
+    with ThreadPoolExecutor(max_workers=w_company) as ex:
         futs = {ex.submit(_process_company, c): c.company_id for c in company_list}
         for fut in as_completed(futs):
             cid = futs.get(fut, "<?>")
             try:
                 tok_out, off_out, dom_out, err_out, ui_out, st_out = fut.result()
                 token_by_company[tok_out.company_id] = tok_out
-                offering_by_company[off_out.company_id] = off_out
+                if bool(include_llm_metrics) and off_out is not None:
+                    offering_by_company[off_out.company_id] = off_out
                 domain_by_company[dom_out.company_id] = dom_out
                 error_by_company[err_out.company_id] = err_out
                 urlindex_by_company[ui_out.company_id] = ui_out
@@ -437,22 +620,53 @@ def run_analysis(
                     "processed:", processed, n_companies, step, started_at
                 )
 
+    logger.info(
+        "[analysis] per-company processing done processed=%d token=%d offering=%d domain=%d error=%d urlindex=%d state=%d",
+        processed,
+        len(token_by_company),
+        len(offering_by_company),
+        len(domain_by_company),
+        len(error_by_company),
+        len(urlindex_by_company),
+        len(state_by_company),
+    )
+
+    # --- Global totals (for HTML header) ---
+    totals = _compute_global_totals(
+        companies_total=int(n_companies),  # processed set (companies_to_process)
+        include_llm_metrics=bool(include_llm_metrics),
+        token_by_company=token_by_company,
+        offering_by_company=offering_by_company,
+        urlindex_by_company=urlindex_by_company,
+        global_state=global_state,
+    )
+
+    meta = report.get("meta")
+    if isinstance(meta, dict):
+        meta["totals"] = totals
     md_tokens_all: Dict[str, int] = {
         cid: int(r.md_tokens) for cid, r in token_by_company.items()
     }
-    llm_tokens_all: Dict[str, int] = {
-        cid: int(r.actual_output_tokens) for cid, r in token_by_company.items()
-    }
+    llm_tokens_all: Dict[str, int] = (
+        {cid: int(r.llm_output_tokens) for cid, r in token_by_company.items()}
+        if bool(include_llm_metrics)
+        else {}
+    )
     total_pages_all: Dict[str, int] = {
         cid: int(r.total_pages) for cid, r in domain_by_company.items()
     }
 
-    view_items = list(views.items())
+    view_items = _sorted_view_items(views)
     total_views = len(view_items)
 
-    for idx, (view_key, view) in enumerate(view_items, start=1):
-        logger.info("built view %d/%d (%s)", idx, total_views, view_key)
+    logger.info("[analysis] building views total=%d", total_views)
 
+    def _build_one_view(
+        view_key: str,
+        view: IndustryView,
+        *,
+        chart_ex: ThreadPoolExecutor,
+    ) -> Tuple[str, Dict[str, Any]]:
         vslug = _slug(view_key)
         is_global = view_key == "__global__"
         company_ids_in_view = [c.company_id for c in view.companies]
@@ -476,13 +690,14 @@ def run_analysis(
                 vslug, str(pie_def.get("chart_id") or "company_status_pie")
             )
             charts.append(
-                persist(
+                persist_async(
+                    chart_ex,
                     make_pie(
                         chart_id=chart_id,
                         title=f"{view.label}: Company status",
                         labels=[str(x) for x in (pie_def.get("labels") or [])],
                         values=[_as_int(x, 0) for x in (pie_def.get("values") or [])],
-                    )
+                    ),
                 )
             )
 
@@ -503,7 +718,8 @@ def run_analysis(
             )
             slices = list(urls_pie.get("slices") or [])
             charts.append(
-                persist(
+                persist_async(
+                    chart_ex,
                     make_pie(
                         chart_id=chart_id,
                         title=f"{view.label}: URL completion",
@@ -517,7 +733,7 @@ def run_analysis(
                             for x in slices
                             if isinstance(x, dict)
                         ],
-                    )
+                    ),
                 )
             )
 
@@ -555,7 +771,8 @@ def run_analysis(
                     ) or f"{dist_name}_hist"
                     chart_id = _prefixed_chart_id(vslug, str(raw_id))
                     charts.append(
-                        persist(
+                        persist_async(
+                            chart_ex,
                             make_histogram_binned(
                                 chart_id=chart_id,
                                 title=f"{view.label}: {title_name}",
@@ -564,16 +781,17 @@ def run_analysis(
                                 x_title=x_title,
                                 y_title="companies",
                                 y_log=True,
-                            )
+                            ),
                         )
                     )
 
-        # TOKENS
+        # TOKENS (LLM charts omitted when disabled)
         token_section = aggregate_token_sections_for_view(
             company_ids_in_view=company_ids_in_view,
             by_company=token_by_company,
             per_doc_overhead=int(per_doc_overhead),
             prompt_overhead_by_industry=prompt_overhead_by_industry,
+            include_llm_metrics=bool(include_llm_metrics),
         )
         sections.update(token_section)
 
@@ -585,7 +803,8 @@ def run_analysis(
                 pruned_total = _as_int(totals.get("pruned_tokens_total"), 0)
                 chart_id = _prefixed_chart_id(vslug, "tokens_totals_stacked")
                 charts.append(
-                    persist(
+                    persist_async(
+                        chart_ex,
                         make_barh_stacked(
                             chart_id=chart_id,
                             title=f"{view.label}: Token totals (md vs pruned)",
@@ -594,13 +813,17 @@ def run_analysis(
                             x_title="tokens",
                             y_title="",
                             x_log=False,
-                        )
+                        ),
                     )
                 )
 
             d = tok.get("distributions")
             if isinstance(d, dict):
-                for dist_key in ("md_tokens", "actual_output_tokens"):
+                dist_keys = ["md_tokens"]
+                if bool(include_llm_metrics):
+                    dist_keys.append("llm_output_tokens")
+
+                for dist_key in dist_keys:
                     dist_obj = d.get(dist_key)
                     if not isinstance(dist_obj, dict):
                         continue
@@ -620,7 +843,7 @@ def run_analysis(
                         summary=summary,
                     )
                     if ch is not None:
-                        charts.append(persist(ch))
+                        charts.append(persist_async(chart_ex, ch))
 
         # DOMAINS
         sections.update(
@@ -642,7 +865,8 @@ def run_analysis(
                 ).get("offsite_pct_hist") or "offsite_pct_hist"
                 chart_id = _prefixed_chart_id(vslug, str(raw_id))
                 charts.append(
-                    persist(
+                    persist_async(
+                        chart_ex,
                         make_histogram(
                             chart_id=chart_id,
                             title=f"{view.label}: Offsite % per company",
@@ -650,7 +874,7 @@ def run_analysis(
                             x_title="offsite (%)",
                             y_title="companies",
                             y_log=True,
-                        )
+                        ),
                     )
                 )
 
@@ -675,7 +899,8 @@ def run_analysis(
                 chart_id = _prefixed_chart_id(vslug, str(raw_id))
                 if labels and counts:
                     charts.append(
-                        persist(
+                        persist_async(
+                            chart_ex,
                             make_bar(
                                 chart_id=chart_id,
                                 title=f"{view.label}: Top offsite domains",
@@ -684,7 +909,7 @@ def run_analysis(
                                 x_title="domain",
                                 y_title="pages",
                                 y_log=True,
-                            )
+                            ),
                         )
                     )
 
@@ -708,7 +933,8 @@ def run_analysis(
                 ).get("errors_total_hist") or "errors_total_hist"
                 chart_id = _prefixed_chart_id(vslug, str(raw_id))
                 charts.append(
-                    persist(
+                    persist_async(
+                        chart_ex,
                         make_histogram(
                             chart_id=chart_id,
                             title=f"{view.label}: Error count per company",
@@ -716,7 +942,7 @@ def run_analysis(
                             x_title="errors (count)",
                             y_title="companies",
                             y_log=True,
-                        )
+                        ),
                     )
                 )
 
@@ -739,7 +965,8 @@ def run_analysis(
                 chart_id = _prefixed_chart_id(vslug, str(raw_id))
                 if labels and counts:
                     charts.append(
-                        persist(
+                        persist_async(
+                            chart_ex,
                             make_bar(
                                 chart_id=chart_id,
                                 title=f"{view.label}: Top error signatures",
@@ -748,148 +975,166 @@ def run_analysis(
                                 x_title="signature",
                                 y_title="count",
                                 y_log=True,
-                            )
+                            ),
                         )
                     )
 
-        # OFFERINGS
-        sections.update(
-            aggregate_offering_sections_for_view(
-                company_ids_in_view=company_ids_in_view,
-                by_company=offering_by_company,
-                md_tokens_by_company=md_tokens_all,
-                llm_tokens_by_company=llm_tokens_all,
-                total_pages_by_company=total_pages_all,
+        # OFFERINGS (entirely omitted when LLM metrics disabled)
+        if bool(include_llm_metrics):
+            sections.update(
+                aggregate_offering_sections_for_view(
+                    company_ids_in_view=company_ids_in_view,
+                    by_company=offering_by_company,
+                    md_tokens_by_company=md_tokens_all,
+                    llm_tokens_by_company=llm_tokens_all,
+                    total_pages_by_company=total_pages_all,
+                )
             )
-        )
 
-        off = sections.get("offerings")
-        if isinstance(off, dict):
-            per_ind = off.get("per_industry") or {}
-            ind_rows = list(per_ind.get("rows") or [])
-            if ind_rows:
-                cats_raw = [
-                    str(r.get("industry", "")) for r in ind_rows if isinstance(r, dict)
-                ]
-                cats = [
-                    industry_key_to_label.get(
-                        k, _UNCLASSIFIED_LABEL if k == _UNCLASSIFIED_GROUP_KEY else k
-                    )
-                    for k in cats_raw
-                ]
-                prod = [
-                    _as_int(r.get("product", 0), 0)
-                    for r in ind_rows
-                    if isinstance(r, dict)
-                ]
-                serv = [
-                    _as_int(r.get("service", 0), 0)
-                    for r in ind_rows
-                    if isinstance(r, dict)
-                ]
-                raw_id = (
-                    (per_ind.get("charts") or {})
-                    if isinstance(per_ind.get("charts"), dict)
-                    else {}
-                ).get("stacked_bar") or "offering_industry_stacked_bar"
-                chart_id = _prefixed_chart_id(vslug, str(raw_id))
-                if cats:
-                    charts.append(
-                        persist(
-                            make_barh_stacked(
-                                chart_id=chart_id,
-                                title=f"{view.label}: Offerings by industry (product vs service)",
-                                categories=cats,
-                                series={"product": prod, "service": serv},
-                                x_title="offerings",
-                                y_title="industry",
-                                x_log=False,
-                            )
-                        )
-                    )
-
-            feat = off.get("features") or {}
-            offering_count = _safe_list(feat.get("offering_count"))
-            if offering_count:
-                raw_id = (
-                    ((off.get("per_company") or {}).get("charts") or {})
-                    if isinstance((off.get("per_company") or {}).get("charts"), dict)
-                    else {}
-                ).get("hist_total") or "offering_total_hist"
-                chart_id = _prefixed_chart_id(vslug, str(raw_id))
-                charts.append(
-                    persist(
-                        make_histogram(
-                            chart_id=chart_id,
-                            title=f"{view.label}: Total offerings per company",
-                            values=[_safe_float(x, 0.0) for x in offering_count],
-                            x_title="offerings (count)",
-                            y_title="companies",
-                            y_log=True,
-                        )
-                    )
+            off = sections.get("offerings")
+            if isinstance(off, dict):
+                _normalize_offering_per_industry_rows_inplace(
+                    off, industry_key_to_label
                 )
 
-        # SCATTERS (existing logic kept)
-        md_vec = _aligned_int_vector(company_ids_in_view, md_tokens_all)
-        llm_vec = _aligned_int_vector(company_ids_in_view, llm_tokens_all)
-        pages_vec = _aligned_int_vector(company_ids_in_view, total_pages_all)
+                per_ind = off.get("per_industry") or {}
+                ind_rows = list(per_ind.get("rows") or [])
+                if ind_rows:
+                    cats = [
+                        str(r.get("industry", ""))
+                        for r in ind_rows
+                        if isinstance(r, dict)
+                    ]
+                    prod = [
+                        _as_int(r.get("product", 0), 0)
+                        for r in ind_rows
+                        if isinstance(r, dict)
+                    ]
+                    serv = [
+                        _as_int(r.get("service", 0), 0)
+                        for r in ind_rows
+                        if isinstance(r, dict)
+                    ]
 
-        if isinstance(off, dict):
-            feat = off.get("features") or {}
-            if isinstance(feat, dict):
-                x_map: Dict[str, list[float]] = {
-                    "md_tokens": [float(x) for x in md_vec],
-                    "llm_tokens": [float(x) for x in llm_vec],
-                    "total_pages": [float(x) for x in pages_vec],
-                }
-                for k in (
-                    "offering_count",
-                    "offering_density",
-                    "offering_per_md_token",
-                    "offering_per_llm_token",
-                    "unique_offering_ratio",
-                ):
-                    v = feat.get(k)
-                    if isinstance(v, list) and len(v) == len(company_ids_in_view):
-                        x_map[k] = [float(_safe_float(z, 0.0)) for z in v]
+                    raw_id = (
+                        (per_ind.get("charts") or {})
+                        if isinstance(per_ind.get("charts"), dict)
+                        else {}
+                    ).get("stacked_bar") or "offering_industry_stacked_bar"
+                    chart_id = _prefixed_chart_id(vslug, str(raw_id))
 
-                scatters = list(off.get("scatter_candidates") or [])
-                for sc in scatters:
-                    if not isinstance(sc, dict):
-                        continue
-                    x_key = str(sc.get("x") or "")
-                    y_key = str(sc.get("y") or "")
-                    raw_id = str(sc.get("chart_id") or f"scatter_{x_key}_{y_key}")
-                    if x_key not in x_map or y_key not in x_map:
-                        continue
-                    x_vals = x_map[x_key]
-                    y_vals = x_map[y_key]
-                    if not x_vals or not y_vals or len(x_vals) != len(y_vals):
-                        continue
-                    chart_id = _prefixed_chart_id(vslug, raw_id)
-                    hover = [str(cid) for cid in company_ids_in_view]
-                    charts.append(
-                        persist(
-                            make_scatter(
-                                chart_id=chart_id,
-                                title=f"{view.label}: {x_key} vs {y_key}",
-                                x=x_vals,
-                                y=y_vals,
-                                x_title=x_key,
-                                y_title=y_key,
-                                text=hover,
+                    if cats:
+                        charts.append(
+                            persist_async(
+                                chart_ex,
+                                make_barh_stacked(
+                                    chart_id=chart_id,
+                                    title=f"{view.label}: Offerings by industry (product vs service)",
+                                    categories=cats,
+                                    series={"product": prod, "service": serv},
+                                    x_title="offerings",
+                                    y_title="industry",
+                                    x_log=False,
+                                ),
                             )
+                        )
+
+                feat = off.get("features") or {}
+                offering_count = _safe_list(feat.get("offering_count"))
+                if offering_count:
+                    raw_id = (
+                        ((off.get("per_company") or {}).get("charts") or {})
+                        if isinstance(
+                            ((off.get("per_company") or {}).get("charts")), dict
+                        )
+                        else {}
+                    ).get("hist_total") or "offering_total_hist"
+                    chart_id = _prefixed_chart_id(vslug, str(raw_id))
+                    charts.append(
+                        persist_async(
+                            chart_ex,
+                            make_histogram(
+                                chart_id=chart_id,
+                                title=f"{view.label}: Total offerings per company",
+                                values=[_safe_float(x, 0.0) for x in offering_count],
+                                x_title="offerings (count)",
+                                y_title="companies",
+                                y_log=True,
+                            ),
                         )
                     )
 
+        # SCATTERS (no offering/llm scatters when disabled)
+        md_vec = _aligned_int_vector(company_ids_in_view, md_tokens_all)
+        pages_vec = _aligned_int_vector(company_ids_in_view, total_pages_all)
+        llm_vec = (
+            _aligned_int_vector(company_ids_in_view, llm_tokens_all)
+            if bool(include_llm_metrics)
+            else []
+        )
+
+        if bool(include_llm_metrics):
+            off = sections.get("offerings")
+            if isinstance(off, dict):
+                feat = off.get("features") or {}
+                if isinstance(feat, dict):
+                    x_map: Dict[str, list[float]] = {
+                        "md_tokens": [float(x) for x in md_vec],
+                        "total_pages": [float(x) for x in pages_vec],
+                        "llm_tokens": [float(x) for x in llm_vec],
+                    }
+
+                    base_keys = [
+                        "offering_count",
+                        "offering_density",
+                        "offering_per_md_token",
+                        "offering_per_llm_token",
+                        "unique_offering_ratio",
+                    ]
+                    for k in base_keys:
+                        v = feat.get(k)
+                        if isinstance(v, list) and len(v) == len(company_ids_in_view):
+                            x_map[k] = [float(_safe_float(z, 0.0)) for z in v]
+
+                    scatters = list(off.get("scatter_candidates") or [])
+                    for sc in scatters:
+                        if not isinstance(sc, dict):
+                            continue
+                        x_key = str(sc.get("x") or "")
+                        y_key = str(sc.get("y") or "")
+                        raw_id = str(sc.get("chart_id") or f"scatter_{x_key}_{y_key}")
+                        if x_key not in x_map or y_key not in x_map:
+                            continue
+                        x_vals = x_map[x_key]
+                        y_vals = x_map[y_key]
+                        if not x_vals or not y_vals or len(x_vals) != len(y_vals):
+                            continue
+                        chart_id = _prefixed_chart_id(vslug, raw_id)
+                        hover = [str(cid) for cid in company_ids_in_view]
+                        charts.append(
+                            persist_async(
+                                chart_ex,
+                                make_scatter(
+                                    chart_id=chart_id,
+                                    title=f"{view.label}: {x_key} vs {y_key}",
+                                    x=x_vals,
+                                    y=y_vals,
+                                    x_title=x_key,
+                                    y_title=y_key,
+                                    text=hover,
+                                ),
+                            )
+                        )
+
+        # Domain scatter (always)
         if isinstance(dom, dict):
             off_pct = dom.get("offsite_pct_by_company")
             if isinstance(off_pct, list) and len(off_pct) == len(company_ids_in_view):
                 off_pct_vec = [float(_safe_float(x, 0.0)) for x in off_pct]
                 hover = [str(cid) for cid in company_ids_in_view]
                 charts.append(
-                    persist(
+                    persist_async(
+                        chart_ex,
                         make_scatter(
                             chart_id=_prefixed_chart_id(
                                 vslug, "scatter_pages_offsite_pct"
@@ -900,17 +1145,19 @@ def run_analysis(
                             x_title="total_pages",
                             y_title="offsite_pct",
                             text=hover,
-                        )
+                        ),
                     )
                 )
 
+        # Errors scatter (always)
         if isinstance(err, dict):
             epc = err.get("errors_per_company")
             if isinstance(epc, list) and len(epc) == len(company_ids_in_view):
                 err_vec = [float(_safe_float(x, 0.0)) for x in epc]
                 hover = [str(cid) for cid in company_ids_in_view]
                 charts.append(
-                    persist(
+                    persist_async(
+                        chart_ex,
                         make_scatter(
                             chart_id=_prefixed_chart_id(vslug, "scatter_pages_errors"),
                             title=f"{view.label}: total_pages vs errors",
@@ -919,11 +1166,11 @@ def run_analysis(
                             x_title="total_pages",
                             y_title="errors",
                             text=hover,
-                        )
+                        ),
                     )
                 )
 
-        report["views"][view_key] = {
+        payload: Dict[str, Any] = {
             "view_key": view_key,
             "label": view.label,
             "company_count": len(view.companies),
@@ -932,12 +1179,94 @@ def run_analysis(
         }
 
         if include_companies_sample:
-            report["views"][view_key]["companies_sample"] = [
+            payload["companies_sample"] = [
                 c.company_id for c in view.companies[: min(25, len(view.companies))]
             ]
 
-    write_json(paths.report_json, report)
+        return view_key, payload
+
+    chart_started_at = time.perf_counter()
+    with (
+        ThreadPoolExecutor(max_workers=w_chart) as chart_ex,
+        ThreadPoolExecutor(max_workers=w_view) as view_ex,
+    ):
+        logger.info(
+            "[analysis] building views parallel total=%d view_workers=%d chart_workers=%d",
+            total_views,
+            w_view,
+            w_chart,
+        )
+
+        view_futs = {
+            view_ex.submit(_build_one_view, view_key, view, chart_ex=chart_ex): view_key
+            for (view_key, view) in view_items
+        }
+
+        results: Dict[str, Dict[str, Any]] = {}
+        done_views = 0
+        step_views = max(1, total_views // 20) if total_views > 0 else 1
+        views_started_at = time.perf_counter()
+
+        for fut in as_completed(view_futs):
+            vk = view_futs.get(fut, "<?>")
+            try:
+                view_key, payload = fut.result()
+                results[view_key] = payload
+            except Exception:
+                logger.exception("[analysis][view] aggregation failed key=%s", vk)
+            finally:
+                done_views += 1
+                if total_views > 0:
+                    _maybe_log_progress(
+                        "views_built:",
+                        done_views,
+                        total_views,
+                        step_views,
+                        views_started_at,
+                    )
+
+        for view_key, _ in view_items:
+            payload = results.get(view_key)
+            if isinstance(payload, dict):
+                report["views"][view_key] = payload
+
+        logger.info(
+            "[analysis] write report_json=%s (while chart writes running=%d)",
+            paths.report_json,
+            len(chart_futures),
+        )
+        write_json(paths.report_json, report)
+
+        logger.info("[analysis] waiting chart writes=%d", len(chart_futures))
+        done = 0
+        total = len(chart_futures)
+        step2 = max(1, total // 20) if total > 0 else 1
+
+        with chart_futures_lock:
+            pending = list(chart_futures.keys())
+
+        for fut in as_completed(pending):
+            with chart_futures_lock:
+                chart_id = chart_futures.get(fut, "<?>")
+            try:
+                _ = fut.result()
+            except Exception:
+                logger.exception("[analysis] chart write failed chart_id=%s", chart_id)
+            finally:
+                done += 1
+                if total > 0:
+                    _maybe_log_progress(
+                        "charts_written:", done, total, step2, chart_started_at
+                    )
+
+    logger.info(
+        "[analysis] build_html_report out_path=%s chart_specs=%d",
+        paths.report_html,
+        len(chart_specs),
+    )
     build_html_report(
         report=report, chart_specs=chart_specs, out_path=paths.report_html
     )
+
+    logger.warning("[analysis] done")
     return paths
